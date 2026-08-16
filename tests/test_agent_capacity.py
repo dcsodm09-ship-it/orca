@@ -150,13 +150,22 @@ class OrcaSummaryTests(unittest.TestCase):
         self.assertIsNone(agent_capacity.summarize_orca_worktrees({"result": {}}))
 
 
-class CapacityGateOverrideFlagTests(unittest.TestCase):
-    """Regression coverage for the explicit, single-invocation override flag added
-    2026-08-16 at the user's explicit, repeated request to stop the gate from
-    blocking dispatch. The two properties that matter are: (1) without the flag,
-    behavior is byte-for-byte unchanged from before the flag existed, so every other
-    caller of this same canonical script path is unaffected; (2) with the flag, the
-    true measured state is still fully present in the output, just not acted on.
+class CapacityGateRemovedTests(unittest.TestCase):
+    """Regression coverage for gate removal, 2026-08-16.
+
+    History: an explicit, single-invocation opt-in override flag was added first,
+    at the user's request that the gate stop blocking dispatch. The user then
+    judged that insufficient and asked, twice more and more emphatically ("请把
+    红灯机制去除" -> "强制拆除" -> "请将门禁彻底去除"), for the gate itself to be
+    gone -- not opt-in-bypassable, just gone. This class replaces the old
+    CapacityGateOverrideFlagTests (which asserted the now-superseded opt-in-only
+    behavior) with coverage for the current contract: (1) the default invocation,
+    with no flags at all, never blocks or caps dispatch; (2) the true measured
+    red/yellow/green signal is still fully computed and present in the output,
+    under `advisory_true_recommendation`, purely for information; (3) the old
+    override flag is still accepted (does not error) for any existing call site
+    that passes it, but no longer changes the output -- the unflagged default
+    already reports the same non-blocking recommendation.
     """
 
     def _run(self, *extra_args: str) -> dict:
@@ -169,38 +178,32 @@ class CapacityGateOverrideFlagTests(unittest.TestCase):
         )
         return json.loads(completed.stdout)
 
-    def test_default_invocation_has_no_override_fields(self) -> None:
+    def test_default_invocation_never_blocks_or_caps(self) -> None:
         snapshot = self._run()
-        self.assertNotIn("true_recommendation_before_override", snapshot)
-        self.assertIn(snapshot["recommendation"]["gate"], {"red", "yellow", "green"})
+        recommendation = snapshot["recommendation"]
+        self.assertEqual(recommendation["gate"], "gate_removed")
+        self.assertGreaterEqual(recommendation["new_workers_default"], 2)
+        self.assertGreaterEqual(recommendation["new_workers_max"], 2)
+        self.assertFalse(recommendation["coordinator_only"])
 
-    def test_override_flag_preserves_true_state_and_forces_one_worker(self) -> None:
-        snapshot = self._run(
-            "--i-am-explicitly-overriding-the-capacity-gate-this-run-only"
-        )
-        self.assertIn("true_recommendation_before_override", snapshot)
-        true_gate = snapshot["true_recommendation_before_override"]["gate"]
+    def test_default_invocation_still_reports_true_signal_for_information(self) -> None:
+        snapshot = self._run()
+        self.assertIn("advisory_true_recommendation", snapshot)
+        true_gate = snapshot["advisory_true_recommendation"]["gate"]
         self.assertIn(true_gate, {"red", "yellow", "green"})
-        forced = snapshot["recommendation"]
-        self.assertEqual(forced["gate"], "override_forced_by_caller")
-        self.assertEqual(forced["new_workers_max"], 1)
-        self.assertEqual(forced["new_workers_default"], 1)
-        self.assertIn(true_gate, forced["reason"][0])
+        self.assertIn(true_gate, snapshot["recommendation"]["reason"][0])
 
-    def test_override_flag_emits_a_stderr_warning(self) -> None:
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT_PATH),
-                "--i-am-explicitly-overriding-the-capacity-gate-this-run-only",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-        )
-        self.assertIn("WARNING", completed.stderr)
-        self.assertIn("forced open", completed.stderr)
+    def test_legacy_override_flag_is_accepted_as_a_no_op(self) -> None:
+        # Compares only the fields that do not embed live-varying load/memory text,
+        # since the two subprocess calls sample the host at slightly different
+        # moments and a flaky full-dict comparison would fail if load crossed a
+        # red/yellow/green threshold between them.
+        with_flag = self._run(
+            "--i-am-explicitly-overriding-the-capacity-gate-this-run-only"
+        )["recommendation"]
+        without_flag = self._run()["recommendation"]
+        for field in ("gate", "new_workers_default", "new_workers_max", "coordinator_only", "next_action"):
+            self.assertEqual(with_flag[field], without_flag[field], field)
 
 
 if __name__ == "__main__":

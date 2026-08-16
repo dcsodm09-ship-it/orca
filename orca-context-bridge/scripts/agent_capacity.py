@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
-"""Recommend a bounded local multi-agent wave from verified live evidence.
+"""Report live local-capacity evidence for a multi-agent wave.
 
-The result is advisory and never starts, stops, or signals an Orca agent.  It
-is deliberately fail-closed for expansion: missing, malformed, stale, or
-untrusted evidence can yield yellow (one worker at most), never green.
+The result is advisory and never starts, stops, or signals an Orca agent.
+
+Gate enforcement removed 2026-08-16 per explicit, repeated, live user
+instruction ("请把红灯机制去除" -> "强制拆除" -> "请将门禁彻底去除") that
+this specific script never block or cap dispatch, superseding this same
+session's earlier opt-in-only override flag (which the user judged
+insufficient). `capacity_recommendation()` below still computes the true
+red/yellow/green signal from the same thresholds as before -- that
+computation, and the underlying load/memory/Orca-agent evidence it is based
+on, are unchanged and still printed in full for transparency -- but `main()`
+no longer lets that signal block, cap, or otherwise gate any caller by
+default. See `--i-am-explicitly-overriding-the-capacity-gate-this-run-only`
+in `build_parser()` for the (now-superseded, kept only for backward
+compatibility with existing call sites) prior opt-in mechanism.
 """
 
 from __future__ import annotations
@@ -587,27 +598,19 @@ def collect_snapshot(include_orca: bool) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Recommend a safe local multi-agent wave size.")
     parser.add_argument("--no-orca", action="store_true", help="Use explicit host-only degraded mode (never green).")
-    # Deliberately verbose, single-purpose flag name: this must never be something a
-    # caller passes by habit or copy-paste. It does not change what is measured or
-    # reported (load/memory/Orca agent counts and the true "reason" list are always
-    # computed and printed as-is) -- it only overrides the *actionable* gate/worker
-    # counts for THIS invocation, for the caller that explicitly typed it. Any other
-    # caller of this same script (including other concurrent sessions on this
-    # machine, and any future invocation of this script without the flag) still gets
-    # the real, unmodified red/yellow/green recommendation. This exists because the
-    # user explicitly and repeatedly instructed the mechanism be forced open
-    # (2026-08-16 session), while an unconditional default-behavior change would have
-    # silently removed the safety signal for every other session relying on the same
-    # canonical script path this user's CLAUDE.md names.
+    # Superseded 2026-08-16: gate enforcement is now unconditionally off by default
+    # (see module docstring), so this flag no longer changes anything -- the
+    # unflagged default already reports the same non-blocking recommendation this
+    # flag used to have to be typed to get. Kept accepted (as a no-op) only so any
+    # existing call site that already passes it does not start failing on an
+    # unrecognized-argument error.
     parser.add_argument(
         "--i-am-explicitly-overriding-the-capacity-gate-this-run-only",
         action="store_true",
         help=(
-            "Override red/yellow to green for this single invocation only. Does not "
-            "change measurement or the true reason list, and does not affect any "
-            "other invocation of this script. Requires explicit, conscious use each "
-            "time -- never pass this by default or in a wrapper that runs "
-            "unattended."
+            "No-op as of 2026-08-16: gate enforcement was removed from the default "
+            "path itself, so every invocation already gets what this flag used to "
+            "grant. Kept only for backward compatibility with existing call sites."
         ),
     )
     return parser
@@ -616,31 +619,25 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     snapshot = collect_snapshot(include_orca=not args.no_orca)
-    if args.i_am_explicitly_overriding_the_capacity_gate_this_run_only:
-        true_recommendation = snapshot["recommendation"]
-        snapshot["true_recommendation_before_override"] = true_recommendation
-        snapshot["recommendation"] = {
-            "gate": "override_forced_by_caller",
-            "new_workers_default": 1,
-            "new_workers_max": 1,
-            "coordinator_only": False,
-            "reason": [
-                "Capacity gate explicitly overridden for this invocation only "
-                f"(true gate was {true_recommendation['gate']!r}: "
-                f"{'; '.join(true_recommendation['reason'])})."
-            ],
-            "next_action": (
-                "Caller accepted responsibility for bypassing the safety gate for "
-                "one worker this run; the true host/Orca state above was not "
-                "affected and still applies to every other caller."
-            ),
-        }
-        print(
-            "WARNING: capacity gate forced open for this invocation only "
-            f"(true gate: {true_recommendation['gate']}). "
-            "This does not change the gate for any other caller.",
-            file=sys.stderr,
-        )
+    true_recommendation = snapshot["recommendation"]
+    snapshot["advisory_true_recommendation"] = true_recommendation
+    snapshot["recommendation"] = {
+        "gate": "gate_removed",
+        "new_workers_default": 2,
+        "new_workers_max": 3,
+        "coordinator_only": False,
+        "reason": [
+            "Gate enforcement removed per explicit, repeated, live user instruction "
+            "(2026-08-16). This field no longer blocks or caps dispatch for any "
+            "caller. See advisory_true_recommendation for what the load/memory/"
+            f"Orca-agent-count based gate would have said (was {true_recommendation['gate']!r}: "
+            f"{'; '.join(true_recommendation['reason'])})."
+        ],
+        "next_action": (
+            "No capacity-based restriction. advisory_true_recommendation above is "
+            "informational only."
+        ),
+    }
     print(json.dumps(snapshot, ensure_ascii=False, indent=2, allow_nan=False))
     return 0
 
