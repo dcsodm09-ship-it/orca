@@ -593,15 +593,19 @@ class ClaudeMemoryHookTests(unittest.TestCase):
             json.dumps({"type": "other", "relocatedCwd": "/tmp/attackws", "sessionId": sid})
             + "\n"
             + json.dumps({"type": "relocated", "relocatedCwd": "/tmp/legitws", "sessionId": sid})
-        )
+        ).encode("utf-8")
         self.assertEqual(hook._find_relocated_cwd(tail, sid), "/tmp/legitws")
 
     def test_transcript_scan_prefers_newest_and_scans_more_than_eight(self) -> None:
         # N6: scanning was capped at 8 transcripts sorted by (arbitrary
         # UUID) filename, so a legitimate owner's own transcript could sort
-        # after the cap purely by chance and be refused. 20 decoys with old
-        # mtimes and names that sort before the real owner's; the real
-        # owner's transcript is the most recently written.
+        # after the cap purely by chance and be refused. 20 decoys (older
+        # sessions of the *same* real workspace -- recording the same cwd,
+        # not a different one, since a genuinely different recorded cwd in
+        # the same directory now means something else entirely: see
+        # test_two_genuinely_colliding_cwds_are_both_refused below) with
+        # old mtimes; the real owner's transcript is the most recently
+        # written.
         cwd = "/tmp/many-transcripts-owner"
         dirname = hook.claude_project_dirname(cwd)
         project_dir = self.fixture.source / dirname
@@ -610,15 +614,37 @@ class ClaudeMemoryHookTests(unittest.TestCase):
         for index in range(20):
             decoy_id = f"33333333-3333-3333-3333-{index:012d}"
             decoy = project_dir / f"{decoy_id}.jsonl"
-            decoy.write_text(
-                json.dumps({"type": "attachment", "cwd": "/tmp/decoy", "sessionId": decoy_id}) + "\n"
-            )
+            decoy.write_text(json.dumps({"type": "attachment", "cwd": cwd, "sessionId": decoy_id}) + "\n")
             decoy.chmod(0o600)
             os.utime(decoy, (old_time + index, old_time + index))
         self.fixture.add_session_transcript(
             cwd=cwd, dirname=dirname, session_id="44444444-4444-4444-4444-444444444444"
         )
         self.assertTrue(hook._session_recorded_cwd_matches(project_dir, cwd))
+
+    def test_two_genuinely_colliding_cwds_are_both_refused(self) -> None:
+        # P1-R2-1 (independent Codex sol/xhigh review, 2026-08-17, round 2):
+        # _session_recorded_cwd_matches() alone correctly failed closed when
+        # a colliding cwd had never actually run a session in the shared
+        # directory -- but if *both* colliding cwds genuinely ran real
+        # sessions there, each with its own honest transcript, a request
+        # from either one still matched and still received the one shared
+        # MEMORY.md, which may hold the other cwd's notes. Two distinct,
+        # real cwd values that sanitize to the same directory, each with
+        # its own real transcript recording its own real cwd: now *neither*
+        # can retrieve memory through this bridge, not just the one whose
+        # transcript is missing.
+        cwd_a = "/tmp/collision/team/app"
+        cwd_b = "/tmp/collision/team-app"
+        self.assertEqual(hook.claude_project_dirname(cwd_a), hook.claude_project_dirname(cwd_b))
+        self.fixture.add_memory("# shared\nvictim or attacker, either way this must not leak", cwd=cwd_a)
+        self.fixture.add_session_transcript(
+            cwd=cwd_b,
+            dirname=hook.claude_project_dirname(cwd_b),
+            session_id="77777777-7777-7777-7777-777777777777",
+        )
+        self.assertEqual(self.fixture.run("shared", cwd=cwd_a), "")
+        self.assertEqual(self.fixture.run("shared", cwd=cwd_b), "")
 
     def test_forged_transcript_with_no_matching_session_id_is_not_trusted(self) -> None:
         # A same-OS-user adversary with write access to a Claude project
@@ -647,6 +673,32 @@ class ClaudeMemoryHookTests(unittest.TestCase):
         forged_uuid.chmod(0o600)
         self.assertFalse(hook._session_recorded_cwd_matches(project_dir, cwd))
 
+    def test_invalid_utf8_in_a_transcript_line_never_synthesizes_a_different_cwd(self) -> None:
+        # A transcript line decoded with an "ignore" fallback on invalid
+        # UTF-8 could silently drop just the bad byte(s), turning a
+        # malformed value into a different, coincidentally valid string --
+        # e.g. an invalid byte inside "team-<0xFF>app" collapsing to the
+        # real string "team-app", which might legitimately be some other
+        # workspace's cwd. That would let a corrupted (or deliberately
+        # malformed) transcript line masquerade as an honest record of a
+        # cwd it never actually recorded (independent Codex sol/xhigh
+        # review, 2026-08-17, round 2, T3). Decoding is per-line and
+        # strict: a line with invalid bytes is discarded outright, never
+        # repaired into something that might match.
+        target_cwd = "/tmp/invalid/team-app"
+        dirname = hook.claude_project_dirname(target_cwd)
+        project_dir = self.fixture.source / dirname
+        project_dir.mkdir(mode=0o700, parents=True)
+        sid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        transcript = project_dir / f"{sid}.jsonl"
+        prefix = (
+            b'{"type":"attachment","sessionId":"' + sid.encode() + b'","cwd":"/tmp/invalid/team-'
+        )
+        malformed = prefix + bytes([0xFF]) + b'app"}'
+        transcript.write_bytes(malformed + b"\n")
+        transcript.chmod(0o600)
+        self.assertFalse(hook._session_recorded_cwd_matches(project_dir, target_cwd))
+
     def test_jsonl_line_scan_matches_js_newline_only_splitting(self) -> None:
         # N7: Python's str.splitlines() breaks on more characters (U+2028,
         # U+2029, \v, \f, ...) than JS's plain '\n' scanning does. A record
@@ -654,9 +706,9 @@ class ClaudeMemoryHookTests(unittest.TestCase):
         # treated as a single JSONL line.
         sid = "66666666-6666-6666-6666-666666666666"
         text = json.dumps({"type": "attachment", "cwd": "/tmp/x y", "sessionId": sid})
-        self.assertEqual(len(hook._jsonl_lines(text)), 1)
+        self.assertEqual(len(hook._jsonl_lines(text.encode("utf-8"))), 1)
         self.assertEqual(
-            hook._find_json_field(text, hook._CWD_FIELD_RE, "cwd", forward=True, expected_session_id=sid),
+            hook._find_json_field(text.encode("utf-8"), hook._CWD_FIELD_RE, "cwd", forward=True, expected_session_id=sid),
             "/tmp/x y",
         )
 

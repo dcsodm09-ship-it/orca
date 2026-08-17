@@ -526,7 +526,7 @@ _SESSION_ID_FORMAT_RE = re.compile(
 )
 
 
-def _jsonl_lines(text: str) -> list[str]:
+def _jsonl_lines(data: bytes) -> list[str]:
     # Plain '\n' splitting only, matching the real binary's JS
     # `indexOf("\n")`/`lastIndexOf("\n")` scanning exactly. Python's
     # str.splitlines() additionally breaks on \v \f \x1c-\x1e \x85 U+2028
@@ -536,11 +536,37 @@ def _jsonl_lines(text: str) -> list[str]:
     # splitlines()-based scan, which can lose a record entirely (fails
     # closed, not exploitable, but a fidelity gap -- independent Claude
     # opus5/max review, 2026-08-17, round 2, N7).
-    return text.split("\n")
+    #
+    # Splits and decodes at the BYTE level, one line at a time, rather than
+    # decoding the whole 64KB head/tail window once with an "ignore"
+    # fallback on failure. The window boundary can legitimately land mid-
+    # character in content this function doesn't even need (truncating a
+    # genuinely valid multi-byte character at the very edge of the window),
+    # so decoding the whole window strictly and giving up entirely on any
+    # single bad byte anywhere would create real false negatives. But
+    # "ignore" is not the safe alternative either: it silently drops
+    # invalid bytes rather than the substring they were part of, so a
+    # malformed value can decode into a *different*, coincidentally valid
+    # string -- e.g. "team-\xffapp" (invalid byte) silently becoming
+    # "team-app" (a real string another cwd might legitimately be), letting
+    # a corrupted transcript field pass the same-string comparison
+    # elsewhere in this file as if it had honestly recorded that cwd
+    # (independent Codex sol/xhigh review, 2026-08-17, round 2, T3).
+    # Per-line strict decoding gets both properties at once: one bad line
+    # (most plausibly the one truncated by the window edge) is discarded
+    # outright rather than corrupted into something else meaningful, while
+    # every other, complete line in the same window is read normally.
+    lines: list[str] = []
+    for raw_line in data.split(b"\n"):
+        try:
+            lines.append(raw_line.decode("utf-8"))
+        except UnicodeDecodeError:
+            lines.append("")
+    return lines
 
 
 def _find_json_field(
-    text: str, field_marker: re.Pattern[str], field: str, forward: bool, expected_session_id: str
+    data: bytes, field_marker: re.Pattern[str], field: str, forward: bool, expected_session_id: str
 ) -> str | None:
     # Line-oriented JSONL scan mirroring the binary's `uEo`: cheap substring
     # pre-check before a real `json.loads` per candidate line, no whole-file
@@ -549,7 +575,7 @@ def _find_json_field(
     # from the end backward (used elsewhere for other single-field lookups).
     # A line must additionally carry sessionId == expected_session_id (see
     # _SESSION_ID_FORMAT_RE's comment) to be trusted at all.
-    lines = _jsonl_lines(text)
+    lines = _jsonl_lines(data)
     ordered = lines if forward else reversed(lines)
     for line in ordered:
         if not field_marker.search(line) or not _SESSION_ID_FIELD_RE.search(line):
@@ -566,7 +592,7 @@ def _find_json_field(
     return None
 
 
-def _find_relocated_cwd(tail_text: str, expected_session_id: str) -> str | None:
+def _find_relocated_cwd(tail_data: bytes, expected_session_id: str) -> str | None:
     # Mirrors the binary's `XTt("relocated", "relocatedCwd")` exactly: scans
     # backward for the most recent line whose *own* JSON record has both
     # `type == "relocated"` and a string `relocatedCwd` -- the gate and the
@@ -576,7 +602,7 @@ def _find_relocated_cwd(tail_text: str, expected_session_id: str) -> str | None:
     # a different line than the one satisfying the gate (independent Claude
     # opus5/max review, 2026-08-17, round 2, N5). Also requires a matching
     # sessionId, same as _find_json_field.
-    for line in reversed(_jsonl_lines(tail_text)):
+    for line in reversed(_jsonl_lines(tail_data)):
         if not (_RELOCATED_TYPE_RE.search(line) and _RELOCATED_CWD_FIELD_RE.search(line)):
             continue
         if not _SESSION_ID_FIELD_RE.search(line):
@@ -606,18 +632,10 @@ def _session_recorded_cwd(jsonl_path: Path) -> str | None:
     if parts is None:
         return None
     head, tail = parts
-    try:
-        tail_text = tail.decode("utf-8")
-    except UnicodeDecodeError:
-        tail_text = tail.decode("utf-8", "ignore")
-    relocated = _find_relocated_cwd(tail_text, session_id)
+    relocated = _find_relocated_cwd(tail, session_id)
     if relocated is not None:
         return relocated
-    try:
-        head_text = head.decode("utf-8")
-    except UnicodeDecodeError:
-        head_text = head.decode("utf-8", "ignore")
-    return _find_json_field(head_text, _CWD_FIELD_RE, "cwd", forward=True, expected_session_id=session_id)
+    return _find_json_field(head, _CWD_FIELD_RE, "cwd", forward=True, expected_session_id=session_id)
 
 
 def _transcripts_newest_first(project_dir: Path) -> list[Path]:
@@ -641,12 +659,38 @@ def _session_recorded_cwd_matches(project_dir: Path, requesting_cwd: str) -> boo
     # project identity. A directory with no transcripts recording this cwd
     # at all -- including one that exists only because a *different* real
     # cwd happened to sanitize to the same name -- fails closed here.
+    #
+    # This alone was not sufficient (independent Codex sol/xhigh review,
+    # 2026-08-17, round 2, P1-R2-1/T1): it correctly failed closed when the
+    # colliding cwd had never actually run a Claude session there, but if
+    # *both* colliding cwds had genuinely, independently run real sessions
+    # in the shared directory -- each with its own honest transcript -- a
+    # request from either one still matched and still received the one
+    # shared MEMORY.md, which may contain the other cwd's notes. That is
+    # Claude Code's own native behavior (it stores both under the same
+    # directory too), and the round-1/round-2 opus5/max reviews and this
+    # bridge's own README treated it as an accepted, documented trade-off
+    # rather than a bug -- but Codex rated the identical scenario P1 in
+    # both rounds, and the dual-review rule this project runs under blocks
+    # on either path's P0/P1, not just one. So: if this directory's own
+    # transcripts, taken together, record more than one distinct real cwd
+    # -- proof the directory is genuinely shared between separate
+    # workspaces, not just a false alarm -- it is now refused for
+    # *everyone*, including the requester whose own cwd does match, not
+    # only for a colliding cwd that never had a session there. The
+    # trade-off is real: a workspace that happens to share a derived
+    # directory with another real workspace loses access to its own memory
+    # through this bridge entirely, rather than risking that memory being
+    # someone else's. Given how this bridge is meant to be used (scoping
+    # what an untrusted-by-default excerpt could contain), refusing
+    # service is the safe failure direction; serving mixed content is not.
     normalized_request = unicodedata.normalize("NFC", requesting_cwd)
     try:
         entries = _transcripts_newest_first(project_dir)
     except OSError:
         return False
     checked = 0
+    own_match_found = False
     for entry in entries:
         if checked >= MAX_TRANSCRIPTS_SCANNED_PER_PROJECT:
             break
@@ -657,8 +701,13 @@ def _session_recorded_cwd_matches(project_dir: Path, requesting_cwd: str) -> boo
         if recorded is None:
             continue
         if unicodedata.normalize("NFC", recorded) == normalized_request:
-            return True
-    return False
+            own_match_found = True
+        else:
+            # A different real cwd is also recorded in this shared
+            # directory -- ambiguous, refuse regardless of whether the
+            # requester's own cwd also matched.
+            return False
+    return own_match_found
 
 
 def read_memory_documents(source_root: Path, cwd: str, limits: Limits) -> list[MemoryDocument]:
@@ -894,10 +943,26 @@ _IPV4_RE = re.compile(
 #    restrict the regex's zone character class either -- broadened to any
 #    run of non-whitespace, non-'%' characters, which both fixes the leak
 #    and still fully redacts realistic zone ids in one piece.
+#
+# 3. A lone trailing ':' had the identical bug as the trailing-period case
+#    above, for the identical reason: ':' is both a candidate character
+#    (needed for the address body itself) and a boundary character, so the
+#    greedy match swallowed a genuine trailing ':' the same way it
+#    swallowed a trailing '.', producing a syntactically invalid candidate
+#    ("2001:db8::1:") that ipaddress.ip_address() correctly rejected --
+#    silently skipping redaction (independent Codex sol/xhigh review,
+#    2026-08-17, round 2, P1-R2-2). Fixed the same way: a lookbehind
+#    forces the match to backtrack off a *lone* trailing ':' (one not
+#    itself preceded by another ':'), and the trailing lookahead rejects
+#    only a ':' that is followed by more hex/colon content, not a bare
+#    dangling one. The "not preceded by another ':'" qualifier on the
+#    lookbehind matters: a real address can legitimately *end* in "::"
+#    (e.g. "2001:db8::"), and a blanket "never end in ':'" rule would have
+#    broken that case.
 _IPV6_CANDIDATE_RE = re.compile(
-    r"(?<![0-9A-Za-z_.:])[0-9a-fA-F:.]{0,64}:[0-9a-fA-F:.]{0,64}(?<!\.)"
+    r"(?<![0-9A-Za-z_.:])[0-9a-fA-F:.]{0,64}:[0-9a-fA-F:.]{0,64}(?<!\.)(?<![^:]:)"
     r"(?:%[^\s%]{1,64})?"
-    r"(?![0-9A-Za-z_:%])(?!\.[0-9a-fA-F])"
+    r"(?![0-9A-Za-z_%])(?!\.[0-9a-fA-F])(?!:[0-9a-fA-F:])"
 )
 # ipaddress.ip_address() correctly rejects a MAC address's 6 groups of 2 hex
 # digits (not a valid IPv6 group count without "::"), so the P1-3 IPv6 fix
