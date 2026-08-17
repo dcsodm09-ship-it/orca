@@ -969,6 +969,134 @@ class InstallEndToEndTests(unittest.TestCase):
         payload = json.loads(self.account_config.read_bytes())
         self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
 
+    def test_uninstall_catches_an_account_relocated_outside_the_one_level_discovery_shape(self) -> None:
+        # R8-P1-B (independent Claude opus5/max review, 2026-08-17, round
+        # 8): the round-7 scan only ever looked at
+        # codex-accounts/<one-level>/home/hooks.json -- exactly the shape
+        # ordinary discovery understands. An account moved into a
+        # subfolder, moved out of codex-accounts entirely, or with its own
+        # home/ subdirectory renamed was invisible to it, so uninstall()
+        # still reported ok:true, deleted the receipt, and left the
+        # relocated config live and untracked -- R7-P1-A's exact harm,
+        # reached through a search shape narrower than the harm it was
+        # meant to guard.
+        installer.install()
+        account_dir = self.account_config.parent.parent
+        archive_dir = self.local_homes / "codex-accounts/archive"
+        archive_dir.mkdir()
+        relocated_dir = archive_dir / "acct-one"
+        account_dir.rename(relocated_dir)
+        self.addCleanup(lambda: relocated_dir.exists() and relocated_dir.rename(account_dir))
+        relocated_config = relocated_dir / "home/hooks.json"
+        receipt_before = (self.runtime_base / "latest-receipt.json").read_bytes()
+
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.uninstall()
+        self.assertIn("does not track", str(ctx.exception))
+        self.assertFalse(installer.PENDING_PATH.exists())
+        self.assertEqual((self.runtime_base / "latest-receipt.json").read_bytes(), receipt_before)
+        payload = json.loads(relocated_config.read_bytes())
+        self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 2)
+
+        relocated_dir.rename(account_dir)
+        installer.uninstall()
+        payload = json.loads(self.account_config.read_bytes())
+        self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
+
+    def test_uninstall_still_works_when_the_codex_home_itself_is_unreachable(self) -> None:
+        # R8-P1-C (independent Claude opus5/max review, 2026-08-17, round
+        # 8): the round-7/8 scan's own enumeration required the Codex home
+        # and accounts root to both exist (must_exist=True), so a receipt
+        # row becoming unreachable for a completely unrelated reason -- the
+        # whole .codex directory genuinely deleted, content and all, not
+        # renamed elsewhere -- made the safety scan abort uninstall()
+        # entirely instead of letting the existing, already-validated
+        # per-row absent/unreachable handling (R3-P1-A) do its normal job
+        # for the accounts that are still there. (A rename that preserves
+        # content is the R8-P1-B scenario covered above, and the scan is
+        # *supposed* to catch that one.)
+        second_account = self.local_homes / "codex-accounts/acct-two/home/hooks.json"
+        second_account.parent.mkdir(parents=True)
+        self._write(second_account, self._base_hooks_json())
+        installer.install()
+
+        self.main_config.chmod(0o600)
+        self.main_config.unlink()
+        self.main_config.parent.rmdir()
+
+        result = installer.uninstall()
+        self.assertTrue(result["ok"])
+        self.assertIn(os.fspath(self.main_config), result["unreachable"])
+        for surviving in (self.account_config, second_account):
+            payload = json.loads(surviving.read_bytes())
+            self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
+
+    def test_uninstall_fails_closed_when_an_unrelated_directory_becomes_unlistable(self) -> None:
+        # R8-P2-B (independent Claude opus5/max review, 2026-08-17, round
+        # 8): os.walk()'s own default silently skips any directory it
+        # cannot list, regardless of *why* -- exactly the fail-open
+        # swallowing this file's stat-guard pattern exists to avoid
+        # everywhere else, and exactly what made the round-7 `is_file()`
+        # guard dead code on Python 3.13+ (its own `is_file()` call
+        # already swallows EACCES there, so the guard's `except OSError`
+        # never fires). An unrelated directory under local-homes becoming
+        # unlistable (a permissions-repair pass, a mid-move race) must
+        # make the safety scan -- and therefore uninstall() -- refuse, not
+        # silently report ok:true having never actually looked inside it.
+        installer.install()
+        blocked_dir = self.local_homes / "codex-accounts/blocked-dir"
+        blocked_dir.mkdir()
+        os.chmod(blocked_dir, 0o000)
+        self.addCleanup(lambda: blocked_dir.exists() and os.chmod(blocked_dir, 0o700))
+
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.uninstall()
+        self.assertIn("cannot list", str(ctx.exception))
+        self.assertTrue((self.runtime_base / "latest-receipt.json").exists())
+        self.assertFalse(installer.PENDING_PATH.exists())
+
+        os.chmod(blocked_dir, 0o700)
+        blocked_dir.rmdir()
+        installer.uninstall()
+
+    def test_uninstall_ignores_untracked_configs_with_malformed_or_unexpected_content(self) -> None:
+        # R8-P1-D / R8-P2-A (independent Claude opus5/max review,
+        # 2026-08-17, round 8): the round-8 safety scan's own payload
+        # parsing re-implemented the `payload.get("hooks", {}).get(...)`
+        # idiom without a structure check on `hooks` itself, so an
+        # untracked config shaped like {"hooks": []}/{"hooks": null}/
+        # {"hooks": "x"} made uninstall() die with a bare AttributeError
+        # traceback and empty stdout (R8-P1-D); and strict_json() sat
+        # outside the scan's own except-and-skip guard, so an untracked
+        # config with malformed JSON (not even valid enough to parse) made
+        # uninstall() refuse with an undiagnosable message naming no path
+        # (R8-P2-A). Neither shape is one of this tool's own configs --
+        # everything this tool writes is well-formed JSON with exactly the
+        # expected structure -- so both must be silently skipped, not
+        # crash and not block a legitimate uninstall.
+        installer.install()
+        # Deliberately outside codex-accounts/<name>/home/ -- ordinary
+        # discovery/install() must never touch this path; only the
+        # broader safety-scan walk should ever look at it.
+        untracked_dir = self.local_homes / "orphaned-config"
+        untracked_dir.mkdir()
+        untracked_config = untracked_dir / "hooks.json"
+        for content in (
+            b'{"hooks": []}',
+            b'{"hooks": null}',
+            b'{"hooks": "x"}',
+            b"not json at all",
+            b"",
+        ):
+            self._write(untracked_config, content)
+            result = installer.uninstall()
+            self.assertTrue(result["ok"])
+            payload = json.loads(self.main_config.read_bytes())
+            self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
+            installer.install()  # re-bridge for the next content variant
+        untracked_config.unlink()
+        installer.uninstall()
+
     def test_verify_and_uninstall_report_not_installed_after_uninstall(self) -> None:
         # P2-4 (independent Claude opus5/max review, 2026-08-17, round 1):
         # latest-receipt.json used to never be cleared by uninstall() at
@@ -1190,8 +1318,67 @@ installer.uninstall()
         account_payload = json.loads(pristine_account.read_bytes())
         self.assertEqual(len(main_payload["hooks"]["UserPromptSubmit"]), 1)
         self.assertEqual(len(account_payload["hooks"]["UserPromptSubmit"]), 1)
-        self.assertFalse(installer.owned_handler(main_payload["hooks"]["UserPromptSubmit"][0]))
-        self.assertFalse(installer.owned_handler(account_payload["hooks"]["UserPromptSubmit"][0]))
+
+    def test_sigkill_mid_uninstall_then_relocating_the_unreverted_account_refuses_instead_of_deleting_the_receipt(
+        self,
+    ) -> None:
+        # R8-P1-A (independent Claude opus5/max review, 2026-08-17, round
+        # 8): a real SIGKILL mid-uninstall, followed by relocating the
+        # account the interrupted attempt had not yet reached, followed by
+        # an ordinary recovery attempt, used to delete the receipt (a
+        # normal, successful "finish the interrupted uninstall" commit)
+        # while the relocated config -- never touched by any of this --
+        # stayed live and became completely untracked, with every
+        # subsequent action refusing forever (round 7's exact permanent
+        # lockout, reached through the one commit path --
+        # recover_pending_install()'s own finishing pass -- that round
+        # 7/8's original uninstall()-only scan never guarded).
+        result = self._run_killed_child(kill_after_atomic_write_calls=3)
+        self.assertEqual(result.returncode, -signal.SIGKILL, "child must have been SIGKILLed, not exited normally")
+
+        pending_path = self.runtime_base / "pending-install.json"
+        self.assertTrue(pending_path.exists(), "a durable journal must survive the kill")
+        latest_path = self.runtime_base / "latest-receipt.json"
+        receipt_before = latest_path.read_bytes()
+
+        # Relocate the account the interrupted attempt never reached (still
+        # bridged at the moment of the kill).
+        account_dir = self.local_homes / "codex-accounts/acct-one"
+        renamed_dir = self.local_homes / "codex-accounts/acct-one-relocated"
+        account_dir.rename(renamed_dir)
+        renamed_config = renamed_dir / "home/hooks.json"
+
+        with (
+            mock.patch.object(installer, "SSD_ROOT", self.ssd_root),
+            mock.patch.object(installer, "LOCAL_HOMES_ROOT", self.local_homes),
+            mock.patch.object(installer, "RUNTIME_BASE", self.runtime_base),
+            mock.patch.object(installer, "PENDING_PATH", pending_path),
+            mock.patch.object(installer, "SOURCE_SCRIPT", self.source_script),
+            mock.patch.object(
+                installer, "volume_uuid", lambda ssd_root=None: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+            ),
+            mock.patch.object(Path, "home", lambda: self.local_homes),
+        ):
+            with self.assertRaises(installer.InstallError) as ctx:
+                installer.recover_pending_install()
+            self.assertIn("does not track", str(ctx.exception))
+
+            # The receipt must survive -- this is the crux of R8-P1-A:
+            # before the fix, this exact recovery attempt deleted it.
+            self.assertTrue(latest_path.exists())
+            self.assertEqual(latest_path.read_bytes(), receipt_before)
+            self.assertTrue(pending_path.exists())
+            payload = json.loads(renamed_config.read_bytes())
+            self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 2)
+
+            # No permanent lockout: moving it back lets recovery finish
+            # normally, exactly as if the relocation never happened.
+            renamed_dir.rename(account_dir)
+            outcome = installer.recover_pending_install()
+            self.assertEqual(outcome["state"], "uninstalled")
+            self.assertFalse(pending_path.exists())
+            payload = json.loads(self.account_config.read_bytes())
+            self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
 
 
 if __name__ == "__main__":

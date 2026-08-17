@@ -217,6 +217,29 @@ def ensure_private_dir(path: Path) -> Path:
     return resolved
 
 
+def _is_regular_file(path: Path) -> bool:
+    # NOT `path.is_file()`. That method's error-swallowing range is not
+    # consistent across Python versions -- round 7's guard (`except OSError:
+    # raise InstallError`) closed the crash on /usr/bin/python3 3.9, where
+    # is_file() re-raises PermissionError, but on 3.13+ is_file() delegates
+    # to os.path.isfile(), which swallows EVERY OSError including EACCES,
+    # so that same guard is dead code there and the fail-open half of
+    # R5-P3-A/R3-P3-B/R6-P2-B survives on the newer interpreter (independent
+    # Claude opus5/max review, 2026-08-17, round 8, R8-P2-B). Calling
+    # `Path.stat()` directly and discriminating errno ourselves -- exactly
+    # `_path_is_absent()`'s pattern -- behaves identically on every version:
+    # only ENOENT (and the family pathlib itself always normalizes into
+    # FileNotFoundError) means "not present"; anything else means "cannot
+    # determine" and must fail closed.
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise InstallError(f"cannot determine whether {path} is a managed config") from exc
+    return stat.S_ISREG(info.st_mode)
+
+
 def _enumerate_hook_configs() -> list[Path]:
     # The raw enumeration discover_hook_configs() is built on, split out so
     # a caller that only wants to know "what managed-shaped configs
@@ -244,25 +267,7 @@ def _enumerate_hook_configs() -> list[Path]:
         if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
             continue
         candidate = account_dir / "home/hooks.json"
-        # Guarded for the same reason _path_is_absent() and _mode_bits()
-        # are: Path.is_file() only reliably swallows ENOENT/ENOTDIR/ELOOP
-        # across interpreter versions. On the documented /usr/bin/python3
-        # 3.9, it re-raises a bare PermissionError for an account
-        # directory that lost +x instead of returning False the way the
-        # PATH python3 (3.14+) silently does -- previously deferred as
-        # R5-P3-A/R3-P3-B/R6-P2-B because nothing *inside this file* called
-        # discover_hook_configs() against such a path, but uninstall()'s
-        # R7-P1-A safety scan (see its comment) now does exactly that on
-        # every call, so an unreadable account directory would otherwise
-        # crash a plain uninstall() with a raw traceback instead of the
-        # clean InstallError this file's failure contract requires
-        # everywhere else (independent Claude opus5/max and Codex
-        # sol/xhigh reviews, 2026-08-17, round 7).
-        try:
-            is_candidate_file = candidate.is_file()
-        except OSError as exc:
-            raise InstallError(f"cannot determine whether {candidate} is a managed config") from exc
-        if is_candidate_file:
+        if _is_regular_file(candidate):
             configs.append(resolve_ssd_path(candidate))
     return list(dict.fromkeys(configs))
 
@@ -316,6 +321,108 @@ def owned_handler(handler: Any) -> bool:
             if token == "--bridge-id" and index + 1 < len(tokens) and tokens[index + 1] == BRIDGE_ID:
                 return True
     return False
+
+
+def _contains_owned_handler(raw: bytes) -> bool:
+    # Used only to inspect content this tool did NOT write (the
+    # untracked-owned-handler safety scan below) -- unlike install()'s own
+    # use of owned_handler() (always preceded by update_hook_config()'s
+    # structure validation) and verify()'s (always preceded by an
+    # after_sha256 digest match against a receipt this tool itself wrote),
+    # this runs against genuinely arbitrary bytes: a stray file, a config
+    # some other tool created, deliberately malformed content. Any parse or
+    # structure failure means "cannot recognize this as one of our own
+    # handlers" -- correct, since every config this tool has ever written
+    # is well-formed JSON with exactly this shape -- and must never be left
+    # to raise past this function (independent Claude opus5/max review,
+    # 2026-08-17, round 8: R8-P1-D, the prior round's scan bare-crashed
+    # with AttributeError on {"hooks": []}/{"hooks": null}/{"hooks": "x"};
+    # R8-P2-A, the prior round's scan let a JSON parse failure escape past
+    # its own except-and-skip guard).
+    try:
+        payload = strict_json(raw)
+    except InstallError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    hooks = payload.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    handlers = hooks.get("UserPromptSubmit")
+    if not isinstance(handlers, list):
+        return False
+    return any(owned_handler(handler) for handler in handlers)
+
+
+def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
+    # Broader-than-discovery safety scan for uninstall()'s /
+    # recover_pending_install()'s untracked-owned-handler check (see their
+    # comments): a directory move that relocates a managed account outside
+    # the one specific shape _enumerate_hook_configs() understands (exactly
+    # one level under codex-accounts/, at home/hooks.json) is still
+    # invisible to ordinary discovery, but must not be invisible to the one
+    # check whose entire job is proving no live handler is about to be
+    # abandoned when a receipt is about to be permanently deleted
+    # (independent Claude opus5/max review, 2026-08-17, round 8, R8-P1-B,
+    # reproduced with an account moved into a subfolder, moved out of
+    # codex-accounts entirely, and with its own home/ subdirectory
+    # renamed -- none of which discover_hook_configs()'s one-level shape
+    # can see, all of which still leave a live, owned handler running).
+    #
+    # Walks the whole local-homes tree -- bounded to real disk contents,
+    # never following symlinked directories (so a symlink cycle cannot
+    # cause an infinite walk), and skipping this bridge's own runtime
+    # directory (its backup files are never named literally "hooks.json",
+    # so nothing real is excluded by skipping it, and it is the one
+    # subtree that can grow large over time) -- for every file named
+    # exactly "hooks.json". A directory (or the root itself) that is simply
+    # gone (ENOENT) degrades that branch to "nothing there" -- normal, and
+    # what lets a genuinely deleted account (R3-P1-A) or a genuinely absent
+    # local-homes tree not abort the caller's transaction. A directory that
+    # EXISTS but cannot be listed for any other reason (EACCES, EIO, ...) is
+    # exactly R8-P2-B's class of bug if silently skipped -- os.walk()'s own
+    # default (`onerror=None`) does silently skip it, so an explicit
+    # `onerror` callback below escalates that specific case to a clean
+    # InstallError instead (independent Claude opus5/max review,
+    # 2026-08-17, round 8, R8-P1-C for the ENOENT-tolerant half, R8-P2-B
+    # for the EACCES-must-not-be-silent half).
+    try:
+        root = resolve_ssd_path(LOCAL_HOMES_ROOT, must_exist=False)
+    except InstallError:
+        return []
+    try:
+        runtime_root = resolve_ssd_path(RUNTIME_BASE, must_exist=False)
+    except InstallError:
+        runtime_root = None
+
+    def _raise_on_unlistable_directory(exc: OSError) -> None:
+        if isinstance(exc, FileNotFoundError):
+            return
+        raise InstallError(f"cannot list {exc.filename}: {exc}") from exc
+
+    untracked_owned: list[str] = []
+    for dirpath, dirnames, _filenames in os.walk(root, onerror=_raise_on_unlistable_directory, followlinks=False):
+        current = Path(dirpath)
+        if runtime_root is not None and (current == runtime_root or is_relative_to(current, runtime_root)):
+            dirnames[:] = []
+            continue
+        candidate = current / "hooks.json"
+        if not _is_regular_file(candidate):
+            continue
+        try:
+            resolved = resolve_ssd_path(candidate)
+        except InstallError:
+            continue
+        candidate_str = os.fspath(resolved)
+        if candidate_str in receipt_paths:
+            continue
+        try:
+            candidate_raw = validate_owned_file(resolved)
+        except InstallError:
+            continue
+        if _contains_owned_handler(candidate_raw):
+            untracked_owned.append(candidate_str)
+    return sorted(dict.fromkeys(untracked_owned))
 
 
 def make_handler(command: str) -> dict[str, Any]:
@@ -800,6 +907,28 @@ def recover_pending_install() -> dict[str, Any]:
         return {"ok": True, "state": "rolled_back", "install_id": receipt["install_id"]}
 
     # kind == "uninstall"
+    # This finishing pass -- reached from a fresh `recover` CLI action, from
+    # install()'s own opening call, or from uninstall()'s opening call --
+    # is the OTHER place a receipt-deleting commit happens, and uninstall()'s
+    # own untracked-owned-handler scan (see its comment) never runs before
+    # it: a real SIGKILL mid-uninstall, followed by relocating an
+    # account this interrupted attempt had not yet reached, followed by any
+    # ordinary recovery attempt, deleted the receipt here with the
+    # relocated config still live and now completely untracked -- the exact
+    # permanent lockout uninstall()'s own scan exists to prevent, reached
+    # through the one commit path that scan does not guard (independent
+    # Claude opus5/max review, 2026-08-17, round 8, R8-P1-A, reproduced
+    # with a genuine SIGKILL). Run the identical scan here, before this
+    # branch does anything else, so this commit path is guarded exactly as
+    # strictly as uninstall()'s own fresh-call path.
+    receipt_paths = {row["path"] for row in receipt["configs"]}
+    untracked_owned = _find_untracked_owned_configs(receipt_paths)
+    if untracked_owned:
+        raise InstallError(
+            "refusing to finish uninstall: found an owned hook handler at a path the current receipt "
+            "does not track (a managed account directory may have moved -- restore it to its "
+            "receipt-recorded path before retrying): " + ", ".join(untracked_owned)
+        )
     drifted = [row for row in rows if row["state"] == "drift"]
     if drifted:
         raise InstallError("pending uninstall cannot finish because a config drifted")
@@ -1230,38 +1359,26 @@ def uninstall() -> dict[str, Any]:
     # sol/xhigh, same round). This is reachable by calling uninstall()
     # directly while a managed path is still renamed -- exactly what this
     # file's own R6-P1-A fix's error message used to recommend as the
-    # first thing to try. Scan every currently-reachable managed-shaped
-    # config not already a receipt path (_enumerate_hook_configs(), not
-    # discover_hook_configs(): the >=2 minimum is an install-time policy,
-    # not a safety precondition here, and must not block cleanup when
-    # fewer accounts remain); if any holds an owned handler, refuse before
-    # writing the pending journal or touching anything, so the receipt and
-    # every config stay exactly as they were and the always-safe
-    # remediation -- restore the path to where the receipt expects it --
-    # remains available.
+    # first thing to try. Scan for any owned handler at a path the receipt
+    # does not track (_find_untracked_owned_configs() -- a walk of the
+    # whole local-homes tree, wider than the one-level-deep shape
+    # _enumerate_hook_configs() understands, so a relocation is caught
+    # regardless of where under local-homes it landed; see that function's
+    # own comment and R8-P1-B); if any is found, refuse before writing the
+    # pending journal or touching anything, so the receipt and every
+    # config stay exactly as they were and the always-safe remediation --
+    # restore the path to where the receipt expects it -- remains
+    # available. recover_pending_install() runs the identical scan before
+    # finishing an interrupted uninstall, since that commit path can also
+    # delete the receipt and does not go through this function at all
+    # (R8-P1-A).
     receipt_paths = {row["path"] for row in receipt["configs"]}
-    untracked_owned: list[str] = []
-    for candidate in _enumerate_hook_configs():
-        candidate_str = os.fspath(candidate)
-        if candidate_str in receipt_paths:
-            continue
-        try:
-            candidate_raw = validate_owned_file(candidate)
-        except InstallError:
-            continue
-        candidate_payload = strict_json(candidate_raw)
-        candidate_handlers = (
-            candidate_payload.get("hooks", {}).get("UserPromptSubmit", [])
-            if isinstance(candidate_payload, dict)
-            else []
-        )
-        if any(owned_handler(handler) for handler in candidate_handlers):
-            untracked_owned.append(candidate_str)
+    untracked_owned = _find_untracked_owned_configs(receipt_paths)
     if untracked_owned:
         raise InstallError(
             "refusing uninstall: found an owned hook handler at a path the current receipt does not "
             "track (a managed account directory may have moved -- restore it to its receipt-recorded "
-            "path before uninstalling): " + ", ".join(sorted(untracked_owned))
+            "path before uninstalling): " + ", ".join(untracked_owned)
         )
     rows = _receipt_rows(receipt)
     drifted = [row for row in rows if row["state"] == "drift"]
