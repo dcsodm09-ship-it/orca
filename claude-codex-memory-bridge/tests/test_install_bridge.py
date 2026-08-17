@@ -681,6 +681,95 @@ class InstallEndToEndTests(unittest.TestCase):
             payload = json.loads(config_path.read_bytes())
             self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
 
+    def test_verify_and_uninstall_fail_closed_on_an_unreadable_managed_config(self) -> None:
+        # R4-P1-A (independent Claude opus5/max review, 2026-08-17, round
+        # 4): the round-4 "absent" check used bare Path.exists()/
+        # Path.is_symlink(), which silently swallow ANY stat() failure --
+        # not just ENOENT (genuinely deleted). A managed config that is
+        # merely unreadable right now (EACCES from a parent directory that
+        # lost +x; EIO from a flaky external disk) was misclassified as
+        # "absent" and treated as nothing-to-do. On interpreters where
+        # Path.exists() swallows PermissionError, uninstall() reported
+        # ok:true, deleted latest-receipt.json, and left the bridge handler
+        # permanently active with the true baseline lost -- P1-1 (round 1's
+        # headline finding) resurrected through the new "absent" path. The
+        # config here is never deleted or renamed -- only its parent
+        # directory's permissions are tightened -- so this must never be
+        # treated as "absent"; it must fail closed with a clean
+        # InstallError, exactly like every other unreadable-path failure
+        # this file already handles.
+        installer.install()
+        unreadable_dir = self.account_config.parent
+        original_mode = stat.S_IMODE(unreadable_dir.stat().st_mode)
+        os.chmod(unreadable_dir, 0o000)
+        self.addCleanup(lambda: unreadable_dir.exists() and os.chmod(unreadable_dir, original_mode))
+
+        with self.assertRaises(installer.InstallError):
+            installer.verify()
+        with self.assertRaises(installer.InstallError):
+            installer.uninstall()
+
+        # The receipt must survive the refusal -- unlike a genuinely absent
+        # row, a merely-unreachable one must not have latest-receipt.json
+        # deleted out from under it.
+        self.assertTrue((self.runtime_base / "latest-receipt.json").exists())
+
+        os.chmod(unreadable_dir, original_mode)
+        # Once the transient condition clears, every action must work
+        # exactly as if nothing had happened -- full recovery, not a
+        # permanent scar.
+        self.assertTrue(installer.verify()["ok"])
+        installer.uninstall()
+        payload = json.loads(self.account_config.read_bytes())
+        self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
+
+    def test_install_survives_a_carried_forward_rows_pruned_backup_directory(self) -> None:
+        # R4-P2-A (independent Claude opus5/max review, 2026-08-17, round
+        # 4): a carried-forward row (see install()'s carried_forward_rows
+        # comment) is copied verbatim into every new receipt without its
+        # `backup` field ever being re-copied into the current
+        # transaction's own backup directory -- so it can keep pointing at
+        # an *older* transaction's directory indefinitely. Before this
+        # fix, `_receipt_rows()` eagerly read and digest-checked every
+        # row's `backup` unconditionally, so a carried-forward row's pruned
+        # backup broke install()'s own internal commit-finalizing
+        # recover_pending_install() call -- wedging the pending journal
+        # with no tool-level recovery (worse than R3-P2-A: that one only
+        # broke uninstall(), this one blocked every action).
+        second_account = self.local_homes / "codex-accounts/acct-two/home/hooks.json"
+        second_account.parent.mkdir(parents=True)
+        self._write(second_account, self._base_hooks_json())
+        installer.install()  # v1: main + account_config + second_account
+        v1_receipt = json.loads((self.runtime_base / "latest-receipt.json").read_bytes())
+        v1_backup_dir = self.runtime_base / "backups" / v1_receipt["install_id"]
+
+        missing = self.account_config.parent / "hooks.json.missing"
+        self.account_config.rename(missing)
+        self.addCleanup(lambda: missing.exists() and missing.rename(self.account_config))
+        installer.install()  # v2: account_config carried forward, backup still -> v1_backup_dir
+
+        for entry in v1_backup_dir.iterdir():
+            entry.chmod(0o600)
+            entry.unlink()
+        v1_backup_dir.chmod(0o700)
+        v1_backup_dir.rmdir()
+
+        # A further install (still without account_config discoverable)
+        # carries the same row forward again. Its own internal recovery
+        # check must not need account_config's now-pruned v1 backup.
+        receipt = installer.install()
+        self.assertIn(os.fspath(self.account_config), {row["path"] for row in receipt["configs"]})
+
+        # uninstall() must also succeed, reporting the still-undiscovered
+        # account as unreachable rather than failing over its pruned
+        # backup, and restore the surviving configs exactly to pristine.
+        result = installer.uninstall()
+        self.assertTrue(result["ok"])
+        self.assertIn(os.fspath(self.account_config), result["unreachable"])
+        for surviving in (self.main_config, second_account):
+            payload = json.loads(surviving.read_bytes())
+            self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
+
     def test_verify_and_uninstall_report_not_installed_after_uninstall(self) -> None:
         # P2-4 (independent Claude opus5/max review, 2026-08-17, round 1):
         # latest-receipt.json used to never be cleared by uninstall() at

@@ -552,6 +552,34 @@ def _load_backup(backup_path: Path, expected_sha256: str) -> bytes:
     return raw
 
 
+def _path_is_absent(path: Path) -> bool:
+    # ENOENT (genuinely deleted/never existed) is the ONLY condition that
+    # may be treated as "absent". Any other stat() failure -- EACCES from a
+    # parent directory that lost +x, EIO from the external SSD this whole
+    # installer is built around returning a transient read error -- means
+    # "cannot determine whether this path exists", not "it doesn't", and
+    # must fail closed instead of being silently treated as absent.
+    # `Path.exists()`/`Path.is_symlink()` (round 4's original check) both
+    # swallow every OSError, not just ENOENT, so a managed config that is
+    # merely unreadable right now -- still on disk, still holding a live
+    # bridge handler -- was misclassified as "absent": uninstall() then
+    # reported ok:true, deleted latest-receipt.json, and permanently lost
+    # the true baseline while the handler kept executing on every Codex
+    # prompt (independent Claude opus5/max review, 2026-08-17, round 4,
+    # R4-P1-A -- reproduced with nothing more than a single `chmod 0o000`
+    # on an account's home directory; on Python interpreters where
+    # Path.exists() swallows PermissionError, round 3's fail-closed
+    # behavior on this exact input was one that this round had genuinely
+    # regressed to fail-open).
+    try:
+        path.lstat()
+        return False
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        raise InstallError(f"cannot determine whether {path} exists") from exc
+
+
 def _receipt_rows(receipt: dict[str, Any]) -> list[dict[str, Any]]:
     _validate_receipt_shape(receipt)
     rows: list[dict[str, Any]] = []
@@ -562,25 +590,27 @@ def _receipt_rows(receipt: dict[str, Any]) -> list[dict[str, Any]]:
         # error at this layer; it is its own outcome, "absent", handled
         # below and tolerated by every caller of this function.
         path = resolve_ssd_path(Path(raw_row["path"]), must_exist=False)
-        backup = resolve_ssd_path(Path(raw_row["backup"]))
-        # backup (the true pristine baseline) is the only one of the three
-        # backup files every caller of this function actually needs, so it
-        # is the only one read/validated eagerly here. prev_backup and
-        # after_backup are validated lazily, only by the specific caller
-        # that needs their bytes (recover_pending_install()'s install-kind
-        # rollback, for prev_backup; nothing currently reads after_backup's
-        # bytes at all -- see install()'s comment on that field). Reading
-        # all three unconditionally for every row used to make uninstall()
-        # -- which never touches prev_backup or after_backup -- fail if
-        # either had become unreachable, including a *previous* install's
-        # now-deleted backup directory, which this file's own comments
-        # already document as never pruned (independent Claude opus5/max
-        # review, 2026-08-17, round 3, R3-P2-A).
-        backup_raw = _load_backup(backup, raw_row["before_sha256"])
+        # backup (the true pristine baseline) is resolved but NOT read here
+        # -- only whichever caller actually ends up needing to write from it
+        # (uninstall()'s revert loop, recover_pending_install()'s
+        # uninstall-direction revert loop) loads it lazily via
+        # _load_backup(), exactly like prev_backup below. A carried-forward
+        # row (see install()'s carried_forward_rows comment) is copied
+        # verbatim into the new receipt without ever being re-copied into
+        # the current transaction's own backup directory, so its `backup`
+        # can keep pointing at an *older* transaction's directory
+        # indefinitely; eagerly reading it here for every row -- including
+        # rows nothing will ever write from, like an "absent" row -- made
+        # that unreachable-but-irrelevant backup file break the whole
+        # receipt instead of only the (nonexistent) operation that would
+        # have needed it (independent Claude opus5/max review, 2026-08-17,
+        # round 4, R4-P2-A). prev_backup/after_backup remain lazy for the
+        # same reason established in round 3 (R3-P2-A).
+        backup = resolve_ssd_path(Path(raw_row["backup"]), must_exist=False)
         prev_backup = resolve_ssd_path(Path(raw_row["prev_backup"]), must_exist=False)
         after_backup = resolve_ssd_path(Path(raw_row["after_backup"]), must_exist=False)
 
-        if not path.exists() and not path.is_symlink():
+        if _path_is_absent(path):
             # Genuinely absent: not "drift" (nothing to compare against --
             # there is no content at all), not a modeling gap. uninstall()
             # and recover_pending_install() both treat this as "nothing to
@@ -600,7 +630,6 @@ def _receipt_rows(receipt: dict[str, Any]) -> list[dict[str, Any]]:
                     **raw_row,
                     "path_obj": path,
                     "backup_obj": backup,
-                    "backup_raw": backup_raw,
                     "prev_backup_obj": prev_backup,
                     "after_backup_obj": after_backup,
                     "state": "absent",
@@ -646,7 +675,6 @@ def _receipt_rows(receipt: dict[str, Any]) -> list[dict[str, Any]]:
                 **raw_row,
                 "path_obj": path,
                 "backup_obj": backup,
-                "backup_raw": backup_raw,
                 "prev_backup_obj": prev_backup,
                 "after_backup_obj": after_backup,
                 "state": state,
@@ -751,7 +779,8 @@ def recover_pending_install() -> dict[str, Any]:
         # why this must not abort the whole transaction.
         if row["state"] in ("before", "both", "absent"):
             continue
-        atomic_write(row["path_obj"], row["backup_raw"], row["before_mode"])
+        backup_raw = _load_backup(row["backup_obj"], row["before_sha256"])
+        atomic_write(row["path_obj"], backup_raw, row["before_mode"])
         restored = validate_owned_file(row["path_obj"])
         restored_mode = _mode_bits(row["path_obj"])
         if sha256_bytes(restored) != row["before_sha256"] or restored_mode != row["before_mode"]:
@@ -1018,16 +1047,20 @@ def verify() -> dict[str, Any]:
     for row in receipt["configs"]:
         if not isinstance(row, dict) or not isinstance(row.get("path"), str):
             raise InstallError("invalid receipt config row")
-        # must_exist=False, then check explicitly: a permanently deleted or
-        # re-provisioned account's path is "absent", not "drift" -- there is
-        # nothing left to compare content against, so verify() must skip and
-        # report it rather than raising (independent Claude opus5/max
-        # review, 2026-08-17, round 3, R3-P1-A; see install()'s
-        # carried-forward comment and _receipt_rows()'s "absent" branch,
-        # which this mirrors without going through _receipt_rows() itself
-        # since verify() does not need backup bytes).
+        # must_exist=False, then check explicitly via _path_is_absent(): a
+        # permanently deleted or re-provisioned account's path is "absent",
+        # not "drift" -- there is nothing left to compare content against,
+        # so verify() must skip and report it rather than raising
+        # (independent Claude opus5/max review, 2026-08-17, round 3,
+        # R3-P1-A; see install()'s carried-forward comment and
+        # _receipt_rows()'s "absent" branch, which this mirrors without
+        # going through _receipt_rows() itself since verify() does not need
+        # backup bytes). Using bare Path.exists()/is_symlink() here (round
+        # 4's original check) swallowed EACCES/EIO the same way as
+        # _receipt_rows()'s absent-check did, so this call site shares
+        # R4-P1-A and gets the same errno-discriminating fix.
         path = resolve_ssd_path(Path(row["path"]), must_exist=False)
-        if not path.exists() and not path.is_symlink():
+        if _path_is_absent(path):
             unreachable.append(os.fspath(path))
             continue
         raw = validate_owned_file(path, private=True)
@@ -1089,7 +1122,8 @@ def uninstall() -> dict[str, Any]:
         for row in rows:
             if row["state"] in ("before", "both", "absent"):
                 continue
-            atomic_write(row["path_obj"], row["backup_raw"], row["before_mode"])
+            backup_raw = _load_backup(row["backup_obj"], row["before_sha256"])
+            atomic_write(row["path_obj"], backup_raw, row["before_mode"])
             restored = validate_owned_file(row["path_obj"])
             restored_mode = _mode_bits(row["path_obj"])
             if sha256_bytes(restored) != row["before_sha256"] or restored_mode != row["before_mode"]:
