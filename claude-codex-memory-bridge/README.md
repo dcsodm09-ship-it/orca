@@ -73,24 +73,51 @@ untrusted historical reference, and emits at most 7,000 UTF-8 bytes.
   colliding cwd that never actually ran a Claude session in the shared
   directory gets no context either, same as before this tightening.
   This refusal only fires once every one of the shared directory's session
-  transcripts has actually been examined — a directory holding more
+  transcripts has actually been *attempted* — a directory holding more
   transcripts than can be scanned within a bounded budget (currently 256)
   is refused outright rather than trusting a partial scan (round-3 fix,
-  R3-P1-1: the round-2 version capped this scan at 16 and stopped early
-  once the requester's own cwd was found, so a colliding transcript sorted
-  past the cap was silently missed — reproduced on a real collision on this
-  machine that was ~6 ordinary sessions away from crossing that cap).
+  R3-P1-1: the round-2 version capped this scan at 16 and always scanned to
+  that cap regardless of ordering or whether the requester's own cwd had
+  already been found, so a colliding transcript that happened to sort past
+  the cap was silently missed — reproduced on a real collision on this
+  machine that was ~6 ordinary sessions away from crossing that cap;
+  wording corrected in round 4, R4-P3-1, from an earlier version that
+  misdescribed the round-2 behavior as stopping specifically *because of*
+  an own-cwd match). "Attempted" rather than "examined" is deliberate
+  (round-4 correction, R4-P3-2): a transcript this bridge cannot read at
+  all — wrong permissions, or its recorded cwd falling outside the 64 KiB
+  head window this bridge reads — is skipped as having no evidence either
+  way, not treated as a forced refusal; none of the real transcripts on
+  this machine hit that case, but the guarantee is "every transcript this
+  bridge could read was read," not "every transcript necessarily
+  contributed a verdict."
   Separately, a workspace whose Claude memory Claude Code itself relocated
   to a differently-named project directory (confirmed real for this
-  repository's own primary workspace) is not found here, since no
-  reverse/cross-directory lookup is implemented — this bridge only
-  recognizes a relocated *target* cwd when it derives to the *same*
-  directory name as the pre-relocation cwd (e.g. a workspace renamed
-  between two paths that happen to sanitize identically), and does not
-  treat that recognition as evidence of a second real workspace sharing the
+  repository's own primary workspace) is not found here in general, since
+  no reverse/cross-directory lookup is implemented — but a relocated
+  *target* cwd recorded inside a transcript that already lives in the
+  directory being checked (e.g. a workspace renamed between two paths that
+  happen to sanitize identically, or a session Claude Code itself re-filed
+  under the new cwd's derived directory while still recording the old cwd
+  in that same record) *is* recognized as proof of ownership for that
+  target cwd (round-4 correction, R4-P3-3: an earlier version of this note
+  said this only happens when the relocated cwd derives to the *same*
+  directory name as the pre-relocation cwd, which a real relocated project
+  on this machine — whose two cwd forms derive to two visibly different
+  directory names — disproves). This bridge does not, on its own, treat a
+  relocated marker as evidence of a *second* real workspace sharing the
   directory (round-3 fix, R3-P2-1: the round-3 collision-refusal above
   initially misread a session's own later relocation as if a different
-  workspace had appeared, and refused the genuine owner too).
+  workspace had appeared, and refused the genuine owner too) — with one
+  known, narrow gap (round-4 finding, R4-P2-1, not yet closed): if the
+  *only* evidence that a second real cwd shares this directory is a
+  relocated marker on a transcript whose plain cwd matches the requester,
+  that second cwd's presence currently goes undetected for this request.
+  This cannot be used to read a victim's memory over their own honest
+  transcript (any real owner's own plain-recorded session still triggers
+  the refusal independently) and requires an already-unlikely chain of
+  preconditions to arise naturally; it is recorded here as a known
+  limitation pending a future round's fix, not treated as resolved.
 - Input JSON rejects duplicate keys and is capped at 8 KiB. Invalid input,
   storage drift, integrity drift, unsafe files, or unavailable SSD state emits
   no context and exits without blocking Codex.

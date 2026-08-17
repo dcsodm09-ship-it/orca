@@ -49,14 +49,20 @@ TRANSCRIPT_HEAD_TAIL_BYTES = 65_536
 # R3-P1-1): _session_recorded_cwd_matches has two obligations -- confirm
 # the requester's own cwd is genuinely recorded here, AND confirm no
 # *other* real cwd is also recorded here (the collision-refusal guarantee
-# added by the round-2 fix). A scan that stops early after finding its own
-# match, the previous behavior, can only guarantee the second half when
-# the directory's transcript count is within the cap; past it, a
-# colliding transcript that never got scanned was silently treated as if
-# it didn't exist. Reproduced end-to-end on a real, already-existing
-# collision on this machine that was only ~6 ordinary sessions away from
-# crossing the old 16-transcript cap. So this cap is no longer "scan this
-# many, then assume the rest agree" -- see _session_recorded_cwd_matches:
+# added by the round-2 fix). The previous behavior capped this scan at 16
+# and trusted whatever it had seen by the time the cap was hit, regardless
+# of ordering or whether the requester's own match had already been found
+# (independent Claude opus5/max review, 2026-08-17, round 4, R4-P3-1:
+# corrects an earlier version of this comment that misdescribed the old
+# behavior as stopping early specifically *because* an own match was
+# found -- it did not; it always scanned to the cap). That cap could only
+# guarantee the collision-refusal half when the directory's transcript
+# count was within it; past it, a colliding transcript that never got
+# scanned was silently treated as if it didn't exist. Reproduced
+# end-to-end on a real, already-existing collision on this machine that
+# was only ~6 ordinary sessions away from crossing the old 16-transcript
+# cap. So this cap is no longer "scan this many, then assume the rest
+# agree" -- see _session_recorded_cwd_matches:
 # a directory with more than this many transcripts cannot be scanned in
 # full within budget and fails closed outright, rather than falling back
 # to a partial, possibly-wrong scan. 256 is generous relative to every
