@@ -35,7 +35,15 @@ HARD_FILE_BYTES = 262_144
 # in full, so cwd verification (see _session_recorded_cwd below) stays cheap
 # even against multi-megabyte-to-multi-gigabyte real transcripts.
 TRANSCRIPT_HEAD_TAIL_BYTES = 65_536
-MAX_TRANSCRIPTS_SCANNED_PER_PROJECT = 8
+# Raised from 8 and switched from name-sort to mtime-sort (see
+# _transcripts_newest_first): sorting by the random-UUID session-id filename
+# made which transcripts got scanned arbitrary, so a legitimate owner's own
+# transcript could sort after the cap purely by chance and be denied
+# (independent Claude opus5/max review, 2026-08-17, round 2, N6; the real
+# binary's own `fWe` has no cap at all). Newest-first is also the right
+# order on its own merits: the most recently active session for a cwd is
+# the most likely one to carry it.
+MAX_TRANSCRIPTS_SCANNED_PER_PROJECT = 16
 HARD_TOTAL_BYTES = 1_048_576
 
 
@@ -461,15 +469,26 @@ _RELOCATED_TYPE_RE = re.compile(r'"type"\s*:\s*"relocated"')
 _RELOCATED_CWD_FIELD_RE = re.compile(r'"relocatedCwd"\s*:')
 
 
+def _jsonl_lines(text: str) -> list[str]:
+    # Plain '\n' splitting only, matching the real binary's JS
+    # `indexOf("\n")`/`lastIndexOf("\n")` scanning exactly. Python's
+    # str.splitlines() additionally breaks on \v \f \x1c-\x1e \x85 U+2028
+    # U+2029, none of which JS treats as a JSONL record separator --
+    # JSON.stringify never escapes U+2028/U+2029, so a record containing one
+    # is one physical line to the real binary but several to a
+    # splitlines()-based scan, which can lose a record entirely (fails
+    # closed, not exploitable, but a fidelity gap -- independent Claude
+    # opus5/max review, 2026-08-17, round 2, N7).
+    return text.split("\n")
+
+
 def _find_json_field(text: str, field_marker: re.Pattern[str], field: str, forward: bool) -> str | None:
-    # Line-oriented JSONL scan mirroring the binary's `uEo`/`XTt`: cheap
-    # substring pre-check before a real `json.loads` per candidate line, no
-    # whole-file parse. forward=True scans from the start and returns the
-    # first match (mirrors `uEo`, used for the plain "cwd" field); forward
-    # =False scans from the end backward and returns the first match found
-    # that way, i.e. the most recent one (mirrors `XTt`, used for a
-    # "relocated" marker's "relocatedCwd").
-    lines = text.splitlines()
+    # Line-oriented JSONL scan mirroring the binary's `uEo`: cheap substring
+    # pre-check before a real `json.loads` per candidate line, no whole-file
+    # parse. forward=True scans from the start and returns the first match
+    # (mirrors `uEo`, used for the plain "cwd" field); forward=False scans
+    # from the end backward (used elsewhere for other single-field lookups).
+    lines = _jsonl_lines(text)
     ordered = lines if forward else reversed(lines)
     for line in ordered:
         if not field_marker.search(line):
@@ -486,6 +505,30 @@ def _find_json_field(text: str, field_marker: re.Pattern[str], field: str, forwa
     return None
 
 
+def _find_relocated_cwd(tail_text: str) -> str | None:
+    # Mirrors the binary's `XTt("relocated", "relocatedCwd")` exactly: scans
+    # backward for the most recent line whose *own* JSON record has both
+    # `type == "relocated"` and a string `relocatedCwd` -- the gate and the
+    # value must come from the same record. The previous version looked up
+    # the most recent `relocatedCwd` value and the most recent
+    # type=="relocated" line independently, so it could return a value from
+    # a different line than the one satisfying the gate (independent Claude
+    # opus5/max review, 2026-08-17, round 2, N5).
+    for line in reversed(_jsonl_lines(tail_text)):
+        if not (_RELOCATED_TYPE_RE.search(line) and _RELOCATED_CWD_FIELD_RE.search(line)):
+            continue
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(record, dict) or record.get("type") != "relocated":
+            continue
+        value = record.get("relocatedCwd")
+        if isinstance(value, str):
+            return value
+    return None
+
+
 def _session_recorded_cwd(jsonl_path: Path) -> str | None:
     parts = _read_head_tail(jsonl_path, TRANSCRIPT_HEAD_TAIL_BYTES)
     if parts is None:
@@ -495,18 +538,26 @@ def _session_recorded_cwd(jsonl_path: Path) -> str | None:
         tail_text = tail.decode("utf-8")
     except UnicodeDecodeError:
         tail_text = tail.decode("utf-8", "ignore")
-    relocated = _find_json_field(tail_text, _RELOCATED_CWD_FIELD_RE, "relocatedCwd", forward=False)
+    relocated = _find_relocated_cwd(tail_text)
     if relocated is not None:
-        # A relocated-marker line only counts if it is genuinely a
-        # "relocated" record, not just any line containing the substring.
-        for line in reversed(tail_text.splitlines()):
-            if _RELOCATED_CWD_FIELD_RE.search(line) and _RELOCATED_TYPE_RE.search(line):
-                return relocated
+        return relocated
     try:
         head_text = head.decode("utf-8")
     except UnicodeDecodeError:
         head_text = head.decode("utf-8", "ignore")
     return _find_json_field(head_text, _CWD_FIELD_RE, "cwd", forward=True)
+
+
+def _transcripts_newest_first(project_dir: Path) -> list[Path]:
+    entries = list(project_dir.iterdir())
+
+    def mtime_key(entry: Path) -> float:
+        try:
+            return entry.lstat().st_mtime
+        except OSError:
+            return float("-inf")
+
+    return sorted(entries, key=mtime_key, reverse=True)
 
 
 def _session_recorded_cwd_matches(project_dir: Path, requesting_cwd: str) -> bool:
@@ -520,7 +571,7 @@ def _session_recorded_cwd_matches(project_dir: Path, requesting_cwd: str) -> boo
     # cwd happened to sanitize to the same name -- fails closed here.
     normalized_request = unicodedata.normalize("NFC", requesting_cwd)
     try:
-        entries = sorted(project_dir.iterdir(), key=lambda item: item.name)
+        entries = _transcripts_newest_first(project_dir)
     except OSError:
         return False
     checked = 0
@@ -660,8 +711,26 @@ _IPV4_RE = re.compile(
 # boundary on both sides closes this without reintroducing the P1-3 gap:
 # real addresses in prose are bounded by whitespace/punctuation, not by
 # more identifier characters.
+#
+# Two more refinements (independent Claude opus5/max review, 2026-08-17,
+# round 2):
+#   - N8: the unbounded `*` quantifiers on both sides of the mandatory ':'
+#     make matching quadratic in the length of a long uniform run of
+#     candidate characters. Not reachable today only because callers already
+#     cap block size to 4,000 chars before this ever runs -- bounding each
+#     side to 64 repetitions (the longest real IPv6 form, including an
+#     IPv4-mapped suffix, is well under that) removes the blowup as a
+#     property of the regex itself, not as something that depends on a
+#     downstream cap staying where it is.
+#   - N9: an IPv6 zone/scope id (`fe80::1%eth0`) previously survived
+#     redaction intact -- `[REDACTED_IP]%eth0` -- leaking the interface
+#     name. ipaddress.ip_address() has parsed the `%<zone>` suffix natively
+#     since Python 3.9 (confirmed against the pinned 3.9.6 interpreter), so
+#     folding an optional zone suffix into the candidate itself is enough:
+#     the whole match, zone included, gets validated and replaced as one.
 _IPV6_CANDIDATE_RE = re.compile(
-    r"(?<![0-9A-Za-z_.:])[0-9a-fA-F:.]*:[0-9a-fA-F:.]*(?![0-9A-Za-z_.:])"
+    r"(?<![0-9A-Za-z_.:])[0-9a-fA-F:.]{0,64}:[0-9a-fA-F:.]{0,64}"
+    r"(?:%[0-9A-Za-z]{1,32})?(?![0-9A-Za-z_.:%])"
 )
 # ipaddress.ip_address() correctly rejects a MAC address's 6 groups of 2 hex
 # digits (not a valid IPv6 group count without "::"), so the P1-3 IPv6 fix

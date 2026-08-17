@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -467,6 +468,70 @@ class ClaudeMemoryHookTests(unittest.TestCase):
                 script_path=self.fixture.script,
                 volume_uuid_reader=lambda _root: TEST_UUID,
             )
+
+    # --- opus5/max round-2 P3s (N5-N9) ------------------------------------
+
+    def test_relocated_gate_and_value_come_from_the_same_line(self) -> None:
+        # N5: the gate ("type":"relocated") and the value ("relocatedCwd")
+        # must come from one shared record, not be found independently and
+        # then mismatched across two different lines.
+        tail = (
+            json.dumps({"type": "other", "relocatedCwd": "/tmp/attackws"})
+            + "\n"
+            + json.dumps({"type": "relocated", "relocatedCwd": "/tmp/legitws"})
+        )
+        self.assertEqual(hook._find_relocated_cwd(tail), "/tmp/legitws")
+
+    def test_transcript_scan_prefers_newest_and_scans_more_than_eight(self) -> None:
+        # N6: scanning was capped at 8 transcripts sorted by (arbitrary
+        # UUID) filename, so a legitimate owner's own transcript could sort
+        # after the cap purely by chance and be refused. 20 decoys with old
+        # mtimes and names that sort before the real owner's; the real
+        # owner's transcript is the most recently written.
+        cwd = "/tmp/many-transcripts-owner"
+        dirname = hook.claude_project_dirname(cwd)
+        project_dir = self.fixture.source / dirname
+        project_dir.mkdir(mode=0o700, parents=True)
+        old_time = 1_700_000_000.0
+        for index in range(20):
+            decoy = project_dir / f"aaa-decoy-{index:02d}.jsonl"
+            decoy.write_text(json.dumps({"type": "attachment", "cwd": "/tmp/decoy"}) + "\n")
+            decoy.chmod(0o600)
+            os.utime(decoy, (old_time + index, old_time + index))
+        self.fixture.add_session_transcript(cwd=cwd, dirname=dirname, session_id="zzz-owner")
+        self.assertTrue(hook._session_recorded_cwd_matches(project_dir, cwd))
+
+    def test_jsonl_line_scan_matches_js_newline_only_splitting(self) -> None:
+        # N7: Python's str.splitlines() breaks on more characters (U+2028,
+        # U+2029, \v, \f, ...) than JS's plain '\n' scanning does. A record
+        # whose string value happens to contain one of those must still be
+        # treated as a single JSONL line.
+        text = json.dumps({"type": "attachment", "cwd": "/tmp/x y"})
+        self.assertEqual(len(hook._jsonl_lines(text)), 1)
+        self.assertEqual(
+            hook._find_json_field(text, hook._CWD_FIELD_RE, "cwd", forward=True),
+            "/tmp/x y",
+        )
+
+    def test_ipv6_candidate_regex_is_not_quadratic(self) -> None:
+        # N8: unbounded quantifiers on both sides of the mandatory ':' made
+        # matching quadratic in long uniform hex/colon runs (measured by
+        # independent review: 127 KB -> 11.4s with the unbounded pattern).
+        # This must stay fast regardless of any caller-side length cap.
+        adversarial = "a1:" * 40_000  # 120,000 characters
+        started = time.monotonic()
+        hook._IPV6_CANDIDATE_RE.findall(adversarial)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_ipv6_zone_id_does_not_survive_redaction(self) -> None:
+        # N9: a link-local address's zone/scope id (interface name) leaked
+        # through redaction unchanged -- "[REDACTED_IP]%eth0".
+        self.fixture.add_memory("# interfaces\nlistening on fe80::1%eth0 for discovery\n")
+        output = self.fixture.run("interfaces")
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("eth0", context)
+        self.assertNotIn("fe80::1", context)
+        self.assertIn("[REDACTED_IP]", context)
 
     def test_unknown_workspace_yields_no_context_without_error(self) -> None:
         # A cwd with no matching Claude project directory at all (e.g. a
