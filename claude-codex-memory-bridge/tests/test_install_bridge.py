@@ -825,21 +825,21 @@ class InstallEndToEndTests(unittest.TestCase):
         # 5): discover_hook_configs() can silently drop an account from
         # discovery on ANY stat() failure it treats as "not found" -- its
         # own instance of the same class of bug R4-P1-A/R5-P1-A fixed
-        # elsewhere in this file (tracked separately as R5-P3-A, and
-        # deliberately deferred: on the /usr/bin/python3 interpreter this
-        # test suite runs under, the underlying call raises loudly instead
-        # of swallowing the error, so R5-P3-A's own trigger cannot be
-        # reproduced end-to-end through this interpreter -- see the round-6
-        # commit message). Whatever the reason a path goes undiscovered,
-        # before this fix install()'s carried-forward row for it was only
-        # classified at the very end, inside its own commit-finalizing
-        # recover_pending_install() call -- by which point every discovered
-        # config and latest-receipt.json had already been written. This
-        # test exercises the actual fixed code path (the pre-flight loop
-        # over carried_forward_rows in install()) directly and
-        # deterministically, independent of *why* a path went undiscovered,
-        # by patching discover_hook_configs() to omit an account whose real
-        # directory is separately made unreadable.
+        # elsewhere in this file (tracked separately as R5-P3-A / R3-P3-B /
+        # R6-P2-B; the underlying unguarded `candidate.is_file()` call was
+        # itself fixed in round 7 -- see _enumerate_hook_configs()'s own
+        # comment -- as a byproduct of uninstall()'s new R7-P1-A safety
+        # scan needing it to fail closed instead of crashing). Whatever the
+        # reason a path goes undiscovered, before this fix install()'s
+        # carried-forward row for it was only classified at the very end,
+        # inside its own commit-finalizing recover_pending_install() call
+        # -- by which point every discovered config and
+        # latest-receipt.json had already been written. This test
+        # exercises the actual fixed code path (the pre-flight loop over
+        # carried_forward_rows in install()) directly and deterministically
+        # via mocking, independent of *why* a path went undiscovered,
+        # rather than relying on the specific (now also fixed) discovery
+        # failure mode.
         second_account = self.local_homes / "codex-accounts/acct-two/home/hooks.json"
         second_account.parent.mkdir(parents=True)
         self._write(second_account, self._base_hooks_json())
@@ -913,6 +913,58 @@ class InstallEndToEndTests(unittest.TestCase):
         # this fix.
         renamed_dir.rename(account_dir)
         installer.install()
+        installer.uninstall()
+        payload = json.loads(self.account_config.read_bytes())
+        self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
+
+    def test_uninstall_refuses_when_a_discovered_config_carries_an_untracked_owned_handler(self) -> None:
+        # R7-P1-A / R7-P1-B (independent Claude opus5/max review AND
+        # independent Codex sol/xhigh review, 2026-08-17, round 7, found
+        # separately): round 6's install()-side fix for R6-P1-A only
+        # closed the *adoption* door -- calling uninstall() directly while
+        # an account directory is still renamed was never guarded at all,
+        # and round 6's own error message recommended exactly that as the
+        # remediation ("...run uninstall first"). Following it made
+        # uninstall() revert whatever it could see (the old, now-absent
+        # path), delete the only receipt as a normal successful commit,
+        # and report ok:true -- while the relocated config kept executing
+        # the bridge with no record left anywhere that it existed (R6-P1-A's
+        # exact stated harm, never actually closed by round 6's fix, just
+        # moved one door over). Worse, once the receipt was gone, renaming
+        # the directory back did not help either: install() now refused to
+        # adopt the still-bridged content (round 6's own fix, correctly),
+        # and no other action could recover it -- every action refused
+        # forever except plan, a brand-new permanent lockout opus's report
+        # rates worse than the original bug.
+        installer.install()
+        account_dir = self.account_config.parent.parent
+        renamed_dir = account_dir.parent / "acct-one-renamed"
+        account_dir.rename(renamed_dir)
+        self.addCleanup(lambda: renamed_dir.exists() and renamed_dir.rename(account_dir))
+        renamed_config = renamed_dir / "home" / "hooks.json"
+        receipt_before = (self.runtime_base / "latest-receipt.json").read_bytes()
+
+        # Following the tool's own advice ("run uninstall first") while the
+        # path is still renamed must now refuse cleanly, not report
+        # ok:true.
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.uninstall()
+        self.assertIn("does not track", str(ctx.exception))
+
+        # Nothing must have become durable or changed: the receipt survives
+        # byte-exact, no pending journal, and the relocated config's
+        # content is completely untouched -- the always-safe remediation
+        # (restore the path to where the receipt expects it) remains
+        # available.
+        self.assertFalse(installer.PENDING_PATH.exists())
+        self.assertEqual((self.runtime_base / "latest-receipt.json").read_bytes(), receipt_before)
+        payload = json.loads(renamed_config.read_bytes())
+        self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 2)
+
+        # No permanent lockout: renaming the directory back to where the
+        # receipt expects it lets a completely normal uninstall proceed
+        # and restore every config byte+mode exact.
+        renamed_dir.rename(account_dir)
         installer.uninstall()
         payload = json.loads(self.account_config.read_bytes())
         self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
