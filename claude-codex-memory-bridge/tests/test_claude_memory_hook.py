@@ -75,9 +75,16 @@ class HookFixture:
         directory = self.source / (dirname or hook.claude_project_dirname(cwd))
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         path = directory / f"{session_id}.jsonl"
-        lines = [json.dumps({"type": "attachment", "cwd": cwd})]
+        # sessionId must match the filename -- real Claude Code transcripts
+        # always agree, and claude_memory_hook.py now requires that
+        # agreement before trusting any record in the file (independent
+        # finding, 2026-08-17: forging a bare {"cwd": ...} line with no
+        # sessionId used to be enough to defeat the collision defense).
+        lines = [json.dumps({"type": "attachment", "cwd": cwd, "sessionId": session_id})]
         if relocated_cwd is not None:
-            lines.append(json.dumps({"type": "relocated", "relocatedCwd": relocated_cwd}))
+            lines.append(
+                json.dumps({"type": "relocated", "relocatedCwd": relocated_cwd, "sessionId": session_id})
+            )
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         path.chmod(0o600)
         return path
@@ -167,6 +174,112 @@ class ClaudeMemoryHookTests(unittest.TestCase):
         self.assertIn("[REDACTED]", context)
         self.assertIn("[REDACTED_IP]", context)
         self.assertIn("[REDACTED_EMAIL]", context)
+
+    # --- found by an independent full-audit Workflow ("完整检查") ---------
+
+    def test_redacts_json_quoted_and_snake_case_credentials(self) -> None:
+        # P0 (both root causes of the same class): _ASSIGNMENT_RE required
+        # the keyword to be immediately followed by whitespace+':'/'=' (so
+        # a JSON-quoted key like "password": "..." never matched -- the
+        # closing quote sat where the separator needed to be) and anchored
+        # the keyword with \b on both sides (so "token" embedded in
+        # "access_token" or "GITHUB_TOKEN" never matched either, since '_'
+        # is itself a word character and no boundary exists there). Real
+        # secrets pasted as JSON, or under the dominant snake_case/
+        # SCREAMING_SNAKE_CASE naming convention, leaked completely.
+        self.fixture.add_memory(
+            "# credentials\n"
+            '{"password": "hunter2xyz", "api_key": "plainsecretvalue123"}\n'
+            "access_token=abcdef123456\n"
+            "DATABASE_PASSWORD=supersecretvalue\n"
+            "AWS_SECRET_ACCESS_KEY=xxxxxxxxxxxxxxxxxxxx\n"
+        )
+        output = self.fixture.run("credentials")
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        for leaked in (
+            "hunter2xyz",
+            "plainsecretvalue123",
+            "abcdef123456",
+            "supersecretvalue",
+            "xxxxxxxxxxxxxxxxxxxx",
+        ):
+            self.assertNotIn(leaked, context)
+        self.assertIn("[REDACTED]", context)
+
+    def test_redacts_standalone_jwt_with_no_prefix(self) -> None:
+        # P1: a JWT with no "Bearer " prefix and no recognized key=/key:
+        # context (e.g. pasted from a log line or curl output) leaked
+        # completely -- dots split it into three pieces each too short for
+        # the long-blob fallback, and it has no fixed prefix _TOKEN_RE knew
+        # about.
+        jwt = (
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+            "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        )
+        self.fixture.add_memory(f"# auth log\nresponse came back as {jwt} today\n")
+        output = self.fixture.run("auth log")
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn(jwt, context)
+        self.assertIn("[REDACTED_TOKEN]", context)
+
+    def test_pem_private_key_redacted_even_when_body_exceeds_4000_chars(self) -> None:
+        # P0: split_blocks() truncated block text to 4,000 characters
+        # *before* redact() ever ran on it (redact() was only called later,
+        # in build_context(), on the already-truncated text). _PEM_RE needs
+        # to see both the BEGIN and END markers in the same string to match
+        # at all; any real key whose body exceeds 4,000 characters (common
+        # -- a realistic RSA key wrapped at ordinary line widths easily
+        # does) had its END marker silently truncated away first, so the
+        # regex never matched and the key's body leaked almost entirely in
+        # the clear. Fixed by redacting the full, untruncated block text
+        # before truncating it.
+        key_body = "".join(f"{i:08x}" for i in range(500))  # deterministic, >4000 chars
+        wrapped = "\n".join(key_body[i : i + 40] for i in range(0, len(key_body), 40))
+        pem = f"-----BEGIN RSA PRIVATE KEY-----\n{wrapped}\n-----END RSA PRIVATE KEY-----"
+        self.assertGreater(len(pem), 4_000)
+        self.fixture.add_memory(f"# key\n{pem}\n")
+        output = self.fixture.run("key")
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("BEGIN RSA PRIVATE KEY", context)
+        # None of the key body's 40-char lines should survive verbatim.
+        for line in wrapped.split("\n"):
+            self.assertNotIn(line, context)
+        self.assertIn("REDACTED_PRIVATE_KEY", context)
+
+    def test_assignment_redaction_does_not_swallow_adjacent_query_params(self) -> None:
+        # P2: the value character class didn't exclude '&', so a recognized
+        # keyword's value directly followed by more '&key=value' pairs (a
+        # pasted curl command or URL) had all of them swallowed into the
+        # redacted span and deleted, not just the one secret value.
+        self.fixture.add_memory(
+            "# curl command\ncurl https://x.example.com?token=abc123&next=xyz&other=1\n"
+        )
+        output = self.fixture.run("curl command")
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("abc123", context)
+        self.assertIn("next=xyz", context)
+        self.assertIn("other=1", context)
+
+    def test_split_blocks_does_not_treat_non_newline_separators_as_heading_boundaries(
+        self,
+    ) -> None:
+        # P1: split_blocks() used str.splitlines(), which breaks on more
+        # characters (U+2028, U+2029, \v, \f, ...) than real Markdown or
+        # this project's own MEMORY.md convention treats as a line break. A
+        # body paragraph containing one of those characters, immediately
+        # followed by text starting with '#', could get read as a genuine
+        # heading that the note's author never wrote -- spoofing the
+        # "section" label shown to Codex and gaining rank_blocks()'s 3x
+        # heading-match scoring bonus on content that never earned it.
+        # U+2028 (LINE SEPARATOR) is exactly such a character: real
+        # Markdown treats it as ordinary text, but str.splitlines() (unlike
+        # a plain '\n' split) breaks on it too.
+        text = "# real heading\nbody line one # spoofed heading\nbody line two\n"
+        doc = hook.MemoryDocument("ref", text, 0)
+        blocks = list(hook.split_blocks(doc))
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0].heading, "real heading")
+        self.assertIn("spoofed heading", blocks[0].text)
 
     def test_redacts_compressed_ipv6_forms(self) -> None:
         # Independent Codex sol/xhigh review (2026-08-17,
@@ -475,12 +588,13 @@ class ClaudeMemoryHookTests(unittest.TestCase):
         # N5: the gate ("type":"relocated") and the value ("relocatedCwd")
         # must come from one shared record, not be found independently and
         # then mismatched across two different lines.
+        sid = "22222222-2222-2222-2222-222222222222"
         tail = (
-            json.dumps({"type": "other", "relocatedCwd": "/tmp/attackws"})
+            json.dumps({"type": "other", "relocatedCwd": "/tmp/attackws", "sessionId": sid})
             + "\n"
-            + json.dumps({"type": "relocated", "relocatedCwd": "/tmp/legitws"})
+            + json.dumps({"type": "relocated", "relocatedCwd": "/tmp/legitws", "sessionId": sid})
         )
-        self.assertEqual(hook._find_relocated_cwd(tail), "/tmp/legitws")
+        self.assertEqual(hook._find_relocated_cwd(tail, sid), "/tmp/legitws")
 
     def test_transcript_scan_prefers_newest_and_scans_more_than_eight(self) -> None:
         # N6: scanning was capped at 8 transcripts sorted by (arbitrary
@@ -494,22 +608,55 @@ class ClaudeMemoryHookTests(unittest.TestCase):
         project_dir.mkdir(mode=0o700, parents=True)
         old_time = 1_700_000_000.0
         for index in range(20):
-            decoy = project_dir / f"aaa-decoy-{index:02d}.jsonl"
-            decoy.write_text(json.dumps({"type": "attachment", "cwd": "/tmp/decoy"}) + "\n")
+            decoy_id = f"33333333-3333-3333-3333-{index:012d}"
+            decoy = project_dir / f"{decoy_id}.jsonl"
+            decoy.write_text(
+                json.dumps({"type": "attachment", "cwd": "/tmp/decoy", "sessionId": decoy_id}) + "\n"
+            )
             decoy.chmod(0o600)
             os.utime(decoy, (old_time + index, old_time + index))
-        self.fixture.add_session_transcript(cwd=cwd, dirname=dirname, session_id="zzz-owner")
+        self.fixture.add_session_transcript(
+            cwd=cwd, dirname=dirname, session_id="44444444-4444-4444-4444-444444444444"
+        )
         self.assertTrue(hook._session_recorded_cwd_matches(project_dir, cwd))
+
+    def test_forged_transcript_with_no_matching_session_id_is_not_trusted(self) -> None:
+        # A same-OS-user adversary with write access to a Claude project
+        # directory (any code executing as the invoking user already has
+        # this -- no elevated privilege needed) used to be able to defeat
+        # the whole collision defense with one forged line:
+        # `echo '{"cwd":"<target>"}' > forged.jsonl`. Requiring the record's
+        # own sessionId to match the file's name (see _SESSION_ID_FORMAT_RE)
+        # closes the naive form of that forgery: a file with no sessionId
+        # field at all, or a non-UUID filename, is never trusted regardless
+        # of what "cwd" it claims (independent finding, 2026-08-17, via a
+        # dedicated full-audit Workflow, confirmed_real after adversarial
+        # re-verification).
+        cwd = "/tmp/forgery-target"
+        dirname = hook.claude_project_dirname(cwd)
+        project_dir = self.fixture.source / dirname
+        project_dir.mkdir(mode=0o700, parents=True)
+        forged = project_dir / "forged.jsonl"
+        forged.write_text(json.dumps({"type": "attachment", "cwd": cwd}) + "\n")
+        forged.chmod(0o600)
+        self.assertFalse(hook._session_recorded_cwd_matches(project_dir, cwd))
+        # Even a UUID-shaped filename doesn't help without the matching
+        # internal sessionId field.
+        forged_uuid = project_dir / "55555555-5555-5555-5555-555555555555.jsonl"
+        forged_uuid.write_text(json.dumps({"type": "attachment", "cwd": cwd}) + "\n")
+        forged_uuid.chmod(0o600)
+        self.assertFalse(hook._session_recorded_cwd_matches(project_dir, cwd))
 
     def test_jsonl_line_scan_matches_js_newline_only_splitting(self) -> None:
         # N7: Python's str.splitlines() breaks on more characters (U+2028,
         # U+2029, \v, \f, ...) than JS's plain '\n' scanning does. A record
         # whose string value happens to contain one of those must still be
         # treated as a single JSONL line.
-        text = json.dumps({"type": "attachment", "cwd": "/tmp/x y"})
+        sid = "66666666-6666-6666-6666-666666666666"
+        text = json.dumps({"type": "attachment", "cwd": "/tmp/x y", "sessionId": sid})
         self.assertEqual(len(hook._jsonl_lines(text)), 1)
         self.assertEqual(
-            hook._find_json_field(text, hook._CWD_FIELD_RE, "cwd", forward=True),
+            hook._find_json_field(text, hook._CWD_FIELD_RE, "cwd", forward=True, expected_session_id=sid),
             "/tmp/x y",
         )
 

@@ -26,10 +26,31 @@ untrusted historical reference, and emits at most 7,000 UTF-8 bytes.
   unit replacement, and 200-character/hash-suffix cap for long paths) and
   reads only that one derived project's `MEMORY.md`, additionally requiring
   one of that project's own session transcripts to record the exact
-  requesting `cwd`. A missing or non-absolute `cwd`, a workspace with no
+  requesting `cwd` **and** carry a `sessionId` matching the transcript's own
+  filename (every genuine Claude Code transcript does; this is checked
+  because the plain cwd match alone is trivially forgeable — see "Transcript
+  authenticity" below). A missing or non-absolute `cwd`, a workspace with no
   matching Claude project yet, or a resolved project whose transcripts never
   recorded this cwd, fails closed to no context rather than falling back to
   scanning every project.
+
+  **Transcript authenticity is not cryptographically guaranteed.** The
+  sessionId/filename check above raises the bar past a one-line forgery
+  (`echo '{"cwd":"..."}' > forged.jsonl`) to requiring a same-OS-user
+  adversary to also produce a UUID-shaped filename with an internally
+  consistent `sessionId`, but it is still a same-user-writable file, not a
+  signature Claude Code provides. Any code already executing as the
+  invoking user — a compromised dependency, a malicious build/install
+  script — has write access to every directory under `~/.claude/projects/`
+  regardless of this bridge, and could in principle still construct a more
+  complete forgery. This bridge's namespace scoping is defense against
+  *accidental* cross-workspace conflation and *unsophisticated* forgery, not
+  a hard security boundary against a determined same-user attacker; treat it
+  accordingly when deciding what threat model it covers (independent
+  finding, 2026-08-17, via a dedicated full-audit Workflow, confirmed_real
+  after adversarial re-verification: a bare forged transcript, with no
+  sessionId check at all, was previously sufficient to defeat the collision
+  defense end to end).
   **Known limits, not covered by the above** (independent Claude opus5/max
   review, 2026-08-17, round 2 — corrects an earlier version of this note
   that overstated the first limit as never serving a different workspace's

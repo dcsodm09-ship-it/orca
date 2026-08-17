@@ -243,6 +243,29 @@ def verify_storage(
 
 
 def verify_script(script_path: Path, expected_script_sha256: str) -> None:
+    # Honest scope of this check (independent finding, 2026-08-17, via a
+    # dedicated full-audit Workflow): this cannot prevent a tampered *this*
+    # file from running malicious code, because the Python interpreter has
+    # already parsed and executed every module-level statement in
+    # claude_memory_hook.py -- including any the attacker inserted -- by
+    # the time this function is even reached, let alone by the time it
+    # would raise. Self-verification-after-the-fact cannot close that
+    # window from inside the file being verified; only something outside
+    # it (checking the file before invoking `python3` on it at all) could.
+    # That is an inherent property of interpreted self-verification, not a
+    # bug specific to this implementation, and it is not fixable by a code
+    # change here.
+    #
+    # What this check is genuinely good for: (1) detecting non-malicious
+    # drift/corruption of an already-installed script and failing closed
+    # rather than running with unexpected contents, and (2) for a modest
+    # tamper that only alters *data or later logic* the interpreter reaches
+    # through this function's own normal control flow (not new top-level
+    # code), stopping before that logic runs. It is defense in depth for
+    # operational integrity, not a code-signing / secure-boot guarantee --
+    # the real backstop against a writable-file attacker is upstream
+    # (0600 owner-only permissions, SSD residency, not being reachable by a
+    # lower-privileged actor at all), not this hash check.
     if not re.fullmatch(r"[0-9a-f]{64}", expected_script_sha256):
         raise BridgeError("invalid expected script digest")
     raw = _read_bounded(script_path, 1_048_576)
@@ -467,6 +490,40 @@ def _read_head_tail(path: Path, window: int) -> tuple[bytes, bytes] | None:
 _CWD_FIELD_RE = re.compile(r'"cwd"\s*:')
 _RELOCATED_TYPE_RE = re.compile(r'"type"\s*:\s*"relocated"')
 _RELOCATED_CWD_FIELD_RE = re.compile(r'"relocatedCwd"\s*:')
+_SESSION_ID_FIELD_RE = re.compile(r'"sessionId"\s*:')
+# Every real record in a genuine Claude Code transcript carries a
+# "sessionId" matching the file's own name (confirmed directly against this
+# session's own real ~/.claude/projects/<dir>/<uuid>.jsonl: every record
+# inspected, across types, has sessionId == the file's basename). Requiring
+# that match here is real, meaningful hardening, not decoration: without it,
+# _session_recorded_cwd_matches trusted *any* owner-owned, correctly-moded
+# `.jsonl` file's bare "cwd" field, with no check that the file was ever
+# produced by Claude Code at all -- a same-OS-user adversary (a malicious
+# build/install script, a compromised dependency; no special privilege
+# needed beyond code execution as the invoking user, which already has
+# write access to every directory under ~/.claude/projects/) could defeat
+# the whole transcript-verification defense with a single forged line:
+# `echo '{"type":"attachment","cwd":"<target>"}' > forged.jsonl`. That
+# converts an otherwise-fail-closed sanitizer collision (the exact case
+# _session_recorded_cwd_matches exists to keep fail-closed) into a real
+# leak of another workspace's memory into a live Codex context (independent
+# finding, 2026-08-17, via a dedicated full-audit Workflow, confirmed_real
+# after adversarial re-verification: reproduced end to end through
+# hook.run()'s complete pipeline, not a unit-level shortcut).
+#
+# This is deliberately NOT presented as closing the gap completely -- it
+# cannot be, without a cryptographic signature Claude Code does not
+# provide. A sufficiently informed adversary who reads this exact file (or
+# this comment) can still forge a session-id-matching filename and a
+# sessionId field that agrees with it. What this closes is the *naive*
+# forgery this bridge's own test suite's original collision repro used
+# (a single field, no session-id consistency at all) and raises the bar
+# for anyone else to "understand and replicate Claude Code's transcript
+# naming convention", not merely "write one line of JSON". See the README's
+# "Known limits" section for the residual, honestly stated.
+_SESSION_ID_FORMAT_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 def _jsonl_lines(text: str) -> list[str]:
@@ -482,22 +539,26 @@ def _jsonl_lines(text: str) -> list[str]:
     return text.split("\n")
 
 
-def _find_json_field(text: str, field_marker: re.Pattern[str], field: str, forward: bool) -> str | None:
+def _find_json_field(
+    text: str, field_marker: re.Pattern[str], field: str, forward: bool, expected_session_id: str
+) -> str | None:
     # Line-oriented JSONL scan mirroring the binary's `uEo`: cheap substring
     # pre-check before a real `json.loads` per candidate line, no whole-file
     # parse. forward=True scans from the start and returns the first match
     # (mirrors `uEo`, used for the plain "cwd" field); forward=False scans
     # from the end backward (used elsewhere for other single-field lookups).
+    # A line must additionally carry sessionId == expected_session_id (see
+    # _SESSION_ID_FORMAT_RE's comment) to be trusted at all.
     lines = _jsonl_lines(text)
     ordered = lines if forward else reversed(lines)
     for line in ordered:
-        if not field_marker.search(line):
+        if not field_marker.search(line) or not _SESSION_ID_FIELD_RE.search(line):
             continue
         try:
             record = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             continue
-        if not isinstance(record, dict):
+        if not isinstance(record, dict) or record.get("sessionId") != expected_session_id:
             continue
         value = record.get(field)
         if isinstance(value, str):
@@ -505,7 +566,7 @@ def _find_json_field(text: str, field_marker: re.Pattern[str], field: str, forwa
     return None
 
 
-def _find_relocated_cwd(tail_text: str) -> str | None:
+def _find_relocated_cwd(tail_text: str, expected_session_id: str) -> str | None:
     # Mirrors the binary's `XTt("relocated", "relocatedCwd")` exactly: scans
     # backward for the most recent line whose *own* JSON record has both
     # `type == "relocated"` and a string `relocatedCwd` -- the gate and the
@@ -513,15 +574,20 @@ def _find_relocated_cwd(tail_text: str) -> str | None:
     # the most recent `relocatedCwd` value and the most recent
     # type=="relocated" line independently, so it could return a value from
     # a different line than the one satisfying the gate (independent Claude
-    # opus5/max review, 2026-08-17, round 2, N5).
+    # opus5/max review, 2026-08-17, round 2, N5). Also requires a matching
+    # sessionId, same as _find_json_field.
     for line in reversed(_jsonl_lines(tail_text)):
         if not (_RELOCATED_TYPE_RE.search(line) and _RELOCATED_CWD_FIELD_RE.search(line)):
+            continue
+        if not _SESSION_ID_FIELD_RE.search(line):
             continue
         try:
             record = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             continue
         if not isinstance(record, dict) or record.get("type") != "relocated":
+            continue
+        if record.get("sessionId") != expected_session_id:
             continue
         value = record.get("relocatedCwd")
         if isinstance(value, str):
@@ -530,6 +596,12 @@ def _find_relocated_cwd(tail_text: str) -> str | None:
 
 
 def _session_recorded_cwd(jsonl_path: Path) -> str | None:
+    session_id = jsonl_path.stem
+    if not _SESSION_ID_FORMAT_RE.fullmatch(session_id):
+        # Not shaped like a real Claude Code session id (a UUID) at all --
+        # never trusted, regardless of content. Real transcripts are always
+        # named `<uuid>.jsonl`; anything else cannot be a genuine one.
+        return None
     parts = _read_head_tail(jsonl_path, TRANSCRIPT_HEAD_TAIL_BYTES)
     if parts is None:
         return None
@@ -538,14 +610,14 @@ def _session_recorded_cwd(jsonl_path: Path) -> str | None:
         tail_text = tail.decode("utf-8")
     except UnicodeDecodeError:
         tail_text = tail.decode("utf-8", "ignore")
-    relocated = _find_relocated_cwd(tail_text)
+    relocated = _find_relocated_cwd(tail_text, session_id)
     if relocated is not None:
         return relocated
     try:
         head_text = head.decode("utf-8")
     except UnicodeDecodeError:
         head_text = head.decode("utf-8", "ignore")
-    return _find_json_field(head_text, _CWD_FIELD_RE, "cwd", forward=True)
+    return _find_json_field(head_text, _CWD_FIELD_RE, "cwd", forward=True, expected_session_id=session_id)
 
 
 def _transcripts_newest_first(project_dir: Path) -> list[Path]:
@@ -672,10 +744,67 @@ _BEARER_RE = re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
 _TOKEN_RE = re.compile(
     r"\b(?:sk-(?:proj-)?|gh[opusr]_|github_pat_|xox[baprs]-|AKIA|ASIA)[A-Za-z0-9_-]{8,}\b"
 )
+# A JWT (header.payload.signature) has no recognizable fixed prefix the way
+# sk-/ghp_/AKIA-style tokens do, so it needs its own shape-based pattern
+# rather than an addition to _TOKEN_RE. Real JWT headers are near-
+# universally `{"typ":...` or `{"alg":...`, which base64url-encodes to a
+# leading "ey" -- a strong, low-false-positive anchor. Segments require 10+
+# characters each to avoid matching short dotted strings that merely look
+# vaguely token-shaped. Previously nothing caught a standalone JWT with no
+# "Bearer " prefix and no recognized key=/key: context (independent
+# finding, 2026-08-17, via a dedicated full-audit Workflow, confirmed_real).
+_JWT_RE = re.compile(r"\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
+# Matches a credential-shaped identifier immediately before a ':'/'=' and
+# redacts only the following value, preserving JSON/YAML-style quoting.
+#
+# Two real gaps found independently, 2026-08-17, via a dedicated full-audit
+# Workflow (confirmed_real after adversarial re-verification, both rated
+# P0 -- this is the mechanism that is supposed to keep real credentials out
+# of a context an LLM API call will see):
+#
+#   1. The old pattern anchored the keyword with `\b` on both sides, so it
+#      never matched a keyword embedded in a snake_case/SCREAMING_SNAKE_CASE
+#      compound identifier -- `_` is a `\w` character, so `\btoken\b` cannot
+#      match the "token" inside "access_token" (no boundary exists between
+#      '_' and 't'). access_token, refresh_token, client_secret,
+#      GITHUB_TOKEN, DATABASE_PASSWORD, OPENAI_API_KEY, and
+#      AWS_SECRET_ACCESS_KEY -- the dominant real-world naming convention
+#      for exactly this kind of value -- all leaked completely unredacted.
+#      Fixed by allowing optional `_`/`-`-joined identifier segments on
+#      both sides of the keyword instead of requiring `\b` immediately
+#      around it.
+#   2. The old pattern required the keyword to be followed (after only
+#      optional whitespace) by a literal ':' or '=' -- but a JSON-quoted
+#      key like `"password": "..."` has a closing '"' immediately after the
+#      keyword, not whitespace/:/=, so the separator never matched and the
+#      whole assignment silently passed through untouched. Fixed by
+#      allowing an optional quote on either side of the keyword and the
+#      value, and redacting only the inner value so quoted input still
+#      looks like valid quoted JSON/YAML afterward.
+#
+# The value's excluded-character set also drops '&' (not just the
+# structural JSON/array delimiters the old pattern excluded) so a
+# recognized key's value inside a query string or curl command doesn't
+# swallow the following '&key=value' pairs into the redacted span and
+# delete them (independent finding, same audit, P2).
 _ASSIGNMENT_RE = re.compile(
-    r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|private[_-]?key)"
-    r"(\s*[:=]\s*)([^\s,;\]\[}\{]{3,})"
+    r"(?i)(?<![A-Za-z0-9])"
+    r"(?P<keyword_run>(?:[A-Za-z][A-Za-z0-9]*[_-])*"
+    r"(?:password|passwd|pwd|secret|token|api[_-]?key|private[_-]?key)"
+    r"(?:[_-][A-Za-z0-9]+)*)"
+    r'(?P<preq>"?)'
+    r"(?P<sep>\s*[:=]\s*)"
+    r'(?P<preval>"?)'
+    r'(?P<value>[^\s,;\]\[}\{"&]{3,})'
+    r'(?P<postval>"?)'
 )
+
+
+def _redact_assignment(match: re.Match[str]) -> str:
+    return (
+        f"{match.group('keyword_run')}{match.group('preq')}{match.group('sep')}"
+        f"{match.group('preval')}[REDACTED]{match.group('postval')}"
+    )
 _QUERY_SECRET_RE = re.compile(
     r"(?i)([?&](?:access_token|api_key|key|password|secret|signature|token)=)[^&#\s]+"
 )
@@ -799,7 +928,8 @@ def redact(text: str) -> str:
     text = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", text)
     text = _BEARER_RE.sub(r"\1[REDACTED]", text)
     text = _TOKEN_RE.sub("[REDACTED_TOKEN]", text)
-    text = _ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]", text)
+    text = _JWT_RE.sub("[REDACTED_TOKEN]", text)
+    text = _ASSIGNMENT_RE.sub(_redact_assignment, text)
     text = _QUERY_SECRET_RE.sub(r"\1[REDACTED]", text)
     text = _IPV4_RE.sub("[REDACTED_IP]", text)
     # IPv6 before MAC: a fully-expanded 8-group IPv6 address written with
@@ -823,9 +953,34 @@ def split_blocks(document: MemoryDocument) -> Iterable[MemoryBlock]:
         buffer.clear()
         if not text:
             return None
-        return MemoryBlock(document.project_ref, heading[:160], text[:4_000], document.mtime_ns)
+        # redact() before truncating to 4,000 chars, not after: a real PEM
+        # private key's BEGIN...END span can easily exceed 4,000 characters,
+        # and _PEM_RE requires seeing both markers in the same string to
+        # match at all. Truncating first (the previous order -- redact() was
+        # only ever called later, in build_context(), on the already-sliced
+        # block.text) silently cut the END marker off before redact() ever
+        # saw the block, so most of a real key's body leaked completely
+        # unredacted (independent finding, 2026-08-17, via a dedicated
+        # full-audit Workflow, confirmed_real: P0, reproduced end to end
+        # with a realistic 4KB+ PEM block wrapped at ordinary line widths --
+        # 96 of 100 body lines survived verbatim). Redacting the full,
+        # untruncated buffered text first means every secret pattern gets a
+        # complete, unmutilated view before any size limit is applied.
+        return MemoryBlock(document.project_ref, heading[:160], redact(text)[:4_000], document.mtime_ns)
 
-    for line in document.text.splitlines():
+    # Plain '\n' splitting only, not str.splitlines(): splitlines() also
+    # breaks on \v \f \x1c-\x1e \x85 U+2028 U+2029, none of which Markdown
+    # (or this project's own real MEMORY.md files) treats as a line break.
+    # A body paragraph that happens to contain one of those characters
+    # could get split into a synthetic extra "line" that starts with `#` --
+    # not a heading the note's author ever wrote, but split_blocks() would
+    # treat it as a genuine Markdown heading anyway: a spoofed "section"
+    # label handed to Codex, plus rank_blocks()'s 3x heading-match scoring
+    # bonus applied to content the prompt never actually matched on its own
+    # merits (independent finding, 2026-08-17, via a dedicated full-audit
+    # Workflow, confirmed_real; the identical lesson already applied to
+    # transcript-line scanning as _jsonl_lines(), see its own comment).
+    for line in document.text.split("\n"):
         match = re.match(r"^#{1,6}\s+(.+?)\s*$", line)
         if match:
             block = flush()
