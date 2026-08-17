@@ -32,10 +32,10 @@ HARD_FILE_LIMIT = 64
 HARD_FILE_BYTES = 262_144
 # Matches the installed Claude Code binary's own `aP` constant: session
 # transcripts are read/scanned only in a head+tail window of this size, not
-# in full, so cwd verification (see _session_recorded_cwd below) stays cheap
+# in full, so cwd verification (see _session_recorded_cwds below) stays cheap
 # even against multi-megabyte-to-multi-gigabyte real transcripts.
 TRANSCRIPT_HEAD_TAIL_BYTES = 65_536
-# Raised from 8 and switched from name-sort to mtime-sort (see
+# Raised from 8 to 16 and switched from name-sort to mtime-sort (see
 # _transcripts_newest_first): sorting by the random-UUID session-id filename
 # made which transcripts got scanned arbitrary, so a legitimate owner's own
 # transcript could sort after the cap purely by chance and be denied
@@ -43,7 +43,27 @@ TRANSCRIPT_HEAD_TAIL_BYTES = 65_536
 # binary's own `fWe` has no cap at all). Newest-first is also the right
 # order on its own merits: the most recently active session for a cwd is
 # the most likely one to carry it.
-MAX_TRANSCRIPTS_SCANNED_PER_PROJECT = 16
+#
+# Raised again, from 16 to 256, and given fail-closed semantics when
+# exceeded (independent Claude opus5/max review, 2026-08-17, round 3,
+# R3-P1-1): _session_recorded_cwd_matches has two obligations -- confirm
+# the requester's own cwd is genuinely recorded here, AND confirm no
+# *other* real cwd is also recorded here (the collision-refusal guarantee
+# added by the round-2 fix). A scan that stops early after finding its own
+# match, the previous behavior, can only guarantee the second half when
+# the directory's transcript count is within the cap; past it, a
+# colliding transcript that never got scanned was silently treated as if
+# it didn't exist. Reproduced end-to-end on a real, already-existing
+# collision on this machine that was only ~6 ordinary sessions away from
+# crossing the old 16-transcript cap. So this cap is no longer "scan this
+# many, then assume the rest agree" -- see _session_recorded_cwd_matches:
+# a directory with more than this many transcripts cannot be scanned in
+# full within budget and fails closed outright, rather than falling back
+# to a partial, possibly-wrong scan. 256 is generous relative to every
+# real project directory observed on this machine (max ~20 transcripts in
+# any one directory) while keeping worst-case per-invocation I/O bounded
+# (each transcript read is itself capped at TRANSCRIPT_HEAD_TAIL_BYTES).
+MAX_TRANSCRIPTS_SCANNED_PER_PROJECT = 256
 HARD_TOTAL_BYTES = 1_048_576
 
 
@@ -621,21 +641,31 @@ def _find_relocated_cwd(tail_data: bytes, expected_session_id: str) -> str | Non
     return None
 
 
-def _session_recorded_cwd(jsonl_path: Path) -> str | None:
+def _session_recorded_cwds(jsonl_path: Path) -> tuple[str | None, str | None]:
+    # Returns (plain_cwd, relocated_cwd) rather than collapsing them into one
+    # relocated-priority value (this function's previous shape). Both are
+    # needed by _session_recorded_cwd_matches: a transcript whose relocated
+    # target matches the requester proves ownership just as well as a plain
+    # match (T4, below), but collapsing to relocated-only *discarded* the
+    # plain value entirely -- including for conflict detection, where it
+    # made a session's own mid-session relocation look identical to a
+    # second, distinct real workspace sharing this directory, and refused
+    # the genuine owner too (independent Claude opus5/max review,
+    # 2026-08-17, round 3, R3-P2-1). See _session_recorded_cwd_matches for
+    # how the pair is actually used.
     session_id = jsonl_path.stem
     if not _SESSION_ID_FORMAT_RE.fullmatch(session_id):
         # Not shaped like a real Claude Code session id (a UUID) at all --
         # never trusted, regardless of content. Real transcripts are always
         # named `<uuid>.jsonl`; anything else cannot be a genuine one.
-        return None
+        return None, None
     parts = _read_head_tail(jsonl_path, TRANSCRIPT_HEAD_TAIL_BYTES)
     if parts is None:
-        return None
+        return None, None
     head, tail = parts
+    plain = _find_json_field(head, _CWD_FIELD_RE, "cwd", forward=True, expected_session_id=session_id)
     relocated = _find_relocated_cwd(tail, session_id)
-    if relocated is not None:
-        return relocated
-    return _find_json_field(head, _CWD_FIELD_RE, "cwd", forward=True, expected_session_id=session_id)
+    return plain, relocated
 
 
 def _transcripts_newest_first(project_dir: Path) -> list[Path]:
@@ -684,29 +714,48 @@ def _session_recorded_cwd_matches(project_dir: Path, requesting_cwd: str) -> boo
     # someone else's. Given how this bridge is meant to be used (scoping
     # what an untrusted-by-default excerpt could contain), refusing
     # service is the safe failure direction; serving mixed content is not.
+    #
+    # That rule's guarantee depends on actually seeing every transcript in
+    # the directory before concluding "no conflict" -- a scan that stops
+    # early cannot make that claim (independent Claude opus5/max review,
+    # 2026-08-17, round 3, R3-P1-1; see MAX_TRANSCRIPTS_SCANNED_PER_PROJECT's
+    # comment for the full account and the real-world repro). So this is no
+    # longer "scan up to N, then trust what was seen": a directory holding
+    # more transcripts than can be scanned within budget cannot be proven
+    # conflict-free and is refused outright, the same fail-closed direction
+    # as every other "cannot verify" case in this function.
     normalized_request = unicodedata.normalize("NFC", requesting_cwd)
     try:
         entries = _transcripts_newest_first(project_dir)
     except OSError:
         return False
-    checked = 0
+    jsonl_entries = [entry for entry in entries if entry.suffix == ".jsonl"]
+    if len(jsonl_entries) > MAX_TRANSCRIPTS_SCANNED_PER_PROJECT:
+        return False
     own_match_found = False
-    for entry in entries:
-        if checked >= MAX_TRANSCRIPTS_SCANNED_PER_PROJECT:
-            break
-        if entry.suffix != ".jsonl":
+    for entry in jsonl_entries:
+        plain, relocated = _session_recorded_cwds(entry)
+        candidates = {
+            unicodedata.normalize("NFC", value) for value in (plain, relocated) if value is not None
+        }
+        if not candidates:
             continue
-        checked += 1
-        recorded = _session_recorded_cwd(entry)
-        if recorded is None:
-            continue
-        if unicodedata.normalize("NFC", recorded) == normalized_request:
+        if normalized_request in candidates:
+            # Either this transcript's plain cwd or its relocated target (if
+            # any) is the requester's own cwd -- a relocated target counts
+            # exactly like a plain match (T4: a session that moved
+            # mid-stream still proves its current, relocated cwd used this
+            # directory), and does *not* by itself make the transcript's
+            # earlier, pre-relocation identity look like a second occupant
+            # (R3-P2-1).
             own_match_found = True
-        else:
-            # A different real cwd is also recorded in this shared
-            # directory -- ambiguous, refuse regardless of whether the
-            # requester's own cwd also matched.
-            return False
+            continue
+        # Neither of this transcript's recorded identities is the
+        # requester's cwd, but it does record at least one real cwd -- a
+        # different real workspace's session lives in this shared
+        # directory. Ambiguous; refuse regardless of whether some other
+        # transcript's own cwd also matched.
+        return False
     return own_match_found
 
 
@@ -725,13 +774,17 @@ def read_memory_documents(source_root: Path, cwd: str, limits: Limits) -> list[M
     # above; both fail toward "reads nothing", never "reads someone else's"):
     #   - claude_project_dirname() is lossy (matching real Claude Code's own
     #     naming): distinct cwd values can derive the same directory name,
-    #     or fold together on a case-insensitive filesystem. When that
-    #     happens this bridge -- like Claude Code itself -- treats them as
-    #     one project; _session_recorded_cwd_matches only additionally
-    #     requires that at least one of that *shared* directory's own
-    #     transcripts actually recorded the exact requesting cwd, closing
-    #     the specific case where an attacker's cwd never really shared a
-    #     directory with the target at all.
+    #     or fold together on a case-insensitive filesystem. Unlike Claude
+    #     Code itself (which treats the colliding cwds as one project and
+    #     serves them the one shared memory), this bridge refuses service to
+    #     *everyone* sharing that directory the moment its own transcripts
+    #     prove more than one distinct real cwd genuinely uses it --
+    #     including the requester whose own cwd does match -- rather than
+    #     risk serving one workspace's notes to another (round-3 tightening,
+    #     independent Codex sol/xhigh review, 2026-08-17, P1-R2-1; see
+    #     _session_recorded_cwd_matches for the full account). A colliding
+    #     cwd that never actually ran a session in the shared directory at
+    #     all was already refused before this tightening and still is.
     #   - Claude Code's own memory location for a workspace is not always
     #     the cwd-derived directory (its own "relocated project" concept,
     #     matched by the real binary via a `relocatedCwd` marker + what

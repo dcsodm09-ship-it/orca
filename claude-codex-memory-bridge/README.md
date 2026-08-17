@@ -57,18 +57,40 @@ untrusted historical reference, and emits at most 7,000 UTF-8 bytes.
   content, which a live sweep of this machine's own `~/.claude/projects/`
   disproved): the cwd→directory derivation is lossy, the same as Claude
   Code's own naming — distinct cwd values can derive the same directory
-  name, or fold together on a case-insensitive filesystem. When that
-  happens, this bridge — like Claude Code itself — treats the colliding
-  cwds as one project and serves them the one shared `MEMORY.md`; four such
-  collisions exist on this machine today, entirely from ordinary same-length
-  CJK-named sibling directories, not a constructed attack. What the
-  session-transcript check *does* close is a colliding cwd that never
-  actually ran a Claude session in that shared directory at all — that case
-  gets no context, not the other project's content. Separately, a workspace
-  whose Claude memory Claude Code itself relocated to a differently-named
-  project directory (confirmed real for this repository's own primary
-  workspace) is not found here, since no reverse/cross-directory lookup is
-  implemented.
+  name, or fold together on a case-insensitive filesystem. Unlike Claude
+  Code itself, which treats the colliding cwds as one project and serves
+  them the one shared `MEMORY.md`, this bridge refuses service to *every*
+  cwd sharing that directory the moment its own transcripts prove more than
+  one distinct real cwd genuinely uses it — including the cwd whose own
+  transcripts *are* present — rather than risk one workspace's notes
+  reaching another (round-3 tightening, independent Codex sol/xhigh review,
+  2026-08-17, P1-R2-1: the round-2 version of this refusal still served the
+  shared file to both colliding cwds whenever each had genuinely, honestly
+  run a session there, and Codex rated that P1 in two consecutive rounds).
+  Four such collisions exist on this machine today, entirely from ordinary
+  same-length CJK-named sibling directories, not a constructed attack; as of
+  round 3 none of the four can read memory through this bridge at all. A
+  colliding cwd that never actually ran a Claude session in the shared
+  directory gets no context either, same as before this tightening.
+  This refusal only fires once every one of the shared directory's session
+  transcripts has actually been examined — a directory holding more
+  transcripts than can be scanned within a bounded budget (currently 256)
+  is refused outright rather than trusting a partial scan (round-3 fix,
+  R3-P1-1: the round-2 version capped this scan at 16 and stopped early
+  once the requester's own cwd was found, so a colliding transcript sorted
+  past the cap was silently missed — reproduced on a real collision on this
+  machine that was ~6 ordinary sessions away from crossing that cap).
+  Separately, a workspace whose Claude memory Claude Code itself relocated
+  to a differently-named project directory (confirmed real for this
+  repository's own primary workspace) is not found here, since no
+  reverse/cross-directory lookup is implemented — this bridge only
+  recognizes a relocated *target* cwd when it derives to the *same*
+  directory name as the pre-relocation cwd (e.g. a workspace renamed
+  between two paths that happen to sanitize identically), and does not
+  treat that recognition as evidence of a second real workspace sharing the
+  directory (round-3 fix, R3-P2-1: the round-3 collision-refusal above
+  initially misread a session's own later relocation as if a different
+  workspace had appeared, and refused the genuine owner too).
 - Input JSON rejects duplicate keys and is capped at 8 KiB. Invalid input,
   storage drift, integrity drift, unsafe files, or unavailable SSD state emits
   no context and exits without blocking Codex.

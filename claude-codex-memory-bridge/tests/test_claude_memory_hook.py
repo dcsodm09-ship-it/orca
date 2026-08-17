@@ -646,6 +646,90 @@ class ClaudeMemoryHookTests(unittest.TestCase):
         self.assertEqual(self.fixture.run("shared", cwd=cwd_a), "")
         self.assertEqual(self.fixture.run("shared", cwd=cwd_b), "")
 
+    def test_conflict_beyond_the_old_scan_cap_is_still_detected(self) -> None:
+        # R3-P1-1 (independent Claude opus5/max review, 2026-08-17, round
+        # 3): the round-2 fix above stopped scanning after
+        # MAX_TRANSCRIPTS_SCANNED_PER_PROJECT (then 16) transcripts, so a
+        # shared directory whose *only* conflicting transcript sorted past
+        # the cap was never seen, and the collision-refusal silently didn't
+        # fire -- reproduced on a real, already-existing collision on this
+        # machine that was ~6 ordinary sessions away from crossing that
+        # cap. 20 owner transcripts (more than the old cap, comfortably
+        # inside the new one) plus exactly one transcript recording a
+        # genuinely different real cwd, given the *oldest* mtime so it
+        # would have sorted dead last under the old newest-first cap.
+        cwd = "/tmp/many-transcripts-collision/team/app"
+        other_cwd = "/tmp/many-transcripts-collision/team-app"
+        self.assertEqual(hook.claude_project_dirname(cwd), hook.claude_project_dirname(other_cwd))
+        dirname = hook.claude_project_dirname(cwd)
+        project_dir = self.fixture.source / dirname
+        project_dir.mkdir(mode=0o700, parents=True)
+        old_time = 1_700_000_000.0
+        conflicting = project_dir / "22222222-2222-2222-2222-222222222222.jsonl"
+        conflicting.write_text(
+            json.dumps(
+                {"type": "attachment", "cwd": other_cwd, "sessionId": "22222222-2222-2222-2222-222222222222"}
+            )
+            + "\n"
+        )
+        conflicting.chmod(0o600)
+        os.utime(conflicting, (old_time, old_time))
+        for index in range(20):
+            decoy_id = f"33333333-3333-3333-3333-{index:012d}"
+            decoy = project_dir / f"{decoy_id}.jsonl"
+            decoy.write_text(json.dumps({"type": "attachment", "cwd": cwd, "sessionId": decoy_id}) + "\n")
+            decoy.chmod(0o600)
+            os.utime(decoy, (old_time + 1_000 + index, old_time + 1_000 + index))
+        self.assertFalse(hook._session_recorded_cwd_matches(project_dir, cwd))
+        self.assertFalse(hook._session_recorded_cwd_matches(project_dir, other_cwd))
+
+    def test_scan_fails_closed_when_transcript_count_exceeds_the_cap(self) -> None:
+        # R3-P1-1's other half: even when every transcript in a directory
+        # agrees (no genuine conflict), a directory holding more transcripts
+        # than MAX_TRANSCRIPTS_SCANNED_PER_PROJECT cannot be proven
+        # conflict-free within budget and must fail closed outright, not
+        # fall back to scanning a subset and trusting it.
+        cwd = "/tmp/too-many-transcripts-owner"
+        dirname = hook.claude_project_dirname(cwd)
+        project_dir = self.fixture.source / dirname
+        project_dir.mkdir(mode=0o700, parents=True)
+        total = hook.MAX_TRANSCRIPTS_SCANNED_PER_PROJECT + 1
+        for index in range(total):
+            session_id = f"33333333-3333-4333-8333-{index:012d}"
+            transcript = project_dir / f"{session_id}.jsonl"
+            transcript.write_text(json.dumps({"type": "attachment", "cwd": cwd, "sessionId": session_id}) + "\n")
+            transcript.chmod(0o600)
+        self.assertFalse(hook._session_recorded_cwd_matches(project_dir, cwd))
+
+    def test_relocated_marker_does_not_manufacture_a_false_collision_for_the_owner(self) -> None:
+        # R3-P2-1 (independent Claude opus5/max review, 2026-08-17, round
+        # 3): the round-3 collision-refusal fix above used the
+        # relocated-priority recorded cwd for *both* matching and conflict
+        # detection. A transcript that plainly recorded the owner's own cwd
+        # but *also* carried an unrelated "relocated" marker (its own later
+        # history, not a second workspace) then looked like a second,
+        # distinct occupant of the directory and got the genuine owner
+        # refused too. Session 1 plainly records the owner's cwd with no
+        # relocation; session 2 also plainly records the owner's cwd but
+        # additionally relocated (mid-session) to a wholly unrelated cwd.
+        cwd = "/tmp/owner-with-a-relocated-session"
+        unrelated_cwd = "/tmp/somewhere-else-entirely"
+        self.fixture.add_memory("# topic\nowner's own note", cwd=cwd, with_transcript=False)
+        self.fixture.add_session_transcript(
+            cwd=cwd,
+            dirname=hook.claude_project_dirname(cwd),
+            session_id="11111111-1111-1111-1111-111111111111",
+        )
+        self.fixture.add_session_transcript(
+            cwd=cwd,
+            dirname=hook.claude_project_dirname(cwd),
+            session_id="66666666-6666-6666-6666-666666666666",
+            relocated_cwd=unrelated_cwd,
+        )
+        output = self.fixture.run("topic", cwd=cwd)
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("owner's own note", context)
+
     def test_forged_transcript_with_no_matching_session_id_is_not_trusted(self) -> None:
         # A same-OS-user adversary with write access to a Claude project
         # directory (any code executing as the invoking user already has
