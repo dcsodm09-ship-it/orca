@@ -86,6 +86,23 @@
 | sol-memory-strengthening-audit | `BLOCKED_HUMAN_DECISION`（4个P0需先定设计方向） | source/wheel/installed 三方身份需先统一 |
 | workflow-learning-l0（2条记录） | `SAFE_NOW`（观察态） | 无法人为"制造"第二次独立复现；保持现状，等待自然复现 |
 | task_2cfbe4265261-safety-lane-report | `BLOCKED_HUMAN_AUTH` | 迁移需人工/管家给出确切 safety 清单 |
+| codex-claude-memory-bridge（反向桥接，新发现，尚未立项） | `SAFE_NOW`（可立项，未开始） | 见下方调研笔记；建议待 claude-codex-memory-bridge 双复核有回执后再动手，避免在姊妹候选结论未定时复制同一模式 |
+
+**2026-08-17 调研笔记（“记忆互通”是否真正双向）**：`orca-context-bridge/scripts/startup_context.py` 的
+`cmd_hook`/`hook_additional_context` 已经是一个真正双向共享的 SessionStart 层——同一份 Orca 中央
+"reviewed_content"（L1-L3）会同时注入 Claude 与 Codex 会话（`--provider claude` / `--provider codex`，
+`resolve_private_memory_root`/`_resolve_managed_ssd_codex_memory` 专门处理 Codex 账户在 SSD 上的 memory
+root 绑定）。但这一层只覆盖 Orca 自己**已审阅**的中央记忆，不是任一 provider 的原生笔记。`claude-codex-memory-bridge`
+补的是 Claude 原生笔记（`~/.claude/projects/*/memory/MEMORY.md`，本会话自己写入的那种）单向喂给 Codex；
+**反方向目前没有对应桥接**：实机确认 `~/.codex/memories/` 下有真实、体量大得多、`.git` 跟踪的原生记忆
+（`MEMORY.md` 235KB、`raw_memories.md` 513KB、已预先精炼的 `memory_summary.md` 7KB/102 行、118 个
+`rollout_summaries/*.md`），Claude 会话目前读不到。关键设计差异，立项时必须处理：Codex 的原生记忆是
+**全局单一存储**（不像 Claude 是按项目目录天然分区的），所以 `claude_project_dirname(cwd)` 那种按工作区
+精确命名空间隔离的方案在这个方向不能直接照搬——反向桥接大概率应该只读已经预先精炼的
+`memory_summary.md`（而不是巨大的 `raw_memories.md`/`MEMORY.md`），复用 `claude_memory_hook.py` 已有的
+`rank_blocks()`/`tokens()`/`redact()`/字节预算截断机制做按 prompt 相关性过滤，而不是做按工作区的访问控制
+（因为源头本来就是全局笔记，没有工作区边界可分）。这本身仍是安全边界类候选，立项后同样需要 Claude
+opus+max 与 Codex sol+max 独立只读双复核才能过。
 
 ### 6.1 外部调研：holaOS 记忆架构对照（新增，2026-08-16）
 
