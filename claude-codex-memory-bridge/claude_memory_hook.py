@@ -9,6 +9,7 @@ redacted context for a Codex UserPromptSubmit event.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import plistlib
@@ -16,6 +17,7 @@ import re
 import stat
 import subprocess
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -28,6 +30,12 @@ INPUT_LIMIT_BYTES = 8_192
 HARD_OUTPUT_LIMIT_BYTES = 7_000
 HARD_FILE_LIMIT = 64
 HARD_FILE_BYTES = 262_144
+# Matches the installed Claude Code binary's own `aP` constant: session
+# transcripts are read/scanned only in a head+tail window of this size, not
+# in full, so cwd verification (see _session_recorded_cwd below) stays cheap
+# even against multi-megabyte-to-multi-gigabyte real transcripts.
+TRANSCRIPT_HEAD_TAIL_BYTES = 65_536
+MAX_TRANSCRIPTS_SCANNED_PER_PROJECT = 8
 HARD_TOTAL_BYTES = 1_048_576
 
 
@@ -245,12 +253,18 @@ def parse_hook_input(raw: bytes) -> tuple[str, str]:
     prompt = payload.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 16_384:
         raise BridgeError("invalid prompt")
-    # `cwd` is the invoking Codex session's working directory, present on every
-    # UserPromptSubmit payload (same field startup_context.py already reads
-    # elsewhere in this project). It is required, not optional: without it there
-    # is no workspace to scope memory to, and this bridge fails closed rather
-    # than fall back to scanning every Claude project (see read_memory_documents
-    # below for why that fallback was the actual bug).
+    # `cwd` is the invoking Codex session's working directory. Per Codex's own
+    # hooks documentation it is a required (non-nullable) `string` on every
+    # hook event's payload, "Working directory for the session" -- confirmed
+    # directly against that documentation, not inferred from another script's
+    # usage (an earlier version of this comment cited startup_context.py's
+    # `payload.get("cwd") or Path.cwd()` fallback as precedent, but that
+    # fallback's own existence shows its author did not treat the field as
+    # guaranteed; independent Claude opus5/max review, 2026-08-17, F5). It is
+    # required here regardless: without it there is no workspace to scope
+    # memory to, and this bridge fails closed rather than fall back to
+    # scanning every Claude project (see read_memory_documents below for why
+    # that fallback was the actual bug).
     cwd = payload.get("cwd")
     if not isinstance(cwd, str) or not cwd.startswith("/") or len(cwd) > 4_096:
         raise BridgeError("invalid cwd")
@@ -310,37 +324,245 @@ def _read_memory_file(path: Path, limit: int) -> tuple[str, int] | None:
         return None
 
 
+_DIRNAME_LENGTH_CAP = 200  # installed binary's `Yre` constant, confirmed below
+
+
+def _utf16_code_units(text: str) -> list[int]:
+    # Python strings are sequences of Unicode code points; JS strings (and
+    # JS regexes without the `u` flag) operate on UTF-16 code units, so an
+    # astral character (outside the Basic Multilingual Plane, e.g. most
+    # emoji) is two separate units there but one code point here. Encoding
+    # to UTF-16 and reading 16-bit units back is how this file reproduces
+    # that distinction exactly.
+    raw = text.encode("utf-16-be", "surrogatepass")
+    return [(raw[i] << 8) | raw[i + 1] for i in range(0, len(raw), 2)]
+
+
+def _sanitize_like_claude_code(text: str) -> str:
+    # Reproduces `e.replace(/[^a-zA-Z0-9]/g, "-")` from the installed Claude
+    # Code 2.1.233 binary (function `fEo`, disassembled from
+    # ~/.local/share/claude/versions/2.1.233 2026-08-17 -- confirmed
+    # independently at two call sites with identical source, including the
+    # one that builds `~/.claude/projects/<name>` itself: `WT`/`bN`). No `u`
+    # flag means the regex runs per UTF-16 code unit, not per code point: a
+    # non-BMP character replaces as *two* '-' characters, not one -- this is
+    # the exact gap independent Codex sol/xhigh review (2026-08-17,
+    # CODEX-SOL-MAX-REVIEW-claude-codex-memory-bridge-2026-08-17.md, P1-2)
+    # found in the previous per-code-point Python implementation.
+    out = []
+    for unit in _utf16_code_units(text):
+        if (0x30 <= unit <= 0x39) or (0x41 <= unit <= 0x5A) or (0x61 <= unit <= 0x7A):
+            out.append(chr(unit))
+        else:
+            out.append("-")
+    return "".join(out)
+
+
+def _base36(value: int) -> str:
+    if value == 0:
+        return "0"
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out: list[str] = []
+    n = abs(value)
+    while n:
+        n, remainder = divmod(n, 36)
+        out.append(digits[remainder])
+    return "".join(reversed(out))
+
+
+def _claude_code_djb2_hash(text: str) -> int:
+    # Reproduces `Iot()` from the same binary: a DJB2-style hash computed
+    # over UTF-16 code units with JS's 32-bit signed integer wraparound
+    # (`(t<<5)-t+code|0`). Used only for the >200-char long-path suffix
+    # (`xDy`/`WT`), so an exact match there matters only for paths that long;
+    # everything else is unaffected by this function.
+    total = 0
+    for code in _utf16_code_units(text):
+        total = ((total << 5) - total + code) & 0xFFFFFFFF
+    if total >= 0x80000000:
+        total -= 0x100000000
+    return total
+
+
 def claude_project_dirname(cwd: str) -> str:
-    """Reproduce Claude Code's project-directory-naming transform.
+    """Reproduce Claude Code's project-directory-naming transform (`WT`/`bN`
+    in the installed 2.1.233 binary), byte-for-byte where it matters:
 
-    Claude Code derives a project's `~/.claude/projects/<name>` directory name
-    from the absolute cwd it was launched in by replacing every character that
-    is not ASCII alphanumeric with a literal '-', one-for-one, with no
-    collapsing of adjacent replacements (verified empirically: a cwd
-    containing a space, multiple '/' separators, and CJK characters maps
-    every one of those individually to '-', e.g.
-    "/Volumes/Extreme SSD/.../完善orca" -> "-Volumes-Extreme-SSD-...---orca").
-    Note this must NOT be Python's `str.isalnum()` alone -- that returns True
-    for CJK characters too (they are Unicode "Letter"), which would wrongly
-    leave them unreplaced; the `.isascii()` guard is required.
+    1. NFC-normalize (binary's `Zu`: `e.normalize("NFC")`, applied to cwd
+       before it ever reaches the sanitizer at every real call site
+       inspected, e.g. `lP()`'s realpath+normalize and the cached
+       `originalCwd` identity object).
+    2. Sanitize per UTF-16 code unit, not per Unicode code point (see
+       `_sanitize_like_claude_code`).
+    3. If the sanitized result is longer than 200 characters (`Yre`),
+       truncate to 200 and append `-` + a base-36 DJB2-style hash of the
+       *normalized* cwd (`xDy`/`Iot`), not the truncated/sanitized text.
 
-    Because every non-alphanumeric character -- including '/' and '.' -- is
-    replaced, the output can never contain a path separator or a '..'
-    segment: path traversal via cwd content is structurally impossible here,
-    independent of the belt-and-suspenders checks in read_memory_documents.
+    This alone is still not a unique, collision-free mapping -- two distinct
+    real cwd values can sanitize to the same name (e.g. "/a/b" and "/a-b"),
+    exactly as the real Claude Code binary's own naming does. Claude Code
+    itself does not treat that name alone as proof of project identity
+    either: it cross-checks against the `cwd`/`relocatedCwd` field recorded
+    inside a project's own session transcripts before trusting a match
+    (binary's `hJc`/`uEo`/`XTt`, used via `fWe`). This bridge does the same
+    -- see `_session_recorded_cwd_matches` and its use in
+    `read_memory_documents` -- so a sanitizer collision with an unrelated
+    workspace fails closed instead of serving that workspace's memory
+    (independent Codex sol/xhigh finding, 2026-08-17, P1-1).
     """
-    return "".join(ch if (ch.isascii() and ch.isalnum()) else "-" for ch in cwd)
+    normalized = unicodedata.normalize("NFC", cwd)
+    sanitized = _sanitize_like_claude_code(normalized)
+    if len(sanitized) <= _DIRNAME_LENGTH_CAP:
+        return sanitized
+    suffix = _base36(_claude_code_djb2_hash(normalized))
+    return f"{sanitized[:_DIRNAME_LENGTH_CAP]}-{suffix}"
+
+
+def _read_head_tail(path: Path, window: int) -> tuple[bytes, bytes] | None:
+    # Owner-only, non-symlink, regular-file read of just the first and last
+    # `window` bytes -- mirrors the installed binary's own `Dqt()`/`aP`
+    # pattern so this stays cheap against large real transcripts (some in
+    # this project's own live ~/.claude/projects/ exceed 10 MB).
+    try:
+        info = path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o022
+        ):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                return None
+            head = os.pread(descriptor, window, 0)
+            tail_start = max(0, opened.st_size - window)
+            tail = os.pread(descriptor, window, tail_start) if opened.st_size else b""
+        finally:
+            os.close(descriptor)
+        return head, tail
+    except OSError:
+        return None
+
+
+_CWD_FIELD_RE = re.compile(r'"cwd"\s*:')
+_RELOCATED_TYPE_RE = re.compile(r'"type"\s*:\s*"relocated"')
+_RELOCATED_CWD_FIELD_RE = re.compile(r'"relocatedCwd"\s*:')
+
+
+def _find_json_field(text: str, field_marker: re.Pattern[str], field: str, forward: bool) -> str | None:
+    # Line-oriented JSONL scan mirroring the binary's `uEo`/`XTt`: cheap
+    # substring pre-check before a real `json.loads` per candidate line, no
+    # whole-file parse. forward=True scans from the start and returns the
+    # first match (mirrors `uEo`, used for the plain "cwd" field); forward
+    # =False scans from the end backward and returns the first match found
+    # that way, i.e. the most recent one (mirrors `XTt`, used for a
+    # "relocated" marker's "relocatedCwd").
+    lines = text.splitlines()
+    ordered = lines if forward else reversed(lines)
+    for line in ordered:
+        if not field_marker.search(line):
+            continue
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        value = record.get(field)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _session_recorded_cwd(jsonl_path: Path) -> str | None:
+    parts = _read_head_tail(jsonl_path, TRANSCRIPT_HEAD_TAIL_BYTES)
+    if parts is None:
+        return None
+    head, tail = parts
+    try:
+        tail_text = tail.decode("utf-8")
+    except UnicodeDecodeError:
+        tail_text = tail.decode("utf-8", "ignore")
+    relocated = _find_json_field(tail_text, _RELOCATED_CWD_FIELD_RE, "relocatedCwd", forward=False)
+    if relocated is not None:
+        # A relocated-marker line only counts if it is genuinely a
+        # "relocated" record, not just any line containing the substring.
+        for line in reversed(tail_text.splitlines()):
+            if _RELOCATED_CWD_FIELD_RE.search(line) and _RELOCATED_TYPE_RE.search(line):
+                return relocated
+    try:
+        head_text = head.decode("utf-8")
+    except UnicodeDecodeError:
+        head_text = head.decode("utf-8", "ignore")
+    return _find_json_field(head_text, _CWD_FIELD_RE, "cwd", forward=True)
+
+
+def _session_recorded_cwd_matches(project_dir: Path, requesting_cwd: str) -> bool:
+    # Defense in depth against claude_project_dirname()'s inherent (and
+    # Claude-Code-native) non-uniqueness: only trust a resolved project
+    # directory once at least one of its own session transcripts records
+    # the exact requesting cwd, the same verification the real Claude Code
+    # binary performs before treating a directory-name match as proof of
+    # project identity. A directory with no transcripts recording this cwd
+    # at all -- including one that exists only because a *different* real
+    # cwd happened to sanitize to the same name -- fails closed here.
+    normalized_request = unicodedata.normalize("NFC", requesting_cwd)
+    try:
+        entries = sorted(project_dir.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return False
+    checked = 0
+    for entry in entries:
+        if checked >= MAX_TRANSCRIPTS_SCANNED_PER_PROJECT:
+            break
+        if entry.suffix != ".jsonl":
+            continue
+        checked += 1
+        recorded = _session_recorded_cwd(entry)
+        if recorded is None:
+            continue
+        if unicodedata.normalize("NFC", recorded) == normalized_request:
+            return True
+    return False
 
 
 def read_memory_documents(source_root: Path, cwd: str, limits: Limits) -> list[MemoryDocument]:
-    # Namespace-scoped by construction: this looks up only the one Claude
-    # project directory that corresponds to the invoking Codex session's own
-    # cwd, never the full `source_root.iterdir()` sweep the previous
-    # implementation did. That sweep read every Claude workspace's memory
-    # indiscriminately -- a cross-workspace memory leak (any Codex session, in
-    # any project, saw every other project's Claude notes) with no
-    # allowlist/namespace boundary at all, found during the closed-loop
-    # Codex<->Claude memory interop review, 2026-08-17.
+    # Looks up only the one Claude project directory *derived from* the
+    # invoking Codex session's own cwd (plus transcript verification, see
+    # _session_recorded_cwd_matches), never the full `source_root.iterdir()`
+    # sweep the previous implementation did. That sweep read every Claude
+    # workspace's memory indiscriminately -- a cross-workspace memory leak
+    # (any Codex session, in any project, saw every other project's Claude
+    # notes) with no allowlist/namespace boundary at all, found during the
+    # closed-loop Codex<->Claude memory interop review, 2026-08-17.
+    #
+    # Two known, deliberately out-of-scope limitations (independent Claude
+    # opus5/max review, 2026-08-17, F1/F2/F4 -- neither reopens the leak
+    # above; both fail toward "reads nothing", never "reads someone else's"):
+    #   - claude_project_dirname() is lossy (matching real Claude Code's own
+    #     naming): distinct cwd values can derive the same directory name,
+    #     or fold together on a case-insensitive filesystem. When that
+    #     happens this bridge -- like Claude Code itself -- treats them as
+    #     one project; _session_recorded_cwd_matches only additionally
+    #     requires that at least one of that *shared* directory's own
+    #     transcripts actually recorded the exact requesting cwd, closing
+    #     the specific case where an attacker's cwd never really shared a
+    #     directory with the target at all.
+    #   - Claude Code's own memory location for a workspace is not always
+    #     the cwd-derived directory (its own "relocated project" concept,
+    #     matched by the real binary via a `relocatedCwd` marker + what
+    #     looks like a project-root-wide reverse index this bridge has no
+    #     access to). This bridge only checks the one directly cwd-derived
+    #     directory, so a genuinely relocated project (memory living under a
+    #     *different*, non-cwd-derived directory name -- confirmed real for
+    #     this very repository, see README) yields no context here rather
+    #     than finding it. No reverse/cross-directory lookup is implemented;
+    #     doing so safely (without reintroducing a full source_root sweep)
+    #     is future work, not attempted in this round.
     if not _safe_directory(source_root):
         raise BridgeError("unsafe Claude projects root")
     project_dirname = claude_project_dirname(cwd)
@@ -359,11 +581,19 @@ def read_memory_documents(source_root: Path, cwd: str, limits: Limits) -> list[M
         return []
     if not _safe_directory(project):
         return []
+    if not _session_recorded_cwd_matches(project, cwd):
+        return []
     memory_dir = project / "memory"
     if not _safe_directory(memory_dir):
         return []
     memory_path = memory_dir / "MEMORY.md"
-    result = _read_memory_file(memory_path, limits.max_file_bytes)
+    # max_total_bytes was an aggregate cap across the multiple documents the
+    # old all-projects sweep could return; now that this only ever reads one
+    # file, max_file_bytes alone governs the read, but a policy could still
+    # set max_total_bytes below max_file_bytes -- honor whichever is
+    # stricter instead of silently ignoring the field (minor gap noted by
+    # independent Codex sol/xhigh review, 2026-08-17).
+    result = _read_memory_file(memory_path, min(limits.max_file_bytes, limits.max_total_bytes))
     if result is None:
         # No memory for this workspace yet -- an expected, benign steady
         # state (e.g. a brand-new project), not a bridge failure. Emits no
@@ -394,10 +624,29 @@ _IPV4_RE = re.compile(
     r"(?<![\d.])(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\."
     r"(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?![\d.])"
 )
-_IPV6_RE = re.compile(r"(?i)(?<![0-9a-f:])(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{0,4}(?![0-9a-f:])")
+# A hand-rolled "N groups of hex separated by ':'" pattern (the previous
+# implementation) only matches IPv6's fully-expanded form and misses the
+# `::` zero-compression every real IPv6 address normally uses in the wild
+# (independent Codex sol/xhigh finding, 2026-08-17,
+# CODEX-SOL-MAX-REVIEW-claude-codex-memory-bridge-2026-08-17.md, P1-3:
+# "2001:db8::1" passed through unredacted). Matching candidates broadly and
+# validating each with the standard library's real IPv6 parser (which
+# understands "::", IPv4-mapped suffixes, and everything else RFC 4291
+# defines) is correct where a regex alone cannot be without reimplementing
+# that grammar.
+_IPV6_CANDIDATE_RE = re.compile(r"(?<![0-9a-fA-F:.])[0-9a-fA-F:.]*:[0-9a-fA-F:.]*(?![0-9a-fA-F:.])")
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _LONG_BLOB_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9+/=_-]{48,}(?![A-Za-z0-9])")
 _HOME_RE = re.compile(r"/Users/[^/\s]+")
+
+
+def _redact_ipv6(match: re.Match[str]) -> str:
+    candidate = match.group(0)
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return candidate
+    return "[REDACTED_IP]" if address.version == 6 else candidate
 
 
 def redact(text: str) -> str:
@@ -408,7 +657,7 @@ def redact(text: str) -> str:
     text = _ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]", text)
     text = _QUERY_SECRET_RE.sub(r"\1[REDACTED]", text)
     text = _IPV4_RE.sub("[REDACTED_IP]", text)
-    text = _IPV6_RE.sub("[REDACTED_IP]", text)
+    text = _IPV6_CANDIDATE_RE.sub(_redact_ipv6, text)
     text = _EMAIL_RE.sub("[REDACTED_EMAIL]", text)
     text = _LONG_BLOB_RE.sub("[REDACTED_BLOB]", text)
     return _HOME_RE.sub("$USER_HOME", text)

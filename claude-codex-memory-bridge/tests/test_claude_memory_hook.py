@@ -39,13 +39,46 @@ class HookFixture:
         self.cwd = cwd
         self.project_dirname = hook.claude_project_dirname(cwd)
 
-    def add_memory(self, text: str, *, cwd: str | None = None, mode: int = 0o600) -> Path:
-        dirname = hook.claude_project_dirname(cwd) if cwd is not None else self.project_dirname
+    def add_memory(
+        self,
+        text: str,
+        *,
+        cwd: str | None = None,
+        mode: int = 0o600,
+        with_transcript: bool = True,
+    ) -> Path:
+        effective_cwd = cwd if cwd is not None else self.cwd
+        dirname = hook.claude_project_dirname(effective_cwd)
         directory = self.source / dirname / "memory"
         directory.mkdir(mode=0o700, parents=True)
         path = directory / "MEMORY.md"
         path.write_text(text, encoding="utf-8")
         path.chmod(mode)
+        if with_transcript:
+            # Real Claude Code only trusts a project directory for a cwd once
+            # a session transcript inside it records that exact cwd (see
+            # claude_memory_hook.py's _session_recorded_cwd_matches); the
+            # fixture reproduces that by default so tests about memory
+            # *content* don't also have to think about transcripts.
+            self.add_session_transcript(cwd=effective_cwd)
+        return path
+
+    def add_session_transcript(
+        self,
+        *,
+        cwd: str,
+        dirname: str | None = None,
+        session_id: str = "11111111-1111-1111-1111-111111111111",
+        relocated_cwd: str | None = None,
+    ) -> Path:
+        directory = self.source / (dirname or hook.claude_project_dirname(cwd))
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = directory / f"{session_id}.jsonl"
+        lines = [json.dumps({"type": "attachment", "cwd": cwd})]
+        if relocated_cwd is not None:
+            lines.append(json.dumps({"type": "relocated", "relocatedCwd": relocated_cwd}))
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        path.chmod(0o600)
         return path
 
     def policy(self, **limit_overrides: int) -> tuple[Path, str]:
@@ -134,12 +167,35 @@ class ClaudeMemoryHookTests(unittest.TestCase):
         self.assertIn("[REDACTED_IP]", context)
         self.assertIn("[REDACTED_EMAIL]", context)
 
+    def test_redacts_compressed_ipv6_forms(self) -> None:
+        # Independent Codex sol/xhigh review (2026-08-17,
+        # CODEX-SOL-MAX-REVIEW-claude-codex-memory-bridge-2026-08-17.md,
+        # P1-3): the previous hand-rolled regex only matched fully-expanded
+        # IPv6 and passed every real-world compressed ("::") form through
+        # unredacted. These are the review's own reproduction vectors
+        # (documentation/reserved ranges, not real server addresses).
+        self.fixture.add_memory(
+            "# server addresses\n"
+            "expanded 2001:0db8:0000:0000:0000:ff00:0042:8329\n"
+            "compressed 2001:db8::1\n"
+            "linklocal fe80::1234\n"
+            "loopback ::1\n"
+        )
+        output = self.fixture.run("server addresses")
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("2001:0db8:0000:0000:0000:ff00:0042:8329", context)
+        self.assertNotIn("2001:db8::1", context)
+        self.assertNotIn("fe80::1234", context)
+        self.assertNotIn("::1", context)
+        self.assertEqual(context.count("[REDACTED_IP]"), 4)
+
     def test_skips_symlinked_memory(self) -> None:
         symlink_cwd = "/Users/tester/symlink-project"
         external = self.root_external_memory("# forbidden topic\nsecret detail")
         symlink_dir = self.fixture.source / hook.claude_project_dirname(symlink_cwd) / "memory"
         symlink_dir.mkdir(mode=0o700, parents=True)
         (symlink_dir / "MEMORY.md").symlink_to(external)
+        self.fixture.add_session_transcript(cwd=symlink_cwd)
         self.assertEqual(self.fixture.run("forbidden topic", cwd=symlink_cwd), "")
 
     def test_skips_group_writable_memory(self) -> None:
@@ -198,11 +254,15 @@ class ClaudeMemoryHookTests(unittest.TestCase):
     # --- workspace-scoping (cross-project memory leak fix) -----------------
 
     def test_claude_project_dirname_matches_known_real_mapping(self) -> None:
-        # This is Claude Code's actual, empirically-verified project-directory
-        # naming transform (confirmed character-for-character against this
-        # session's own real ~/.claude/projects/ mapping) -- every character
-        # that is not ASCII alphanumeric becomes exactly one '-', including
-        # each character of a multi-character CJK run, with no collapsing.
+        # For short, BMP-only, <=200-char paths (both cases here), the
+        # transform reduces to "every non-ASCII-alphanumeric character
+        # becomes one '-'" -- confirmed character-for-character against this
+        # session's own real ~/.claude/projects/ mapping. The NFC
+        # normalization, UTF-16-code-unit semantics, and 200-char/hash-suffix
+        # branch (see claude_project_dirname's docstring, disassembled
+        # directly from the installed Claude Code 2.1.233 binary) only
+        # change the output for non-BMP characters or longer paths -- see the
+        # dedicated tests below for those.
         self.assertEqual(
             hook.claude_project_dirname(
                 "/Volumes/Extreme SSD/Orca/workspaces/orca/完善orca"
@@ -215,6 +275,105 @@ class ClaudeMemoryHookTests(unittest.TestCase):
             ),
             "-Volumes-Extreme-SSD-Orca-workspaces-orca-codex-restore-tool",
         )
+
+    def test_claude_project_dirname_matches_non_bmp_utf16_semantics(self) -> None:
+        # Independent Codex sol/xhigh review (2026-08-17,
+        # CODEX-SOL-MAX-REVIEW-claude-codex-memory-bridge-2026-08-17.md,
+        # P1-2) found the previous per-Unicode-code-point implementation
+        # disagreed with the real Claude Code binary for non-BMP characters:
+        # JS's non-`u`-flag regex replaces per UTF-16 code unit, so one
+        # emoji (a surrogate pair) becomes two '-' characters, not one. This
+        # exact vector -- and the real binary's exact output for it -- comes
+        # from that review.
+        self.assertEqual(
+            hook.claude_project_dirname("/tmp/emoji-\U0001f600-x"),
+            "-tmp-emoji----x",
+        )
+
+    def test_claude_project_dirname_caps_long_paths_with_hash_suffix(self) -> None:
+        # Independent Codex sol/xhigh review (same report, P1-2) found the
+        # real Claude Code binary truncates sanitized names longer than 200
+        # characters to 200 chars + '-' + a hash of the original cwd, which
+        # the previous implementation didn't replicate at all. This checks
+        # the *shape* (length, cap point, hash-suffix presence) rather than
+        # a specific hash value, since the review's own long-path vector
+        # used a different literal path than this one.
+        long_cwd = "/" + "a" * 219
+        result = hook.claude_project_dirname(long_cwd)
+        self.assertEqual(len(result), 207)  # 200 + '-' + 6 base-36 hash chars
+        self.assertEqual(result[:200], "-" + "a" * 199)
+        self.assertEqual(result[200], "-")
+        self.assertRegex(result[201:], r"^[0-9a-z]{1,6}$")
+
+    def test_cross_workspace_sanitizer_collision_fails_closed(self) -> None:
+        # The most severe independent finding (Codex sol/xhigh, same report,
+        # P1-1): claude_project_dirname() is not injective -- distinct real
+        # cwd values can sanitize to the identical directory name (this is
+        # true of the real Claude Code binary's own naming too, not just
+        # this bridge's reproduction of it). Two such cwd values here
+        # collide to the same sanitized name; only the first has a memory
+        # file *and* a session transcript recording it as that project's
+        # cwd. A request from the second (colliding, but genuinely
+        # different, and never-recorded-in-any-transcript) cwd must not
+        # receive the first's content -- this is the exact scenario the
+        # review's own reproduction used, and the exact case
+        # _session_recorded_cwd_matches exists to close.
+        cwd_a = "/tmp/collision/team/app"
+        cwd_b = "/tmp/collision/team-app"
+        self.assertEqual(
+            hook.claude_project_dirname(cwd_a), hook.claude_project_dirname(cwd_b)
+        )
+        self.fixture.add_memory("# victim secret\nVICTIM_PRIVATE_91c2f0", cwd=cwd_a)
+        output = self.fixture.run("victim secret", cwd=cwd_b)
+        self.assertEqual(output, "")
+
+    def test_session_transcript_verification_still_allows_the_real_owner(self) -> None:
+        # The positive counterpart to the collision test above: a request
+        # from the cwd that genuinely IS recorded in the resolved project's
+        # own transcript must still work normally.
+        cwd_a = "/tmp/collision/team/app"
+        self.fixture.add_memory("# victim secret\nVICTIM_PRIVATE_91c2f0", cwd=cwd_a)
+        output = self.fixture.run("victim secret", cwd=cwd_a)
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("VICTIM_PRIVATE_91c2f0", context)
+
+    def test_relocated_cwd_marker_is_honored(self) -> None:
+        # Mirrors the real binary's own fallback (`hJc`/`relocatedCwd`): a
+        # transcript's "relocated" marker is preferred over its plain "cwd"
+        # field. This only actually changes which directory gets served when
+        # the relocated cwd derives to the *same* directory name as the
+        # original recorded cwd (e.g. a workspace renamed between two paths
+        # that happen to sanitize identically) -- this bridge does not do a
+        # reverse/cross-directory lookup for a relocated project whose new
+        # cwd derives to a *different* name (independent Claude opus5/max
+        # review, 2026-08-17, F4: a known, documented, deliberately
+        # out-of-scope limitation -- see read_memory_documents()'s comment).
+        old_cwd = "/tmp/renamed/team/app"
+        new_cwd = "/tmp/renamed/team-app"
+        self.assertEqual(
+            hook.claude_project_dirname(old_cwd), hook.claude_project_dirname(new_cwd)
+        )
+        self.fixture.add_memory(
+            "# moved project\nsurvives relocation", cwd=old_cwd, with_transcript=False
+        )
+        self.fixture.add_session_transcript(
+            cwd=old_cwd,
+            dirname=hook.claude_project_dirname(old_cwd),
+            relocated_cwd=new_cwd,
+        )
+        output = self.fixture.run("moved project", cwd=new_cwd)
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("survives relocation", context)
+
+    def test_fails_closed_when_no_session_transcript_records_this_cwd(self) -> None:
+        # A project directory with a memory file but zero session
+        # transcripts recording this cwd (any cwd) is not a realistic steady
+        # state for a genuine Claude Code project -- MEMORY.md is only ever
+        # written by a real session, and that session's own transcript is
+        # written alongside it -- but the bridge still must fail closed
+        # rather than trust the directory name alone.
+        self.fixture.add_memory("# topic\ndetail", with_transcript=False)
+        self.assertEqual(self.fixture.run("topic"), "")
 
     def test_only_returns_memory_for_the_requesting_workspace(self) -> None:
         # The bug this guards against: read_memory_documents() used to scan

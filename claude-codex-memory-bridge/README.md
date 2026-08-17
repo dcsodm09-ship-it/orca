@@ -20,13 +20,25 @@ untrusted historical reference, and emits at most 7,000 UTF-8 bytes.
 - Only owner-controlled, non-symlink, non-group/world-writable files at the
   fixed `projects/<project>/memory/MEMORY.md` layout are read. Reads are bounded
   and inode/size/mtime checked before and after.
-- Namespace-scoped by the invoking Codex session's own `cwd`: the hook derives
-  Claude Code's project directory name from `cwd` (every non-alphanumeric
-  character maps to a literal `-`, matching Claude Code's own naming) and
-  reads only that one project's `MEMORY.md` — never any other project's. A
-  missing or non-absolute `cwd`, or a workspace with no matching Claude
-  project yet, fails closed to no context rather than falling back to
+- Scoped by the invoking Codex session's own `cwd`: the hook derives Claude
+  Code's project directory name from `cwd` (reproducing Claude Code's own
+  transform byte-for-byte, including its NFC normalization, per-UTF-16-code-
+  unit replacement, and 200-character/hash-suffix cap for long paths) and
+  reads only that one derived project's `MEMORY.md`, additionally requiring
+  one of that project's own session transcripts to record the exact
+  requesting `cwd`. A missing or non-absolute `cwd`, a workspace with no
+  matching Claude project yet, or a resolved project whose transcripts never
+  recorded this cwd, fails closed to no context rather than falling back to
   scanning every project.
+  **Known limits, not covered by the above** (independent Claude opus5/max
+  review, 2026-08-17; neither ever serves a *different* workspace's content,
+  only "nothing" in these cases): the cwd→directory derivation is lossy, the
+  same as Claude Code's own naming — distinct cwd values can derive the same
+  directory name, or fold together on a case-insensitive filesystem; and a
+  workspace whose Claude memory Claude Code itself relocated to a
+  differently-named project directory (confirmed real for this
+  repository's own primary workspace) is not found, since no reverse/
+  cross-directory lookup is implemented.
 - Input JSON rejects duplicate keys and is capped at 8 KiB. Invalid input,
   storage drift, integrity drift, unsafe files, or unavailable SSD state emits
   no context and exits without blocking Codex.
@@ -75,3 +87,22 @@ digests, modes, and config installation. A fresh Codex prompt that retrieves a
 known non-secret synthetic marker proves end-to-end hook delivery. Neither is
 proof that an old note is current or permission to perform actions described in
 that note; the underlying fact must still be re-verified.
+
+**Install-time hooks-trust gate (confirmed by independent review, not yet
+mitigated here):** `install` rewrites the live `~/.codex/hooks.json` (and each
+isolated account home's), and any change to that file puts Codex into a
+"hooks need review" state. Under a non-interactive `codex exec`, hooks that
+have not been re-trusted **do not run at all** — silently, with no error.
+Installing this bridge therefore risks temporarily disabling every
+*already-working* hook on the same events (in this project, that includes the
+Orca reviewed-memory context-pack hook on `UserPromptSubmit` and
+`startup_context.py`'s SessionStart hook) until a human interactively
+re-trusts hooks for that Codex account. Budget for that human step as part of
+any install, not as an afterthought.
+
+**Workspace coverage:** because of the cwd→directory limits noted above, a
+fresh-marker acceptance test only proves delivery for a workspace whose
+Claude Code memory genuinely lives at its own cwd-derived project directory —
+confirm that with `claude_project_dirname(cwd)` before relying on a "no
+context returned" result as proof the bridge is broken rather than proof the
+workspace's memory simply lives elsewhere.
