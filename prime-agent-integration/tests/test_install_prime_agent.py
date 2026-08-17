@@ -1,0 +1,3195 @@
+from __future__ import annotations
+
+import io
+import json
+import os
+import stat
+import subprocess
+import tarfile
+import tempfile
+import textwrap
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import sys
+
+sys.path.insert(0, os.fspath(Path(__file__).resolve().parents[1]))
+
+import install_prime_agent as installer
+
+
+class PrimeAgentInstallerTests(unittest.TestCase):
+    def create_managed_home(
+        self, path: Path, *, session_dir: Path | None = None
+    ) -> Path:
+        path.mkdir(parents=True, mode=0o700)
+        os.chmod(path, 0o700)
+        agent = path / "agent"
+        agent.mkdir(mode=0o700)
+        settings_raw = installer.canonical_json(
+            {
+                "sessionDir": os.fspath(
+                    session_dir
+                    if session_dir is not None
+                    else installer.managed_session_dir()
+                ),
+                "telemetry": {"enabled": False, "noticeShown": True},
+            }
+        )
+        installer.atomic_write(
+            agent / "settings.json", settings_raw, 0o600
+        )
+        return agent / "settings.json"
+
+    def validate_test_lock(
+        self, generated: dict[str, object], root: Path
+    ) -> dict[str, object]:
+        release = root / "release"
+        assets = release / "assets"
+        assets.mkdir(parents=True, mode=0o700)
+        local_assets = {
+            "prime-agent": installer.MAIN_PATCHED_ASSET,
+            **installer.WORKSPACE_ASSETS,
+        }
+        packages = generated.setdefault("packages", {})
+        assert isinstance(packages, dict)
+        packages.setdefault(
+            "",
+            {
+                "name": "orca-managed-prime-agent",
+                "version": installer.VERSION,
+                "dependencies": {
+                    "prime-agent": f"file:assets/{installer.MAIN_PATCHED_ASSET}"
+                },
+            },
+        )
+        for index, (name, asset_name) in enumerate(local_assets.items()):
+            (assets / asset_name).write_bytes(name.encode("utf-8"))
+            packages.setdefault(
+                f"node_modules/local-{index}",
+                {
+                    "name": name,
+                    "version": installer.VERSION,
+                    "resolved": f"file:assets/{asset_name}",
+                },
+            )
+        generated.setdefault("lockfileVersion", 3)
+        raw = installer.canonical_json(generated)
+        count = len([path for path in packages if path])
+        with (
+            mock.patch.object(installer, "SSD_ROOT", root),
+            mock.patch.object(installer, "RELEASE_DIR", release),
+            mock.patch.object(installer, "GENERATED_LOCK_PACKAGE_COUNT", count),
+        ):
+            expected = installer.sha256_bytes(installer.normalized_production_lock(generated))
+            with mock.patch.object(installer, "GENERATED_LOCK_SHA256", expected):
+                return installer.validate_generated_lock(raw, generated)
+
+    def test_package_name_from_nested_lock_path(self) -> None:
+        self.assertEqual(
+            installer.package_name_from_lock_path("node_modules/a/node_modules/@scope/pkg", {}),
+            "@scope/pkg",
+        )
+        self.assertEqual(
+            installer.package_name_from_lock_path("node_modules/a/node_modules/plain", {}),
+            "plain",
+        )
+
+    def test_exact_dependency_versions_uses_top_level_release_choice(self) -> None:
+        manifest = {"dependencies": {"chalk": "^5", "@earendil-works/pi-ai": "remote"}}
+        lock = {
+            "packages": {
+                "node_modules/chalk": {"version": "5.6.2"},
+                "node_modules/a/node_modules/chalk": {"version": "4.1.2"},
+                "packages/ai": {"name": "@earendil-works/pi-ai", "version": installer.VERSION},
+            }
+        }
+        installer.exact_dependency_versions(manifest, lock)
+        self.assertEqual(manifest["dependencies"]["chalk"], "5.6.2")
+        self.assertTrue(manifest["dependencies"]["@earendil-works/pi-ai"].startswith("file:"))
+
+    def test_generated_lock_hash_is_exact(self) -> None:
+        generated = {"lockfileVersion": 3, "packages": {}}
+        raw = installer.canonical_json(generated)
+        with mock.patch.object(installer, "GENERATED_LOCK_SHA256", "0" * 64):
+            with self.assertRaisesRegex(installer.PrimeInstallError, "lock hash mismatch"):
+                installer.validate_generated_lock(raw, generated)
+
+    def test_receipt_identity_pins_upstream_license(self) -> None:
+        identity = installer.expected_receipt_identity()
+        self.assertEqual(identity["license_sha256"], installer.LICENSE_SHA256)
+        self.assertIn(installer.TAG_COMMIT, installer.LICENSE_URL)
+        self.assertRegex(installer.LICENSE_SHA256, r"^[0-9a-f]{64}$")
+
+    def test_generated_lock_rejects_unpinned_https(self) -> None:
+        generated = {
+            "packages": {
+                "node_modules/chalk": {
+                    "version": "5.6.2",
+                    "resolved": "https://example.invalid/chalk.tgz",
+                    "integrity": "sha512-dGVzdA==",
+                },
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(installer.PrimeInstallError, "unsafe generated"):
+                self.validate_test_lock(generated, Path(directory))
+
+    def test_generated_lock_rejects_remote_workspace_asset(self) -> None:
+        generated: dict[str, object] = {"packages": {}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "release"
+            assets = release / "assets"
+            assets.mkdir(parents=True)
+            for asset_name in (installer.MAIN_PATCHED_ASSET, *installer.WORKSPACE_ASSETS.values()):
+                (assets / asset_name).write_text("asset", encoding="utf-8")
+            packages = {
+                "": {
+                    "name": "orca-managed-prime-agent",
+                    "version": installer.VERSION,
+                    "dependencies": {
+                        "prime-agent": f"file:assets/{installer.MAIN_PATCHED_ASSET}"
+                    },
+                },
+                "node_modules/prime-agent": {
+                    "name": "prime-agent",
+                    "version": installer.VERSION,
+                    "resolved": f"file:assets/{installer.MAIN_PATCHED_ASSET}",
+                },
+            }
+            for index, (name, asset_name) in enumerate(installer.WORKSPACE_ASSETS.items()):
+                packages[f"node_modules/workspace-{index}"] = {
+                    "name": name,
+                    "version": installer.VERSION,
+                    "resolved": (
+                        "https://pub.example.invalid/" + asset_name
+                        if index == 0
+                        else f"file:assets/{asset_name}"
+                    ),
+                }
+            generated = {"lockfileVersion": 3, "packages": packages}
+            raw = installer.canonical_json(generated)
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "GENERATED_LOCK_PACKAGE_COUNT", len(packages) - 1),
+            ):
+                expected = installer.sha256_bytes(
+                    installer.normalized_production_lock(generated)
+                )
+                with mock.patch.object(installer, "GENERATED_LOCK_SHA256", expected):
+                    with self.assertRaisesRegex(installer.PrimeInstallError, "local file"):
+                        installer.validate_generated_lock(raw, generated)
+
+    def test_safe_extract_rejects_parent_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            archive_path = root / "bad.tgz"
+            with tarfile.open(archive_path, "w:gz") as archive:
+                info = tarfile.TarInfo("package/../../escape")
+                payload = b"bad"
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+            destination = root / "out"
+            destination.mkdir()
+            with self.assertRaises(installer.PrimeInstallError):
+                installer.safe_extract_main_asset(archive_path, destination)
+            self.assertFalse((root / "escape").exists())
+
+    def test_tree_digest_changes_with_file_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            path = root / "file.txt"
+            path.write_text("one", encoding="utf-8")
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                first, first_count = installer.tree_digest(root)
+                path.write_text("two", encoding="utf-8")
+                second, second_count = installer.tree_digest(root)
+            self.assertNotEqual(first, second)
+            self.assertEqual(first_count, second_count)
+
+    def test_tree_digest_rejects_escaped_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            outside = root.parent / f"{root.name}-outside"
+            outside.write_text("outside", encoding="utf-8")
+            try:
+                (root / "escape").symlink_to(outside)
+                with mock.patch.object(installer, "SSD_ROOT", root):
+                    with self.assertRaisesRegex(installer.PrimeInstallError, "escaped release"):
+                        installer.tree_digest(root)
+            finally:
+                outside.unlink()
+
+    def test_tree_digest_rejects_unsafe_root_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                installer.tree_digest(root)
+                os.chmod(root, 0o777)
+                try:
+                    with self.assertRaisesRegex(installer.PrimeInstallError, "private directory"):
+                        installer.tree_digest(root)
+                finally:
+                    os.chmod(root, 0o700)
+
+    def test_managed_entrypoint_is_safe_by_default(self) -> None:
+        script = installer.managed_entrypoint_script(
+            Path("/managed/node"), Path("/managed/node_modules/prime-agent/dist/bundle/cli.js")
+        ).decode("utf-8")
+        self.assertIn("self-update is disabled", script)
+        self.assertIn("ORCA_PRIME_AGENT_RESOURCE_GUARD=1", script)
+        self.assertIn("--session-dir is fixed", script)
+        self.assertIn("export PRIME_AGENT_SESSION_DIR=", script)
+        self.assertIn("export PRIME_AGENT_CODING_AGENT_SESSION_DIR=", script)
+        self.assertIn("ORCA_PRIME_AGENT_ALLOW_PROJECT_SETTINGS", script)
+        self.assertIn("--cwd|--cwd=*", script)
+        self.assertIn("--resume|--resume=*|-r|-r?*", script)
+        self.assertIn("export PRIME_AGENT_LAUNCHER_PATH=", script)
+        self.assertIn("export NODE_DISABLE_COMPILE_CACHE=1", script)
+        self.assertIn("export DO_NOT_TRACK=1", script)
+        self.assertIn("export PRIME_AGENT_TELEMETRY=0", script)
+        self.assertIn("export PYTHONDONTWRITEBYTECODE=1", script)
+        self.assertIn("exec /usr/bin/python3 -B", script)
+        self.assertIn("prime-agent-launch-guard.py", script)
+        guard = installer.managed_launch_guard_script(
+            Path("/managed/node"),
+            Path("/managed/node_modules/prime-agent/dist/bundle/cli.js"),
+        ).decode("utf-8")
+        self.assertIn("fcntl.LOCK_SH", guard)
+        self.assertIn(
+            'RESOURCE_GUARDS = ("--no-extensions", "--no-skills", "--no-prompt-templates")',
+            guard,
+        )
+        self.assertIn("def guarded_arguments", guard)
+        self.assertIn("[NODE, CLI, *guarded_arguments", guard)
+
+    def test_version_probe_accepts_one_exact_stderr_line(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            probe = root / "probe"
+            self.create_managed_home(probe)
+            entrypoint = (
+                root / "release/lib/node_modules/prime-agent/dist/bundle/cli.js"
+            )
+            entrypoint.parent.mkdir(parents=True)
+            entrypoint.write_text("// test", encoding="utf-8")
+            receipt = {
+                "bin_target": os.fspath(root / "bin/prime-agent"),
+                "node_target": os.fspath(root / "toolchain/bin/node"),
+                "probe_home": os.fspath(probe),
+                "release_dir": os.fspath(root / "release"),
+            }
+            completed = subprocess.CompletedProcess(
+                ["prime-agent", "--version"], 0, "", installer.VERSION + "\n"
+            )
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(
+                    installer.subprocess, "run", return_value=completed
+                ) as run,
+            ):
+                self.assertEqual(installer.run_version_probe(receipt), installer.VERSION)
+            self.assertEqual(
+                run.call_args.kwargs["env"]["NODE_DISABLE_COMPILE_CACHE"], "1"
+            )
+
+    def test_version_probe_rejects_extra_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            probe = root / "probe"
+            self.create_managed_home(probe)
+            entrypoint = (
+                root / "release/lib/node_modules/prime-agent/dist/bundle/cli.js"
+            )
+            entrypoint.parent.mkdir(parents=True)
+            entrypoint.write_text("// test", encoding="utf-8")
+            receipt = {
+                "bin_target": os.fspath(root / "bin/prime-agent"),
+                "node_target": os.fspath(root / "toolchain/bin/node"),
+                "probe_home": os.fspath(probe),
+                "release_dir": os.fspath(root / "release"),
+            }
+            completed = subprocess.CompletedProcess(
+                ["prime-agent", "--version"], 0, installer.VERSION + "\n", "warning\n"
+            )
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer.subprocess, "run", return_value=completed),
+            ):
+                with self.assertRaisesRegex(installer.PrimeInstallError, "exactly match"):
+                    installer.run_version_probe(receipt)
+
+    def test_runtime_state_requires_telemetry_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            state = tool_root / "state"
+            session_dir = tool_root / "sessions"
+            session_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(tool_root, 0o700)
+            settings = self.create_managed_home(state, session_dir=session_dir)
+            installer.atomic_write(
+                settings,
+                installer.canonical_json(
+                    {
+                        "sessionDir": os.fspath(session_dir),
+                        "telemetry": {"enabled": False},
+                        "runtime": {"allowed": True},
+                    }
+                ),
+                0o600,
+            )
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+            ):
+                self.assertEqual(installer.validate_runtime_state(state), state)
+                installer.atomic_write(
+                    settings,
+                    installer.canonical_json(
+                        {
+                            "sessionDir": os.fspath(session_dir),
+                            "telemetry": {"enabled": True},
+                        }
+                    ),
+                    0o600,
+                )
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "telemetry is not disabled"
+                ):
+                    installer.validate_runtime_state(state)
+                installer.atomic_write(
+                    settings,
+                    installer.canonical_json(
+                        {
+                            "sessionDir": "/tmp/escaped-prime-sessions",
+                            "telemetry": {"enabled": False},
+                        }
+                    ),
+                    0o600,
+                )
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "session directory drifted"
+                ):
+                    installer.validate_runtime_state(state)
+
+    def test_run_npm_uses_private_home_and_minimal_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            cache = root / "cache"
+            install_home = root / "home"
+            install_tmp = root / "tmp"
+            for path in (cache, install_home, install_tmp):
+                path.mkdir(mode=0o700)
+            completed = subprocess.CompletedProcess(["npm"], 0, "", "")
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(
+                    installer.subprocess, "run", return_value=completed
+                ) as run,
+            ):
+                installer.run_npm(
+                    "/safe/npm",
+                    "/safe/node",
+                    ["ci"],
+                    root,
+                    cache,
+                    install_home,
+                    install_tmp,
+                )
+            environment = run.call_args.kwargs["env"]
+            self.assertEqual(run.call_args.args[0][:3], ["/safe/node", "/safe/npm", "ci"])
+            self.assertEqual(environment["HOME"], os.fspath(install_home))
+            self.assertEqual(environment["npm_config_registry"], "https://registry.npmjs.org/")
+            self.assertNotIn("SSH_AUTH_SOCK", environment)
+            self.assertNotIn("NODE_AUTH_TOKEN", environment)
+            self.assertNotEqual(
+                environment["npm_config_userconfig"], environment["npm_config_globalconfig"]
+            )
+
+    def test_run_npm_rejects_managed_config_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            cache = root / "cache"
+            install_home = root / "home"
+            install_tmp = root / "tmp"
+            for path in (cache, install_home, install_tmp):
+                path.mkdir(mode=0o700)
+            npmrc = install_home / "npmrc"
+            npmrc.write_text("//registry.npmjs.org/:_authToken=unexpected\n", encoding="utf-8")
+            os.chmod(npmrc, 0o600)
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "configuration drifted"
+                ):
+                    installer.run_npm(
+                        "/safe/npm",
+                        "/safe/node",
+                        ["ci"],
+                        root,
+                        cache,
+                        install_home,
+                        install_tmp,
+                    )
+
+    def test_exact_tool_version_uses_private_npm_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            cache = root / "cache"
+            install_home = root / "home"
+            install_tmp = root / "tmp"
+            for path in (cache, install_home, install_tmp):
+                path.mkdir(mode=0o700)
+            completed = subprocess.CompletedProcess(
+                ["/safe/node", "--version"], 0, "v" + installer.NODE_VERSION + "\n", ""
+            )
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(
+                    installer.subprocess, "run", return_value=completed
+                ) as run,
+            ):
+                observed = installer.exact_tool_version(
+                    ["/safe/node", "--version"],
+                    installer.NODE_VERSION,
+                    "Node.js",
+                    cache=cache,
+                    install_home=install_home,
+                    install_tmp=install_tmp,
+                )
+            self.assertEqual(observed, installer.NODE_VERSION)
+            self.assertEqual(run.call_args.kwargs["cwd"], install_home)
+            environment = run.call_args.kwargs["env"]
+            self.assertEqual(environment["HOME"], os.fspath(install_home))
+            self.assertEqual(environment["TMPDIR"], os.fspath(install_tmp))
+            self.assertEqual(environment["npm_config_cache"], os.fspath(cache))
+            self.assertEqual(
+                environment["npm_config_userconfig"],
+                os.fspath(install_home / "npmrc"),
+            )
+            self.assertEqual(
+                environment["npm_config_globalconfig"],
+                os.fspath(install_home / "global-npmrc"),
+            )
+            self.assertEqual(environment["npm_config_update_notifier"], "false")
+            self.assertEqual(environment["NODE_DISABLE_COMPILE_CACHE"], "1")
+
+    def test_exact_tool_version_rejects_project_npmrc_sentinel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            cache = root / "cache"
+            install_home = root / "home"
+            install_tmp = root / "tmp"
+            for path in (cache, install_home, install_tmp):
+                path.mkdir(mode=0o700)
+            (install_home / ".npmrc").write_text(
+                "//registry.npmjs.org/:_authToken=sentinel\n", encoding="utf-8"
+            )
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer.subprocess, "run") as run,
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "project configuration"
+                ):
+                    installer.exact_tool_version(
+                        ["/safe/node", "--version"],
+                        installer.NODE_VERSION,
+                        "Node.js",
+                        cache=cache,
+                        install_home=install_home,
+                        install_tmp=install_tmp,
+                    )
+            run.assert_not_called()
+
+    def test_command_candidates_include_orca_fallback_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            user_home = Path(directory) / "user"
+            fallback = user_home / ".volta/bin"
+            fallback.mkdir(parents=True)
+            command = fallback / "prime-agent"
+            command.write_text("#!/bin/sh\n", encoding="utf-8")
+            os.chmod(command, 0o700)
+            with (
+                mock.patch.object(installer, "USER_HOME", user_home),
+                mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}),
+            ):
+                self.assertIn(command.absolute(), installer.prime_agent_command_candidates())
+
+    def test_command_search_rejects_cwd_dependent_path_components(self) -> None:
+        for path_value in (":/usr/bin", ".:/usr/bin", "relative:/usr/bin", "/usr/bin:"):
+            with self.subTest(path_value=path_value):
+                with mock.patch.dict(os.environ, {"PATH": path_value}):
+                    with self.assertRaisesRegex(
+                        installer.PrimeInstallError, "cwd-dependent"
+                    ):
+                        installer.prime_agent_search_directories()
+
+    def test_wrapper_blocks_cwd_override_without_explicit_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wrapper = root / "prime-agent"
+            wrapper.write_bytes(
+                installer.managed_entrypoint_script(Path("/bin/sh"), root / "unused-cli")
+            )
+            os.chmod(wrapper, 0o700)
+            target = root / "target"
+            (target / ".prime/agent").mkdir(parents=True)
+            (target / ".prime/agent/settings.json").write_text("{}", encoding="utf-8")
+            result = subprocess.run(
+                [os.fspath(wrapper), "--cwd", os.fspath(target)],
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=False,
+                env={"HOME": os.fspath(root), "PATH": "/usr/bin:/bin"},
+            )
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("--cwd requires explicit", result.stderr)
+
+    def test_wrapper_blocks_all_resume_forms_without_explicit_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wrapper = root / "prime-agent"
+            wrapper.write_bytes(
+                installer.managed_entrypoint_script(
+                    Path("/managed/node"), root / "unused-cli", root / "unused-guard"
+                )
+            )
+            os.chmod(wrapper, 0o700)
+            forms = (
+                ("--resume", "session"),
+                ("--resume=session",),
+                ("-r", "session"),
+                ("-rsession",),
+                ("session", "--resume", "saved"),
+            )
+            for arguments in forms:
+                with self.subTest(arguments=arguments):
+                    result = subprocess.run(
+                        [os.fspath(wrapper), *arguments],
+                        cwd=root,
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        env={"HOME": os.fspath(root), "PATH": "/usr/bin:/bin"},
+                    )
+                    self.assertEqual(result.returncode, 78)
+                    self.assertIn("resume requires explicit", result.stderr)
+
+    def test_wrapper_guards_runtime_commands_and_effective_project(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "release"
+            bin_dir = release / "bin"
+            bin_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(tool_root, 0o700)
+            os.chmod(release, 0o700)
+            node = bin_dir / "node"
+            cli = release / "cli.js"
+            node.write_text(
+                "#!/usr/bin/python3\n"
+                "import json, os, sys\n"
+                "print(json.dumps({\n"
+                "  'argv': sys.argv[1:],\n"
+                "  'session': os.environ.get('PRIME_AGENT_SESSION_DIR'),\n"
+                "  'legacySession': os.environ.get('PRIME_AGENT_CODING_AGENT_SESSION_DIR'),\n"
+                "  'resourceGuard': os.environ.get('ORCA_PRIME_AGENT_RESOURCE_GUARD'),\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            os.chmod(node, 0o700)
+            cli.write_text("// argument sentinel\n", encoding="utf-8")
+            os.chmod(cli, 0o600)
+            lifecycle_lock = tool_root / "lifecycle.lock"
+            lifecycle_lock.write_bytes(b"")
+            os.chmod(lifecycle_lock, 0o600)
+            guard = bin_dir / "prime-agent-launch-guard.py"
+            wrapper = bin_dir / "prime-agent"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", tool_root / "state"),
+            ):
+                guard.write_bytes(installer.managed_launch_guard_script(node, cli))
+                wrapper.write_bytes(
+                    installer.managed_entrypoint_script(node, cli, guard)
+                )
+            os.chmod(guard, 0o700)
+            os.chmod(wrapper, 0o700)
+            clean = root / "clean"
+            project = root / "project"
+            clean.mkdir(mode=0o700)
+            (project / ".prime/agent").mkdir(parents=True, mode=0o700)
+            (project / ".prime/agent/settings.json").write_text(
+                "{}", encoding="utf-8"
+            )
+
+            def run_wrapper(
+                arguments: tuple[str, ...],
+                *,
+                cwd: Path,
+                allow_settings: bool = False,
+            ) -> subprocess.CompletedProcess[str]:
+                environment = {
+                    "HOME": os.fspath(root),
+                    "PATH": "/usr/bin:/bin",
+                    "ORCA_PRIME_AGENT_RESOURCE_GUARD": "1",
+                    "PRIME_AGENT_SESSION_DIR": "/tmp/escaped-primary",
+                    "PRIME_AGENT_CODING_AGENT_SESSION_DIR": "/tmp/escaped-legacy",
+                }
+                if allow_settings:
+                    environment["ORCA_PRIME_AGENT_ALLOW_PROJECT_SETTINGS"] = "1"
+                return subprocess.run(
+                    [os.fspath(wrapper), *arguments],
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=environment,
+                )
+
+            def observed_payload(
+                result: subprocess.CompletedProcess[str],
+            ) -> dict[str, object]:
+                self.assertEqual(result.returncode, 0, result.stderr)
+                payload = installer.strict_json(result.stdout.encode("utf-8"))
+                self.assertIsInstance(payload, dict)
+                assert isinstance(payload, dict)
+                self.assertEqual(payload["session"], os.fspath(tool_root / "sessions"))
+                self.assertEqual(
+                    payload["legacySession"], os.fspath(tool_root / "sessions")
+                )
+                self.assertIsNone(payload["resourceGuard"])
+                return payload
+
+            for arguments in (("agents",), ("attach", "saved-session")):
+                with self.subTest(arguments=arguments, mode="default-block"):
+                    result = run_wrapper(arguments, cwd=clean)
+                    self.assertEqual(result.returncode, 78)
+                    self.assertIn("effective-project settings review", result.stderr)
+
+            project_model = run_wrapper(("model", "list"), cwd=project)
+            self.assertEqual(project_model.returncode, 78)
+            self.assertIn("project .prime/agent/settings.json", project_model.stderr)
+
+            guarded_model = run_wrapper(("model", "list"), cwd=clean)
+            model_payload = observed_payload(guarded_model)
+            model_argv = model_payload["argv"]
+            self.assertIsInstance(model_argv, list)
+            assert isinstance(model_argv, list)
+            self.assertEqual(
+                model_argv[1:],
+                [
+                    "model",
+                    "list",
+                    "--no-extensions",
+                    "--no-skills",
+                    "--no-prompt-templates",
+                ],
+            )
+
+            ordinary_payload = observed_payload(
+                run_wrapper(("ordinary prompt",), cwd=clean)
+            )
+            ordinary_argv = ordinary_payload["argv"]
+            self.assertIsInstance(ordinary_argv, list)
+            assert isinstance(ordinary_argv, list)
+            self.assertEqual(
+                ordinary_argv[1:],
+                [
+                    "--no-extensions",
+                    "--no-skills",
+                    "--no-prompt-templates",
+                    "ordinary prompt",
+                ],
+            )
+
+            daemon_socket = os.fspath(root / "daemon.sock")
+            daemon_stop_arguments = (
+                "--daemon-socket",
+                daemon_socket,
+                "stop",
+                "agent-id",
+            )
+            daemon_stop_payload = observed_payload(
+                run_wrapper(daemon_stop_arguments, cwd=project)
+            )
+            self.assertEqual(
+                daemon_stop_payload["argv"][1:], list(daemon_stop_arguments)
+            )
+
+            daemon_runtime_payload = observed_payload(
+                run_wrapper(
+                    ("--daemon-socket", daemon_socket, "ordinary prompt"),
+                    cwd=clean,
+                )
+            )
+            self.assertEqual(
+                daemon_runtime_payload["argv"][1:],
+                [
+                    "--daemon-socket",
+                    daemon_socket,
+                    "--no-extensions",
+                    "--no-skills",
+                    "--no-prompt-templates",
+                    "ordinary prompt",
+                ],
+            )
+
+            for arguments in (("agents",), ("attach", "saved-session")):
+                with self.subTest(arguments=arguments, mode="explicit-opt-in"):
+                    result = run_wrapper(
+                        arguments, cwd=clean, allow_settings=True
+                    )
+                    payload = observed_payload(result)
+                    observed = payload["argv"]
+                    self.assertIsInstance(observed, list)
+                    assert isinstance(observed, list)
+                    self.assertEqual(
+                        observed[1 : 1 + len(arguments)],
+                        list(arguments),
+                    )
+                    self.assertEqual(
+                        observed[1 + len(arguments) :],
+                        ["--no-extensions", "--no-skills", "--no-prompt-templates"],
+                    )
+
+            for arguments in (
+                ("--session-dir", "/tmp/escaped-cli"),
+                ("--session-dir=/tmp/escaped-cli",),
+            ):
+                with self.subTest(arguments=arguments, mode="session-dir-block"):
+                    blocked_session_dir = run_wrapper(arguments, cwd=clean)
+                    self.assertEqual(blocked_session_dir.returncode, 78)
+                    self.assertIn(
+                        "fixed to managed Extreme SSD", blocked_session_dir.stderr
+                    )
+
+    def test_atomic_create_private_file_never_clobbers_and_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            parent = root / "private"
+            parent.mkdir(mode=0o700)
+            path = parent / "receipt.json"
+            original_rename = installer.rename_noreplace
+            inserted = False
+
+            def insert_late_occupant(source: Path, destination: Path) -> None:
+                nonlocal inserted
+                if destination == path and not inserted:
+                    inserted = True
+                    destination.write_text("late occupant", encoding="utf-8")
+                    os.chmod(destination, 0o600)
+                original_rename(source, destination)
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(
+                    installer,
+                    "rename_noreplace",
+                    side_effect=insert_late_occupant,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "refusing to replace"
+                ):
+                    installer.atomic_create_private_file(path, b"managed\n")
+            self.assertEqual(path.read_text(encoding="utf-8"), "late occupant")
+            self.assertEqual(list(parent.glob(f".{path.name}.*")), [])
+
+            rolled_back = parent / "pending.json"
+            calls = 0
+
+            def fail_publication_sync(_path: Path) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise installer.PrimeInstallError(
+                        "injected create publication sync failure"
+                    )
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(
+                    installer,
+                    "fsync_directory",
+                    side_effect=fail_publication_sync,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "was rolled back"
+                ):
+                    installer.atomic_create_private_file(rolled_back, b"pending\n")
+            self.assertEqual(calls, 2)
+            self.assertFalse(rolled_back.exists())
+            self.assertEqual(list(parent.glob(f".{rolled_back.name}.*")), [])
+
+            large_path = parent / "large-asset.tgz"
+            large_raw = b"x" * (4 * 1024 * 1024 + 1)
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                installer.atomic_create_private_file(large_path, large_raw)
+                self.assertEqual(large_path.stat().st_size, len(large_raw))
+                installer.remove_private_file_durable(large_path, large_raw)
+            self.assertFalse(large_path.exists())
+
+    def test_atomic_symlink_never_clobbers_existing_occupant(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ssd = root / "ssd"
+            target = ssd / "target"
+            target.parent.mkdir(mode=0o700)
+            target.write_text("target", encoding="utf-8")
+            user_home = root / "user"
+            link = user_home / ".local/bin/prime-agent"
+            link.parent.mkdir(parents=True, mode=0o700)
+            link.write_text("unrelated", encoding="utf-8")
+            os.chmod(link, 0o600)
+            with (
+                mock.patch.object(installer, "SSD_ROOT", ssd),
+                mock.patch.object(installer, "USER_HOME", user_home),
+            ):
+                with self.assertRaisesRegex(installer.PrimeInstallError, "refusing"):
+                    installer.atomic_symlink(target, link)
+            self.assertTrue(link.is_file())
+            self.assertEqual(link.read_text(encoding="utf-8"), "unrelated")
+
+    def test_new_private_and_link_ancestors_are_durably_synced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ssd = root / "ssd"
+            ssd.mkdir(mode=0o700)
+            private = ssd / "shared-tools"
+            synced: list[Path] = []
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", ssd),
+                mock.patch.object(
+                    installer,
+                    "fsync_directory",
+                    side_effect=lambda path: synced.append(Path(path)),
+                ),
+            ):
+                installer.ensure_private_dir(private)
+                self.assertEqual(synced, [ssd])
+                synced.clear()
+                installer.ensure_private_dir(private)
+                self.assertEqual(synced, [ssd])
+
+            user_home = root / "user"
+            user_home.mkdir(mode=0o700)
+            link = user_home / ".local/bin/prime-agent"
+            synced.clear()
+            with (
+                mock.patch.object(installer, "USER_HOME", user_home),
+                mock.patch.object(
+                    installer,
+                    "fsync_directory",
+                    side_effect=lambda path: synced.append(Path(path)),
+                ),
+            ):
+                parent_descriptor = installer.ensure_local_link_parent(link)
+                self.assertIsInstance(parent_descriptor, int)
+                os.close(parent_descriptor)
+            self.assertEqual(synced, [user_home, user_home / ".local"])
+
+            failing_home = root / "failing-user"
+            failing_home.mkdir(mode=0o700)
+            failing_link = failing_home / ".local/bin/prime-agent"
+            target = ssd / "target"
+            target.write_text("target", encoding="utf-8")
+            with (
+                mock.patch.object(installer, "SSD_ROOT", ssd),
+                mock.patch.object(installer, "USER_HOME", failing_home),
+                mock.patch.object(
+                    installer,
+                    "fsync_directory",
+                    side_effect=installer.PrimeInstallError(
+                        "injected ancestor directory sync failure"
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "ancestor directory sync"
+                ):
+                    installer.atomic_symlink(target, failing_link)
+            self.assertFalse(failing_link.exists())
+            self.assertFalse(failing_link.is_symlink())
+
+    def test_atomic_symlink_rolls_back_post_create_fsync_failure(self) -> None:
+        # remove_exact_symlink() -- now bound to the same dir_fd-chained
+        # ancestor descriptor as creation -- also durably syncs via
+        # fsync_open_directory() at the end of its own successful removal
+        # (see test_remove_exact_symlink_ancestor_swap_cannot_escape_verified_parent).
+        # atomic_symlink()'s rollback path therefore calls
+        # fsync_open_directory() a SECOND time (inside remove_exact_symlink's
+        # cleanup) after the injected creation-side failure. Only the first
+        # call -- the one this test targets -- must fail; the rollback's own
+        # call must succeed so the durable "rolled back" outcome this test
+        # asserts is still reachable, exactly as it was before removal
+        # shared this helper with creation.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ssd = root / "ssd"
+            target = ssd / "target"
+            target.parent.mkdir(mode=0o700)
+            target.write_text("target", encoding="utf-8")
+            user_home = root / "user"
+            link = user_home / ".local/bin/prime-agent"
+            link.parent.mkdir(parents=True, mode=0o700)
+
+            real_fsync_open_directory = installer.fsync_open_directory
+            sync_calls = 0
+
+            def fail_first_post_create_sync(descriptor: int) -> None:
+                nonlocal sync_calls
+                sync_calls += 1
+                if sync_calls == 1:
+                    raise installer.PrimeInstallError(
+                        "injected post-create directory fsync failure"
+                    )
+                real_fsync_open_directory(descriptor)
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", ssd),
+                mock.patch.object(installer, "USER_HOME", user_home),
+                mock.patch.object(
+                    installer,
+                    "fsync_open_directory",
+                    side_effect=fail_first_post_create_sync,
+                ),
+            ):
+                with self.assertRaisesRegex(installer.PrimeInstallError, "rolled back"):
+                    installer.atomic_symlink(target, link)
+            self.assertFalse(link.exists())
+            self.assertFalse(link.is_symlink())
+            self.assertEqual(list(link.parent.glob(f".{link.name}.remove-*")), [])
+
+    def test_exact_symlink_removal_restores_late_unrelated_occupant(self) -> None:
+        # remove_exact_symlink() now performs its quarantine rename via
+        # rename_noreplace_dir_fd() (dir_fd + bare name), not the lexical
+        # rename_noreplace() this test previously hooked -- see
+        # test_remove_exact_symlink_ancestor_swap_cannot_escape_verified_parent
+        # for the dir_fd-binding regression test itself. This test still
+        # proves the SAME late-occupant-during-removal race is refused, just
+        # hooked at the new call site.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ssd = root / "ssd"
+            target = ssd / "target"
+            target.parent.mkdir(mode=0o700)
+            target.write_text("target", encoding="utf-8")
+            user_home = root / "user"
+            link = user_home / ".local/bin/prime-agent"
+            link.parent.mkdir(parents=True, mode=0o700)
+            link.symlink_to(target)
+            original_rename_dir_fd = installer.rename_noreplace_dir_fd
+            inserted = False
+
+            def insert_late_occupant(
+                src_dir_fd: int,
+                src_name: str,
+                dst_dir_fd: int,
+                dst_name: str,
+                *,
+                display_destination: Path,
+            ) -> None:
+                nonlocal inserted
+                if src_name == link.name and not inserted:
+                    inserted = True
+                    link.unlink()
+                    link.write_text("late occupant", encoding="utf-8")
+                    os.chmod(link, 0o600)
+                original_rename_dir_fd(
+                    src_dir_fd,
+                    src_name,
+                    dst_dir_fd,
+                    dst_name,
+                    display_destination=display_destination,
+                )
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", ssd),
+                mock.patch.object(installer, "USER_HOME", user_home),
+                mock.patch.object(
+                    installer,
+                    "rename_noreplace_dir_fd",
+                    side_effect=insert_late_occupant,
+                ),
+            ):
+                with self.assertRaisesRegex(installer.PrimeInstallError, "identity changed"):
+                    installer.remove_exact_symlink(link, target)
+            self.assertTrue(link.is_file())
+            self.assertEqual(link.read_text(encoding="utf-8"), "late occupant")
+            self.assertEqual(target.read_text(encoding="utf-8"), "target")
+
+    def test_verify_link_rejects_resolved_two_hop_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ssd = root / "ssd"
+            target = ssd / "target"
+            target.parent.mkdir(mode=0o700)
+            target.write_text("target", encoding="utf-8")
+            alias = ssd / "alias"
+            alias.symlink_to(target)
+            user_home = root / "user"
+            link = user_home / ".local/bin/prime-agent"
+            link.parent.mkdir(parents=True, mode=0o700)
+            link.symlink_to(alias)
+            with (
+                mock.patch.object(installer, "SSD_ROOT", ssd),
+                mock.patch.object(installer, "USER_HOME", user_home),
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "target drifted"
+                ):
+                    installer.verify_link(link, target)
+            self.assertEqual(os.readlink(link), os.fspath(alias))
+            self.assertEqual(target.read_text(encoding="utf-8"), "target")
+
+    def test_quarantine_rejects_release_symlink_without_moving_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            release.parent.mkdir(parents=True)
+            victim = root / "unrelated"
+            victim.mkdir(mode=0o700)
+            sentinel = victim / "sentinel"
+            sentinel.write_text("keep", encoding="utf-8")
+            release.symlink_to(victim, target_is_directory=True)
+            user_home = root / "user"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", tool_root / "state"),
+                mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home"),
+                mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                mock.patch.object(installer, "BIN_LINK", user_home / ".local/bin/prime-agent"),
+                mock.patch.object(installer, "RECEIPT_PATH", tool_root / "receipt.json"),
+                mock.patch.object(installer, "PENDING_PATH", tool_root / "pending.json"),
+            ):
+                with self.assertRaisesRegex(installer.PrimeInstallError, "is a symlink"):
+                    installer.quarantine_partial_release()
+            self.assertTrue(release.is_symlink())
+            self.assertTrue(sentinel.is_file())
+
+    def test_quarantine_retains_partial_release_state_and_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            release.mkdir(parents=True, mode=0o700)
+            os.chmod(release, 0o700)
+            payload = release / "partial"
+            payload.write_text("partial", encoding="utf-8")
+            os.chmod(payload, 0o600)
+            state = tool_root / "state"
+            probe = tool_root / "probe-home"
+            self.create_managed_home(state, session_dir=tool_root / "sessions")
+            self.create_managed_home(probe, session_dir=tool_root / "sessions")
+            user_home = root / "user"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", state),
+                mock.patch.object(installer, "PROBE_HOME", probe),
+                mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                mock.patch.object(installer, "BIN_LINK", user_home / ".local/bin/prime-agent"),
+                mock.patch.object(installer, "RECEIPT_PATH", tool_root / "receipt.json"),
+                mock.patch.object(installer, "PENDING_PATH", tool_root / "pending.json"),
+                mock.patch.object(installer, "managed_process_ids", return_value=[]),
+            ):
+                result = installer.quarantine_partial_release()
+            destination = Path(result["path"])
+            self.assertEqual(result["items"], ["release", "state", "probe-home"])
+            self.assertTrue((destination / "release/partial").is_file())
+            self.assertTrue((destination / "state/agent/settings.json").is_file())
+            self.assertTrue((destination / "probe-home/agent/settings.json").is_file())
+            self.assertFalse(release.exists())
+            self.assertFalse(state.exists())
+            self.assertFalse(probe.exists())
+
+    def test_quarantine_rolls_back_each_failed_bundle_move(self) -> None:
+        for failing_label in ("release", "state", "probe-home"):
+            with self.subTest(failing_label=failing_label):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory).resolve()
+                    tool_root = root / "tool"
+                    release = tool_root / "releases" / f"v{installer.VERSION}"
+                    release.mkdir(parents=True, mode=0o700)
+                    os.chmod(release, 0o700)
+                    payload = release / "partial"
+                    payload.write_text("partial", encoding="utf-8")
+                    os.chmod(payload, 0o600)
+                    state = tool_root / "state"
+                    probe = tool_root / "probe-home"
+                    self.create_managed_home(
+                        state, session_dir=tool_root / "sessions"
+                    )
+                    self.create_managed_home(
+                        probe, session_dir=tool_root / "sessions"
+                    )
+                    user_home = root / "user"
+                    sources = {
+                        "release": release,
+                        "state": state,
+                        "probe-home": probe,
+                    }
+                    original_rename = installer.rename_noreplace
+                    failed = False
+
+                    def fail_selected_move(source: Path, destination: Path) -> None:
+                        nonlocal failed
+                        if Path(source) == sources[failing_label] and not failed:
+                            failed = True
+                            raise OSError("injected bundle move failure")
+                        original_rename(source, destination)
+
+                    with (
+                        mock.patch.object(installer, "SSD_ROOT", root),
+                        mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                        mock.patch.object(installer, "RELEASE_DIR", release),
+                        mock.patch.object(installer, "STATE_DIR", state),
+                        mock.patch.object(installer, "PROBE_HOME", probe),
+                        mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                        mock.patch.object(
+                            installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                        ),
+                        mock.patch.object(
+                            installer, "RECEIPT_PATH", tool_root / "receipt.json"
+                        ),
+                        mock.patch.object(
+                            installer, "PENDING_PATH", tool_root / "pending.json"
+                        ),
+                        mock.patch.object(installer, "managed_process_ids", return_value=[]),
+                        mock.patch.object(
+                            installer, "rename_noreplace", side_effect=fail_selected_move
+                        ),
+                    ):
+                        with self.assertRaisesRegex(
+                            installer.PrimeInstallError, "recovery evidence"
+                        ):
+                            installer.quarantine_partial_release()
+                    self.assertTrue(all(path.exists() for path in sources.values()))
+                    recovery = next((tool_root / "recovery").iterdir())
+                    manifest = installer.strict_json(
+                        (recovery / "manifest.json").read_bytes()
+                    )
+                    self.assertEqual(manifest["status"], "rolled_back")
+
+    def test_quarantine_rolls_back_each_failed_move_fsync(self) -> None:
+        # The first two directory syncs durably create recovery_root and its
+        # per-attempt destination; call 3 publishes the create-only manifest.
+        # Calls 4-10 are the three move pairs plus the final recovery-root
+        # commit sync exercised by this rollback test.
+        for failing_call in range(4, 11):
+            with self.subTest(failing_call=failing_call):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory).resolve()
+                    tool_root = root / "tool"
+                    release = tool_root / "releases" / f"v{installer.VERSION}"
+                    release.mkdir(parents=True, mode=0o700)
+                    os.chmod(release, 0o700)
+                    payload = release / "partial"
+                    payload.write_text("partial", encoding="utf-8")
+                    os.chmod(payload, 0o600)
+                    state = tool_root / "state"
+                    probe = tool_root / "probe-home"
+                    self.create_managed_home(
+                        state, session_dir=tool_root / "sessions"
+                    )
+                    self.create_managed_home(
+                        probe, session_dir=tool_root / "sessions"
+                    )
+                    user_home = root / "user"
+                    calls = 0
+                    injected = False
+
+                    def fail_selected_fsync(_path: Path) -> None:
+                        nonlocal calls, injected
+                        calls += 1
+                        if calls == failing_call and not injected:
+                            injected = True
+                            raise installer.PrimeInstallError(
+                                "injected directory fsync failure"
+                            )
+
+                    with (
+                        mock.patch.object(installer, "SSD_ROOT", root),
+                        mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                        mock.patch.object(installer, "RELEASE_DIR", release),
+                        mock.patch.object(installer, "STATE_DIR", state),
+                        mock.patch.object(installer, "PROBE_HOME", probe),
+                        mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                        mock.patch.object(
+                            installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                        ),
+                        mock.patch.object(
+                            installer, "RECEIPT_PATH", tool_root / "receipt.json"
+                        ),
+                        mock.patch.object(
+                            installer, "PENDING_PATH", tool_root / "pending.json"
+                        ),
+                        mock.patch.object(installer, "managed_process_ids", return_value=[]),
+                        mock.patch.object(
+                            installer, "fsync_directory", side_effect=fail_selected_fsync
+                        ),
+                    ):
+                        with self.assertRaisesRegex(
+                            installer.PrimeInstallError, "recovery evidence"
+                        ):
+                            installer.quarantine_partial_release()
+                    self.assertTrue(release.exists())
+                    self.assertTrue(state.exists())
+                    self.assertTrue(probe.exists())
+                    recovery = next((tool_root / "recovery").iterdir())
+                    manifest = installer.strict_json(
+                        (recovery / "manifest.json").read_bytes()
+                    )
+                    self.assertEqual(manifest["status"], "rolled_back")
+
+    def test_quarantine_crash_during_rollback_remains_nonterminal(self) -> None:
+        class SimulatedCrash(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            recovery_root = tool_root / "recovery"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            release.mkdir(parents=True, mode=0o700)
+            os.chmod(release, 0o700)
+            (release / "partial").write_text("partial", encoding="utf-8")
+            state = tool_root / "state"
+            self.create_managed_home(state, session_dir=tool_root / "sessions")
+            user_home = root / "user"
+            original_rename = installer.rename_noreplace
+            recovery_root_syncs = 0
+
+            def fail_final_recovery_root_sync(path: Path) -> None:
+                nonlocal recovery_root_syncs
+                if Path(path) == recovery_root:
+                    recovery_root_syncs += 1
+                    if recovery_root_syncs == 2:
+                        raise installer.PrimeInstallError(
+                            "injected final recovery-root sync failure"
+                        )
+
+            def crash_on_first_reverse_move(source: Path, target: Path) -> None:
+                if target == state and source != state:
+                    raise SimulatedCrash("injected crash during rollback")
+                original_rename(source, target)
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", state),
+                mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home"),
+                mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                mock.patch.object(
+                    installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                ),
+                mock.patch.object(
+                    installer, "RECEIPT_PATH", tool_root / "receipt.json"
+                ),
+                mock.patch.object(
+                    installer, "PENDING_PATH", tool_root / "pending.json"
+                ),
+                mock.patch.object(installer, "managed_process_ids", return_value=[]),
+                mock.patch.object(
+                    installer,
+                    "fsync_directory",
+                    side_effect=fail_final_recovery_root_sync,
+                ),
+                mock.patch.object(
+                    installer,
+                    "rename_noreplace",
+                    side_effect=crash_on_first_reverse_move,
+                ),
+            ):
+                with self.assertRaises(SimulatedCrash):
+                    installer.quarantine_partial_release()
+                destination = next(recovery_root.iterdir())
+                manifest = installer.strict_json(
+                    (destination / "manifest.json").read_bytes()
+                )
+                self.assertEqual(manifest["status"], "rolling_back")
+                expected = f"RECOVERY:{destination}:rolling_back"
+                self.assertEqual(installer.recovery_manifest_conflicts(), [expected])
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "unresolved or unknown"
+                ):
+                    installer.resume_incomplete_quarantine()
+
+    def test_quarantine_never_clobbers_late_forward_or_rollback_occupants(self) -> None:
+        with self.subTest(race="forward"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                tool_root = root / "tool"
+                release = tool_root / "releases" / f"v{installer.VERSION}"
+                release.mkdir(parents=True, mode=0o700)
+                os.chmod(release, 0o700)
+                (release / "partial").write_text("original", encoding="utf-8")
+                user_home = root / "user"
+                original_rename = installer.rename_noreplace
+                inserted = False
+
+                def insert_forward_occupant(source: Path, target: Path) -> None:
+                    nonlocal inserted
+                    if source == release and not inserted:
+                        inserted = True
+                        target.mkdir(mode=0o700)
+                        (target / "late").write_text("late", encoding="utf-8")
+                    original_rename(source, target)
+
+                with (
+                    mock.patch.object(installer, "SSD_ROOT", root),
+                    mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                    mock.patch.object(installer, "RELEASE_DIR", release),
+                    mock.patch.object(installer, "STATE_DIR", tool_root / "state"),
+                    mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home"),
+                    mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                    mock.patch.object(
+                        installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                    ),
+                    mock.patch.object(
+                        installer, "RECEIPT_PATH", tool_root / "receipt.json"
+                    ),
+                    mock.patch.object(
+                        installer, "PENDING_PATH", tool_root / "pending.json"
+                    ),
+                    mock.patch.object(installer, "managed_process_ids", return_value=[]),
+                    mock.patch.object(
+                        installer,
+                        "rename_noreplace",
+                        side_effect=insert_forward_occupant,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        installer.PrimeInstallError, "recovery evidence"
+                    ):
+                        installer.quarantine_partial_release()
+                recovery = next((tool_root / "recovery").iterdir())
+                self.assertEqual(
+                    (release / "partial").read_text(encoding="utf-8"), "original"
+                )
+                self.assertEqual(
+                    (recovery / "release/late").read_text(encoding="utf-8"), "late"
+                )
+                manifest = installer.strict_json(
+                    (recovery / "manifest.json").read_bytes()
+                )
+                self.assertEqual(manifest["status"], "rolled_back")
+
+        with self.subTest(race="rollback"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                tool_root = root / "tool"
+                release = tool_root / "releases" / f"v{installer.VERSION}"
+                release.mkdir(parents=True, mode=0o700)
+                os.chmod(release, 0o700)
+                (release / "partial").write_text("original", encoding="utf-8")
+                state = tool_root / "state"
+                probe = tool_root / "probe-home"
+                self.create_managed_home(state, session_dir=tool_root / "sessions")
+                self.create_managed_home(probe, session_dir=tool_root / "sessions")
+                user_home = root / "user"
+                original_rename = installer.rename_noreplace
+                failed = False
+
+                def fail_after_late_source(source: Path, target: Path) -> None:
+                    nonlocal failed
+                    if source == state and not failed:
+                        failed = True
+                        release.mkdir(mode=0o700)
+                        (release / "late").write_text("late", encoding="utf-8")
+                        raise OSError("injected move failure after late occupant")
+                    original_rename(source, target)
+
+                with (
+                    mock.patch.object(installer, "SSD_ROOT", root),
+                    mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                    mock.patch.object(installer, "RELEASE_DIR", release),
+                    mock.patch.object(installer, "STATE_DIR", state),
+                    mock.patch.object(installer, "PROBE_HOME", probe),
+                    mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                    mock.patch.object(
+                        installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                    ),
+                    mock.patch.object(
+                        installer, "RECEIPT_PATH", tool_root / "receipt.json"
+                    ),
+                    mock.patch.object(
+                        installer, "PENDING_PATH", tool_root / "pending.json"
+                    ),
+                    mock.patch.object(installer, "managed_process_ids", return_value=[]),
+                    mock.patch.object(
+                        installer,
+                        "rename_noreplace",
+                        side_effect=fail_after_late_source,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        installer.PrimeInstallError, "recovery evidence"
+                    ):
+                        installer.quarantine_partial_release()
+                recovery = next((tool_root / "recovery").iterdir())
+                self.assertEqual(
+                    (release / "late").read_text(encoding="utf-8"), "late"
+                )
+                self.assertEqual(
+                    (recovery / "release/partial").read_text(encoding="utf-8"),
+                    "original",
+                )
+                manifest = installer.strict_json(
+                    (recovery / "manifest.json").read_bytes()
+                )
+                self.assertEqual(manifest["status"], "rollback_failed")
+                self.assertTrue(
+                    any("occupied" in error for error in manifest["rollback_errors"])
+                )
+
+    def test_recover_resumes_a_moving_quarantine_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            recovery_root = tool_root / "recovery"
+            destination = recovery_root / "partial-interrupted"
+            destination.mkdir(parents=True, mode=0o700)
+            for path in (tool_root, recovery_root, destination):
+                os.chmod(path, 0o700)
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            release.parent.mkdir(mode=0o700)
+            recovered_release = destination / "release"
+            recovered_release.mkdir(mode=0o700)
+            os.chmod(recovered_release, 0o700)
+            (recovered_release / "partial").write_text(
+                "original", encoding="utf-8"
+            )
+            state = tool_root / "state"
+            probe = tool_root / "probe-home"
+            sessions = tool_root / "sessions"
+            self.create_managed_home(state, session_dir=sessions)
+            self.create_managed_home(probe, session_dir=sessions)
+            sessions.mkdir(mode=0o700)
+            manifest_path = destination / "manifest.json"
+            installer.atomic_write(
+                manifest_path,
+                installer.canonical_json(
+                    {
+                        "schema": "orca.prime-agent-partial-recovery.v1",
+                        "version": installer.VERSION,
+                        "status": "moving",
+                        "items": ["release", "state", "probe-home", "sessions"],
+                    }
+                ),
+                0o600,
+            )
+            synced: list[Path] = []
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", state),
+                mock.patch.object(installer, "PROBE_HOME", probe),
+                mock.patch.object(installer, "managed_process_ids", return_value=[]),
+                mock.patch.object(
+                    installer,
+                    "fsync_directory",
+                    side_effect=lambda path: synced.append(Path(path)),
+                ),
+            ):
+                result = installer.resume_incomplete_quarantine()
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertTrue(result["resumed_after_interruption"])
+            for label, source in (
+                ("state", state),
+                ("probe-home", probe),
+                ("sessions", sessions),
+            ):
+                self.assertFalse(source.exists())
+                self.assertTrue((destination / label).exists())
+            self.assertEqual(
+                (destination / "release/partial").read_text(encoding="utf-8"),
+                "original",
+            )
+            manifest = installer.strict_json(manifest_path.read_bytes())
+            self.assertEqual(manifest["status"], "quarantined")
+            self.assertTrue(manifest["resumed_after_interruption"])
+            self.assertEqual(synced[:2], [release.parent, destination])
+            self.assertIn(recovery_root, synced)
+
+    def test_recover_blocks_unresolved_or_unknown_recovery_manifests(self) -> None:
+        for status in ("recovery_conflict", "rollback_failed", "unexpected"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                tool_root = root / "tool"
+                recovery_root = tool_root / "recovery"
+                destination = recovery_root / "partial-unresolved"
+                destination.mkdir(parents=True, mode=0o700)
+                for path in (tool_root, recovery_root, destination):
+                    os.chmod(path, 0o700)
+                installer.atomic_write(
+                    destination / "manifest.json",
+                    installer.canonical_json(
+                        {
+                            "schema": "orca.prime-agent-partial-recovery.v1",
+                            "version": installer.VERSION,
+                            "status": status,
+                            "items": ["release"],
+                        }
+                    ),
+                    0o600,
+                )
+                pending = tool_root / "pending.json"
+                receipt = tool_root / "receipt.json"
+                pending.write_bytes(b"pending")
+                receipt.write_bytes(b"receipt")
+                os.chmod(pending, 0o600)
+                os.chmod(receipt, 0o600)
+                with (
+                    mock.patch.object(installer, "SSD_ROOT", root),
+                    mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                    mock.patch.object(
+                        installer,
+                        "RELEASE_DIR",
+                        tool_root / "releases" / f"v{installer.VERSION}",
+                    ),
+                    mock.patch.object(installer, "STATE_DIR", tool_root / "state"),
+                    mock.patch.object(
+                        installer, "PROBE_HOME", tool_root / "probe-home"
+                    ),
+                    mock.patch.object(
+                        installer, "PENDING_PATH", pending
+                    ),
+                    mock.patch.object(
+                        installer, "RECEIPT_PATH", receipt
+                    ),
+                    mock.patch.object(
+                        installer, "finalize_pending_install"
+                    ) as finalize,
+                    mock.patch.object(installer, "verify") as verify,
+                    mock.patch.object(
+                        installer, "quarantine_partial_release"
+                    ) as quarantine,
+                ):
+                    with self.assertRaisesRegex(
+                        installer.PrimeInstallError, "unresolved or unknown"
+                    ):
+                        installer._recover_locked()
+                finalize.assert_not_called()
+                verify.assert_not_called()
+                quarantine.assert_not_called()
+
+    def test_plan_reports_unresolved_recovery_manifest_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            recovery_root = tool_root / "recovery"
+            destination = recovery_root / "partial-unresolved"
+            destination.mkdir(parents=True, mode=0o700)
+            for path in (tool_root, recovery_root, destination):
+                os.chmod(path, 0o700)
+            manifest_path = destination / "manifest.json"
+            manifest_raw = installer.canonical_json(
+                {
+                    "schema": "orca.prime-agent-partial-recovery.v1",
+                    "version": installer.VERSION,
+                    "status": "rollback_failed",
+                    "items": ["release"],
+                }
+            )
+            installer.atomic_write(manifest_path, manifest_raw, 0o600)
+            user_home = root / "user"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(
+                    installer,
+                    "RELEASE_DIR",
+                    tool_root / "releases" / f"v{installer.VERSION}",
+                ),
+                mock.patch.object(installer, "STATE_DIR", tool_root / "state"),
+                mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home"),
+                mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                mock.patch.object(
+                    installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                ),
+                mock.patch.object(
+                    installer, "RECEIPT_PATH", tool_root / "receipt.json"
+                ),
+                mock.patch.object(
+                    installer, "PENDING_PATH", tool_root / "pending.json"
+                ),
+                mock.patch.object(
+                    installer,
+                    "preflight",
+                    return_value={
+                        "volume_uuid": "TEST-UUID",
+                        "node_version": installer.NODE_VERSION,
+                        "npm_version": installer.NPM_VERSION,
+                        "orca_support": {"test": "support"},
+                    },
+                ),
+                mock.patch.object(
+                    installer, "prime_agent_command_candidates", return_value=[]
+                ),
+            ):
+                result = installer.plan()
+            expected = f"RECOVERY:{destination}:rollback_failed"
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["recovery_conflicts"], [expected])
+            self.assertIn(expected, result["conflicts"])
+            self.assertEqual(manifest_path.read_bytes(), manifest_raw)
+
+    def test_pending_install_refuses_missing_probe_without_committing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            release.mkdir(parents=True, mode=0o700)
+            os.chmod(release, 0o700)
+            state = tool_root / "state"
+            self.create_managed_home(state, session_dir=tool_root / "sessions")
+            probe = tool_root / "probe-home"
+            pending = tool_root / "pending.json"
+            receipt_path = tool_root / "receipt.json"
+            lifecycle_lock = tool_root / "lifecycle.lock"
+            lifecycle_lock.write_bytes(b"")
+            os.chmod(lifecycle_lock, 0o600)
+            receipt = {
+                "volume_uuid": "TEST-UUID",
+                "orca_support": {"test": "support"},
+                "lifecycle_lock": os.fspath(lifecycle_lock),
+            }
+            installer.atomic_write(
+                pending,
+                installer.canonical_json(
+                    {"schema": installer.JOURNAL_SCHEMA, "receipt": receipt}
+                ),
+                0o600,
+            )
+            user_home = root / "user"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", state),
+                mock.patch.object(installer, "PROBE_HOME", probe),
+                mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                mock.patch.object(installer, "BIN_LINK", user_home / ".local/bin/prime-agent"),
+                mock.patch.object(installer, "RECEIPT_PATH", receipt_path),
+                mock.patch.object(installer, "PENDING_PATH", pending),
+                mock.patch.object(installer, "validate_receipt_identity", return_value=receipt),
+                mock.patch.object(installer, "volume_uuid", return_value="TEST-UUID"),
+                mock.patch.object(
+                    installer, "verify_orca_support", return_value={"test": "support"}
+                ),
+            ):
+                with self.assertRaisesRegex(installer.PrimeInstallError, "probe-home"):
+                    installer.finalize_pending_install()
+            self.assertTrue(pending.is_file())
+            self.assertFalse(receipt_path.exists())
+            self.assertFalse((user_home / ".prime").exists())
+
+    def test_pending_install_checks_alternate_command_before_finalize(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pending = Path(directory).resolve() / "pending-install.json"
+            pending.write_bytes(b"pending")
+            with (
+                mock.patch.object(installer, "PENDING_PATH", pending),
+                mock.patch.object(
+                    installer,
+                    "prime_agent_command_candidates",
+                    return_value=[Path("/alternate/bin/prime-agent")],
+                ) as scan,
+                mock.patch.object(installer, "finalize_pending_install") as finalize,
+                mock.patch.object(installer, "preflight") as preflight,
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "existing prime-agent command"
+                ):
+                    installer._install_locked()
+            scan.assert_called_once_with()
+            finalize.assert_not_called()
+            preflight.assert_not_called()
+
+    def test_pending_journal_follows_complete_tree_durability_barrier(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            release.mkdir(parents=True, mode=0o700)
+            payload = release / "payload"
+            payload.write_text("runtime", encoding="utf-8")
+            os.chmod(payload, 0o600)
+            state = tool_root / "state"
+            probe = tool_root / "probe-home"
+            self.create_managed_home(state, session_dir=tool_root / "sessions")
+            self.create_managed_home(probe, session_dir=tool_root / "sessions")
+            sessions = tool_root / "sessions"
+            sessions.mkdir(mode=0o700)
+            os.chmod(tool_root, 0o700)
+            pending = tool_root / "pending-install.json"
+            receipt = {"version": installer.VERSION}
+            events: list[str] = []
+            real_atomic_create = installer.atomic_create_private_file
+
+            def record_sync(path: Path) -> None:
+                events.append("sync:" + os.fspath(path))
+
+            def record_write(path: Path, raw: bytes, mode: int = 0o600) -> None:
+                events.append("write:" + os.fspath(path))
+                real_atomic_create(path, raw, mode)
+
+            patches = (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", state),
+                mock.patch.object(installer, "PROBE_HOME", probe),
+                mock.patch.object(installer, "PENDING_PATH", pending),
+            )
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+                with (
+                    mock.patch.object(
+                        installer, "sync_private_tree", side_effect=record_sync
+                    ),
+                    mock.patch.object(
+                        installer,
+                        "atomic_create_private_file",
+                        side_effect=record_write,
+                    ),
+                ):
+                    durable = installer.write_pending_install(receipt)
+                self.assertEqual(
+                    events,
+                    [
+                        "sync:" + os.fspath(release),
+                        "sync:" + os.fspath(state),
+                        "sync:" + os.fspath(probe),
+                        "sync:" + os.fspath(sessions),
+                        "write:" + os.fspath(pending),
+                    ],
+                )
+                self.assertIn("release_tree_sha256", durable)
+                self.assertTrue(pending.is_file())
+                pending.unlink()
+
+                for failing_call in range(1, 5):
+                    with self.subTest(failing_call=failing_call):
+                        calls = 0
+
+                        def fail_selected_sync(_path: Path) -> None:
+                            nonlocal calls
+                            calls += 1
+                            if calls == failing_call:
+                                raise installer.PrimeInstallError(
+                                    "injected durable-tree sync failure"
+                                )
+
+                        with (
+                            mock.patch.object(
+                                installer,
+                                "sync_private_tree",
+                                side_effect=fail_selected_sync,
+                            ),
+                            mock.patch.object(
+                                installer, "atomic_create_private_file"
+                            ) as journal_write,
+                        ):
+                            with self.assertRaisesRegex(
+                                installer.PrimeInstallError, "injected"
+                            ):
+                                installer.write_pending_install(receipt)
+                        journal_write.assert_not_called()
+                        self.assertFalse(pending.exists())
+
+    def test_pending_journal_publication_preserves_late_occupant(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            release.mkdir(parents=True, mode=0o700)
+            os.chmod(tool_root, 0o700)
+            os.chmod(release, 0o700)
+            payload = release / "payload"
+            payload.write_text("runtime", encoding="utf-8")
+            os.chmod(payload, 0o600)
+            state = tool_root / "state"
+            probe = tool_root / "probe-home"
+            sessions = tool_root / "sessions"
+            self.create_managed_home(state, session_dir=sessions)
+            self.create_managed_home(probe, session_dir=sessions)
+            sessions.mkdir(mode=0o700)
+            pending = tool_root / "pending-install.json"
+            original_rename = installer.rename_noreplace
+            inserted = False
+
+            def insert_late_journal(source: Path, destination: Path) -> None:
+                nonlocal inserted
+                if destination == pending and not inserted:
+                    inserted = True
+                    destination.write_text("late journal", encoding="utf-8")
+                    os.chmod(destination, 0o600)
+                original_rename(source, destination)
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", state),
+                mock.patch.object(installer, "PROBE_HOME", probe),
+                mock.patch.object(installer, "PENDING_PATH", pending),
+                mock.patch.object(
+                    installer,
+                    "rename_noreplace",
+                    side_effect=insert_late_journal,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "refusing to replace"
+                ):
+                    installer.write_pending_install({"version": installer.VERSION})
+            self.assertEqual(pending.read_text(encoding="utf-8"), "late journal")
+            self.assertEqual(list(tool_root.glob(f".{pending.name}.*")), [])
+
+    def test_sync_private_tree_orders_file_and_directory_barriers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tree = root / "tree"
+            child = tree / "child"
+            child.mkdir(parents=True, mode=0o700)
+            os.chmod(tree, 0o700)
+            payload = child / "payload"
+            payload.write_text("runtime", encoding="utf-8")
+            os.chmod(payload, 0o600)
+            (tree / "payload-link").symlink_to(Path("child/payload"))
+            events: list[str] = []
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(
+                    installer,
+                    "fsync_regular_file",
+                    side_effect=lambda path: events.append("file:" + os.fspath(path)),
+                ),
+                mock.patch.object(
+                    installer,
+                    "fsync_directory",
+                    side_effect=lambda path: events.append("dir:" + os.fspath(path)),
+                ),
+            ):
+                installer.sync_private_tree(tree)
+            self.assertEqual(
+                events,
+                [
+                    "file:" + os.fspath(payload),
+                    "dir:" + os.fspath(child),
+                    "dir:" + os.fspath(tree),
+                    "dir:" + os.fspath(tree.parent),
+                ],
+            )
+
+    def test_uninstall_restores_command_if_process_appears_after_disable(self) -> None:
+        receipt = {"bin_target": "/managed/prime-agent"}
+        events: list[str] = []
+
+        def removed(_path: Path, _target: Path) -> None:
+            events.append("removed")
+
+        def scanned(_receipt: dict[str, object]) -> list[int]:
+            events.append("scanned")
+            return [4321]
+
+        def restored(_target: Path, _link: Path) -> None:
+            events.append("restored")
+
+        with (
+            mock.patch.object(installer, "load_receipt", return_value=receipt),
+            mock.patch.object(installer, "verify_command_state", return_value=True),
+            mock.patch.object(installer, "remove_exact_symlink", side_effect=removed),
+            mock.patch.object(installer, "managed_process_ids", side_effect=scanned),
+            mock.patch.object(installer, "atomic_symlink", side_effect=restored),
+        ):
+            with self.assertRaisesRegex(installer.PrimeInstallError, "command was restored"):
+                installer._uninstall_locked()
+        self.assertEqual(events, ["removed", "scanned", "restored"])
+
+    def test_process_scan_detects_title_only_daemon(self) -> None:
+        receipt = {"release_dir": "/managed/release"}
+        completed = subprocess.CompletedProcess(
+            ["ps"], 0, "424242 prime-agent prime-agent\n", ""
+        )
+        with mock.patch.object(
+            installer.subprocess, "run", return_value=completed
+        ) as run:
+            self.assertEqual(installer.managed_process_ids(receipt), [424242])
+        self.assertIn("pid=,comm=,args=", run.call_args.args[0])
+
+    def test_process_scan_ignores_nearby_process_title(self) -> None:
+        receipt = {"release_dir": "/managed/release"}
+        completed = subprocess.CompletedProcess(
+            ["ps"], 0, "424242 prime-agent-helper prime-agent-helper\n", ""
+        )
+        with mock.patch.object(installer.subprocess, "run", return_value=completed):
+            self.assertEqual(installer.managed_process_ids(receipt), [])
+
+    def test_process_scan_ignores_managed_path_prefix_only(self) -> None:
+        receipt = {"release_dir": "/managed/release"}
+        entrypoint = (
+            "/managed/release/lib/node_modules/prime-agent/dist/bundle/cli.js"
+        )
+        completed = subprocess.CompletedProcess(
+            ["ps"],
+            0,
+            f"424242 /usr/bin/python3 /usr/bin/python3 --note={entrypoint}.backup\n",
+            "",
+        )
+        with mock.patch.object(installer.subprocess, "run", return_value=completed):
+            self.assertEqual(installer.managed_process_ids(receipt), [])
+
+    def test_process_scan_detects_exact_path_argument_with_spaces(self) -> None:
+        receipt = {"release_dir": "/managed release"}
+        entrypoint = (
+            "/managed release/lib/node_modules/prime-agent/dist/bundle/cli.js"
+        )
+        completed = subprocess.CompletedProcess(
+            ["ps"], 0, f"424242 node /managed/node {entrypoint} --version\n", ""
+        )
+        with mock.patch.object(installer.subprocess, "run", return_value=completed):
+            self.assertEqual(installer.managed_process_ids(receipt), [424242])
+
+    def test_uninstall_scans_even_when_command_is_already_disabled(self) -> None:
+        receipt = {"bin_target": "/managed/prime-agent"}
+        with (
+            mock.patch.object(installer, "load_receipt", return_value=receipt),
+            mock.patch.object(installer, "verify_command_state", return_value=False),
+            mock.patch.object(installer, "managed_process_ids", return_value=[4321]) as scan,
+        ):
+            with self.assertRaisesRegex(installer.PrimeInstallError, "still running"):
+                installer._uninstall_locked()
+        scan.assert_called_once_with(receipt)
+
+    def test_uninstall_restores_command_after_indeterminate_process_scan(self) -> None:
+        receipt = {"bin_target": "/managed/prime-agent"}
+        with (
+            mock.patch.object(installer, "load_receipt", return_value=receipt),
+            mock.patch.object(installer, "verify_command_state", return_value=True),
+            mock.patch.object(installer, "remove_exact_symlink"),
+            mock.patch.object(
+                installer,
+                "managed_process_ids",
+                side_effect=installer.PrimeInstallError("scan unavailable"),
+            ),
+            mock.patch.object(installer, "atomic_symlink") as restore,
+        ):
+            with self.assertRaisesRegex(installer.PrimeInstallError, "command was restored"):
+                installer._uninstall_locked()
+        restore.assert_called_once_with(Path(receipt["bin_target"]), installer.BIN_LINK)
+
+    def test_uninstall_preserves_late_occupant_when_restore_fails(self) -> None:
+        receipt = {"bin_target": "/managed/prime-agent"}
+        with (
+            mock.patch.object(installer, "load_receipt", return_value=receipt),
+            mock.patch.object(installer, "verify_command_state", return_value=True),
+            mock.patch.object(installer, "remove_exact_symlink"),
+            mock.patch.object(installer, "managed_process_ids", return_value=[4321]),
+            mock.patch.object(
+                installer,
+                "atomic_symlink",
+                side_effect=installer.PrimeInstallError("late occupant"),
+            ),
+        ):
+            with self.assertRaisesRegex(installer.PrimeInstallError, "not overwritten"):
+                installer._uninstall_locked()
+
+    def test_enable_cleanup_preserves_post_unlink_durability_error(self) -> None:
+        receipt = {"bin_target": "/managed/prime-agent"}
+        cleanup_error = installer.PrimeInstallError(
+            "managed symlink was removed but parent-directory durability is "
+            "unconfirmed: /managed/bin/prime-agent"
+        )
+        with (
+            mock.patch.object(
+                installer, "verify", return_value={"command_enabled": False}
+            ),
+            mock.patch.object(installer, "load_receipt", return_value=receipt),
+            mock.patch.object(installer, "atomic_symlink"),
+            mock.patch.object(
+                installer,
+                "verify_command_state",
+                side_effect=installer.PrimeInstallError("ambiguous command"),
+            ),
+            mock.patch.object(
+                installer, "remove_exact_symlink", side_effect=cleanup_error
+            ),
+        ):
+            with self.assertRaises(installer.PrimeInstallError) as raised:
+                installer._enable_locked()
+        message = str(raised.exception)
+        self.assertIn("removed but parent-directory durability is unconfirmed", message)
+        self.assertNotIn("preserved for inspection", message)
+
+    def test_exclusive_lifecycle_lock_refuses_in_flight_shared_launcher(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            tool_root.mkdir(mode=0o700)
+            lock = tool_root / "lifecycle.lock"
+            lock.write_bytes(b"")
+            os.chmod(lock, 0o600)
+            ready = root / "ready"
+            child = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import fcntl,os,sys,time; "
+                        "fd=os.open(sys.argv[1],os.O_RDONLY); "
+                        "fcntl.flock(fd,fcntl.LOCK_SH); "
+                        "open(sys.argv[2],'wb').close(); time.sleep(30)"
+                    ),
+                    os.fspath(lock),
+                    os.fspath(ready),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                for _ in range(100):
+                    if ready.exists():
+                        break
+                    child.poll()
+                    if child.returncode is not None:
+                        self.fail("shared-lock child exited before readiness")
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                with (
+                    mock.patch.object(installer, "SSD_ROOT", root),
+                    mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                ):
+                    with self.assertRaisesRegex(installer.PrimeInstallError, "busy"):
+                        with installer.exclusive_lifecycle_lock(create=False):
+                            self.fail("exclusive lock must not be acquired")
+            finally:
+                child.terminate()
+                child.wait(timeout=5)
+
+    def test_generated_launch_guard_holds_shared_lock_for_child_lifetime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            tool_root.mkdir(mode=0o700)
+            lock = tool_root / "lifecycle.lock"
+            lock.write_bytes(b"")
+            os.chmod(lock, 0o600)
+            ready = root / "ready"
+            fake_node = root / "fake-node"
+            fake_node.write_text(
+                '#!/bin/sh\n: > "$1"\nsleep 2\n', encoding="utf-8"
+            )
+            os.chmod(fake_node, 0o700)
+            guard = root / "launch-guard.py"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+            ):
+                guard.write_bytes(
+                    installer.managed_launch_guard_script(fake_node, ready)
+                )
+            os.chmod(guard, 0o700)
+            child = subprocess.Popen(
+                ["/usr/bin/python3", "-B", os.fspath(guard)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env={"PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            try:
+                for _ in range(200):
+                    if ready.exists():
+                        break
+                    child.poll()
+                    if child.returncode is not None:
+                        self.fail("generated launch guard exited before readiness")
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                with (
+                    mock.patch.object(installer, "SSD_ROOT", root),
+                    mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                ):
+                    with self.assertRaisesRegex(installer.PrimeInstallError, "busy"):
+                        with installer.exclusive_lifecycle_lock(create=False):
+                            self.fail("exclusive lock must not overlap launch guard")
+            finally:
+                child.wait(timeout=5)
+
+    def test_pending_install_commits_with_command_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            state = tool_root / "state"
+            probe_home = tool_root / "probe-home"
+            session_dir = tool_root / "sessions"
+            user_home = root / "user"
+            receipt_path = tool_root / "receipts" / f"v{installer.VERSION}.json"
+            pending = tool_root / "pending-install.json"
+            for path in (release / "bin", user_home, receipt_path.parent):
+                path.mkdir(parents=True, mode=0o700, exist_ok=True)
+            os.chmod(release, 0o700)
+            settings = self.create_managed_home(
+                state, session_dir=tool_root / "sessions"
+            )
+            self.create_managed_home(
+                probe_home, session_dir=tool_root / "sessions"
+            )
+            session_dir.mkdir(mode=0o700)
+            entrypoint = release / "bin" / "prime-agent"
+            entrypoint.write_text("#!/bin/sh\n", encoding="utf-8")
+            os.chmod(entrypoint, 0o700)
+            launch_guard = release / "bin" / "prime-agent-launch-guard.py"
+            launch_guard.write_text("#!/usr/bin/python3\n", encoding="utf-8")
+            os.chmod(launch_guard, 0o700)
+            lifecycle_lock = tool_root / "lifecycle.lock"
+            lifecycle_lock.write_bytes(b"")
+            os.chmod(lifecycle_lock, 0o600)
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                digest, entries = installer.tree_digest(release)
+            state_link = user_home / ".prime"
+            bin_link = user_home / ".local/bin/prime-agent"
+            receipt = {
+                "schema": installer.RECEIPT_SCHEMA,
+                "version": installer.VERSION,
+                "tag_commit": installer.TAG_COMMIT,
+                "volume_uuid": "TEST-UUID",
+                "release_dir": os.fspath(release),
+                "state_dir": os.fspath(state),
+                "state_link": os.fspath(state_link),
+                "bin_link": os.fspath(bin_link),
+                "bin_target": os.fspath(entrypoint),
+                "launch_guard": os.fspath(launch_guard),
+                "lifecycle_lock": os.fspath(lifecycle_lock),
+                "node_target": os.fspath(release / "toolchain/bin/node"),
+                "npm_target": os.fspath(
+                    release / "toolchain/lib/node_modules/npm/bin/npm-cli.js"
+                ),
+                "probe_home": os.fspath(probe_home),
+                "probe_agent_dir": os.fspath(probe_home / "agent"),
+                "session_dir": os.fspath(session_dir),
+                "asset_sha256": installer.ASSETS,
+                "node_asset_sha256": installer.NODE_ASSET_SHA256,
+                "upstream_lock_sha256": installer.LOCK_SHA256,
+                "license_sha256": installer.LICENSE_SHA256,
+                "production_lock_sha256": installer.GENERATED_LOCK_SHA256,
+                "patched_manifest_names": sorted(("prime-agent", *installer.WORKSPACE_PACKAGES)),
+                "closure": {
+                    "lock_sha256": installer.GENERATED_LOCK_SHA256,
+                    "packages_checked": installer.GENERATED_LOCK_PACKAGE_COUNT,
+                    "registry_packages_checked": installer.GENERATED_LOCK_PACKAGE_COUNT - 4,
+                },
+                "node_version": installer.NODE_VERSION,
+                "npm_version": installer.NPM_VERSION,
+                "lifecycle_scripts_executed": False,
+                "daemon_started": False,
+                "credentials_configured": False,
+                "command_default_enabled": False,
+                "project_settings_default_allowed": False,
+                "project_executable_resources_default_allowed": False,
+                "telemetry_default_enabled": False,
+                "telemetry_settings": os.fspath(settings),
+                "release_tree_sha256": digest,
+                "release_tree_entries": entries,
+                "orca_support": {"test": "support"},
+            }
+            installer.atomic_write(
+                pending,
+                installer.canonical_json(
+                    {"schema": installer.JOURNAL_SCHEMA, "receipt": receipt}
+                ),
+                0o600,
+            )
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", state),
+                mock.patch.object(installer, "PROBE_HOME", probe_home),
+                mock.patch.object(installer, "USER_HOME", user_home),
+                mock.patch.object(installer, "STATE_LINK", state_link),
+                mock.patch.object(installer, "BIN_LINK", bin_link),
+                mock.patch.object(installer, "RECEIPT_PATH", receipt_path),
+                mock.patch.object(installer, "PENDING_PATH", pending),
+                mock.patch.object(installer, "volume_uuid", return_value="TEST-UUID"),
+                mock.patch.object(
+                    installer, "verify_orca_support", return_value={"test": "support"}
+                ),
+            ):
+                with mock.patch.object(
+                    installer,
+                    "prime_agent_command_candidates",
+                    return_value=[Path("/alternate/bin/prime-agent")],
+                ):
+                    with self.assertRaisesRegex(
+                        installer.PrimeInstallError, "existing prime-agent command"
+                    ):
+                        installer.finalize_pending_install()
+                self.assertTrue(pending.is_file())
+                self.assertFalse(receipt_path.exists())
+                self.assertFalse(state_link.exists())
+                first = installer.finalize_pending_install()
+            self.assertEqual(first["version"], installer.VERSION)
+            self.assertTrue(state_link.is_symlink())
+            self.assertFalse(bin_link.exists())
+            self.assertFalse(bin_link.is_symlink())
+            self.assertTrue(receipt_path.is_file())
+            self.assertFalse(pending.exists())
+
+    def test_receipt_publication_preserves_late_occupant_and_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "release"
+            state = tool_root / "state"
+            probe = tool_root / "probe-home"
+            sessions = tool_root / "sessions"
+            receipts = tool_root / "receipts"
+            user_home = root / "user"
+            for path in (release, receipts, user_home):
+                path.mkdir(parents=True, mode=0o700, exist_ok=True)
+            for path in (tool_root, release, receipts, user_home):
+                os.chmod(path, 0o700)
+            payload = release / "payload"
+            payload.write_text("runtime", encoding="utf-8")
+            os.chmod(payload, 0o600)
+            self.create_managed_home(state, session_dir=sessions)
+            self.create_managed_home(probe, session_dir=sessions)
+            sessions.mkdir(mode=0o700)
+            lifecycle_lock = tool_root / "lifecycle.lock"
+            lifecycle_lock.write_bytes(b"")
+            os.chmod(lifecycle_lock, 0o600)
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                digest, entries = installer.tree_digest(release)
+            receipt = {
+                "version": installer.VERSION,
+                "volume_uuid": "TEST-UUID",
+                "orca_support": {"test": "support"},
+                "lifecycle_lock": os.fspath(lifecycle_lock),
+                "release_tree_sha256": digest,
+                "release_tree_entries": entries,
+            }
+            pending = tool_root / "pending-install.json"
+            receipt_path = receipts / f"v{installer.VERSION}.json"
+            installer.atomic_write(
+                pending,
+                installer.canonical_json(
+                    {"schema": installer.JOURNAL_SCHEMA, "receipt": receipt}
+                ),
+                0o600,
+            )
+            original_rename = installer.rename_noreplace
+            inserted = False
+
+            def insert_late_receipt(source: Path, destination: Path) -> None:
+                nonlocal inserted
+                if destination == receipt_path and not inserted:
+                    inserted = True
+                    destination.write_text("late receipt", encoding="utf-8")
+                    os.chmod(destination, 0o600)
+                original_rename(source, destination)
+
+            state_link = user_home / ".prime"
+            bin_link = user_home / ".local/bin/prime-agent"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", state),
+                mock.patch.object(installer, "PROBE_HOME", probe),
+                mock.patch.object(installer, "USER_HOME", user_home),
+                mock.patch.object(installer, "STATE_LINK", state_link),
+                mock.patch.object(installer, "BIN_LINK", bin_link),
+                mock.patch.object(installer, "RECEIPT_PATH", receipt_path),
+                mock.patch.object(installer, "PENDING_PATH", pending),
+                mock.patch.object(
+                    installer, "validate_receipt_identity", return_value=receipt
+                ),
+                mock.patch.object(installer, "volume_uuid", return_value="TEST-UUID"),
+                mock.patch.object(
+                    installer, "verify_orca_support", return_value={"test": "support"}
+                ),
+                mock.patch.object(
+                    installer,
+                    "rename_noreplace",
+                    side_effect=insert_late_receipt,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "refusing to replace"
+                ):
+                    installer.finalize_pending_install()
+            self.assertEqual(
+                receipt_path.read_text(encoding="utf-8"), "late receipt"
+            )
+            self.assertTrue(pending.is_file())
+            self.assertTrue(state_link.is_symlink())
+            self.assertFalse(bin_link.exists())
+            self.assertEqual(list(receipts.glob(f".{receipt_path.name}.*")), [])
+
+    def test_make_patched_asset_refuses_symlinked_output_path(self) -> None:
+        # Regression for P1-1: make_patched_asset() used to publish through a
+        # direct `patched.open("wb")` on a known, predictable output path,
+        # with no O_NOFOLLOW, create-only semantics, or destination-identity
+        # check. If that path had been swapped for a symlink to a file
+        # outside SSD_ROOT between assets-dir creation and this write, the
+        # write would silently follow the symlink and clobber the victim.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            assets = release / "assets"
+            assets.mkdir(parents=True, mode=0o700)
+            os.chmod(tool_root / "releases", 0o700)
+            os.chmod(release, 0o700)
+            os.chmod(assets, 0o700)
+
+            original_asset = root / "prime-agent-source.tgz"
+            manifest_payload = installer.canonical_json(
+                {"name": "prime-agent", "version": installer.VERSION}
+            )
+            with tarfile.open(original_asset, "w:gz") as archive:
+                info = tarfile.TarInfo("package/package.json")
+                info.size = len(manifest_payload)
+                archive.addfile(info, io.BytesIO(manifest_payload))
+
+            # A victim file OUTSIDE the mocked SSD root, plus a symlink at the
+            # exact predictable output path make_patched_asset is about to
+            # write, simulating a same-UID process that placed it there
+            # between assets-dir creation and this call.
+            victim = root.parent / f"{root.name}-make-patched-asset-victim"
+            victim.write_bytes(b"victim content, must survive unchanged")
+            output_name = "prime-agent-orca-pinned-victim-test.tgz"
+            output_path = assets / output_name
+            try:
+                output_path.symlink_to(victim)
+                with (
+                    mock.patch.object(installer, "SSD_ROOT", root),
+                    mock.patch.object(installer, "RELEASE_DIR", release),
+                ):
+                    with self.assertRaisesRegex(
+                        installer.PrimeInstallError, "refusing to replace"
+                    ):
+                        installer.make_patched_asset(
+                            original_asset,
+                            {"packages": {}},
+                            assets,
+                            expected_name="prime-agent",
+                            managed_name="prime-agent",
+                            output_name=output_name,
+                        )
+                self.assertTrue(output_path.is_symlink())
+                self.assertEqual(os.readlink(output_path), os.fspath(victim))
+                self.assertEqual(
+                    victim.read_bytes(), b"victim content, must survive unchanged"
+                )
+                self.assertEqual(list(assets.glob(f".{output_name}.*")), [])
+            finally:
+                victim.unlink()
+
+    def test_make_patched_asset_refuses_preexisting_unpack_directory(self) -> None:
+        # Regression for independent review round 2, 2026-08-18, P1
+        # (residual of round-1 P1-1): make_patched_asset() used to call
+        # ensure_private_dir() on its per-package ".unpacked-<name>"
+        # directory, which accepts a pre-existing same-UID directory.
+        # Because that name is fully deterministic (computed from
+        # `managed_name`, a module constant), a same-UID attacker could
+        # pre-plant it -- with extra files already inside -- at any point
+        # during the long download window that precedes this call, and
+        # have it silently trusted: extraction never deletes non-member
+        # files, so anything already there survived and was swept into the
+        # published patched tarball by the old rglob()-based archive loop.
+        # create_fresh_private_dir() now refuses ANY pre-existing occupant
+        # at this deterministic path.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            assets = release / "assets"
+            assets.mkdir(parents=True, mode=0o700)
+            os.chmod(tool_root / "releases", 0o700)
+            os.chmod(release, 0o700)
+            os.chmod(assets, 0o700)
+
+            original_asset = root / "prime-agent-source.tgz"
+            manifest_payload = installer.canonical_json(
+                {"name": "prime-agent", "version": installer.VERSION}
+            )
+            with tarfile.open(original_asset, "w:gz") as archive:
+                info = tarfile.TarInfo("package/package.json")
+                info.size = len(manifest_payload)
+                archive.addfile(info, io.BytesIO(manifest_payload))
+
+            # Attacker pre-plants the deterministic unpack directory, with a
+            # file that was never part of the real, digest-verified
+            # tarball already sitting where the real "package" root lands.
+            unpacked = release / ".unpacked-prime-agent"
+            planted_package = unpacked / "package"
+            planted_package.mkdir(parents=True, mode=0o700)
+            # mkdir(parents=True, mode=...) only applies `mode` to the leaf;
+            # chmod the intermediate directory explicitly so it looks
+            # exactly like the fully-valid, same-UID 0700 directory
+            # ensure_private_dir() used to silently accept.
+            os.chmod(unpacked, 0o700)
+            (planted_package / "evil.js").write_bytes(b"attacker payload")
+
+            output_name = "prime-agent-orca-pinned-preplant-test.tgz"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+            ):
+                with self.assertRaisesRegex(installer.PrimeInstallError, "cannot create"):
+                    installer.make_patched_asset(
+                        original_asset,
+                        {"packages": {}},
+                        assets,
+                        expected_name="prime-agent",
+                        managed_name="prime-agent",
+                        output_name=output_name,
+                    )
+            # Nothing was ever published from the attacker's directory, and
+            # the pre-planted content is left exactly as the attacker left
+            # it (never read, never trusted).
+            self.assertFalse((assets / output_name).exists())
+            self.assertEqual(
+                (planted_package / "evil.js").read_bytes(), b"attacker payload"
+            )
+
+    def test_extract_node_toolchain_refuses_preexisting_destination_with_symlinked_subdir(
+        self,
+    ) -> None:
+        # Regression for independent review round 2, 2026-08-18, P1
+        # (residual of round-1 P1-1): extract_node_toolchain() used to call
+        # ensure_private_dir() on its destination, which accepts a
+        # pre-existing same-UID directory. A same-UID attacker could
+        # pre-plant the deterministic "toolchain" directory with a
+        # symlinked "bin" pointing outside SSD_ROOT during the long
+        # download window that precedes this call; extraction then wrote,
+        # and chmod'd, straight through the symlink, and the function
+        # returned SUCCESS with a node path resolving outside SSD_ROOT.
+        # create_fresh_private_dir() now refuses any pre-existing occupant
+        # at this deterministic path, so the extraction loop never runs.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ssd = root / "ssd"
+            ssd.mkdir(mode=0o700)
+            destination = ssd / "toolchain"
+
+            outside = root / "outside-victim"
+            outside.mkdir(mode=0o755)
+            (outside / "sentinel").write_bytes(b"do-not-touch")
+
+            destination.mkdir(mode=0o700)
+            (destination / "bin").symlink_to(outside, target_is_directory=True)
+
+            # A complete node+npm layout, so an unfixed extract_node_toolchain
+            # would actually reach its final success return (matching the
+            # original report's "raised=None (the function RETURNS SUCCESS)")
+            # instead of incidentally failing on an unrelated missing file.
+            node_asset = root / "node.tgz"
+            expected_root = f"node-v{installer.NODE_VERSION}-darwin-arm64"
+            node_payload = b"#!/bin/sh\necho fake-node\n"
+            npm_payload = b"#!/usr/bin/env node\n// fake npm cli\n"
+            with tarfile.open(node_asset, "w:gz") as archive:
+                info = tarfile.TarInfo(f"{expected_root}/bin/node")
+                info.mode = 0o755
+                info.size = len(node_payload)
+                archive.addfile(info, io.BytesIO(node_payload))
+                info = tarfile.TarInfo(f"{expected_root}/lib/node_modules/npm/bin/npm-cli.js")
+                info.mode = 0o644
+                info.size = len(npm_payload)
+                archive.addfile(info, io.BytesIO(npm_payload))
+
+            with mock.patch.object(installer, "SSD_ROOT", ssd):
+                with self.assertRaises(installer.PrimeInstallError):
+                    installer.extract_node_toolchain(node_asset, destination)
+
+            # Nothing under the attacker's directory may have been written
+            # to, or have had its permissions changed, because the
+            # extraction loop must never have run.
+            self.assertEqual(sorted(p.name for p in outside.iterdir()), ["sentinel"])
+            self.assertEqual((outside / "sentinel").read_bytes(), b"do-not-touch")
+            self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o755)
+
+    def test_safe_extract_main_asset_manifest_excludes_untracked_files(self) -> None:
+        # Regression for independent review round 2, 2026-08-18, P1: the
+        # manifest safe_extract_main_asset() returns must list only the
+        # paths it itself verified from the digest-checked tar, never
+        # anything else physically sitting in `destination` -- extraction
+        # only writes tar members and never deletes pre-existing,
+        # non-member content, so a caller that walked the directory
+        # instead of trusting this manifest (the old code) would publish
+        # untracked files unchanged.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            archive_path = root / "asset.tgz"
+            payload = installer.canonical_json(
+                {"name": "prime-agent", "version": installer.VERSION}
+            )
+            with tarfile.open(archive_path, "w:gz") as archive:
+                info = tarfile.TarInfo("package/package.json")
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+
+            destination = root / "out"
+            destination.mkdir(mode=0o700)
+            untracked_dir = destination / "package"
+            untracked_dir.mkdir(mode=0o700)
+            (untracked_dir / "evil.js").write_bytes(b"attacker payload")
+
+            package_dir, manifest = installer.safe_extract_main_asset(
+                archive_path, destination
+            )
+
+            self.assertIn(Path("package.json"), manifest)
+            self.assertNotIn(Path("evil.js"), manifest)
+            # The untracked file is left physically in place (extraction
+            # never deletes non-member content) but must never be reported
+            # as part of the verified manifest.
+            self.assertTrue((package_dir / "evil.js").exists())
+
+    def test_make_patched_asset_ignores_files_injected_after_extraction(self) -> None:
+        # Regression for independent review round 2, 2026-08-18, P1:
+        # make_patched_asset() used to build the published tarball by
+        # walking package_dir.rglob("*") -- everything physically present
+        # at archiving time, including a file a same-UID racer wrote into
+        # package_dir in the window between safe_extract_main_asset()
+        # returning and the archive loop starting. It now archives only
+        # the manifest safe_extract_main_asset() itself verified, so a
+        # file injected in that exact window is never published. Follows
+        # this file's established convention for testing a TOCTOU window
+        # (see test_atomic_symlink_ancestor_swap_cannot_escape_verified_parent):
+        # wrap the real function with a side_effect that races immediately
+        # after it returns, rather than mocking away the logic under test.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            assets = release / "assets"
+            assets.mkdir(parents=True, mode=0o700)
+            os.chmod(tool_root / "releases", 0o700)
+            os.chmod(release, 0o700)
+            os.chmod(assets, 0o700)
+
+            original_asset = root / "prime-agent-source.tgz"
+            manifest_payload = installer.canonical_json(
+                {"name": "prime-agent", "version": installer.VERSION}
+            )
+            with tarfile.open(original_asset, "w:gz") as archive:
+                info = tarfile.TarInfo("package/package.json")
+                info.size = len(manifest_payload)
+                archive.addfile(info, io.BytesIO(manifest_payload))
+
+            real_safe_extract_main_asset = installer.safe_extract_main_asset
+
+            def race_after_extraction(asset: Path, destination: Path):
+                package_dir, manifest = real_safe_extract_main_asset(asset, destination)
+                # The instant after extraction finishes and is verified, a
+                # same-UID racer drops an extra file straight into the
+                # now-real (and no longer creatable-fresh) package
+                # directory.
+                (package_dir / "postinstall-evil.js").write_bytes(b"attacker payload")
+                return package_dir, manifest
+
+            output_name = "prime-agent-orca-pinned-race-test.tgz"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(
+                    installer,
+                    "safe_extract_main_asset",
+                    side_effect=race_after_extraction,
+                ),
+            ):
+                patched, _digest, _manifest = installer.make_patched_asset(
+                    original_asset,
+                    {"packages": {}},
+                    assets,
+                    expected_name="prime-agent",
+                    managed_name="prime-agent",
+                    output_name=output_name,
+                )
+
+            with tarfile.open(patched, "r:gz") as published:
+                names = published.getnames()
+            self.assertIn("package/package.json", names)
+            self.assertNotIn("package/postinstall-evil.js", names)
+
+    def test_atomic_symlink_ancestor_swap_cannot_escape_verified_parent(self) -> None:
+        # Regression for P1-2: ensure_local_link_parent() used to verify the
+        # immediate parent purely by path, and atomic_symlink() then
+        # re-resolved that same parent by path a second time to actually
+        # create the link, with no descriptor held open across the gap. A
+        # same-UID racer that swapped the verified parent for a symlink to an
+        # outside directory in that window made atomic_symlink() create the
+        # public command link inside the attacker's directory instead.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ssd = root / "ssd"
+            target = ssd / "target"
+            target.parent.mkdir(mode=0o700)
+            target.write_text("target", encoding="utf-8")
+            user_home = root / "user"
+            real_bin = user_home / ".local/bin"
+            real_bin.mkdir(parents=True, mode=0o700)
+            link = real_bin / "prime-agent"
+            escape = root / "escape"
+            escape.mkdir(mode=0o700)
+            relocated = real_bin.with_name("bin-relocated-by-race")
+
+            real_ensure_local_link_parent = installer.ensure_local_link_parent
+
+            def race_after_verification(candidate_link: Path) -> int:
+                descriptor = real_ensure_local_link_parent(candidate_link)
+                # The instant after the immediate parent (real_bin) is
+                # verified and its descriptor is held open, a same-UID racer
+                # relocates it and drops a symlink to an outside directory in
+                # its place -- exactly the P1-2 repro.
+                real_bin.rename(relocated)
+                real_bin.symlink_to(escape, target_is_directory=True)
+                return descriptor
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", ssd),
+                mock.patch.object(installer, "USER_HOME", user_home),
+                mock.patch.object(
+                    installer,
+                    "ensure_local_link_parent",
+                    side_effect=race_after_verification,
+                ),
+            ):
+                installer.atomic_symlink(target, link)
+
+            # The link must land inside the directory that was actually
+            # verified and held open (its relocated real location) -- never
+            # inside the attacker's escape directory, regardless of what the
+            # lexical path user/.local/bin resolves to by the time the link
+            # is created.
+            self.assertFalse((escape / "prime-agent").exists())
+            self.assertFalse((escape / "prime-agent").is_symlink())
+            self.assertTrue(real_bin.is_symlink())
+            self.assertEqual(os.readlink(real_bin), os.fspath(escape))
+            relocated_link = relocated / "prime-agent"
+            self.assertTrue(relocated_link.is_symlink())
+            self.assertEqual(os.readlink(relocated_link), os.fspath(target))
+
+    def test_atomic_symlink_deeper_ancestor_swap_cannot_escape_verified_parent(
+        self,
+    ) -> None:
+        # Regression for P1-2 residual, creation side (independent review
+        # round 1, 2026-08-18, finding (b)): the prior fix pinned only the
+        # IMMEDIATE parent (~/.local/bin) with O_NOFOLLOW|O_DIRECTORY, but
+        # reached it by first walking every EARLIER ancestor (~/.local)
+        # purely lexically -- lstat-checked, then re-resolved by path
+        # string a moment later. A same-UID racer that swapped ~/.local
+        # itself for a symlink to an outside directory in that window could
+        # still redirect the eventual immediate-parent open, and therefore
+        # the created link, into the attacker's directory -- one level
+        # above where the previous regression test's race lands.
+        # ensure_local_link_parent() now opens EVERY ancestor relative to
+        # the descriptor of the previously opened and verified ancestor
+        # (dir_fd-chained all the way from USER_HOME), so this test swaps
+        # ~/.local the instant after it is opened and verified but before
+        # ~/.local/bin is opened relative to that held descriptor.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ssd = root / "ssd"
+            target = ssd / "target"
+            target.parent.mkdir(mode=0o700)
+            target.write_text("target", encoding="utf-8")
+            user_home = root / "user"
+            real_local = user_home / ".local"
+            real_local.mkdir(parents=True, mode=0o700)
+            link = real_local / "bin/prime-agent"
+            escape = root / "escape"
+            escape.mkdir(mode=0o700)
+            relocated = real_local.with_name(".local-relocated-by-race")
+
+            real_open_component = installer.open_verified_directory_component
+
+            def race_between_ancestors(
+                parent_descriptor: int,
+                name: str,
+                display_path: Path,
+                *,
+                create_missing: bool,
+            ) -> int:
+                descriptor = real_open_component(
+                    parent_descriptor, name, display_path, create_missing=create_missing
+                )
+                if name == ".local":
+                    # ~/.local itself has just been opened and verified, and
+                    # its descriptor is held open -- the instant before
+                    # ~/.local/bin is opened relative to it, a same-UID
+                    # racer relocates ~/.local and drops a symlink to an
+                    # outside directory in its place.
+                    real_local.rename(relocated)
+                    real_local.symlink_to(escape, target_is_directory=True)
+                return descriptor
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", ssd),
+                mock.patch.object(installer, "USER_HOME", user_home),
+                mock.patch.object(
+                    installer,
+                    "open_verified_directory_component",
+                    side_effect=race_between_ancestors,
+                ),
+            ):
+                installer.atomic_symlink(target, link)
+
+            # bin/prime-agent must never be created under the attacker's
+            # escape directory, regardless of what the lexical path
+            # user/.local resolves to by the time ~/.local/bin is opened.
+            self.assertFalse((escape / "bin").exists())
+            self.assertFalse((escape / "bin").is_symlink())
+            self.assertTrue(real_local.is_symlink())
+            self.assertEqual(os.readlink(real_local), os.fspath(escape))
+            relocated_link = relocated / "bin/prime-agent"
+            self.assertTrue(relocated_link.is_symlink())
+            self.assertEqual(os.readlink(relocated_link), os.fspath(target))
+
+    def test_verify_link_rejects_interposed_ancestor_symlink(self) -> None:
+        # Regression for P1-2 residual, verification side (independent
+        # review round 1, 2026-08-18, finding (a) -- the reason for the
+        # prior round's NO_GO). This needs NO race at all: verify_link()
+        # used to resolve the link purely via its own lexical path
+        # (link.lstat(), os.readlink(link)), with no check that the link's
+        # ancestors were still the real, non-symlinked USER_HOME structure.
+        # Renaming ~/.local aside and dropping a symlink to an
+        # attacker-owned directory that itself holds an honestly-shaped
+        # bin/prime-agent -> <the same managed target> made verify_link()
+        # -- and therefore verify_command_state() -- report success for a
+        # command path whose real parent directory is entirely
+        # attacker-controlled. Both must now fail closed.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ssd = root / "ssd"
+            target = ssd / "target"
+            target.parent.mkdir(mode=0o700)
+            target.write_text("target", encoding="utf-8")
+            user_home = root / "user"
+            real_bin = user_home / ".local/bin"
+            real_bin.mkdir(parents=True, mode=0o700)
+            link = real_bin / "prime-agent"
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", ssd),
+                mock.patch.object(installer, "USER_HOME", user_home),
+            ):
+                installer.atomic_symlink(target, link)
+                # Sanity: the honestly created link verifies before the
+                # ancestor is interposed.
+                installer.verify_link(link, target)
+
+                real_local = user_home / ".local"
+                relocated = real_local.with_name(".local-relocated")
+                real_local.rename(relocated)
+                attacker_dir = root / "attacker"
+                attacker_bin = attacker_dir / "bin"
+                attacker_bin.mkdir(parents=True, mode=0o700)
+                (attacker_bin / "prime-agent").symlink_to(target)
+                real_local.symlink_to(attacker_dir, target_is_directory=True)
+
+                # The lexical path user/.local/bin/prime-agent now resolves,
+                # via the interposed symlink, to the attacker's own
+                # honestly-shaped bin/prime-agent -> target -- exactly what
+                # verify_command_state() inspects. It must be refused, not
+                # silently accepted, even though the leaf link's own target
+                # text is byte-for-byte identical to the legitimate one.
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "link parent is missing|unsafe link parent|"
+                    "cannot inspect link parent",
+                ):
+                    installer.verify_link(link, target)
+
+                receipt = {"bin_target": os.fspath(target)}
+                with (
+                    mock.patch.object(installer, "BIN_LINK", link),
+                    mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}),
+                ):
+                    with self.assertRaisesRegex(
+                        installer.PrimeInstallError,
+                        "link parent is missing|unsafe link parent|"
+                        "cannot inspect link parent",
+                    ):
+                        installer.verify_command_state(receipt)
+
+            # The attacker's own files must be untouched, and the real
+            # (relocated) link must still be exactly what was honestly
+            # created.
+            self.assertEqual(
+                os.readlink(attacker_bin / "prime-agent"), os.fspath(target)
+            )
+            real_relocated_link = relocated / "bin/prime-agent"
+            self.assertTrue(real_relocated_link.is_symlink())
+            self.assertEqual(os.readlink(real_relocated_link), os.fspath(target))
+
+    def test_remove_private_file_durable_detects_reoccupied_original_path(self) -> None:
+        # Regression for P1-3: after rename_noreplace() moved the original
+        # file into quarantine, remove_private_file_durable() used to verify
+        # only the quarantine copy and never re-check that the original
+        # lexical path was actually left absent -- so a benign race with
+        # another managed step, or a hostile same-UID actor, recreating a
+        # file at that exact path immediately after it was vacated went
+        # completely undetected and the function still reported success.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            parent = root / "private"
+            parent.mkdir(mode=0o700)
+            path = parent / "pending.json"
+            raw = b"managed pending payload\n"
+            installer.atomic_write(path, raw, 0o600)
+
+            original_rename = installer.rename_noreplace
+            reoccupied = False
+
+            def insert_reoccupant_after_rename(source: Path, destination: Path) -> None:
+                nonlocal reoccupied
+                original_rename(source, destination)
+                if source == path and not reoccupied:
+                    reoccupied = True
+                    source.write_text("reoccupant", encoding="utf-8")
+                    os.chmod(source, 0o600)
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(
+                    installer,
+                    "rename_noreplace",
+                    side_effect=insert_reoccupant_after_rename,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "re-occupied"
+                ):
+                    installer.remove_private_file_durable(path, raw)
+            # The re-occupant must be left exactly as the race created it,
+            # and the quarantine copy must be retained (not silently deleted)
+            # once a re-occupation is detected, so the incident is inspectable.
+            self.assertTrue(path.is_file())
+            self.assertFalse(path.is_symlink())
+            self.assertEqual(path.read_text(encoding="utf-8"), "reoccupant")
+            quarantine_candidates = list(parent.glob(f".{path.name}.remove-*"))
+            self.assertEqual(len(quarantine_candidates), 1)
+            self.assertEqual(quarantine_candidates[0].read_bytes(), raw)
+
+    def test_sandbox_e2e_main_refuses_under_pythonoptimize(self) -> None:
+        # Regression for P1-4 (belt-and-suspenders half): sandbox_e2e.py's
+        # lifecycle-acceptance body used bare `assert` statements, which
+        # `python -O` / `PYTHONOPTIMIZE=1` strip entirely -- so a real
+        # lifecycle failure could previously report a pass under those common
+        # environment settings. main() must now refuse to run at all under
+        # __debug__ is False, before any lifecycle logic executes.
+        project_root = Path(installer.__file__).resolve().parent
+        sandbox_script = project_root / "tests" / "sandbox_e2e.py"
+        env = dict(os.environ)
+        env["PYTHONOPTIMIZE"] = "1"
+        result = subprocess.run(
+            [sys.executable, os.fspath(sandbox_script)],
+            cwd=project_root,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 4)
+        payload = json.loads(result.stdout)
+        self.assertIs(payload["ok"], False)
+        self.assertIn("PYTHONOPTIMIZE", payload["error"])
+
+    def test_sandbox_e2e_require_survives_pythonoptimize_with_failing_lifecycle_mock(
+        self,
+    ) -> None:
+        # Regression for P1-4 (core half): proves the hardened lifecycle
+        # checks themselves -- not just main()'s outer guard -- still catch a
+        # genuinely failing/mocked lifecycle result under `python -O`. Calls
+        # sandbox_e2e.run() directly (bypassing main()'s own __debug__ guard)
+        # with install() mocked to return a receipt a real install would
+        # never produce (command_default_enabled=True), and confirms this
+        # still fails loudly instead of silently reporting a pass -- which a
+        # bare `assert` would have silently allowed under -O.
+        project_root = Path(installer.__file__).resolve().parent
+        driver = textwrap.dedent(
+            f"""
+            import sys
+            sys.path.insert(0, {os.fspath(project_root)!r})
+            sys.path.insert(0, {os.fspath(project_root / "tests")!r})
+            from unittest import mock
+            import install_prime_agent as installer
+            import sandbox_e2e
+
+            fake_receipt = {{
+                "command_default_enabled": True,
+                "session_dir": "/nonexistent-session-dir",
+                "license_sha256": installer.LICENSE_SHA256,
+                "bin_target": "/usr/bin/true",
+                "production_lock_sha256": "0" * 64,
+                "release_tree_sha256": "0" * 64,
+                "release_tree_entries": 0,
+            }}
+            with mock.patch.object(installer, "install", return_value=fake_receipt):
+                sandbox_e2e.run(None)
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-O", "-c", driver],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("AssertionError", result.stderr)
+        self.assertIn("command_default_enabled", result.stderr)
+        self.assertNotIn('"ok": true', result.stdout)
+
+    def test_remove_exact_symlink_ancestor_swap_cannot_escape_verified_parent(
+        self,
+    ) -> None:
+        # Regression for independent review round 3/4, 2026-08-18, P1
+        # finding A (residual of P1-2): remove_exact_symlink() used to
+        # lstat/readlink/rename the public command link entirely by lexical
+        # path (path.lstat(), os.readlink(path), rename_noreplace(path,
+        # quarantine)), with no binding to the SAME dir_fd-chained ancestor
+        # descriptor creation (atomic_symlink() -> ensure_local_link_parent())
+        # and verification (verify_link() -> verify_link_parent_descriptor())
+        # already use. A same-UID racer that swapped the verified parent for
+        # a symlink to an outside directory in the window between removal's
+        # own ancestor-chain verification and its leaf lstat/rename/unlink
+        # steps could make removal follow the interposed symlink instead of
+        # the real, held-open parent -- the removal-side counterpart of the
+        # creation-side race already refused by
+        # test_atomic_symlink_ancestor_swap_cannot_escape_verified_parent.
+        # remove_exact_symlink() must now stay bound to the real, relocated
+        # directory (via open_verified_ancestor_chain()'s returned
+        # descriptor) regardless of what the lexical parent path resolves to
+        # by the time the leaf steps run.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ssd = root / "ssd"
+            target = ssd / "target"
+            target.parent.mkdir(mode=0o700)
+            target.write_text("target", encoding="utf-8")
+            user_home = root / "user"
+            real_bin = user_home / ".local/bin"
+            real_bin.mkdir(parents=True, mode=0o700)
+            link = real_bin / "prime-agent"
+            escape = root / "escape"
+            escape.mkdir(mode=0o700)
+            relocated = real_bin.with_name("bin-relocated-by-race")
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", ssd),
+                mock.patch.object(installer, "USER_HOME", user_home),
+            ):
+                installer.atomic_symlink(target, link)
+
+                real_open_ancestor_chain = installer.open_verified_ancestor_chain
+
+                def race_after_removal_verification(
+                    candidate_link: Path, *, create_missing: bool
+                ) -> int:
+                    descriptor = real_open_ancestor_chain(
+                        candidate_link, create_missing=create_missing
+                    )
+                    if not create_missing:
+                        # remove_exact_symlink() calls with
+                        # create_missing=False. The instant after the
+                        # immediate parent (real_bin) is verified for
+                        # REMOVAL and its descriptor is held open, a
+                        # same-UID racer relocates it and drops a symlink
+                        # to an outside directory in its place.
+                        real_bin.rename(relocated)
+                        real_bin.symlink_to(escape, target_is_directory=True)
+                    return descriptor
+
+                with mock.patch.object(
+                    installer,
+                    "open_verified_ancestor_chain",
+                    side_effect=race_after_removal_verification,
+                ):
+                    installer.remove_exact_symlink(link, target)
+
+            # The real link must have been removed from the directory that
+            # was actually verified and held open (its relocated real
+            # location) -- the attacker's escape directory must never have
+            # been touched, regardless of what the lexical path
+            # user/.local/bin resolves to by the time removal's leaf steps
+            # run.
+            self.assertFalse((escape / "prime-agent").exists())
+            self.assertFalse((escape / "prime-agent").is_symlink())
+            self.assertEqual(sorted(p.name for p in escape.iterdir()), [])
+            self.assertTrue(real_bin.is_symlink())
+            self.assertEqual(os.readlink(real_bin), os.fspath(escape))
+            relocated_link = relocated / "prime-agent"
+            self.assertFalse(relocated_link.exists())
+            self.assertFalse(relocated_link.is_symlink())
+            # No quarantine leftovers under the relocated real directory.
+            self.assertEqual(sorted(p.name for p in relocated.iterdir()), [])
+
+    def test_daemon_socket_agents_attach_require_effective_project_gate(
+        self,
+    ) -> None:
+        # Regression for independent review round 3/4, 2026-08-18, P1
+        # finding B: managed_entrypoint_script() only remapped a leading
+        # "--daemon-socket <value>" pair's managed_command to the true
+        # command token ($3) for the two commands stop/rename, so
+        # "--daemon-socket <sock> agents"/"... attach <session>" never
+        # matched the agents/attach effective-project deny gate and ran
+        # with no ORCA_PRIME_AGENT_ALLOW_PROJECT_SETTINGS=1 requirement.
+        # Companion P2 in the same finding: because session_start was
+        # therefore also miscomputed for every OTHER public command
+        # (config, doctor, help, list, package, schedule, send, session,
+        # shutdown, status) reached via --daemon-socket, resource-guard
+        # flags could land between the socket value and the command token
+        # for those forms. Both are fixed together: the entrypoint now
+        # remaps managed_command generically for every public command form,
+        # and guarded_arguments() carries its own defense-in-depth
+        # recognition of the non-session public commands so it never
+        # inserts guards before one of them even if RESOURCE_GUARD_ENV
+        # somehow reached it anyway.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "release"
+            bin_dir = release / "bin"
+            bin_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(tool_root, 0o700)
+            os.chmod(release, 0o700)
+            node = bin_dir / "node"
+            cli = release / "cli.js"
+            node.write_text(
+                "#!/usr/bin/python3\n"
+                "import json, os, sys\n"
+                "print(json.dumps({\n"
+                "  'argv': sys.argv[1:],\n"
+                "  'resourceGuard': os.environ.get('ORCA_PRIME_AGENT_RESOURCE_GUARD'),\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            os.chmod(node, 0o700)
+            cli.write_text("// argument sentinel\n", encoding="utf-8")
+            os.chmod(cli, 0o600)
+            lifecycle_lock = tool_root / "lifecycle.lock"
+            lifecycle_lock.write_bytes(b"")
+            os.chmod(lifecycle_lock, 0o600)
+            guard = bin_dir / "prime-agent-launch-guard.py"
+            wrapper = bin_dir / "prime-agent"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", tool_root / "state"),
+            ):
+                guard.write_bytes(installer.managed_launch_guard_script(node, cli))
+                wrapper.write_bytes(
+                    installer.managed_entrypoint_script(node, cli, guard)
+                )
+            os.chmod(guard, 0o700)
+            os.chmod(wrapper, 0o700)
+            clean = root / "clean"
+            clean.mkdir(mode=0o700)
+            daemon_socket = os.fspath(root / "daemon.sock")
+
+            def run_wrapper(
+                arguments: tuple[str, ...], *, allow_settings: bool = False
+            ) -> subprocess.CompletedProcess[str]:
+                environment = {
+                    "HOME": os.fspath(root),
+                    "PATH": "/usr/bin:/bin",
+                    "ORCA_PRIME_AGENT_RESOURCE_GUARD": "1",
+                }
+                if allow_settings:
+                    environment["ORCA_PRIME_AGENT_ALLOW_PROJECT_SETTINGS"] = "1"
+                return subprocess.run(
+                    [os.fspath(wrapper), *arguments],
+                    cwd=clean,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=environment,
+                )
+
+            for arguments in (
+                ("--daemon-socket", daemon_socket, "agents"),
+                ("--daemon-socket", daemon_socket, "attach", "saved-session"),
+            ):
+                with self.subTest(arguments=arguments, mode="daemon-socket-default-block"):
+                    result = run_wrapper(arguments)
+                    self.assertEqual(result.returncode, 78)
+                    self.assertIn("effective-project settings review", result.stderr)
+
+            # Explicit opt-in: now succeeds, and resource-guard flags land
+            # immediately after the command and its own positional args --
+            # never between the socket value and the command token.
+            allowed = run_wrapper(
+                ("--daemon-socket", daemon_socket, "agents", "saved-session"),
+                allow_settings=True,
+            )
+            self.assertEqual(allowed.returncode, 0, allowed.stderr)
+            allowed_payload = installer.strict_json(allowed.stdout.encode("utf-8"))
+            self.assertIsInstance(allowed_payload, dict)
+            assert isinstance(allowed_payload, dict)
+            self.assertEqual(
+                allowed_payload["argv"][1:],
+                [
+                    "--daemon-socket",
+                    daemon_socket,
+                    "agents",
+                    "saved-session",
+                    "--no-extensions",
+                    "--no-skills",
+                    "--no-prompt-templates",
+                ],
+            )
+
+            # A non-stop/rename public command (config) reached via
+            # --daemon-socket must never receive resource-guard flags at
+            # all -- and, being a public/non-session command, must run
+            # without the effective-project gate too.
+            config_result = run_wrapper(
+                ("--daemon-socket", daemon_socket, "config", "get", "x")
+            )
+            self.assertEqual(config_result.returncode, 0, config_result.stderr)
+            config_payload = installer.strict_json(
+                config_result.stdout.encode("utf-8")
+            )
+            self.assertIsInstance(config_payload, dict)
+            assert isinstance(config_payload, dict)
+            self.assertEqual(
+                config_payload["argv"][1:],
+                ["--daemon-socket", daemon_socket, "config", "get", "x"],
+            )
+            self.assertIsNone(config_payload["resourceGuard"])
+
+
+if __name__ == "__main__":
+    unittest.main()
