@@ -192,6 +192,64 @@ def validate_owned_file(path: Path, *, private: bool = False) -> bytes:
     return raw
 
 
+def _read_for_detection(path: Path) -> bytes | None:
+    # Used only by the untracked-owned-handler safety scan
+    # (_find_untracked_owned_configs(), below) to inspect content this tool
+    # did not write and does not manage -- deliberately NOT
+    # validate_owned_file(), whose checks (uid match, not group/other-
+    # writable, size cap) are the right questions for "may I safely
+    # rewrite this file?" and the wrong ones for "does this file currently
+    # contain a live handler of mine?": every one of them silently answers
+    # "no handler here" for a file that is merely unowned, loosely
+    # permissioned, or oversized -- none of which means a handler actually
+    # inside it is not real and not executing (independent Claude opus5/max
+    # review, 2026-08-17, round 9, R9-P1-B, reproduced with nothing more
+    # than `chmod 0664` on a relocated, still-live config -- the *same*
+    # relocation the scan otherwise correctly refuses, silently waved
+    # through the instant its mode or ownership stopped matching
+    # validate_owned_file()'s unrelated write-safety policy).
+    #
+    # Returns None only for conditions that genuinely mean "this cannot be
+    # one of our configs" (not a regular file; a symlink -- O_NOFOLLOW
+    # refuses it at open time, and _is_regular_file() already screened the
+    # common case). Every other failure -- cannot open, cannot read,
+    # identity changed mid-read -- escalates to InstallError, matching
+    # this file's fail-closed discipline everywhere else stat-level
+    # ambiguity comes up (_path_is_absent(), _is_regular_file()). This is
+    # deliberately narrower than a blanket "let read errors propagate":
+    # the real target machine's local-homes tree already holds several
+    # unrelated hooks.json files (other tools' hook configs), and giving
+    # any one of them a permanent veto over uninstall the moment its mode
+    # or owner looks unusual would trade R9-P1-B's silent-abandonment
+    # risk for an equally real denial-of-service risk -- so only actual
+    # read failures escalate, not "not owned by us" or "not private".
+    descriptor = -1
+    try:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+            return None
+        if before.st_size > MAX_MANAGED_FILE_BYTES:
+            raise InstallError(f"cannot safely inspect {path}: too large")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise InstallError(f"file identity changed while inspecting {path}")
+        chunks: list[bytes] = []
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    except OSError as exc:
+        raise InstallError(f"cannot read {path}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def ensure_private_dir(path: Path) -> Path:
     if path.exists():
         try:
@@ -416,9 +474,14 @@ def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
         candidate_str = os.fspath(resolved)
         if candidate_str in receipt_paths:
             continue
-        try:
-            candidate_raw = validate_owned_file(resolved)
-        except InstallError:
+        # _read_for_detection(), not validate_owned_file(): this is
+        # detecting whether a live handler exists, not deciding whether to
+        # trust the file enough to rewrite it -- see that function's own
+        # comment and R9-P1-B. None means "not a file we can identify";
+        # any other failure raises and is deliberately NOT caught here, so
+        # it escalates out of this whole scan as InstallError.
+        candidate_raw = _read_for_detection(resolved)
+        if candidate_raw is None:
             continue
         if _contains_owned_handler(candidate_raw):
             untracked_owned.append(candidate_str)
@@ -850,6 +913,31 @@ def recover_pending_install() -> dict[str, Any]:
     _validate_receipt_shape(receipt)
     rows = _receipt_rows(receipt)
 
+    # Run the untracked-owned-handler safety scan (see uninstall()'s own
+    # comment) once here, before either direction's finishing logic, so
+    # NEITHER branch can report success while abandoning a live, owned
+    # handler at a path this journal's receipt does not track. Round 9
+    # added this scan only to the "kind == uninstall" branch below; the
+    # "kind == install" rollback branch is an equally real receipt/journal
+    # commit -- for a first-ever install there is no latest-receipt.json
+    # at all yet, so a relocated account whose row silently becomes
+    # "absent" (skipped by that branch's own `install_state != "after"`
+    # filter) is abandoned with no receipt ever having existed to reveal
+    # it, which is strictly worse than the uninstall-side version of the
+    # same bug (independent Claude opus5/max review, 2026-08-17, round 9,
+    # R9-P1-A, reproduced with a real SIGKILL mid-install followed by a
+    # single `mv` of an already-bridged account). Checking once here,
+    # shared by both branches, is what round 8's own report called out as
+    # the better fix over duplicating the scan per branch.
+    receipt_paths = {row["path"] for row in receipt["configs"]}
+    untracked_owned = _find_untracked_owned_configs(receipt_paths)
+    if untracked_owned:
+        raise InstallError(
+            "refusing to finish pending install/uninstall: found an owned hook handler at a path the "
+            "current receipt does not track (a managed account directory may have moved -- restore it "
+            "to its receipt-recorded path before retrying): " + ", ".join(untracked_owned)
+        )
+
     latest_path = RUNTIME_BASE / "latest-receipt.json"
     latest_matches_this_receipt = False
     if latest_path.exists() or latest_path.is_symlink():
@@ -907,28 +995,9 @@ def recover_pending_install() -> dict[str, Any]:
         return {"ok": True, "state": "rolled_back", "install_id": receipt["install_id"]}
 
     # kind == "uninstall"
-    # This finishing pass -- reached from a fresh `recover` CLI action, from
-    # install()'s own opening call, or from uninstall()'s opening call --
-    # is the OTHER place a receipt-deleting commit happens, and uninstall()'s
-    # own untracked-owned-handler scan (see its comment) never runs before
-    # it: a real SIGKILL mid-uninstall, followed by relocating an
-    # account this interrupted attempt had not yet reached, followed by any
-    # ordinary recovery attempt, deleted the receipt here with the
-    # relocated config still live and now completely untracked -- the exact
-    # permanent lockout uninstall()'s own scan exists to prevent, reached
-    # through the one commit path that scan does not guard (independent
-    # Claude opus5/max review, 2026-08-17, round 8, R8-P1-A, reproduced
-    # with a genuine SIGKILL). Run the identical scan here, before this
-    # branch does anything else, so this commit path is guarded exactly as
-    # strictly as uninstall()'s own fresh-call path.
-    receipt_paths = {row["path"] for row in receipt["configs"]}
-    untracked_owned = _find_untracked_owned_configs(receipt_paths)
-    if untracked_owned:
-        raise InstallError(
-            "refusing to finish uninstall: found an owned hook handler at a path the current receipt "
-            "does not track (a managed account directory may have moved -- restore it to its "
-            "receipt-recorded path before retrying): " + ", ".join(untracked_owned)
-        )
+    # (The untracked-owned-handler safety scan guarding this finishing pass
+    # -- and the "kind == install" one above -- now runs once, shared,
+    # right after `rows = _receipt_rows(receipt)`; see that comment.)
     drifted = [row for row in rows if row["state"] == "drift"]
     if drifted:
         raise InstallError("pending uninstall cannot finish because a config drifted")

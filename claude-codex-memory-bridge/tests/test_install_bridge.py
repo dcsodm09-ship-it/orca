@@ -1059,6 +1059,53 @@ class InstallEndToEndTests(unittest.TestCase):
         blocked_dir.rmdir()
         installer.uninstall()
 
+    def test_uninstall_refuses_a_relocated_account_even_after_its_mode_or_owner_looks_unusual(self) -> None:
+        # R9-P1-B (independent Claude opus5/max review, 2026-08-17, round
+        # 9): the round-8/9 scan's own `except InstallError: continue`
+        # around reading an untracked candidate reused
+        # validate_owned_file()'s write-safety checks (uid match, not
+        # group/other-writable, size cap) to decide "does this look like
+        # one of our handlers" -- the wrong question. A relocated,
+        # still-live account that the scan correctly refuses stops being
+        # refused the instant its mode picks up a stray write bit (the
+        # kind of thing `cp`/`rsync`/an archive restore under a permissive
+        # umask does routinely): validate_owned_file() then raises
+        # "unsafe file ownership or mode", the scan's guard swallows that
+        # as "not one of ours", and uninstall() reports ok:true with the
+        # handler still live and the receipt gone.
+        installer.install()
+        account_dir = self.account_config.parent.parent
+        renamed_dir = self.local_homes / "codex-accounts/acct-one-relocated"
+        account_dir.rename(renamed_dir)
+        self.addCleanup(lambda: renamed_dir.exists() and renamed_dir.rename(account_dir))
+        renamed_config = renamed_dir / "home/hooks.json"
+
+        # Control: the plain relocation is refused, exactly as the other
+        # relocation tests in this file already establish.
+        with self.assertRaises(installer.InstallError):
+            installer.uninstall()
+
+        # A single mode change that a routine copy/restore could produce
+        # -- still fully readable, still fully live -- must not flip the
+        # outcome to a silent success.
+        os.chmod(renamed_config, 0o664)
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.uninstall()
+        self.assertIn("does not track", str(ctx.exception))
+        self.assertTrue((self.runtime_base / "latest-receipt.json").exists())
+        self.assertFalse(installer.PENDING_PATH.exists())
+        payload = json.loads(renamed_config.read_bytes())
+        self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 2)
+
+        # Restore the installed mode (0o600, not the pristine 0o644) --
+        # anything else would trip the pre-existing, unrelated drift check
+        # once the path is back under receipt tracking.
+        os.chmod(renamed_config, 0o600)
+        renamed_dir.rename(account_dir)
+        installer.uninstall()
+        payload = json.loads(self.account_config.read_bytes())
+        self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
+
     def test_uninstall_ignores_untracked_configs_with_malformed_or_unexpected_content(self) -> None:
         # R8-P1-D / R8-P2-A (independent Claude opus5/max review,
         # 2026-08-17, round 8): the round-8 safety scan's own payload
@@ -1074,6 +1121,16 @@ class InstallEndToEndTests(unittest.TestCase):
         # everything this tool writes is well-formed JSON with exactly the
         # expected structure -- so both must be silently skipped, not
         # crash and not block a legitimate uninstall.
+        #
+        # R9-P3-C (independent Claude opus5/max review, 2026-08-17, round
+        # 9): this test's payloads sit outside codex-accounts/<name>/home/
+        # -- a location round 8's own (one-level-deep) scan never looked
+        # at, so this exact test passed unchanged on the round-8 baseline
+        # and did not actually prove the crash/block bugs were fixed at
+        # the shape that mattered. It is still worth keeping as broad
+        # content-shape coverage; the companion test right below places a
+        # single variant at the one-level shape specifically to be
+        # non-vacuous against round 8.
         installer.install()
         # Deliberately outside codex-accounts/<name>/home/ -- ordinary
         # discovery/install() must never touch this path; only the
@@ -1096,6 +1153,23 @@ class InstallEndToEndTests(unittest.TestCase):
             installer.install()  # re-bridge for the next content variant
         untracked_config.unlink()
         installer.uninstall()
+
+    def test_uninstall_ignores_an_untracked_config_with_malformed_content_at_the_one_level_shape(self) -> None:
+        # R9-P3-C companion (independent Claude opus5/max review,
+        # 2026-08-17, round 9): places malformed content exactly where
+        # round 8's own scan looked (codex-accounts/<name>/home/
+        # hooks.json) rather than outside it, so this test genuinely
+        # distinguishes the round-8 baseline (bare AttributeError crash,
+        # R8-P1-D) from the round-9 fix. install() runs *before* this
+        # untracked account exists, so ordinary discovery never touches
+        # its malformed content.
+        installer.install()
+        untracked_dir = self.local_homes / "codex-accounts/acct-untracked/home"
+        untracked_dir.mkdir(parents=True)
+        self._write(untracked_dir / "hooks.json", b'{"hooks": []}')
+
+        result = installer.uninstall()
+        self.assertTrue(result["ok"])
 
     def test_verify_and_uninstall_report_not_installed_after_uninstall(self) -> None:
         # P2-4 (independent Claude opus5/max review, 2026-08-17, round 1):
@@ -1377,6 +1451,147 @@ installer.uninstall()
             outcome = installer.recover_pending_install()
             self.assertEqual(outcome["state"], "uninstalled")
             self.assertFalse(pending_path.exists())
+            payload = json.loads(self.account_config.read_bytes())
+            self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
+
+
+class InstallCrashRecoveryTests(unittest.TestCase):
+    # Mirrors UninstallCrashRecoveryTests's real-SIGKILL methodology, but
+    # for the "kind == install" rollback branch specifically -- R9-P1-A
+    # needs a genuinely fresh, never-installed machine, so it cannot share
+    # UninstallCrashRecoveryTests's setUp(), which installs before any
+    # test body runs.
+
+    def setUp(self) -> None:
+        self._stack = contextlib.ExitStack()
+        self.addCleanup(self._stack.close)
+        self.temp = self._stack.enter_context(tempfile.TemporaryDirectory())
+        self.root = Path(self.temp).resolve()
+        self.ssd_root = self.root / "ssd"
+        self.local_homes = self.ssd_root / "Orca/local-homes"
+        self.runtime_base = self.local_homes / ".shared-runtime/claude-codex-memory-bridge"
+        self.pending_path = self.runtime_base / "pending-install.json"
+        source_dir = self.ssd_root / "source"
+        self.source_script = source_dir / "claude_memory_hook.py"
+
+        self.local_homes.mkdir(parents=True)
+        (self.local_homes / ".codex").mkdir()
+        (self.local_homes / ".claude/projects").mkdir(parents=True)
+        (self.local_homes / "codex-accounts/acct-one/home").mkdir(parents=True)
+        source_dir.mkdir()
+
+        self.main_config = self.local_homes / ".codex/hooks.json"
+        self.account_config = self.local_homes / "codex-accounts/acct-one/home/hooks.json"
+        InstallEndToEndTests._write(self.main_config, InstallEndToEndTests._base_hooks_json())
+        InstallEndToEndTests._write(self.account_config, InstallEndToEndTests._base_hooks_json())
+        InstallEndToEndTests._write(self.source_script, b"#!/usr/bin/env python3\n# fixture hook script\n")
+
+        self._stack.enter_context(mock.patch.object(installer, "SSD_ROOT", self.ssd_root))
+        self._stack.enter_context(mock.patch.object(installer, "LOCAL_HOMES_ROOT", self.local_homes))
+        self._stack.enter_context(mock.patch.object(installer, "RUNTIME_BASE", self.runtime_base))
+        self._stack.enter_context(mock.patch.object(installer, "PENDING_PATH", self.pending_path))
+        self._stack.enter_context(mock.patch.object(installer, "SOURCE_SCRIPT", self.source_script))
+        self._stack.enter_context(
+            mock.patch.object(
+                installer, "volume_uuid", lambda ssd_root=None: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+            )
+        )
+        self._stack.enter_context(mock.patch.object(Path, "home", lambda: self.local_homes))
+        # Deliberately NOT installed yet -- R9-P1-A needs a fresh machine.
+
+    def _run_killed_child(self, kill_after_atomic_write_calls: int) -> subprocess.CompletedProcess:
+        module_dir = str(Path(installer.__file__).resolve().parent)
+        script = f"""
+import os, signal, sys
+sys.path.insert(0, {module_dir!r})
+from pathlib import Path
+import install_bridge as installer
+
+installer.SSD_ROOT = Path({str(self.ssd_root)!r})
+installer.LOCAL_HOMES_ROOT = Path({str(self.local_homes)!r})
+installer.RUNTIME_BASE = Path({str(self.runtime_base)!r})
+installer.PENDING_PATH = Path({str(self.pending_path)!r})
+installer.SOURCE_SCRIPT = Path({str(self.source_script)!r})
+installer.volume_uuid = lambda ssd_root=None: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+Path.home = classmethod(lambda cls: Path({str(self.local_homes)!r}))
+
+real_atomic_write = installer.atomic_write
+calls = {{"n": 0}}
+def killing_atomic_write(path, raw, mode=0o600):
+    calls["n"] += 1
+    if calls["n"] == {kill_after_atomic_write_calls}:
+        os.kill(os.getpid(), signal.SIGKILL)
+    return real_atomic_write(path, raw, mode)
+installer.atomic_write = killing_atomic_write
+
+installer.install()
+"""
+        script_path = Path(self.temp) / "child.py"
+        script_path.write_text(script)
+        return subprocess.run([sys.executable, os.fspath(script_path)])
+
+    def test_sigkill_mid_install_then_relocating_the_bridged_account_refuses_instead_of_finishing_rollback(
+        self,
+    ) -> None:
+        # R9-P1-A (independent Claude opus5/max review, 2026-08-17, round
+        # 9): recover_pending_install()'s "kind == install" rollback
+        # branch had no untracked-owned-handler scan at all (round 9 only
+        # added one to the "kind == uninstall" branch). A real SIGKILL
+        # during a first-ever install, after both live configs were
+        # written but before latest-receipt.json, followed by relocating
+        # one of the just-bridged accounts, followed by an ordinary
+        # recovery attempt, used to report {"ok": true, "state":
+        # "rolled_back"}, delete the pending journal, and abandon the
+        # relocated account's live handler with NO receipt ever having
+        # existed to reveal it -- strictly worse than R8-P1-A, since
+        # there is not even a receipt left behind to suggest something is
+        # wrong.
+        #
+        # Real write order for this 2-config fixture (measured, not
+        # guessed): #1-2 release files, #3-6 per-config backups, #7
+        # receipt.json, #8 the pending journal, #9-#10 the two live
+        # configs, #11 latest-receipt.json. Killing at #11 leaves both
+        # live configs bridged but the install not yet committed.
+        result = self._run_killed_child(kill_after_atomic_write_calls=11)
+        self.assertEqual(result.returncode, -signal.SIGKILL, "child must have been SIGKILLed, not exited normally")
+
+        self.assertTrue(self.pending_path.exists(), "a durable journal must survive the kill")
+        latest_path = self.runtime_base / "latest-receipt.json"
+        self.assertFalse(latest_path.exists(), "a first-ever install must not have committed yet")
+
+        account_dir = self.account_config.parent.parent
+        renamed_dir = self.local_homes / "codex-accounts/acct-one-relocated"
+        account_dir.rename(renamed_dir)
+        renamed_config = renamed_dir / "home/hooks.json"
+
+        with (
+            mock.patch.object(installer, "SSD_ROOT", self.ssd_root),
+            mock.patch.object(installer, "LOCAL_HOMES_ROOT", self.local_homes),
+            mock.patch.object(installer, "RUNTIME_BASE", self.runtime_base),
+            mock.patch.object(installer, "PENDING_PATH", self.pending_path),
+            mock.patch.object(installer, "SOURCE_SCRIPT", self.source_script),
+            mock.patch.object(
+                installer, "volume_uuid", lambda ssd_root=None: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+            ),
+            mock.patch.object(Path, "home", lambda: self.local_homes),
+        ):
+            with self.assertRaises(installer.InstallError) as ctx:
+                installer.recover_pending_install()
+            self.assertIn("does not track", str(ctx.exception))
+
+            # Nothing must have finished: the journal survives, no receipt
+            # was written, and the relocated config is untouched.
+            self.assertTrue(self.pending_path.exists())
+            self.assertFalse(latest_path.exists())
+            payload = json.loads(renamed_config.read_bytes())
+            self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 2)
+
+            # No permanent lockout: moving it back lets the rollback
+            # finish normally.
+            renamed_dir.rename(account_dir)
+            outcome = installer.recover_pending_install()
+            self.assertEqual(outcome["state"], "rolled_back")
+            self.assertFalse(self.pending_path.exists())
             payload = json.loads(self.account_config.read_bytes())
             self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
 
