@@ -141,6 +141,68 @@ opus+max 与 Codex sol+max 独立只读双复核才能过。
 | 给 L1-L3 记忆条目加 `kind` 字段（preference/identity/fact/procedure/blocker/reference，纯 additive） | `SAFE_NOW`（可作为独立小候选） | 可在下一轮直接起草 schema 扩展候选，走常规测试流程 |
 | 给 claude-codex-memory-bridge 补命名空间路径 allowlist（拒绝 `..`/绝对路径/跨工作区） | `DONE`（修复已实施，见第 6 节候选行）→ `BLOCKED_DUAL_REVIEW`（等双复核回执） | 已随该候选 commit `b9ce3e1e62` 一起送审，见上 |
 
+### 2026-08-18 补充：`ORCA_CONTEXT_NACK_V1`（wiki 新鲜度不匹配）根因 + SKILL.md 文档纠错
+
+由 `/goal` 驱动的 Workflow（`wf_a7fc1fef-ad1`）派出的只读调查 agent 查清本次会话启动时报的
+`ORCA_CONTEXT_NACK_V1`（`reason=central reviewed source freshness mismatch: wiki`）：**根因是
+`wiki/orca-context-wiki.json` 在 `reviewed-startup-pack-manifest.json` 钉哈希（2026-08-14
+15:28:05）之后约 10 小时（2026-08-15 01:35:14）被手工改过，没人重新钉 manifest**——`verify_reviewed_pack()`
+的比对逻辑本身是对的（`capabilities`/`graphify_catalog` 两个源哈希都仍匹配，只有 `wiki` 不匹配），不是代码
+bug。因为 wiki 是人工撰写、可复核的内容（不是脚本可以安全重新生成的派生产物），且 reviewed manifest 本身就是
+权威记录，按本文档已有的 `startup-reviewed-pack-schema3-fastfix` 先例，重新钉哈希这个动作本身需要人工先复核
+新内容，再走标准双复核门禁才算数——本次**未擅自重新钉**，只如实查清根因并给出建议：人工审阅当前
+`wiki/orca-context-wiki.json` 内容后，产出一个把 `shared_source_sha256s.wiki` 重新钉为
+`538fd671d651a9381d1c7e18920ddfd631ce1cfae38cb69a431116dee7f17f1d` 的新 manifest 候选，再走 Claude
+opus+max 与 Codex sol+max 双复核。`BLOCKED_HUMAN_AUTH`（wiki 内容复核）+ `BLOCKED_DUAL_REVIEW`（manifest
+候选）。
+
+**顺带side finding**：已安装的 hook 脚本（`~/.agents/skills/orca-context-bridge/scripts/*.py`）仍是
+`REVIEWED_PACK_MANIFEST_SCHEMA_VERSION = 2`（单一固定 schema，无 v3/v4，无 routes 概念），而本仓库
+`orca-context-bridge/scripts/*.py` 已经是 v3 部署 / v4 最新（含 routes）。这是一个独立于本次 NACK 根因的
+部署滞后（installed hook 落后于仓库），未验证是否影响其他行为，记为新发现，`SAFE_NOW`（只需重新走一次安装/
+同步流程，不涉及代码改动，但本轮未执行——不确定 installed hook 是否有其他会话正在使用，未擅自替换）。
+
+同一个 agent 核对了 `orca-context-bridge/SKILL.md` 当时未提交的文档 diff（+135/-6 行）：逐条对照实际脚本源码
+后，**除 1 处外全部准确**——错误的一条是"Live `open` 拒绝通过符号链接指向的 provider 可执行文件"，实际
+`verified_provider_executable()` 是先 `Path.resolve(strict=True)` 解析符号链接、再校验解析后的目标，所以
+符号链接指向的 provider 可执行文件是**被接受**、不是被拒绝。已改正并提交（commit `bf14f80b1e`），文档其余部分
+（per-account resume mutex、`--resolve-pending` 复核流程、O_NOFOLLOW exec-time 检查、manifest schema
+v3→v4、`--dangerously-skip-permissions` 范围限制、linked account-home 接受规则）逐条核对源码后确认准确，
+`DONE`。
+
+### 2026-08-18 补充：本机项目优缺点普查 + 外部调研 → orca-context-bridge 完成态跟踪的 5 条排序建议
+
+同一 Workflow 另外两路只读 agent 分别做了（a）本机 orca-context-bridge / `skills/review-orca-workflow-learning`
+/ `orchestration-dynamic-scheduler` / R2 恢复九轮 saga / `install_bridge.py` 十一轮加固史的优缺点普查，
+（b）外部调研（Temporal/Saga/事件溯源/事务性 outbox/幂等键/CRDT 等完成态跟踪模式 + 在本机 Darwin/arm64 上
+实测验证的 `os.supports_dir_fd` 行为 + 用户提供的一份短视频里 7 种主流 Agent 架构分类的可信度核对与到 Orca 的
+映射）。核心诊断：**orca-context-bridge 当前的 sessions.json/acks/handoffs 机制结构上是一个所有 session 都能
+写的可变共享存储（无单写者约束、无持久事件历史），这正是 Blackboard 架构的经典弱点（"多方同时写就会乱、难调试"）
+——也正是假阳性"完成"与假阴性"工作丢失"两类问题的根源**；而现有的 Claude opus+max/Codex sol+max 双复核门禁
+本质上是一个手搭的 Graph-Workflow 检查点，但目前只是约定、没有被机制强制。五条按优先级排序、每条都点名本机哪个
+项目的教训：
+
+1. 把 sessions/acks/handoffs 换成（或垫一层）复用 `skills/review-orca-workflow-learning/scripts/event_journal.py`
+   已经设计好但从未接入运行时的 per-run 哈希链事件日志 schema（`orca.dispatch.started`/`orca.worker.heartbeat`/
+   `orca.worker.done`/`orca.workflow.settled` 等事件类型已就绪）。
+2. 每个 ack/handoff 用 `O_CREAT|O_EXCL` 做"恰好一次"发布（参照同一 skill 的 `startup_admission.py::consume_token()`），
+   加心跳 TTL 自动回收失联 dispatch——直接对应本文档第 63 行记录过的真实事故："worker 静默卡死超 6 小时无心跳，
+   被现有 Monitor 误判为仍在跑"。
+3. 状态/门禁字段的含义不能跨版本静默改变：`agent_capacity.py` 把 `recommendation.gate` 的语义从"红黄绿"
+   静默改成永远 `"gate_removed"`（真实红黄绿挪到新字段 `advisory_true_recommendation`），任何还在按旧语义读
+   `gate` 字段的调用方（包括用户自己 CLAUDE.md 里那条规则）都会被静默误导；新语义应该版本化，不是原地替换。
+4. 完成回执要求"反向对照"（对修复前状态必须失败）+ 构建/运行时可达性检查，不能只看测试通过：R2 saga 第 4 轮
+   发现两个模块从未接入真实 CLI 构建配置，导致连续四轮"通过"的双复核其实验证的是一段任何真实调用都跑不到的代码
+   （根因 commit `ebac46c6f0`）；第 6 轮发现一个"大 diff"回归测试的数据可压缩到 26KB，从未真正触发它声称修复的
+   bug。
+5. 审计每一个状态变更入口（create/resume/cancel/crash-recovery/resolve-pending），不能只查主路径，也不能把
+   "能不能安全覆盖"的校验器挪去回答"这是不是我们的文件"：`install_bridge.py` 十一轮历史里，round 6→7 修好了
+   `install()` 的改名检测但漏了 `uninstall()` 的同款漏洞（且 round 6 自己的报错文案还把用户导向永久锁死）；
+   round 9 的两个 P1 都是"覆盖安全校验器被拿去回答所有权问题"的同一类错误。
+
+调研全文（含 macOS `os.supports_dir_fd` 实测清单、TOCTOU 修复配方、7 种 Agent 架构与真实文献的逐条核对、
+Orca 编排层/orca-context-bridge 层分别对应哪种架构）见本次报告 `reports/ORCA-COLLAB-STATE-AND-PRIME-AGENT-2026-08-18.md`。
+
 ## 7. Prime Agent 集成
 
 `BLOCKED_DUAL_REVIEW`（Codex 一路已派出）+ `BLOCKED_CAPACITY`（Claude opus/max 一侧仍待配额）：Claude opus+max **与** Codex sol+max 需都完成才算数；当前 Claude 账户周配额 100%，Opus/max 暂不可用。
