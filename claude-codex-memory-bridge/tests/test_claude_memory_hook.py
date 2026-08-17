@@ -189,6 +189,54 @@ class ClaudeMemoryHookTests(unittest.TestCase):
         self.assertNotIn("::1", context)
         self.assertEqual(context.count("[REDACTED_IP]"), 4)
 
+    def test_ipv6_redaction_does_not_corrupt_ordinary_code_and_prose(self) -> None:
+        # Round-2 regression (independent Claude opus5/max review,
+        # 2026-08-17, N2): the P1-3 IPv6 fix's candidate regex only excluded
+        # hex/dot/colon neighbors, not ordinary letters, so a hex-letter run
+        # embedded in an unrelated word could still parse as a syntactically
+        # valid *compressed* IPv6 address (e.g. "d::" in "std::vector" is a
+        # valid address: group 0x000d + "::"). That silently deleted real
+        # characters from both sides of the match, not just failed to
+        # redact something. These are the review's own reproduction
+        # vectors.
+        self.fixture.add_memory(
+            "# code notes\n"
+            "std::vector<int> is a C++ container.\n"
+            "See Foo::bar() and namespace::fn for details.\n"
+            "hello::world and df::stat are just identifiers.\n"
+            "A CSS rule can start with ::before.\n"
+        )
+        output = self.fixture.run("code notes")
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        for untouched in (
+            "std::vector<int>",
+            "Foo::bar()",
+            "namespace::fn",
+            "hello::world",
+            "df::stat",
+            "::before",
+        ):
+            self.assertIn(untouched, context)
+        self.assertNotIn("[REDACTED_IP]", context)
+
+    def test_redacts_mac_addresses(self) -> None:
+        # Round-2 regression (independent Claude opus5/max review,
+        # 2026-08-17, N3): ipaddress.ip_address() correctly rejects a MAC's
+        # 6 groups of 2 hex digits as invalid IPv6, so switching to it for
+        # P1-3 silently dropped MAC redaction that round 1's looser,
+        # unvalidated regex had caught (by accident, but caught it).
+        self.fixture.add_memory(
+            "# device notes\n"
+            "interface hwaddr de:ad:be:ef:00:11\n"
+            "another form AC:DE:48:00:11:22 and 00:1B:44:11:3A:B7\n"
+        )
+        output = self.fixture.run("device notes")
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("de:ad:be:ef:00:11", context)
+        self.assertNotIn("AC:DE:48:00:11:22", context)
+        self.assertNotIn("00:1B:44:11:3A:B7", context)
+        self.assertEqual(context.count("[REDACTED_IP]"), 3)
+
     def test_skips_symlinked_memory(self) -> None:
         symlink_cwd = "/Users/tester/symlink-project"
         external = self.root_external_memory("# forbidden topic\nsecret detail")

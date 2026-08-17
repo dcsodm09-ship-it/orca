@@ -401,14 +401,22 @@ def claude_project_dirname(cwd: str) -> str:
     This alone is still not a unique, collision-free mapping -- two distinct
     real cwd values can sanitize to the same name (e.g. "/a/b" and "/a-b"),
     exactly as the real Claude Code binary's own naming does. Claude Code
-    itself does not treat that name alone as proof of project identity
-    either: it cross-checks against the `cwd`/`relocatedCwd` field recorded
-    inside a project's own session transcripts before trusting a match
-    (binary's `hJc`/`uEo`/`XTt`, used via `fWe`). This bridge does the same
-    -- see `_session_recorded_cwd_matches` and its use in
-    `read_memory_documents` -- so a sanitizer collision with an unrelated
-    workspace fails closed instead of serving that workspace's memory
-    (independent Codex sol/xhigh finding, 2026-08-17, P1-1).
+    itself does *not* generally re-verify that name before trusting it: for
+    the ordinary (<=200-char) case this bridge always looks up, its own
+    project-existence check (`j3`, disassembled independently) is a bare
+    `readdir()` on the derived directory -- no transcript cross-check at
+    all. `hJc`/`uEo`/`XTt` (the transcript-verification functions this
+    bridge's `_session_recorded_cwd_matches` mirrors) only run inside Claude
+    Code for its long-path hash-suffix siblings and a separate cross-
+    worktree lookup path, neither reached by the primary lookup (independent
+    Claude opus5/max review, 2026-08-17, N4 -- corrects an earlier version
+    of this docstring that claimed parity here). This bridge is therefore
+    deliberately *stricter* than Claude Code's own primary lookup, not
+    merely equivalent to it: requiring a transcript match here closes a
+    sanitizer collision with an unrelated workspace that Claude Code's own
+    bare-`readdir` check would not have caught either (independent Codex
+    sol/xhigh finding, 2026-08-17, P1-1; see `_session_recorded_cwd_matches`
+    and its use in `read_memory_documents`).
     """
     normalized = unicodedata.normalize("NFC", cwd)
     sanitized = _sanitize_like_claude_code(normalized)
@@ -634,7 +642,37 @@ _IPV4_RE = re.compile(
 # understands "::", IPv4-mapped suffixes, and everything else RFC 4291
 # defines) is correct where a regex alone cannot be without reimplementing
 # that grammar.
-_IPV6_CANDIDATE_RE = re.compile(r"(?<![0-9a-fA-F:.])[0-9a-fA-F:.]*:[0-9a-fA-F:.]*(?![0-9a-fA-F:.])")
+#
+# The candidate must not be immediately flanked by an ordinary word/token
+# character (letter, digit, underscore, or another '.'/':' -- those are
+# already part of the character class and so would already be absorbed into
+# the match if adjacent). Without this, a run of hex-alphabet letters that is
+# actually part of a normal identifier gets misread as an address: e.g.
+# "std::vector" contains the letter run "d::" (d is hex) immediately
+# followed by "vector" -- "d::" alone is syntactically a *valid* compressed
+# IPv6 address (group 0x000d + "::"), so ipaddress.ip_address() accepts it,
+# and the naive candidate boundary (only excluding hex/dot/colon neighbors)
+# let the match start right after the non-hex "t" in "std", corrupting real
+# text: "std::vector" -> "st[REDACTED_IP]vector",
+# "namespace::fn" -> "namesp[REDACTED_IP]n" (deleting "ace" and "f", not
+# just failing to redact something -- a round-2 regression, independent
+# Claude opus5/max review, 2026-08-17, N2). Requiring a genuine token
+# boundary on both sides closes this without reintroducing the P1-3 gap:
+# real addresses in prose are bounded by whitespace/punctuation, not by
+# more identifier characters.
+_IPV6_CANDIDATE_RE = re.compile(
+    r"(?<![0-9A-Za-z_.:])[0-9a-fA-F:.]*:[0-9a-fA-F:.]*(?![0-9A-Za-z_.:])"
+)
+# ipaddress.ip_address() correctly rejects a MAC address's 6 groups of 2 hex
+# digits (not a valid IPv6 group count without "::"), so the P1-3 IPv6 fix
+# silently dropped the MAC-address redaction round 1's looser regex had
+# caught only by accident (round-2 regression, independent Claude opus5/max
+# review, 2026-08-17, N3). Matched and redacted as its own, narrower,
+# non-ambiguous shape -- 6 exactly-2-digit hex groups is specific enough to
+# need no further validation the way the IPv6 candidate above does.
+_MAC_ADDRESS_RE = re.compile(
+    r"(?<![0-9A-Fa-f:-])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f:-])"
+)
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _LONG_BLOB_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9+/=_-]{48,}(?![A-Za-z0-9])")
 _HOME_RE = re.compile(r"/Users/[^/\s]+")
@@ -657,7 +695,13 @@ def redact(text: str) -> str:
     text = _ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]", text)
     text = _QUERY_SECRET_RE.sub(r"\1[REDACTED]", text)
     text = _IPV4_RE.sub("[REDACTED_IP]", text)
+    # IPv6 before MAC: a fully-expanded 8-group IPv6 address written with
+    # exactly 2 hex digits per group is shaped like two adjacent MAC-sized
+    # (6-group) runs: matching MAC first could nibble a 6-group slice out of
+    # a real 8-group address and leave the remaining 2 groups dangling.
+    # Redacting the whole address first removes that ambiguity.
     text = _IPV6_CANDIDATE_RE.sub(_redact_ipv6, text)
+    text = _MAC_ADDRESS_RE.sub("[REDACTED_IP]", text)
     text = _EMAIL_RE.sub("[REDACTED_EMAIL]", text)
     text = _LONG_BLOB_RE.sub("[REDACTED_BLOB]", text)
     return _HOME_RE.sub("$USER_HOME", text)

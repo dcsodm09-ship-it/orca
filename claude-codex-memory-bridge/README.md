@@ -31,14 +31,23 @@ untrusted historical reference, and emits at most 7,000 UTF-8 bytes.
   recorded this cwd, fails closed to no context rather than falling back to
   scanning every project.
   **Known limits, not covered by the above** (independent Claude opus5/max
-  review, 2026-08-17; neither ever serves a *different* workspace's content,
-  only "nothing" in these cases): the cwd→directory derivation is lossy, the
-  same as Claude Code's own naming — distinct cwd values can derive the same
-  directory name, or fold together on a case-insensitive filesystem; and a
-  workspace whose Claude memory Claude Code itself relocated to a
-  differently-named project directory (confirmed real for this
-  repository's own primary workspace) is not found, since no reverse/
-  cross-directory lookup is implemented.
+  review, 2026-08-17, round 2 — corrects an earlier version of this note
+  that overstated the first limit as never serving a different workspace's
+  content, which a live sweep of this machine's own `~/.claude/projects/`
+  disproved): the cwd→directory derivation is lossy, the same as Claude
+  Code's own naming — distinct cwd values can derive the same directory
+  name, or fold together on a case-insensitive filesystem. When that
+  happens, this bridge — like Claude Code itself — treats the colliding
+  cwds as one project and serves them the one shared `MEMORY.md`; four such
+  collisions exist on this machine today, entirely from ordinary same-length
+  CJK-named sibling directories, not a constructed attack. What the
+  session-transcript check *does* close is a colliding cwd that never
+  actually ran a Claude session in that shared directory at all — that case
+  gets no context, not the other project's content. Separately, a workspace
+  whose Claude memory Claude Code itself relocated to a differently-named
+  project directory (confirmed real for this repository's own primary
+  workspace) is not found here, since no reverse/cross-directory lookup is
+  implemented.
 - Input JSON rejects duplicate keys and is capped at 8 KiB. Invalid input,
   storage drift, integrity drift, unsafe files, or unavailable SSD state emits
   no context and exits without blocking Codex.
