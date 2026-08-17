@@ -108,9 +108,35 @@ def resolve_ssd_path(path: Path, *, must_exist: bool = True) -> Path:
         raise InstallError(f"path unavailable: {path}") from exc
     if not is_relative_to(resolved, root):
         raise InstallError(f"path is outside Extreme SSD: {path}")
-    if must_exist and resolved.stat().st_dev != root.stat().st_dev:
-        raise InstallError(f"path is on the wrong device: {path}")
+    if must_exist:
+        # These two stat() calls used to run unguarded: a TOCTOU race (the
+        # path vanishing between resolve() above and here) or any other
+        # OSError (e.g. a permission change) would propagate as a raw,
+        # uncaught exception -- main()'s except clause only catches
+        # InstallError, so this crashed the whole installer with a Python
+        # traceback instead of the clean {"ok": false, "error": ...} every
+        # other failure mode in this file produces (found in the full-audit
+        # Workflow, 2026-08-17, deferred at the time because install_bridge.py
+        # had never been run; now in scope ahead of an actual install).
+        try:
+            same_device = resolved.stat().st_dev == root.stat().st_dev
+        except OSError as exc:
+            raise InstallError(f"path unavailable: {path}") from exc
+        if not same_device:
+            raise InstallError(f"path is on the wrong device: {path}")
     return resolved
+
+
+def _mode_bits(path: Path) -> int:
+    # Shared guarded replacement for the several `stat.S_IMODE(path.stat().st_mode)`
+    # call sites below that used to call path.stat() directly and let a bare
+    # OSError (deleted/racing file, permission error) crash the installer
+    # instead of producing a clean InstallError (see resolve_ssd_path's
+    # comment above for the same class of bug and its origin).
+    try:
+        return stat.S_IMODE(path.stat().st_mode)
+    except OSError as exc:
+        raise InstallError(f"cannot stat {path}") from exc
 
 
 def validate_owned_file(path: Path, *, private: bool = False) -> bytes:
@@ -206,14 +232,38 @@ def discover_hook_configs() -> list[Path]:
 
 
 def owned_handler(handler: Any) -> bool:
+    # Structural match against the exact `--bridge-id <BRIDGE_ID>` argv pair
+    # make_release() generates, not a raw substring search over the whole
+    # command string. A substring check treats BRIDGE_ID appearing *anywhere*
+    # in an unrelated hook's command -- inside a comment, a log message, an
+    # unrelated flag's value, or another bridge's command that merely mentions
+    # this one -- as "owned by this installer", and update_hook_config()
+    # deletes/replaces whatever owned_handler() returns True for. That would
+    # silently destroy a hook this installer never created (found in the
+    # full-audit Workflow, 2026-08-17, deferred at the time because
+    # install_bridge.py had never been run; now in scope ahead of an actual
+    # install). Parsing the command the way a shell would and requiring
+    # BRIDGE_ID to be the exact token immediately following an exact
+    # `--bridge-id` token closes that: BRIDGE_ID showing up as a substring of
+    # some other token, or without the adjacent flag, no longer matches.
     if not isinstance(handler, dict):
         return False
     hooks = handler.get("hooks")
     if not isinstance(hooks, list):
         return False
     for hook in hooks:
-        if isinstance(hook, dict) and BRIDGE_ID in str(hook.get("command", "")):
-            return True
+        if not isinstance(hook, dict):
+            continue
+        command = hook.get("command")
+        if not isinstance(command, str):
+            continue
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            continue
+        for index, token in enumerate(tokens):
+            if token == "--bridge-id" and index + 1 < len(tokens) and tokens[index + 1] == BRIDGE_ID:
+                return True
     return False
 
 
@@ -403,7 +453,7 @@ def _receipt_rows(receipt: dict[str, Any]) -> list[dict[str, Any]]:
         if sha256_bytes(backup_raw) != raw_row["before_sha256"]:
             raise InstallError(f"transaction backup digest mismatch: {backup}")
         current = validate_owned_file(path)
-        current_mode = stat.S_IMODE(path.stat().st_mode)
+        current_mode = _mode_bits(path)
         current_sha = sha256_bytes(current)
         before_matches = current_sha == raw_row["before_sha256"] and current_mode == before_mode
         after_matches = current_sha == raw_row["after_sha256"] and current_mode == after_mode
@@ -472,7 +522,7 @@ def recover_pending_install() -> dict[str, Any]:
             continue
         atomic_write(row["path_obj"], row["backup_raw"], row["before_mode"])
         restored = validate_owned_file(row["path_obj"])
-        restored_mode = stat.S_IMODE(row["path_obj"].stat().st_mode)
+        restored_mode = _mode_bits(row["path_obj"])
         if sha256_bytes(restored) != row["before_sha256"] or restored_mode != row["before_mode"]:
             raise InstallError(f"transaction rollback verification failed: {row['path_obj']}")
     remove_file_durable(pending_path)
@@ -489,7 +539,7 @@ def install() -> dict[str, Any]:
     for path in configs:
         raw = validate_owned_file(path)
         originals[path] = raw
-        original_modes[path] = stat.S_IMODE(path.stat().st_mode)
+        original_modes[path] = _mode_bits(path)
         updated[path] = update_hook_config(raw, release["command"])
     write_runtime(release)
     install_id = timestamp_id()
@@ -536,7 +586,7 @@ def install() -> dict[str, Any]:
         for path in configs:
             if updated[path] != originals[path] or original_modes[path] != 0o600:
                 current = validate_owned_file(path)
-                current_mode = stat.S_IMODE(path.stat().st_mode)
+                current_mode = _mode_bits(path)
                 if current != originals[path] or current_mode != original_modes[path]:
                     raise InstallError(f"hook config changed during install: {path}")
                 atomic_write(path, updated[path], 0o600)
@@ -659,7 +709,7 @@ def plan() -> dict[str, Any]:
                 "path": os.fspath(path),
                 "before_sha256": sha256_bytes(raw),
                 "after_sha256": sha256_bytes(after),
-                "will_change": raw != after or stat.S_IMODE(path.stat().st_mode) != 0o600,
+                "will_change": raw != after or _mode_bits(path) != 0o600,
             }
         )
     return {
