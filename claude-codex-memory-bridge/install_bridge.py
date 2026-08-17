@@ -913,6 +913,38 @@ def install() -> dict[str, Any]:
 
         previous_row = previous_rows_by_path.get(os.fspath(path))
         if previous_row is None:
+            # Never touched by a previous install *under this exact path*
+            # -- but that is not the same claim as "its current content is
+            # genuinely pristine". A managed directory renamed or moved
+            # between installs (an ordinary way to relocate storage on an
+            # external SSD -- a plain `mv`, no crash/race/privilege/mock)
+            # resolves to a path string with no entry in
+            # previous_rows_by_path, even though its *content* is still
+            # whatever the previous install wrote. Trusting "no receipt
+            # row for this path" as "pristine" adopted an already-bridged
+            # config as its own baseline, so uninstall() -- comparing
+            # against that self-referential baseline -- reported ok:true
+            # while leaving the handler live, undetectable, and permanent
+            # (latest-receipt.json is deleted in the same operation): P1-1
+            # resurrected through a door install()'s own P1-1 fix never
+            # covered (independent Claude opus5/max review, 2026-08-17,
+            # round 6, R6-P1-A, reproduced on every prior revision of this
+            # file with nothing more than a single `mv` of a pooled
+            # account directory). Refuse instead of silently adopting
+            # already-bridged content: the operator either restores the
+            # old path (the carried-forward row then does its job
+            # normally) or runs uninstall first.
+            existing_payload = strict_json(raw)
+            existing_handlers = (
+                existing_payload.get("hooks", {}).get("UserPromptSubmit", [])
+                if isinstance(existing_payload, dict)
+                else []
+            )
+            if any(owned_handler(handler) for handler in existing_handlers):
+                raise InstallError(
+                    "refusing to record an already-bridged config as a pristine baseline "
+                    f"(did this path move since the last install? run uninstall first): {path}"
+                )
             # Never touched by a previous install this receipt covers --
             # its current content genuinely is the pristine baseline, and
             # (trivially) also this transaction's own starting point.

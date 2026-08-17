@@ -873,6 +873,50 @@ class InstallEndToEndTests(unittest.TestCase):
         payload = json.loads(self.account_config.read_bytes())
         self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
 
+    def test_install_refuses_to_adopt_an_already_bridged_config_as_pristine_after_a_rename(self) -> None:
+        # R6-P1-A (independent Claude opus5/max review, 2026-08-17, round
+        # 6): a pooled account directory renamed or moved between two
+        # installs, with its hooks.json content untouched, resolves to a
+        # path string with no entry in the previous receipt --
+        # previous_rows_by_path.get(new_path) is None, exactly as if it
+        # were a genuinely brand-new account. Before this fix, install()
+        # adopted that already-bridged content as its own "pristine"
+        # baseline; uninstall() then compared against that
+        # self-referential baseline, reported ok:true, and left the bridge
+        # handler live and undetectable forever, with latest-receipt.json
+        # deleted in the same operation -- round 1's P1-1 outcome,
+        # reproduced on every prior revision of this file with nothing
+        # more than a single directory rename (no crash, race, privilege,
+        # or mock), through a door P1-1's own fix never covered.
+        installer.install()
+        account_dir = self.account_config.parent.parent  # codex-accounts/acct-one
+        renamed_dir = account_dir.parent / "acct-one-renamed"
+        account_dir.rename(renamed_dir)
+        renamed_config = renamed_dir / "home" / "hooks.json"
+        self.assertTrue(renamed_config.is_file())
+
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.install()
+        self.assertIn("already-bridged", str(ctx.exception))
+
+        # Nothing must have become durable, and the renamed config's
+        # content must be untouched -- a clean, pre-transaction refusal,
+        # not a partial adoption.
+        self.assertFalse(installer.PENDING_PATH.exists())
+        self.assertTrue((self.runtime_base / "latest-receipt.json").exists())
+        payload = json.loads(renamed_config.read_bytes())
+        self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 2)
+
+        # Renaming it back to its original path must let a normal install
+        # and uninstall proceed exactly as before -- the carried-forward
+        # machinery for a genuinely *temporary* rename is untouched by
+        # this fix.
+        renamed_dir.rename(account_dir)
+        installer.install()
+        installer.uninstall()
+        payload = json.loads(self.account_config.read_bytes())
+        self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
+
     def test_verify_and_uninstall_report_not_installed_after_uninstall(self) -> None:
         # P2-4 (independent Claude opus5/max review, 2026-08-17, round 1):
         # latest-receipt.json used to never be cleared by uninstall() at
