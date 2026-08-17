@@ -533,6 +533,52 @@ class ClaudeMemoryHookTests(unittest.TestCase):
         self.assertNotIn("fe80::1", context)
         self.assertIn("[REDACTED_IP]", context)
 
+    # --- found by an independent post-fix verification Workflow ----------
+
+    def test_addresses_redact_even_with_no_space_before_a_sentence_period(self) -> None:
+        # Pre-existing since the very first commit, unchanged by every prior
+        # fix round: _IPV4_RE and _IPV6_CANDIDATE_RE's trailing negative
+        # lookaheads both disqualified a following '.', so an address
+        # written as ordinary prose ("reachable at 10.0.0.1.") never
+        # redacted at all -- there was no position where "next char is
+        # neither digit/dot nor absent" held when a period was glued
+        # directly onto the address with no separating space. No existing
+        # test caught this because every prior IP-redaction fixture happened
+        # to follow the address with a space or comma, never a bare period.
+        self.fixture.add_memory(
+            "# hosts\n"
+            "reachable at 198.51.100.42.\n"
+            "server at 2001:db8::1.\n"
+            "backup at fe80::1234.\n"
+        )
+        output = self.fixture.run("hosts")
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("198.51.100.42", context)
+        self.assertNotIn("2001:db8::1", context)
+        self.assertNotIn("fe80::1234", context)
+        self.assertEqual(context.count("[REDACTED_IP]"), 3)
+
+    def test_ipv6_zone_id_with_non_alnum_characters_still_redacts(self) -> None:
+        # The first zone-id fix (N9) only accepted a plain-alnum zone/scope
+        # id in its optional suffix, and -- critically -- made the *base
+        # address's own* match conditional on the zone group either being
+        # absent or ending cleanly. A real zone id containing anything else
+        # (a VLAN suffix like "eth0.100", an underscored adapter name, a
+        # Windows GUID zone id in braces) made every match boundary fail, so
+        # the match failed to start at all: the base IPv6 address leaked
+        # completely unredacted -- worse than before the N9 fix existed.
+        self.fixture.add_memory(
+            "# interfaces\n"
+            "vlan sub-interface fe80::1%eth0.100\n"
+            "underscored adapter fe80::1%eth_0\n"
+            "windows zone fe80::1%{4D36E972-E325-11CE-BFC1-08002BE10318}\n"
+        )
+        output = self.fixture.run("interfaces")
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        for leaked_fragment in ("fe80::1", "eth0.100", "eth_0", "4D36E972"):
+            self.assertNotIn(leaked_fragment, context)
+        self.assertEqual(context.count("[REDACTED_IP]"), 3)
+
     def test_unknown_workspace_yields_no_context_without_error(self) -> None:
         # A cwd with no matching Claude project directory at all (e.g. a
         # brand-new workspace with no Claude history yet) is an expected,

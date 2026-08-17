@@ -679,9 +679,24 @@ _ASSIGNMENT_RE = re.compile(
 _QUERY_SECRET_RE = re.compile(
     r"(?i)([?&](?:access_token|api_key|key|password|secret|signature|token)=)[^&#\s]+"
 )
+# The trailing boundary must reject a '.' that continues into more digits
+# (part of a longer dotted run this isn't the real end of) but must NOT
+# reject a bare sentence-final '.' with nothing address-like after it --
+# `(?![\d.])` did the former correctly but also did the latter, so an
+# address written as ordinary prose ("reachable at 10.0.0.1.") never
+# redacted at all: there's no position where "next char is neither
+# digit/dot nor absent" holds when a period is glued directly onto the
+# address with no separating space (independently found while verifying
+# the round-2 fixes, 2026-08-17, via a dedicated workflow re-check --
+# reproduced this exact leak all the way through hook.run()'s real output,
+# unrelated to the IPv6/N9 work that prompted the re-check). Splitting the
+# single lookahead into "not immediately followed by a digit" and
+# "not immediately followed by a dot that is itself followed by a digit"
+# distinguishes the two cases; the same fix applies to _IPV6_CANDIDATE_RE
+# below for the identical reason.
 _IPV4_RE = re.compile(
     r"(?<![\d.])(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\."
-    r"(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?![\d.])"
+    r"(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?!\d)(?!\.\d)"
 )
 # A hand-rolled "N groups of hex separated by ':'" pattern (the previous
 # implementation) only matches IPv6's fully-expanded form and misses the
@@ -728,9 +743,32 @@ _IPV4_RE = re.compile(
 #     since Python 3.9 (confirmed against the pinned 3.9.6 interpreter), so
 #     folding an optional zone suffix into the candidate itself is enough:
 #     the whole match, zone included, gets validated and replaced as one.
+# Two further fixes on top of the N9 zone-id fix (both found independently
+# while re-verifying the round-2 fixes, 2026-08-17, via a dedicated
+# workflow re-check, not by either prior review round):
+#
+# 1. Same sentence-final-period gap as _IPV4_RE above ("server at
+#    fe80::1234." never redacted): the trailing lookahead must reject
+#    continuing into more address-shaped content, not a bare terminal '.'.
+#
+# 2. The N9 fix's zone-id group only accepted `[0-9A-Za-z]`, and (critically)
+#    made the base address's own match conditional on the zone group either
+#    being absent or being one of those chars followed by a real boundary.
+#    A real zone id containing anything else -- a VLAN suffix ("eth0.100"),
+#    an underscore-named adapter ("eth_0"), a Windows GUID zone id
+#    ("{4D36E972-...}") -- made *every* boundary fail, so the match failed
+#    to start at all: the base IPv6 address leaked completely unredacted,
+#    which is worse than before the N9 fix (which at least redacted the
+#    address and only leaked the zone name). ipaddress.ip_address() does
+#    not itself validate zone-id content (confirmed: it accepts any
+#    non-empty string after '%'), so there is no correctness reason to
+#    restrict the regex's zone character class either -- broadened to any
+#    run of non-whitespace, non-'%' characters, which both fixes the leak
+#    and still fully redacts realistic zone ids in one piece.
 _IPV6_CANDIDATE_RE = re.compile(
-    r"(?<![0-9A-Za-z_.:])[0-9a-fA-F:.]{0,64}:[0-9a-fA-F:.]{0,64}"
-    r"(?:%[0-9A-Za-z]{1,32})?(?![0-9A-Za-z_.:%])"
+    r"(?<![0-9A-Za-z_.:])[0-9a-fA-F:.]{0,64}:[0-9a-fA-F:.]{0,64}(?<!\.)"
+    r"(?:%[^\s%]{1,64})?"
+    r"(?![0-9A-Za-z_:%])(?!\.[0-9a-fA-F])"
 )
 # ipaddress.ip_address() correctly rejects a MAC address's 6 groups of 2 hex
 # digits (not a valid IPv6 group count without "::"), so the P1-3 IPv6 fix
