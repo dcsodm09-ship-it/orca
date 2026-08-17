@@ -12,9 +12,11 @@
 - **prime-agent-integration 未安装、不能安装**：即便本轮安全修复全部收敛，`sandbox_e2e.py`
   真实跑一遍会在第一步就 fail-closed——2026-08-14 钉的上游 npm 锁定哈希已经和 2026-08-18
   registry 实际解析结果对不上（上游漂移，不是本轮修复引入的回归，fail-closed 正确触发）。
-- **prime-agent 的 4 个原始 P1 全部修好，另外发现并修好 2 个新 P1**（回合 3 的 Claude
-  opus/max 找到，Codex sol/xhigh 三轮全给 GO——这正是双路复核要防的"单路漏判"场景）。
-  第 4 轮修复已完成、测试 69/69 全过；**第 4 轮的独立双复核仍在进行中**，收敛前不装、不启用。
+- **prime-agent 的 4 个原始 P1 全部修好，round 2-4 又连续发现并修了 4 个新 P1**——全部
+  是 Claude opus/max 独立复现找到的，**Codex sol/xhigh 前 3 轮全给 GO，第 4 轮被 OpenAI
+  自己的 cybersecurity 内容策略拦截未能给出结论**。截至 round 4，`--daemon-socket` 门禁
+  绕过只修了一半（等号形式、重复 flag、`update` 自更新门禁仍可绕过）+ 1 个新的静默误报
+  "已禁用"问题，**round 5 修复正在进行**。收敛前不装、不启用。
 - **`ORCA_CONTEXT_NACK_V1`（wiki 新鲜度不匹配）根因已查清**，不是代码 bug：wiki 内容在
   manifest 钉哈希后被手工改过没人重新钉；未擅自重新钉（需要人工复核+双复核门禁）。
 - `orca-context-bridge/SKILL.md` 一份未提交的文档更新（+135/-6 行）逐条核对源码，改正了
@@ -79,23 +81,50 @@ Codex `gpt-5.6-sol/xhigh` 只读复核发现 4 个 P1（`P0=0`）：
 
 已提交 commit `0efcff855a`（round 1-4 累计状态，因为此前这个候选从未入库，只能整体提交一次）。
 
-### 派发方式的一个教训（本轮真实踩到）
+### 派发方式的教训 + Codex 侧真正的根因（本轮真实踩到，含一次自我纠正）
 
-Round 4 的双复核最初按 round 1-3 同样的方式派发（Claude 子 agent 用 `codex-design` 
-agent type 走 `mcp__codex-pool__pool_run`）。**Codex 那一路被底层 dispatcher 以
-"cybersecurity risk" 分类拒绝**（`task_error`），而这正是用户自己 CLAUDE.md 里那条硬
-规则想防的情况："Claude 负责跨模型协调时，必须通过 Orca orchestration 建立唯一 Run、
-Task、Dispatch...需要 Codex 的任务由 Orca 创建同级 Codex worker，不在普通 Claude 子
-agent...中裸跑 Codex。" Round 1-3 用 `pool_run` 侥幸没被拦，round 4 被拦——不管具体
-分类器触发原因是什么，正确的修法都是换成真正的 Orca orchestration，而不是重试同一条
-路径。已改用 `orca orchestration run-create/task-create/worker-start --agent codex`
-重新派发（`run_eb586aaed81d` / `task_f85c90f50c9f` / `ctx_2964e7816768`）。
+Round 4 双复核最初按 round 1-3 同样的方式派发（Claude 子 agent 用 `codex-design` agent
+type 走 `mcp__codex-pool__pool_run`）。Codex 那一路被底层 dispatcher 以 "cybersecurity
+risk" 分类拒绝（`task_error`）。当时判断这是"没走真正 Orca orchestration"的问题（用户
+CLAUDE.md 的硬规则确实要求跨模型 Codex 协调必须经 Orca Run/Task/Dispatch，不能在裸
+Claude 子 agent 里跑），于是改用 `orca orchestration run-create/task-create/
+worker-start --agent codex` 重新派发（`run_eb586aaed81d` / `task_f85c90f50c9f` /
+`ctx_2964e7816768`，真实起了一个 `codex`/`gpt-5.6-sol max` 终端）。
 
-### Round 4 独立双复核结果
+**结果：同样被拦，说明之前的判断是错的**——终端里真实回显的是 OpenAI/Codex 自己的内容
+分类器拒绝：`"We take extra caution with cybersecurity requests. If you're a security
+professional, you may be able to apply for Trusted Access."`（含
+`https://openai.com/form/enterprise-trusted-access-for-cyber/` 链接）。也就是说
+**这是 Codex 侧对"复现漏洞/绕过检查"这类措辞的内容策略拦截，与走 pool_run 还是走正规
+Orca orchestration 无关**——round 1-3 类似措辞的复核任务侥幸没触发，round 4 的提示词
+（含"construct and run REAL repro attempts""more adversarial than your prior
+ones"等措辞）触发了。已用 `orca orchestration worker-stop` 干净收掉这个卡住的终端，
+`task-update --status failed` 记录了真实原因（真实的 Run/Task/Dispatch 收尾，不是
+假装它完成了）。Round 5 会换用更克制的措辞（强调"验证自己团队代码的安全修复是否正确"
+而不是"构造攻击/绕过"）重新走 Codex 这一路。
 
-<!-- ROUND4_REVIEW_RESULTS_PLACEHOLDER -->
-_（正在进行，完成后回填本节：Claude opus/max 结论 + Codex sol/xhigh（经真正 Orca
-orchestration 派发）结论。收敛前状态：NO-GO，不装、不启用。）_
+### Round 4 独立双复核结果：**NO-GO**（不装、不启用）
+
+**Claude opus/max**（真实复现、非读 diff）：**NO_GO，P0=0，P1=3，P2=3，P3=4**。
+Round 3 的发现 A（`remove_exact_symlink` 祖先目录换位竞态）确认真正修复。发现 B
+（`--daemon-socket` 门禁绕过）**只修了一半**：
+- **P1-1**：`update` 自更新禁令判断读的是 `$1`，没跟着 round 4 的 remap 走——
+  `--daemon-socket <sock> update` 仍可绕过（应 rc=64，实测 rc=0）。
+- **P1-2**：`--daemon-socket=<sock> agents`（等号形式）与重复
+  `--daemon-socket <s1> --daemon-socket <s2> agents` 仍绕过 effective-project 门禁
+  （应 rc=78，实测 rc=0）——round 4 只堵了空格分隔形式。
+- **P1-3**（新发现，第 1 轮 P1-2 的镜像方向）：`verify_command_state()` 的"链接不存在"
+  判断仍是词法路径，把 `~/.local` 换成不含 `bin/prime-agent` 的目录后，`uninstall`
+  会返回 `{"command_disabled": true, "already_disabled": true}`，但真实受管命令链接
+  完全没被动过——**静默误报"已禁用"，不需要竞态，是静态条件即可复现**。
+
+另有 3 个 P2（资源守卫参数在 `=` 形式下位置错乱；生命周期锁可被同 UID inode 换位绕开
+互斥；`package-lock.json` 校验后 `npm ci` 独立重读同一路径、两者间无身份绑定）和 4 个
+P3（详见下方 round 5 小节引用的原始报告）。**回归检查**：69/69 测试仍全过，前 4 轮
+已修的 5 个 P1 逐条真实重放确认仍然成立。
+
+**Codex sol/max**：因上述内容策略拦截未能给出复核结论，任务已按真实原因标记 `failed`
+（见上）。
 
 ### 与安全问题独立的阻断项：上游锁定哈希已过期
 
