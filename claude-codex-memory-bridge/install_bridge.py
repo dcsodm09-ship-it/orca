@@ -381,6 +381,187 @@ def owned_handler(handler: Any) -> bool:
     return False
 
 
+_NOT_PARSED = object()  # sentinel: "this attempt did not yield a JSON value" (None is a real JSON value)
+
+# Codecs retried, in this order, once _safe_parse_strict_utf8() (canonical UTF-8, no BOM
+# tolerance, duplicate keys rejected) fails to parse a candidate file's bytes at all.
+# "utf-8-sig" strips a leading BOM when present and otherwise decodes identically to plain
+# "utf-8", so it alone covers both the BOM and no-BOM UTF-8 cases -- a separate bare "utf-8"
+# entry would only ever produce a duplicate of a text already tried. The utf-16/utf-32 families
+# each include the BOM-sensing form plus both explicit byte orders, since a naive backup/
+# restore tool or manual re-save in a text editor can plausibly produce any of the three
+# (independent Claude opus5/max review, 2026-08-17, round 10, encoding-bypass finding).
+_DETECTION_ENCODINGS: tuple[str, ...] = (
+    "utf-8-sig",
+    "utf-16",
+    "utf-16-le",
+    "utf-16-be",
+    "utf-32",
+    "utf-32-le",
+    "utf-32-be",
+)
+
+# Every hooks.json this tool has ever written, and every realistic third-party tool's hooks.json,
+# is a handful of UserPromptSubmit handler entries -- a few KB at most. Both of the expensive
+# per-file operations below -- Layer 1's multi-encoding decode/parse, AND Layer 0's own
+# per-handler owned_handler() shape check, which is NOT free either (each call runs
+# shlex.split() on that handler's command string) -- are only ever needed at that size. Bounding
+# BOTH under this one threshold keeps a large, unrelated, or deliberately oversized
+# "hooks.json"-named file from turning a routine uninstall()/recover_pending_install() call into
+# a multi-second-to-minutes exclusive-lock hold (both call sites hold the installer lock for the
+# whole safety scan -- see _find_untracked_owned_configs()'s own comment). A file over this bound
+# skips straight to Layer 2's byte-pattern marker check, which stays cheap regardless of size (a
+# `bytes in bytes` substring search, not a decode, independent of handler count) -- crossing this
+# bound trades the precise structural answer for the cheap, fail-closed-on-ambiguity one; it does
+# not silently drop detection to nothing (self-check Workflow design round, 2026-08-18, round 2
+# pressure-test: a ~3.9MB well-formed hooks.json-shaped file cost 1.0-1.15s in Layer 0's own
+# shape-check loop alone, and 1.8-5.9s through Layer 1's decode/parse fan-out, before this bound
+# existed).
+_STRUCTURAL_DETECTION_MAX_BYTES = 65_536
+
+
+def _safe_parse_strict_utf8(raw: bytes) -> Any:
+    # Layer 0: the exact canonical interpretation (strict UTF-8, duplicate keys rejected) every
+    # file this tool has ever written satisfies. Returns _NOT_PARSED, never raises: `raw` is
+    # untrusted, arbitrary bytes here (see _contains_owned_handler()'s own comment), and this
+    # catches RecursionError as well as strict_json()'s own InstallError -- a deeply-nested but
+    # otherwise well-formed UTF-8 JSON document is well within MAX_MANAGED_FILE_BYTES (self-check
+    # Workflow design round, 2026-08-18, round 2 pressure-test P1: an earlier version of this
+    # detection path only caught JSONDecodeError, letting RecursionError escape this module's
+    # "must never be left to raise past this function" contract for _contains_owned_handler()).
+    try:
+        return strict_json(raw)
+    except InstallError:
+        return _NOT_PARSED
+    except RecursionError:
+        return _NOT_PARSED
+
+
+def _lenient_decode_candidates(raw: bytes) -> list[str]:
+    # Best-effort decode of `raw` under each of _DETECTION_ENCODINGS. Never raises: a codec that
+    # simply cannot decode these particular bytes (wrong byte count for a 2-/4-byte encoding, an
+    # invalid code unit) is omitted from the result rather than treated as an error -- exactly
+    # like strict_json()'s own UnicodeDecodeError-to-"not this" handling, just across more than
+    # one codec. Identical decoded text produced by two different codec names (e.g. a BOM'd
+    # "utf-16" and the matching explicit "utf-16-le"/"utf-16-be") is kept only once, so the
+    # caller's parse-and-check work is never duplicated.
+    candidates: list[str] = []
+    seen_text: set[str] = set()
+    for encoding in _DETECTION_ENCODINGS:
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if text in seen_text:
+            continue
+        seen_text.add(text)
+        candidates.append(text)
+    return candidates
+
+
+def _lenient_parse_last_key_wins(text: str) -> Any:
+    # Layer 1's tolerant JSON parse, deliberately more forgiving than strict_json() in two ways a
+    # naive backup/restore tool or manual re-save can plausibly produce for content that started
+    # life as one of this installer's own files: last-key-wins on a duplicate object key (rather
+    # than strict_json()'s reject-on-duplicate), and tolerance of trailing bytes after the JSON
+    # value ends (raw_decode() only consumes a single leading value; strict_json()'s full
+    # json.loads() would reject anything left over). Returns _NOT_PARSED, never raises, for
+    # anything that is not a recognizable JSON document, including a RecursionError from
+    # pathologically deep nesting, caught here at the actual recursive call (see
+    # _safe_parse_strict_utf8()'s comment for the same class of bug).
+    stripped = text.lstrip()
+    if not stripped:
+        return _NOT_PARSED
+
+    def last_key_wins(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        return dict(pairs)
+
+    decoder = json.JSONDecoder(object_pairs_hook=last_key_wins)
+    try:
+        value, _end = decoder.raw_decode(stripped)
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        return _NOT_PARSED
+    return value
+
+
+def _owned_shape_match(payload: Any) -> bool | None:
+    # The single decision point both parse layers funnel every successfully-parsed payload
+    # through. None means `payload` is not recognizable as one of our hooks.json documents at
+    # all (dict -> "hooks":dict -> "UserPromptSubmit":list) -- genuinely ambiguous, the caller
+    # should keep looking under a different encoding/strategy. True or False means `payload`
+    # unambiguously IS shaped like one of our configs, definitively containing (True) or not
+    # containing (False) an owned handler -- final for that parse attempt.
+    if not isinstance(payload, dict):
+        return None
+    hooks = payload.get("hooks")
+    if not isinstance(hooks, dict):
+        return None
+    handlers = hooks.get("UserPromptSubmit")
+    if not isinstance(handlers, list):
+        return None
+    return any(owned_handler(handler) for handler in handlers)
+
+
+def _raw_bytes_contain_bridge_marker(raw: bytes) -> bool:
+    # Layer 2's final, genuine-ambiguity-only fallback: a pure byte-substring search for the
+    # literal `--bridge-id <BRIDGE_ID>` marker under every byte width this file's own detection
+    # encodings could plausibly render it in. ASCII/UTF-8/Latin-1 all encode this marker's
+    # characters identically as single bytes, so one "utf-8" pattern covers all three; UTF-16 and
+    # UTF-32, little- and big-endian, each need their own pattern. Deliberately NOT a decode of
+    # the whole buffer under each codec -- `bytes.__contains__` is a fast, size-independent C-level
+    # substring search, so this stays cheap even for a multi-megabyte file, unlike Layer 1's
+    # structural parse. Only ever reached when no encoding produced a structurally recognizable
+    # payload (or the file was too large to attempt one), so a hit here is ambiguous evidence, not
+    # proof -- the caller fails closed on it rather than trusting it as a positive detection.
+    marker_text = f"--bridge-id {BRIDGE_ID}"
+    for encoding in ("utf-8", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
+        if marker_text.encode(encoding) in raw:
+            return True
+    return False
+
+
+def _attempt_structural_detection(raw: bytes) -> bool | None:
+    # Layers 0+1 combined: the expensive structural parse-and-shape-check path (real JSON
+    # parsing, plus -- on any successful parse -- owned_handler()'s per-handler shlex.split()
+    # calls), attempted only when `raw` is within _STRUCTURAL_DETECTION_MAX_BYTES. Returns None
+    # when nothing here resolved a definitive answer, whether because `raw` was too large to
+    # attempt at all, or because every attempt within budget failed to produce a recognizable
+    # payload -- the caller (_contains_owned_handler()) treats both the same way, falling through
+    # to the cheap marker-only Layer 2.
+    #
+    #   Layer 0 (_safe_parse_strict_utf8): the canonical interpretation. Succeeding at all --
+    #   regardless of whether the parsed value then matches our shape -- is dispositive: bytes
+    #   that are valid UTF-8 JSON have exactly one correct reading, so a structural mismatch here
+    #   is a definitive negative, not a "try another encoding" signal.
+    #
+    #   Layer 1 (_lenient_decode_candidates / _lenient_parse_last_key_wins): only reached when
+    #   Layer 0 found no reading at all. Retries a fixed list of plausible encodings with a more
+    #   tolerant parse (last-key-wins duplicates, trailing garbage after the value). The moment
+    #   any one attempt resolves to our recognizable shape (true OR false), that result is taken
+    #   as final and every later encoding is skipped -- this is what keeps a proven,
+    #   structurally-understood negative from ever reaching Layer 2 (self-check Workflow design
+    #   round, 2026-08-18, round 1 pressure-test P2: without this short-circuit, a legitimate
+    #   unrelated hooks.json that happened to mention the marker text in an unrelated field --
+    #   e.g. a migration-history note, or another handler's own log-message argument -- was
+    #   wrongly escalated to InstallError even though it had already been conclusively proven not
+    #   to contain an owned handler; only reachable in practice for a document within
+    #   _STRUCTURAL_DETECTION_MAX_BYTES -- see _find_untracked_owned_configs()'s own comment for
+    #   the accepted, documented residual gap above that bound).
+    if len(raw) > _STRUCTURAL_DETECTION_MAX_BYTES:
+        return None
+    payload = _safe_parse_strict_utf8(raw)
+    if payload is not _NOT_PARSED:
+        return bool(_owned_shape_match(payload))
+    for text in _lenient_decode_candidates(raw):
+        payload = _lenient_parse_last_key_wins(text)
+        if payload is _NOT_PARSED:
+            continue
+        match = _owned_shape_match(payload)
+        if match is not None:
+            return match
+    return None
+
+
 def _contains_owned_handler(raw: bytes) -> bool:
     # Used only to inspect content this tool did NOT write (the
     # untracked-owned-handler safety scan below) -- unlike install()'s own
@@ -397,19 +578,47 @@ def _contains_owned_handler(raw: bytes) -> bool:
     # with AttributeError on {"hooks": []}/{"hooks": null}/{"hooks": "x"};
     # R8-P2-A, the prior round's scan let a JSON parse failure escape past
     # its own except-and-skip guard).
-    try:
-        payload = strict_json(raw)
-    except InstallError:
-        return False
-    if not isinstance(payload, dict):
-        return False
-    hooks = payload.get("hooks")
-    if not isinstance(hooks, dict):
-        return False
-    handlers = hooks.get("UserPromptSubmit")
-    if not isinstance(handlers, list):
-        return False
-    return any(owned_handler(handler) for handler in handlers)
+    #
+    # Round 11 rewrite (self-check Workflow, 2026-08-18, on top of an
+    # independent Claude opus5/max round-10 finding this scan's own
+    # unit-level testing had not chained through end-to-end calls): the
+    # single strict_json()-or-nothing parse this used to do let a live,
+    # well-formed, owned handler saved in ANY encoding other than plain
+    # UTF-8 -- UTF-8 BOM, a duplicate top-level "hooks" key, trailing
+    # comment text, or UTF-16 from a naive editor or backup/restore tool
+    # being the realistic case, not just an adversarial one -- decode-fail
+    # and silently return False, chaining through install()/verify()/
+    # uninstall() into a durable, total bypass of this whole safety scan.
+    # This now tries two stages, and stops at whichever produces a
+    # definitive answer:
+    #
+    #   Stage 1 (_attempt_structural_detection): Layers 0+1, see that
+    #   function's own comment -- the precise, structurally-verified answer,
+    #   attempted only up to _STRUCTURAL_DETECTION_MAX_BYTES.
+    #
+    #   Stage 2 (_raw_bytes_contain_bridge_marker): reached whenever Stage 1
+    #   returned None -- either genuinely ambiguous (no attempt, across
+    #   every encoding, ever produced a structurally recognizable payload)
+    #   or skipped entirely for being oversized. This is a cheap,
+    #   size-independent raw byte-pattern search for the marker text under
+    #   any width. A hit means "cannot rule out an owned handler" and fails
+    #   closed with InstallError (raising, not returning True: this stage
+    #   never actually confirmed a structural match, so it must not report
+    #   a false positive detection either -- only escalate the ambiguity to
+    #   the caller, which _find_untracked_owned_configs() further tempers
+    #   for content specifically inside RUNTIME_BASE -- see that function's
+    #   own comment); no hit means a genuine, if softer, negative and
+    #   returns False, matching this function's original conservative
+    #   default for content nothing here can identify as ours.
+    result = _attempt_structural_detection(raw)
+    if result is not None:
+        return result
+    if _raw_bytes_contain_bridge_marker(raw):
+        raise InstallError(
+            "cannot rule out an owned hook handler: content matches the bridge marker but does "
+            "not parse as a recognizable hooks.json under any supported encoding"
+        )
+    return False
 
 
 def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
@@ -429,11 +638,18 @@ def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
     #
     # Walks the whole local-homes tree -- bounded to real disk contents,
     # never following symlinked directories (so a symlink cycle cannot
-    # cause an infinite walk), and skipping this bridge's own runtime
-    # directory (its backup files are never named literally "hooks.json",
-    # so nothing real is excluded by skipping it, and it is the one
-    # subtree that can grow large over time) -- for every file named
-    # exactly "hooks.json". A directory (or the root itself) that is simply
+    # cause an infinite walk) -- for every file named exactly "hooks.json",
+    # INCLUDING inside this bridge's own RUNTIME_BASE (round 11, self-check
+    # Workflow, 2026-08-18, on top of an independent Claude opus5/max
+    # round-10 finding: an earlier version of this scan pruned RUNTIME_BASE
+    # out of the walk entirely on the theory that its backup files are
+    # never named literally "hooks.json" -- true, but that same reasoning
+    # also means nothing real is lost by walking in, and a directory move
+    # that relocates a managed account INTO somewhere under RUNTIME_BASE --
+    # e.g. a naive backup/restore tool that preserves original filenames
+    # while staging content there -- was invisible to the pruned version,
+    # the exact class of blind spot this whole function exists to close for
+    # every other subtree). A directory (or the root itself) that is simply
     # gone (ENOENT) degrades that branch to "nothing there" -- normal, and
     # what lets a genuinely deleted account (R3-P1-A) or a genuinely absent
     # local-homes tree not abort the caller's transaction. A directory that
@@ -443,7 +659,44 @@ def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
     # `onerror` callback below escalates that specific case to a clean
     # InstallError instead (independent Claude opus5/max review,
     # 2026-08-17, round 8, R8-P1-C for the ENOENT-tolerant half, R8-P2-B
-    # for the EACCES-must-not-be-silent half).
+    # for the EACCES-must-not-be-silent half) -- EXCEPT specifically inside
+    # RUNTIME_BASE, where an unlistable directory, an unreadable or
+    # oversized file (_read_for_detection()'s own raises), AND an
+    # unparseable-but-marker-suspicious file (_contains_owned_handler()'s
+    # own Stage 2) all instead degrade to "nothing found there", same as ENOENT
+    # (self-check Workflow, 2026-08-18, round 2 pressure-test: RUNTIME_BASE's
+    # backups/releases directories are never pruned -- this file's own
+    # design, documented at their creation sites -- and accumulate for the
+    # tool's entire lifetime, so an ordinary, non-adversarial permission
+    # fault or an oversized/corrupted stray file there -- a stray quarantine
+    # flag, imperfect backup/restore tooling, a UID mismatch after moving
+    # the external SSD between machines (this repo's whole operating
+    # domain) -- becomes steadily more likely over time and, if still
+    # fail-closed here, would permanently hard-block BOTH uninstall() and
+    # recover_pending_install() (the tool's own crash-recovery path) with no
+    # self-healing action available, since RUNTIME_BASE content is never
+    # pruned by this tool. Two things make this narrower "nothing found
+    # there" policy the right trade-off specifically for RUNTIME_BASE,
+    # unlike every other subtree: (1) every real file this tool ever writes
+    # there is deliberately never named literally "hooks.json"
+    # (grep-confirmed against every atomic_write() call site; atomic_write()'s
+    # own mkstemp()-based temp-file naming means no transient bare
+    # "hooks.json" ever appears mid-write either), so an unlistable
+    # subdirectory or an unrecognizable file here can only ever be hiding
+    # non-candidate files -- never the one filename this scan is actually
+    # looking for; and (2) RUNTIME_BASE and everything under it is created
+    # exclusively by ensure_private_dir()/atomic_write() at mode
+    # 0o700/0o600 under this process's own uid, so a THIRD PARTY managing to
+    # place unreadable or unrecognizable content here already requires a
+    # level of access (the same uid, or root) that makes this scan's
+    # fail-closed protection close to worthless as a defense against them
+    # anyway. Trading that narrow, low-value blind spot for keeping the
+    # tool's own recovery path from becoming permanently unusable is the
+    # better default. The equivalent ambiguity OUTSIDE RUNTIME_BASE (a large
+    # or unparseable-but-marker-suspicious third-party file elsewhere under
+    # local-homes) is deliberately left fail-closed, same as before -- now
+    # with the offending path included in the error, so an operator hitting
+    # that rarer case can actually locate and act on it.
     try:
         root = resolve_ssd_path(LOCAL_HOMES_ROOT, must_exist=False)
     except InstallError:
@@ -453,17 +706,19 @@ def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
     except InstallError:
         runtime_root = None
 
+    def _is_under_runtime_root(path: Path) -> bool:
+        return runtime_root is not None and (path == runtime_root or is_relative_to(path, runtime_root))
+
     def _raise_on_unlistable_directory(exc: OSError) -> None:
         if isinstance(exc, FileNotFoundError):
+            return
+        if exc.filename and _is_under_runtime_root(Path(exc.filename)):
             return
         raise InstallError(f"cannot list {exc.filename}: {exc}") from exc
 
     untracked_owned: list[str] = []
-    for dirpath, dirnames, _filenames in os.walk(root, onerror=_raise_on_unlistable_directory, followlinks=False):
+    for dirpath, _dirnames, _filenames in os.walk(root, onerror=_raise_on_unlistable_directory, followlinks=False):
         current = Path(dirpath)
-        if runtime_root is not None and (current == runtime_root or is_relative_to(current, runtime_root)):
-            dirnames[:] = []
-            continue
         candidate = current / "hooks.json"
         if not _is_regular_file(candidate):
             continue
@@ -477,13 +732,29 @@ def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
         # _read_for_detection(), not validate_owned_file(): this is
         # detecting whether a live handler exists, not deciding whether to
         # trust the file enough to rewrite it -- see that function's own
-        # comment and R9-P1-B. None means "not a file we can identify";
-        # any other failure raises and is deliberately NOT caught here, so
-        # it escalates out of this whole scan as InstallError.
-        candidate_raw = _read_for_detection(resolved)
-        if candidate_raw is None:
-            continue
-        if _contains_owned_handler(candidate_raw):
+        # comment and R9-P1-B. None means "not a file we can identify"; any
+        # other failure (cannot open/read, oversized, identity changed
+        # mid-read) raises InstallError, handled by the same RUNTIME_BASE
+        # tolerance / path-annotated re-raise as _contains_owned_handler()'s
+        # own ambiguous-content raise just below -- both calls share one
+        # try block for exactly that reason (self-check Workflow, 2026-08-18,
+        # round-11 final-check pressure test: an earlier version of this fix
+        # wrapped only the _contains_owned_handler() call, so an oversized
+        # file or an ordinary permission fault -- e.g. a UID mismatch after
+        # moving the external SSD between machines -- on a candidate under
+        # RUNTIME_BASE still hard-locked uninstall()/recover_pending_install()/
+        # install() via this earlier, unwrapped call, exactly the failure
+        # mode this whole block exists to close).
+        try:
+            candidate_raw = _read_for_detection(resolved)
+            if candidate_raw is None:
+                continue
+            owned = _contains_owned_handler(candidate_raw)
+        except InstallError as exc:
+            if _is_under_runtime_root(resolved):
+                continue
+            raise InstallError(f"{exc} (at {candidate_str})") from exc
+        if owned:
             untracked_owned.append(candidate_str)
     return sorted(dict.fromkeys(untracked_owned))
 

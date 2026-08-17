@@ -264,6 +264,69 @@ class InstallBridgeTests(unittest.TestCase):
             self.assertEqual(config.read_bytes(), after)
             self.assertFalse(pending.exists())
 
+    def test_contains_owned_handler_recognizes_encoding_variants_without_crashing(self) -> None:
+        # Round-11 self-check (2026-08-18): _contains_owned_handler() used
+        # to call strict_json() (canonical UTF-8 only) and treat any
+        # decode/parse failure as "not one of ours" -- so a live, owned
+        # handler saved with a UTF-8 BOM, a duplicate top-level "hooks" key,
+        # trailing comment text, or UTF-16 encoding was silently reported as
+        # absent. Fails against commit 6fb376c671 (round 10): every variant
+        # below returns False there instead of True.
+        owned_command = f"/usr/bin/python3 hook.py --bridge-id {installer.BRIDGE_ID}"
+        canonical = json.dumps(
+            {"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": owned_command}]}]}}
+        )
+        variants = {
+            "utf8_bom": b"\xef\xbb\xbf" + canonical.encode("utf-8"),
+            "utf16": canonical.encode("utf-16"),
+            "trailing_comment": canonical.encode("utf-8") + b"\n// exported by some tool\n",
+            "duplicate_key": (
+                '{"hooks": {"UserPromptSubmit": []}, "hooks": '
+                + json.dumps({"UserPromptSubmit": [{"hooks": [{"type": "command", "command": owned_command}]}]})
+                + "}"
+            ).encode("utf-8"),
+        }
+        for name, raw in variants.items():
+            with self.subTest(variant=name):
+                self.assertTrue(installer._contains_owned_handler(raw))
+
+    def test_contains_owned_handler_does_not_crash_on_pathologically_nested_content(self) -> None:
+        # Round-11 self-check (2026-08-18, round-1 pressure-test P1
+        # finding): a deeply nested payload (well within
+        # MAX_MANAGED_FILE_BYTES) raises RecursionError out of the
+        # underlying json.loads()/JSONDecoder().raw_decode() call, which
+        # this function's original strict_json()-only parse (and the
+        # lenient fallback later added to fix the encoding variants above)
+        # both left uncaught -- escaping this function's own "must never be
+        # left to raise past this function" contract all the way out
+        # through main()'s `except InstallError` as a bare traceback. Plain
+        # UTF-8 so this reproduces the crash at Layer 0 (the same call
+        # baseline's strict_json()-only parse already made) -- confirmed by
+        # hand against commit 6fb376c671: this exact payload raises an
+        # uncaught RecursionError there instead of returning False.
+        depth = 2000
+        nested = ("[" * depth + "1" + "]" * depth).encode("utf-8")
+        self.assertLess(len(nested), 65_536)  # within the structural-detection size bound
+        self.assertFalse(installer._contains_owned_handler(nested))
+
+    def test_contains_owned_handler_does_not_escalate_a_proven_unrelated_config(self) -> None:
+        # Round-11 self-check (2026-08-18, round-1 pressure-test P2
+        # finding): the raw byte-marker fallback (Stage 2) that fails
+        # closed on genuine ambiguity used to run even when Stage 1 had
+        # already structurally parsed the content and definitively proven
+        # every handler in it is not ours -- so a legitimate, unrelated
+        # hooks.json that merely mentioned the bridge marker in an
+        # unrelated field (documenting an unrelated past migration, for
+        # example) was wrongly escalated to InstallError instead of
+        # returning the already-proven False.
+        unrelated = json.dumps(
+            {
+                "hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/usr/bin/true"}]}]},
+                "_migration_note": f"previously used --bridge-id {installer.BRIDGE_ID}, since replaced",
+            }
+        ).encode("utf-8")
+        self.assertFalse(installer._contains_owned_handler(unrelated))
+
 
 class InstallEndToEndTests(unittest.TestCase):
     # plan()/install()/verify()/uninstall() were entirely uncovered by the
@@ -1002,6 +1065,178 @@ class InstallEndToEndTests(unittest.TestCase):
         installer.uninstall()
         payload = json.loads(self.account_config.read_bytes())
         self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
+
+    def test_uninstall_catches_a_relocated_account_saved_with_a_utf8_bom(self) -> None:
+        # Round-10-vs-round-11 encoding-bypass finding (self-check Workflow,
+        # 2026-08-18, escalating an independent Claude opus5/max round-10
+        # unit-level finding to a full end-to-end chain): the round-10 scan's
+        # _contains_owned_handler() called strict_json() (canonical UTF-8
+        # only) and treated ANY decode/parse failure as "not one of ours".
+        # A relocated, still-live account's hooks.json re-saved with a
+        # leading UTF-8 BOM -- something several editors/export tools add
+        # by default, not a contrived adversarial encoding -- decode-failed
+        # strict_json() and was silently waved through: install() returned
+        # a normal receipt, verify() reported ok:true, and uninstall()
+        # reported ok:true while the orphan's real, byte-identical,
+        # hash-verifiable handler stayed live with no receipt referencing
+        # it again. Fails against commit 6fb376c671 (round 10): uninstall()
+        # there returns ok:true instead of raising.
+        installer.install()
+        account_dir = self.account_config.parent.parent
+        archive_dir = self.local_homes / "codex-accounts/archive"
+        archive_dir.mkdir()
+        relocated_dir = archive_dir / "acct-one"
+        account_dir.rename(relocated_dir)
+        self.addCleanup(lambda: relocated_dir.exists() and relocated_dir.rename(account_dir))
+        relocated_config = relocated_dir / "home/hooks.json"
+
+        live_command_bytes = relocated_config.read_bytes()
+        self.assertIn(f"--bridge-id {installer.BRIDGE_ID}".encode(), live_command_bytes)
+        relocated_config.write_bytes(b"\xef\xbb\xbf" + live_command_bytes)
+
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.uninstall()
+        self.assertIn("does not track", str(ctx.exception))
+        self.assertTrue((self.runtime_base / "latest-receipt.json").exists())
+        self.assertFalse(installer.PENDING_PATH.exists())
+        self.assertTrue(relocated_config.read_bytes().endswith(live_command_bytes))
+
+        relocated_config.write_bytes(live_command_bytes)
+        relocated_dir.rename(account_dir)
+        installer.uninstall()
+
+    def test_uninstall_catches_an_account_relocated_into_the_bridges_own_runtime_tree(self) -> None:
+        # Round-10-vs-round-11 RUNTIME_BASE-prune finding (self-check
+        # Workflow, 2026-08-18, on top of a one-sentence, never-reproduced
+        # round-9 mention): the round-10 scan unconditionally pruned its own
+        # RUNTIME_BASE subtree from the walk on the theory that the bridge's
+        # own backup files are never named literally "hooks.json" -- true
+        # for what the bridge itself writes, but it says nothing about a
+        # THIRD PARTY (an operator, a restore/migration script) relocating
+        # an already-live, already-bridged account directory BY HAND into
+        # that same tree. A plain rename plus a plain uninstall() call was
+        # enough to make the relocated account permanently invisible. Fails
+        # against commit 6fb376c671 (round 10): uninstall() there returns
+        # ok:true instead of raising.
+        installer.install()
+        account_dir = self.account_config.parent.parent
+        staged_dir = self.runtime_base / "backups/misc-staging/acct-one-relocated"
+        staged_dir.parent.mkdir(parents=True)
+        account_dir.rename(staged_dir)
+        self.addCleanup(lambda: staged_dir.exists() and staged_dir.rename(account_dir))
+        relocated_config = staged_dir / "home/hooks.json"
+        self.assertTrue(relocated_config.exists())
+
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.uninstall()
+        self.assertIn("does not track", str(ctx.exception))
+        self.assertIn(os.fspath(relocated_config), str(ctx.exception))
+        self.assertTrue((self.runtime_base / "latest-receipt.json").exists())
+        self.assertFalse(installer.PENDING_PATH.exists())
+
+        staged_dir.rename(account_dir)
+        installer.uninstall()
+
+    def test_uninstall_tolerates_an_unrecognizable_file_inside_its_own_runtime_tree(self) -> None:
+        # Round-11 self-check (2026-08-18, round-2 pressure-test finding):
+        # closing the RUNTIME_BASE blind spot above by simply walking in
+        # created a new lockout -- a single oversized or unparseable-under-
+        # every-supported-encoding file happening to be named "hooks.json"
+        # anywhere under RUNTIME_BASE (whose backups/releases directories
+        # are, by this file's own design, never pruned and accumulate for
+        # the tool's whole lifetime) would permanently hard-block both
+        # uninstall() and recover_pending_install() with no self-healing
+        # path, since nothing in this tool ever removes RUNTIME_BASE
+        # content. Because every real file the bridge itself ever writes
+        # there is never named literally "hooks.json", and RUNTIME_BASE is
+        # 0o700/uid-exclusive, this ambiguity is deliberately tolerated
+        # (treated as "nothing found there") specifically inside
+        # RUNTIME_BASE -- unlike the equivalent case elsewhere under
+        # local-homes, which stays fail-closed (see the sibling test
+        # immediately below).
+        installer.install()
+        stray_dir = self.runtime_base / "backups/misc-staging/stray"
+        stray_dir.mkdir(parents=True)
+        stray_config = stray_dir / "hooks.json"
+        # Not valid JSON under any supported encoding, but contains the
+        # literal marker text as incidental byte padding -- exactly the
+        # ambiguous-content shape _contains_owned_handler()'s Stage 2 would
+        # otherwise fail closed on.
+        stray_config.write_bytes(
+            b"not valid json padding " * 3000 + f"--bridge-id {installer.BRIDGE_ID}".encode() + b" more padding"
+        )
+        self.assertGreater(stray_config.stat().st_size, 65_536)  # past the structural-detection size bound
+
+        result = installer.uninstall()
+        self.assertTrue(result["ok"])
+        self.assertFalse(installer.PENDING_PATH.exists())
+
+    def test_uninstall_tolerates_an_oversized_file_inside_its_own_runtime_tree(self) -> None:
+        # Round-11 self-check (2026-08-18, final-check pressure test,
+        # independently confirmed by two separate agents): an earlier
+        # version of the tolerance fix above only wrapped
+        # _contains_owned_handler()'s own raise -- _read_for_detection()'s
+        # raise for a file over MAX_MANAGED_FILE_BYTES sits one call
+        # earlier in the same loop body and was left unwrapped, so an
+        # oversized (but otherwise ordinary) "hooks.json"-named file under
+        # RUNTIME_BASE -- e.g. a legitimate large backup, or debris from an
+        # imperfect restore tool -- still permanently locked out
+        # uninstall()/recover_pending_install()/install(), exactly the
+        # failure mode the RUNTIME_BASE tolerance exists to close.
+        installer.install()
+        stray_dir = self.runtime_base / "backups/misc-staging/oversized"
+        stray_dir.mkdir(parents=True)
+        stray_config = stray_dir / "hooks.json"
+        stray_config.write_bytes(b"0" * (installer.MAX_MANAGED_FILE_BYTES + 1))
+
+        result = installer.uninstall()
+        self.assertTrue(result["ok"])
+        self.assertFalse(installer.PENDING_PATH.exists())
+
+    def test_uninstall_tolerates_an_unreadable_file_inside_its_own_runtime_tree(self) -> None:
+        # Sibling to the oversized-file tolerance test above, same
+        # unwrapped-_read_for_detection() gap, different trigger: a
+        # "hooks.json"-named file under RUNTIME_BASE this process cannot
+        # read at all (a UID mismatch after moving the external SSD
+        # between machines is this repo's own stated example scenario).
+        installer.install()
+        stray_dir = self.runtime_base / "backups/misc-staging/unreadable"
+        stray_dir.mkdir(parents=True)
+        stray_config = stray_dir / "hooks.json"
+        stray_config.write_bytes(b'{"hooks":{"UserPromptSubmit":[]}}\n')
+        os.chmod(stray_config, 0o000)
+        self.addCleanup(lambda: stray_config.exists() and os.chmod(stray_config, 0o600))
+
+        result = installer.uninstall()
+        self.assertTrue(result["ok"])
+        self.assertFalse(installer.PENDING_PATH.exists())
+
+    def test_uninstall_still_fails_closed_on_an_ambiguous_file_outside_runtime_base(self) -> None:
+        # Sibling control for the tolerance test above: the same
+        # unparseable-but-marker-suspicious content, placed OUTSIDE
+        # RUNTIME_BASE (an ordinary location under local-homes this scan
+        # has no special reason to trust), must still fail closed rather
+        # than silently pass -- and the error must name the offending path,
+        # so an operator hitting this rarer, legitimate ambiguity can
+        # actually find and act on it (round-11 self-check, 2026-08-18,
+        # round-2 pressure-test finding: an earlier version of this fix
+        # omitted the path from this specific error, unlike the sibling
+        # "cannot list" EACCES error which already includes exc.filename).
+        installer.install()
+        stray_dir = self.local_homes / "codex-accounts/stray-tool-cache"
+        stray_dir.mkdir()
+        stray_config = stray_dir / "hooks.json"
+        stray_config.write_bytes(
+            b"not valid json padding " * 3000 + f"--bridge-id {installer.BRIDGE_ID}".encode() + b" more padding"
+        )
+        self.assertGreater(stray_config.stat().st_size, 65_536)  # past the structural-detection size bound
+
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.uninstall()
+        self.assertIn("cannot rule out", str(ctx.exception))
+        self.assertIn(os.fspath(stray_config), str(ctx.exception))
+        self.assertTrue((self.runtime_base / "latest-receipt.json").exists())
+        self.assertFalse(installer.PENDING_PATH.exists())
 
     def test_uninstall_still_works_when_the_codex_home_itself_is_unreachable(self) -> None:
         # R8-P1-C (independent Claude opus5/max review, 2026-08-17, round
