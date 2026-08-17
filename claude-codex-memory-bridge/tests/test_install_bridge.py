@@ -770,6 +770,109 @@ class InstallEndToEndTests(unittest.TestCase):
             payload = json.loads(surviving.read_bytes())
             self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
 
+    def test_uninstall_leaves_no_pending_journal_when_a_live_rows_backup_is_unloadable(self) -> None:
+        # R5-P1-A (independent Claude opus5/max review, 2026-08-17, round
+        # 5): making `backup` lazy per-row (the round-4 fix for R4-P2-A)
+        # silently removed a precondition uninstall() had relied on since
+        # round 4: _receipt_rows() used to read and digest-check every
+        # row's `backup` *before* uninstall() wrote its durable journal, so
+        # an unloadable backup was always a clean, nothing-happened
+        # refusal. Once that read moved inside the write loop, the same
+        # input instead surfaced *after* the journal was already durable
+        # and after earlier rows had already been reverted -- a half-
+        # uninstalled system with a pending journal that recover_pending_
+        # install() itself could not clear (it hits the identical
+        # unloadable backup), leaving every tool action refusing forever
+        # if the backup was permanently gone. This is the negative
+        # invariant opus's report calls out as missing: a failed uninstall
+        # must leave no pending journal behind, and must not have reverted
+        # anything, when the trigger was a single live row's own current
+        # backup being gone -- not a carried-forward row's stale one
+        # (that's R4-P2-A, already covered above).
+        second_account = self.local_homes / "codex-accounts/acct-two/home/hooks.json"
+        second_account.parent.mkdir(parents=True)
+        self._write(second_account, self._base_hooks_json())
+        installer.install()
+        receipt = json.loads((self.runtime_base / "latest-receipt.json").read_bytes())
+        backup_dir = self.runtime_base / "backups" / receipt["install_id"]
+        self.assertTrue(backup_dir.is_dir())
+        for entry in backup_dir.iterdir():
+            entry.chmod(0o600)
+            entry.unlink()
+        backup_dir.chmod(0o700)
+        backup_dir.rmdir()
+
+        with self.assertRaises(installer.InstallError):
+            installer.uninstall()
+
+        # Nothing must have become durable, and nothing must have been
+        # reverted -- a clean, pre-transaction refusal, exactly round 4's
+        # behavior for the same input.
+        self.assertFalse(installer.PENDING_PATH.exists())
+        self.assertTrue((self.runtime_base / "latest-receipt.json").exists())
+        for config_path in (self.main_config, self.account_config, second_account):
+            payload = json.loads(config_path.read_bytes())
+            self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 2)
+
+        # Every other action must still work normally -- this is not a
+        # lockout, it is a refusal over data that is genuinely gone.
+        self.assertTrue(installer.verify()["ok"])
+        self.assertTrue(installer.plan()["ok"])
+        self.assertEqual(installer.recover_pending_install(), {"ok": True, "state": "none"})
+
+    def test_install_refuses_before_writing_anything_when_a_carried_forward_row_is_indeterminate(self) -> None:
+        # R5-P2-A (independent Claude opus5/max review, 2026-08-17, round
+        # 5): discover_hook_configs() can silently drop an account from
+        # discovery on ANY stat() failure it treats as "not found" -- its
+        # own instance of the same class of bug R4-P1-A/R5-P1-A fixed
+        # elsewhere in this file (tracked separately as R5-P3-A, and
+        # deliberately deferred: on the /usr/bin/python3 interpreter this
+        # test suite runs under, the underlying call raises loudly instead
+        # of swallowing the error, so R5-P3-A's own trigger cannot be
+        # reproduced end-to-end through this interpreter -- see the round-6
+        # commit message). Whatever the reason a path goes undiscovered,
+        # before this fix install()'s carried-forward row for it was only
+        # classified at the very end, inside its own commit-finalizing
+        # recover_pending_install() call -- by which point every discovered
+        # config and latest-receipt.json had already been written. This
+        # test exercises the actual fixed code path (the pre-flight loop
+        # over carried_forward_rows in install()) directly and
+        # deterministically, independent of *why* a path went undiscovered,
+        # by patching discover_hook_configs() to omit an account whose real
+        # directory is separately made unreadable.
+        second_account = self.local_homes / "codex-accounts/acct-two/home/hooks.json"
+        second_account.parent.mkdir(parents=True)
+        self._write(second_account, self._base_hooks_json())
+        installer.install()  # main + account_config + second_account, all bridged
+
+        unreadable_dir = self.account_config.parent
+        original_mode = stat.S_IMODE(unreadable_dir.stat().st_mode)
+        os.chmod(unreadable_dir, 0o000)
+        self.addCleanup(lambda: unreadable_dir.exists() and os.chmod(unreadable_dir, original_mode))
+
+        with mock.patch.object(
+            installer,
+            "discover_hook_configs",
+            return_value=[self.main_config, second_account],
+        ):
+            with self.assertRaises(installer.InstallError):
+                installer.install()
+
+        # Nothing must have become durable, and -- crucially, unlike round
+        # 5's bug -- neither discovered config was rewritten either: the
+        # refusal happened before any live write, not after every
+        # discovered config was already bridged.
+        self.assertFalse(installer.PENDING_PATH.exists())
+        for config_path in (self.main_config, second_account):
+            payload = json.loads(config_path.read_bytes())
+            self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 2)
+
+        os.chmod(unreadable_dir, original_mode)
+        self.assertTrue(installer.verify()["ok"])
+        installer.uninstall()
+        payload = json.loads(self.account_config.read_bytes())
+        self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
+
     def test_verify_and_uninstall_report_not_installed_after_uninstall(self) -> None:
         # P2-4 (independent Claude opus5/max review, 2026-08-17, round 1):
         # latest-receipt.json used to never be cleared by uninstall() at

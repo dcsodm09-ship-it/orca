@@ -773,13 +773,26 @@ def recover_pending_install() -> dict[str, Any]:
     drifted = [row for row in rows if row["state"] == "drift"]
     if drifted:
         raise InstallError("pending uninstall cannot finish because a config drifted")
+    # Load every backup this recovery pass will write from before writing
+    # any of them -- the same ordering fix as uninstall()'s own loop (R5-P1-A):
+    # by the time this branch runs the journal is already durable, so an
+    # unloadable backup here cannot *create* a wedge, but discovering it
+    # mid-loop would still leave some rows reverted and others not, and the
+    # only way to try again is to re-run the identical loop. Failing before
+    # any write means a re-run always starts from the same, fully-untouched
+    # state instead of an unpredictable partial one.
+    backup_bytes = {
+        os.fspath(row["path_obj"]): _load_backup(row["backup_obj"], row["before_sha256"])
+        for row in rows
+        if row["state"] not in ("before", "both", "absent")
+    }
     for row in rows:
         # "absent" (a carried-forward row whose path no longer exists at
         # all) has nothing to revert -- see uninstall()'s own comment for
         # why this must not abort the whole transaction.
         if row["state"] in ("before", "both", "absent"):
             continue
-        backup_raw = _load_backup(row["backup_obj"], row["before_sha256"])
+        backup_raw = backup_bytes[os.fspath(row["path_obj"])]
         atomic_write(row["path_obj"], backup_raw, row["before_mode"])
         restored = validate_owned_file(row["path_obj"])
         restored_mode = _mode_bits(row["path_obj"])
@@ -853,6 +866,27 @@ def install() -> dict[str, Any]:
         previous_rows_by_path[missing_path]
         for missing_path in sorted(set(previous_rows_by_path) - discovered_paths)
     ]
+    # Classify each carried-forward row's disk state now, before anything
+    # this install does becomes durable -- not only at commit time, which
+    # is what install()'s own finalizing recover_pending_install() call
+    # used to do implicitly. discover_hook_configs() drops a path from
+    # `configs` on ANY stat() failure it treats as "not found" (its own
+    # instance of the class of bug R4-P1-A/R5-P1-A fixed elsewhere in this
+    # file -- see R5-P3-A, deliberately deferred as its own P3), so an
+    # account whose directory merely became unreadable between discovery
+    # and now looks identical here to one that was genuinely deleted. If
+    # the path is genuinely gone (ENOENT), _path_is_absent() returns True
+    # and the row is carried forward exactly as before; if it is merely
+    # indeterminate (EACCES, EIO, ...), it raises here -- so install()
+    # refuses cleanly before writing a single live config or the receipt,
+    # instead of writing everything successfully and then having the
+    # commit-finalizing check discover the same problem afterward and
+    # report "install failed" while every discovered config is, in fact,
+    # already bridged (independent Claude opus5/max review, 2026-08-17,
+    # round 5, R5-P2-A, reproduced with a single `chmod` on an account
+    # directory between discovery and commit).
+    for row in carried_forward_rows:
+        _path_is_absent(resolve_ssd_path(Path(row["path"]), must_exist=False))
 
     originals: dict[Path, bytes] = {}
     updated: dict[Path, bytes] = {}
@@ -1112,6 +1146,29 @@ def uninstall() -> dict[str, Any]:
     # whole uninstall over it (independent Claude opus5/max review,
     # 2026-08-17, round 3, R3-P1-A).
     unreachable = [os.fspath(row["path_obj"]) for row in rows if row["state"] == "absent"]
+    # Load every backup this transaction will actually write from BEFORE the
+    # durable journal exists, not lazily inside the write loop below. Round
+    # 4 validated every needed backup eagerly inside _receipt_rows(), so an
+    # unloadable backup was always a clean, nothing-happened refusal. Making
+    # `backup` lazy per-row (R4-P2-A's fix) removed that implicit
+    # precondition: the same unloadable-backup input moved from "refuse
+    # before anything becomes durable" to "discover it after the journal is
+    # written and after earlier rows have already been reverted" -- leaving
+    # a half-uninstalled system (some configs reverted, one still bridged)
+    # with a pending journal that recover_pending_install() itself cannot
+    # clear, because it hits the identical unloadable backup. If the backup
+    # is permanently gone, no tool action can ever finish or abandon the
+    # uninstall (independent Claude opus5/max review, 2026-08-17, round 5,
+    # R5-P1-A, reproduced end to end with a single `rm -rf` of a live
+    # backup directory -- no crash, race, privilege, or carried-forward row
+    # required). Loading here keeps R4-P2-A's fix intact: before/both/
+    # absent rows are still skipped, so a carried-forward row's pruned
+    # backup remains harmless.
+    backup_bytes = {
+        os.fspath(row["path_obj"]): _load_backup(row["backup_obj"], row["before_sha256"])
+        for row in rows
+        if row["state"] not in ("before", "both", "absent")
+    }
     receipt_raw = canonical_json(receipt)
     atomic_write(
         PENDING_PATH,
@@ -1122,7 +1179,7 @@ def uninstall() -> dict[str, Any]:
         for row in rows:
             if row["state"] in ("before", "both", "absent"):
                 continue
-            backup_raw = _load_backup(row["backup_obj"], row["before_sha256"])
+            backup_raw = backup_bytes[os.fspath(row["path_obj"])]
             atomic_write(row["path_obj"], backup_raw, row["before_mode"])
             restored = validate_owned_file(row["path_obj"])
             restored_mode = _mode_bits(row["path_obj"])
