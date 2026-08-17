@@ -469,22 +469,39 @@ class InstallEndToEndTests(unittest.TestCase):
         # bridge stayed active in every config the whole time. No crash
         # needed to trigger it -- an ordinary write failure partway through
         # an upgrade was enough, which is what this test injects.
-        installer.install()
+        #
+        # This test originally injected the failure at a fixed atomic_write
+        # call count (#7). On the exact round-3 candidate that count landed
+        # on backup/<install_id>/receipt.json -- BEFORE the pending journal
+        # was even written -- so the test never actually reached the
+        # mixed-v1/v2-live-writes recovery branch it claimed to cover; it
+        # passed for an unrelated reason (independent Codex sol/xhigh
+        # review, 2026-08-17, round 3, P2-R3-TEST). Rewritten to be
+        # path-and-phase-addressed instead of call-count-addressed: fail
+        # exactly the second live config's write, and assert the pending
+        # journal is already durable at that moment -- this is structurally
+        # guaranteed to land inside the intended window regardless of how
+        # many internal atomic_write calls precede it.
+        v1_receipt = installer.install()
+        v1_command = v1_receipt["command"]
         self.source_script.chmod(0o644)
         self.source_script.write_bytes(b"#!/usr/bin/env python3\n# upgraded fixture hook script\n")
         self.source_script.chmod(0o644)
 
         real_atomic_write = installer.atomic_write
-        calls = {"n": 0}
+        observed = {}
 
         def failing_atomic_write(path, raw, mode=0o600):
-            calls["n"] += 1
-            # Let the durable pre-write phase (backups, after-backups,
-            # receipt.json, the pending journal) through, then fail before
-            # either config's *live* content is rewritten -- disk is left
-            # holding the fully consistent, still-working v1 install, same
-            # as opus's real-SIGKILL repro.
-            if calls["n"] == 7:
+            if path == self.account_config:
+                # Captured *inside* the injected failure, before install()'s
+                # own except-block self-heal (see below) has a chance to run
+                # -- this is the only point at which the genuine mid-
+                # transaction mixed v1/v2 state is actually observable on
+                # disk.
+                observed["pending_durable"] = installer.PENDING_PATH.exists()
+                observed["main_command_mid_transaction"] = json.loads(self.main_config.read_bytes())[
+                    "hooks"
+                ]["UserPromptSubmit"][1]["hooks"][0]["command"]
                 raise installer.InstallError("simulated disk error")
             return real_atomic_write(path, raw, mode)
 
@@ -492,22 +509,44 @@ class InstallEndToEndTests(unittest.TestCase):
             with self.assertRaises(installer.InstallError):
                 installer.install()
 
-        # Both configs must still show the v1-installed bridge -- untouched,
-        # not reverted to pristine and not left half-upgraded.
-        v1_payload = json.loads(self.main_config.read_bytes())
-        handlers = v1_payload["hooks"]["UserPromptSubmit"]
-        self.assertEqual(len(handlers), 2)
-        self.assertTrue(installer.owned_handler(handlers[1]))
+        # Proves the injected failure genuinely landed inside the live-write
+        # phase -- pending journal already durable, first live config
+        # (main_config, discovered before account_config) already rewritten
+        # to v2 -- not before the pending journal existed, which is exactly
+        # what made the original fixed-call-count version of this test
+        # vacuous (P2-R3-TEST).
+        self.assertIn("pending_durable", observed, "the injected failure never fired")
+        self.assertTrue(observed["pending_durable"])
+        self.assertNotEqual(observed["main_command_mid_transaction"], v1_command)
+
+        # install() self-heals synchronously: recover_pending_install() runs
+        # inside install()'s own except block before it raises. So by the
+        # time install() has actually returned control here, both configs
+        # are already rolled back to PREV (v1, this transaction's own
+        # starting point) -- not left mixed, and not over-rolled-back to
+        # true pristine. Independently confirmed by Codex sol/xhigh's round
+        # 3 report using its own path-addressed probe ("install 返回
+        # ...; 三份配置 byte-exact 回到 v1 installed bytes").
+        for config_path in (self.main_config, self.account_config):
+            payload = json.loads(config_path.read_bytes())
+            handlers = payload["hooks"]["UserPromptSubmit"]
+            self.assertEqual(len(handlers), 2)
+            self.assertTrue(installer.owned_handler(handlers[1]))
+            self.assertEqual(handlers[1]["hooks"][0]["command"], v1_command)
 
         # Every tool action must still work -- this is the crux of R2-P1-A:
         # before the fix, every one of these raised "config drifted" forever.
         self.assertTrue(installer.verify()["ok"])
         self.assertTrue(installer.plan()["ok"])
+        # A subsequent explicit recover is a clean no-op: install() already
+        # finished the rollback and cleared the pending journal itself.
+        self.assertEqual(installer.recover_pending_install(), {"ok": True, "state": "none"})
+
         installer.uninstall()
         pristine_payload = json.loads(self.main_config.read_bytes())
         self.assertEqual(len(pristine_payload["hooks"]["UserPromptSubmit"]), 1)
 
-    def test_install_refuses_when_a_previously_managed_config_goes_undiscovered(self) -> None:
+    def test_install_carries_forward_a_temporarily_undiscovered_config_without_losing_baseline(self) -> None:
         # P1-R2-1 (independent Codex sol/xhigh review, 2026-08-17, round
         # 2): a config path covered by the latest receipt but not
         # discovered by *this* install call (e.g. a Codex account's
@@ -515,9 +554,21 @@ class InstallEndToEndTests(unittest.TestCase):
         # treated as a brand-new path the next time it reappeared, using
         # its current -- already bridged -- content as the new "pristine"
         # baseline. uninstall() would then never revert it, while
-        # reporting ok:true. Failing closed the moment a previously-known
-        # path goes missing is the safe direction; a later install with
-        # every previously-known path present again must succeed.
+        # reporting ok:true.
+        #
+        # Round 3's first fix (commit 870810d468) closed this by refusing
+        # the whole install outright the instant any managed path went
+        # undiscovered -- but round 3's own independent review found that
+        # this reintroduces the exact "every action refuses forever except
+        # plan" lockout signature for the far more common case: an account
+        # permanently retired or re-provisioned under a new path, not a
+        # temporary rename (independent Claude opus5/max review,
+        # 2026-08-17, round 3, R3-P1-A; independent Codex sol/xhigh review,
+        # 2026-08-17, round 3, P1-R3-1 -- both reproduced this
+        # independently). The fix is to carry the undiscovered row forward
+        # unchanged instead of refusing -- this test covers the temporary
+        # case; test_permanently_retired_account_does_not_lock_out_other_
+        # accounts below covers the permanent case both reviews demanded.
         # discover_hook_configs() itself requires at least 2 configs, so a
         # second account is needed here -- otherwise renaming the only
         # account's hooks.json away trips that pre-existing guard instead
@@ -529,18 +580,106 @@ class InstallEndToEndTests(unittest.TestCase):
         missing = self.account_config.parent / "hooks.json.missing"
         self.account_config.rename(missing)
         try:
-            with self.assertRaises(installer.InstallError) as ctx:
-                installer.install()
-            self.assertIn("no longer discoverable", str(ctx.exception))
+            receipt = installer.install()
+            self.assertIn(os.fspath(self.account_config), {row["path"] for row in receipt["configs"]})
+            self.assertTrue(installer.verify()["ok"])
         finally:
             missing.rename(self.account_config)
-        # The account config was never touched by the refused install, so
-        # a normal install now (with every path discoverable again) must
-        # succeed and remain fully uninstallable.
-        installer.install()
+        # The account config's content was never touched while it was
+        # undiscovered -- its row still points at the real original
+        # baseline, so a normal uninstall now (with every path discoverable
+        # again) must restore it exactly, byte-for-byte, back to pristine.
         installer.uninstall()
         payload = json.loads(self.account_config.read_bytes())
         self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
+
+    def test_permanently_retired_account_does_not_lock_out_other_accounts(self) -> None:
+        # R3-P1-A / P1-R3-1 (independent Claude opus5/max review AND
+        # independent Codex sol/xhigh review, 2026-08-17, round 3, found
+        # separately): permanently retiring a receipt-managed account
+        # (deleted, or re-provisioned under a fresh path -- indistinguishable
+        # from deletion to this installer, and something the real account
+        # tooling genuinely does) used to lock install/verify/uninstall
+        # completely: install refused (missing path), verify/uninstall both
+        # raised on the same missing path, recover was a no-op (state:none),
+        # and only plan still reported ok:true. The still-existing accounts'
+        # bridge handlers stayed active forever with no tool-level way to
+        # remove them. Reproduces round 3's Codex report's exact repro
+        # shape: retire one of several managed accounts, then drive every
+        # tool action, then add a brand-new account.
+        second_account = self.local_homes / "codex-accounts/acct-two/home/hooks.json"
+        second_account.parent.mkdir(parents=True)
+        self._write(second_account, self._base_hooks_json())
+        installer.install()
+        retired_dir = self.account_config.parent
+        gone = self.local_homes / "codex-accounts/acct-one-DELETED-not-restored/home/hooks.json.gone"
+        gone.parent.mkdir(parents=True)
+        self.account_config.rename(gone)
+        retired_dir.rmdir()
+        # No `finally` restore -- this account is gone for good, unlike the
+        # temporary-rename test above.
+
+        # verify() must not raise: it reports the retired path as
+        # unreachable and still checks the surviving accounts.
+        verify_result = installer.verify()
+        self.assertTrue(verify_result["ok"])
+        self.assertIn(os.fspath(self.account_config), verify_result["unreachable"])
+        self.assertIn(os.fspath(self.main_config), verify_result["configs"])
+        self.assertIn(os.fspath(second_account), verify_result["configs"])
+
+        # plan()/install() must keep working for the surviving accounts.
+        self.assertTrue(installer.plan()["ok"])
+        receipt = installer.install()
+        self.assertIn(os.fspath(self.account_config), {row["path"] for row in receipt["configs"]})
+
+        # A brand-new account must still be installable while the retired
+        # one remains carried forward.
+        fresh_account = self.local_homes / "codex-accounts/acct-three/home/hooks.json"
+        fresh_account.parent.mkdir(parents=True)
+        self._write(fresh_account, self._base_hooks_json())
+        receipt = installer.install()
+        self.assertIn(os.fspath(fresh_account), {row["path"] for row in receipt["configs"]})
+
+        # uninstall() must not raise either: it restores every surviving,
+        # currently-existing account to pristine and reports the retired
+        # path as unreachable rather than refusing the whole transaction.
+        uninstall_result = installer.uninstall()
+        self.assertTrue(uninstall_result["ok"])
+        self.assertIn(os.fspath(self.account_config), uninstall_result["unreachable"])
+        for surviving in (self.main_config, second_account, fresh_account):
+            payload = json.loads(surviving.read_bytes())
+            self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
+
+    def test_uninstall_survives_a_pruned_prior_install_backup_directory(self) -> None:
+        # R3-P2-A (independent Claude opus5/max review, 2026-08-17, round
+        # 3): a receipt row's `prev_backup`/`after_backup` can point into a
+        # *previous* install transaction's backup directory (this file's
+        # own comments document backup directories as never pruned, but
+        # nothing enforces that on disk -- an operator or disk-cleanup tool
+        # could still remove an old one). uninstall() never reads
+        # prev_backup or after_backup at all -- only `backup`, the
+        # permanent pristine baseline -- so it must not fail just because
+        # a stale, unrelated prior-transaction backup directory is gone.
+        v1_receipt = installer.install()
+        self.source_script.chmod(0o644)
+        self.source_script.write_bytes(b"#!/usr/bin/env python3\n# upgraded fixture hook script\n")
+        self.source_script.chmod(0o644)
+        installer.install()  # v2 (upgrade) -- its receipt's prev_backup fields point into v1's backup dir
+        v1_backup_dir = self.runtime_base / "backups" / v1_receipt["install_id"]
+        self.assertTrue(v1_backup_dir.is_dir())
+        for entry in v1_backup_dir.iterdir():
+            entry.chmod(0o600)
+            entry.unlink()
+        v1_backup_dir.chmod(0o700)
+        v1_backup_dir.rmdir()
+
+        # uninstall() must still succeed and restore every config exactly
+        # to true pristine -- it never needed the pruned v1 backup dir.
+        result = installer.uninstall()
+        self.assertTrue(result["ok"])
+        for config_path in (self.main_config, self.account_config):
+            payload = json.loads(config_path.read_bytes())
+            self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
 
     def test_verify_and_uninstall_report_not_installed_after_uninstall(self) -> None:
         # P2-4 (independent Claude opus5/max review, 2026-08-17, round 1):

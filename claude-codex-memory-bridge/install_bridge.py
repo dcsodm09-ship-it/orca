@@ -27,7 +27,19 @@ from typing import Any, Callable
 
 BRIDGE_ID = "orca-claude-native-memory-v1"
 POLICY_SCHEMA = "orca.claude-native-memory-bridge-policy.v1"
-RECEIPT_SCHEMA = "orca.claude-native-memory-bridge-receipt.v1"
+# v2 (bumped from v1 without a version change at the time -- independent
+# Codex sol/xhigh review, 2026-08-17, round 3, P2-R3-COMPAT): round 3 added
+# required per-row fields (prev_backup/prev_sha256/prev_mode/after_backup)
+# but left this constant at v1, so a receipt written by the prior candidate
+# passed the top-level schema check here and only failed later, deep inside
+# per-row validation, with the same generic "invalid receipt config row"
+# error a genuinely corrupted receipt produces -- indistinguishable from
+# actual corruption. Bumping to v2 makes an old-shaped receipt fail the
+# top-level schema check immediately and unambiguously instead. No target
+# machine has ever completed a real install with any prior schema version
+# (confirmed at every review round so far), so there is no live v1 receipt
+# to migrate; this is a clean version bump, not a migration.
+RECEIPT_SCHEMA = "orca.claude-native-memory-bridge-receipt.v2"
 JOURNAL_SCHEMA = "orca.claude-native-memory-bridge-journal.v1"
 SSD_ROOT = Path("/Volumes/Extreme SSD")
 LOCAL_HOMES_ROOT = SSD_ROOT / "Orca/local-homes"
@@ -533,23 +545,69 @@ def _validate_receipt_shape(receipt: Any) -> dict[str, Any]:
     return receipt
 
 
+def _load_backup(backup_path: Path, expected_sha256: str) -> bytes:
+    raw = validate_owned_file(backup_path, private=True)
+    if sha256_bytes(raw) != expected_sha256:
+        raise InstallError(f"transaction backup digest mismatch: {backup_path}")
+    return raw
+
+
 def _receipt_rows(receipt: dict[str, Any]) -> list[dict[str, Any]]:
     _validate_receipt_shape(receipt)
     rows: list[dict[str, Any]] = []
     for raw_row in receipt["configs"]:
-        path = resolve_ssd_path(Path(raw_row["path"]))
+        # must_exist=False: a row whose target no longer exists at all
+        # (an account genuinely deleted, not just temporarily undiscovered
+        # -- see install()'s comment on carried-forward rows) is not an
+        # error at this layer; it is its own outcome, "absent", handled
+        # below and tolerated by every caller of this function.
+        path = resolve_ssd_path(Path(raw_row["path"]), must_exist=False)
         backup = resolve_ssd_path(Path(raw_row["backup"]))
-        backup_raw = validate_owned_file(backup, private=True)
-        if sha256_bytes(backup_raw) != raw_row["before_sha256"]:
-            raise InstallError(f"transaction backup digest mismatch: {backup}")
-        prev_backup = resolve_ssd_path(Path(raw_row["prev_backup"]))
-        prev_backup_raw = validate_owned_file(prev_backup, private=True)
-        if sha256_bytes(prev_backup_raw) != raw_row["prev_sha256"]:
-            raise InstallError(f"transaction prev-backup digest mismatch: {prev_backup}")
-        after_backup = resolve_ssd_path(Path(raw_row["after_backup"]))
-        after_backup_raw = validate_owned_file(after_backup, private=True)
-        if sha256_bytes(after_backup_raw) != raw_row["after_sha256"]:
-            raise InstallError(f"transaction after-backup digest mismatch: {after_backup}")
+        # backup (the true pristine baseline) is the only one of the three
+        # backup files every caller of this function actually needs, so it
+        # is the only one read/validated eagerly here. prev_backup and
+        # after_backup are validated lazily, only by the specific caller
+        # that needs their bytes (recover_pending_install()'s install-kind
+        # rollback, for prev_backup; nothing currently reads after_backup's
+        # bytes at all -- see install()'s comment on that field). Reading
+        # all three unconditionally for every row used to make uninstall()
+        # -- which never touches prev_backup or after_backup -- fail if
+        # either had become unreachable, including a *previous* install's
+        # now-deleted backup directory, which this file's own comments
+        # already document as never pruned (independent Claude opus5/max
+        # review, 2026-08-17, round 3, R3-P2-A).
+        backup_raw = _load_backup(backup, raw_row["before_sha256"])
+        prev_backup = resolve_ssd_path(Path(raw_row["prev_backup"]), must_exist=False)
+        after_backup = resolve_ssd_path(Path(raw_row["after_backup"]), must_exist=False)
+
+        if not path.exists() and not path.is_symlink():
+            # Genuinely absent: not "drift" (nothing to compare against --
+            # there is no content at all), not a modeling gap. uninstall()
+            # and recover_pending_install() both treat this as "nothing to
+            # do for this row" rather than refusing the whole transaction
+            # (independent Claude opus5/max review, 2026-08-17, round 3,
+            # R3-P1-A: round 3's original fix for Codex P1-R2-1 refused
+            # install() outright the moment a managed path went
+            # undiscovered, but uninstall()/verify() still unconditionally
+            # required the path to exist -- so a *permanently* deleted
+            # account, not just a temporarily renamed one, had no
+            # supported way to ever be uninstalled or verified again: every
+            # action refused forever except plan, the exact lockout
+            # signature round 1 and round 2's own fixes each separately
+            # introduced too).
+            rows.append(
+                {
+                    **raw_row,
+                    "path_obj": path,
+                    "backup_obj": backup,
+                    "backup_raw": backup_raw,
+                    "prev_backup_obj": prev_backup,
+                    "after_backup_obj": after_backup,
+                    "state": "absent",
+                    "install_state": "absent",
+                }
+            )
+            continue
 
         current = validate_owned_file(path)
         current_mode = _mode_bits(path)
@@ -590,9 +648,7 @@ def _receipt_rows(receipt: dict[str, Any]) -> list[dict[str, Any]]:
                 "backup_obj": backup,
                 "backup_raw": backup_raw,
                 "prev_backup_obj": prev_backup,
-                "prev_backup_raw": prev_backup_raw,
                 "after_backup_obj": after_backup,
-                "after_backup_raw": after_backup_raw,
                 "state": state,
                 "install_state": install_state,
             }
@@ -642,7 +698,11 @@ def recover_pending_install() -> dict[str, Any]:
 
     if kind == "install":
         if latest_matches_this_receipt:
-            drifted = [row for row in rows if row["install_state"] not in ("after", "both")]
+            # "absent" (a carried-forward row for a currently-undiscoverable
+            # path -- see install()'s comment) is an acceptable resting
+            # state for a committed install: that row was never part of
+            # this transaction's write set to begin with.
+            drifted = [row for row in rows if row["install_state"] not in ("after", "both", "absent")]
             if drifted:
                 raise InstallError("committed install journal has config drift")
             remove_file_durable(pending_path)
@@ -672,7 +732,8 @@ def recover_pending_install() -> dict[str, Any]:
         for row in reversed(rows):
             if row["install_state"] != "after":
                 continue
-            atomic_write(row["path_obj"], row["prev_backup_raw"], row["prev_mode"])
+            prev_backup_raw = _load_backup(row["prev_backup_obj"], row["prev_sha256"])
+            atomic_write(row["path_obj"], prev_backup_raw, row["prev_mode"])
             restored = validate_owned_file(row["path_obj"])
             restored_mode = _mode_bits(row["path_obj"])
             if sha256_bytes(restored) != row["prev_sha256"] or restored_mode != row["prev_mode"]:
@@ -685,7 +746,10 @@ def recover_pending_install() -> dict[str, Any]:
     if drifted:
         raise InstallError("pending uninstall cannot finish because a config drifted")
     for row in rows:
-        if row["state"] in ("before", "both"):
+        # "absent" (a carried-forward row whose path no longer exists at
+        # all) has nothing to revert -- see uninstall()'s own comment for
+        # why this must not abort the whole transaction.
+        if row["state"] in ("before", "both", "absent"):
             continue
         atomic_write(row["path_obj"], row["backup_raw"], row["before_mode"])
         restored = validate_owned_file(row["path_obj"])
@@ -733,18 +797,33 @@ def install() -> dict[str, Any]:
     # handler in place forever while reporting ok:true (independent Codex
     # sol/xhigh review, 2026-08-17, round 2, P1-R2-1, reproduced with a
     # plain rename-then-restore of one account's hooks.json between two
-    # ordinary installs -- no crash, race, or privilege needed). Failing
-    # closed here is the safe direction; a path only *gaining* receipt
-    # coverage (a newly discovered account) is unaffected and already
-    # handled correctly below.
+    # ordinary installs -- no crash, race, or privilege needed).
+    #
+    # The fix is to carry the row forward into the new receipt completely
+    # unchanged (not to refuse the install outright, which round 2's
+    # version of this fix did): a temporarily-undiscoverable path keeps
+    # its real before_*/prev_*/after_* baseline waiting for it, and when
+    # it reappears, the existing "does current content match the last
+    # known installed state" check above runs exactly as it always does.
+    # If the path never reappears -- a genuine deletion, not a temporary
+    # rename -- the carried-forward row is what lets uninstall()/verify()
+    # recognize and tolerate it as "absent" (see _receipt_rows()) rather
+    # than requiring it to exist, which is what refusing here would have
+    # forced them into needing anyway. Refusing the whole install instead
+    # (round 3's first attempt at this fix) closed Codex P1-R2-1 but
+    # reintroduced the identical "every action refuses forever except
+    # plan" lockout for the much more common permanent case -- deleting or
+    # re-provisioning a pooled Codex account, which the real target
+    # machine's account tooling does under a fresh UUID indistinguishable
+    # from deletion (independent Claude opus5/max review, 2026-08-17,
+    # round 3, R3-P1-A). A path only *gaining* receipt coverage (a newly
+    # discovered account) is unaffected and already handled correctly
+    # below.
     discovered_paths = {os.fspath(path) for path in configs}
-    missing_paths = sorted(set(previous_rows_by_path) - discovered_paths)
-    if missing_paths:
-        raise InstallError(
-            "the following previously-managed hook configs are no longer discoverable "
-            "and cannot be safely carried forward by install (run uninstall first): "
-            + ", ".join(missing_paths)
-        )
+    carried_forward_rows = [
+        previous_rows_by_path[missing_path]
+        for missing_path in sorted(set(previous_rows_by_path) - discovered_paths)
+    ]
 
     originals: dict[Path, bytes] = {}
     updated: dict[Path, bytes] = {}
@@ -858,7 +937,14 @@ def install() -> dict[str, Any]:
                 "after_mode": 0o600,
             }
             for path in configs
-        ],
+        ]
+        # Paths this install run could not discover are carried forward
+        # verbatim from the previous receipt (see the comment above
+        # carried_forward_rows's computation): this install never reads
+        # or touches them, so their row -- including whichever backup
+        # files it already points at -- is still exactly as valid as it
+        # was in the receipt it came from.
+        + carried_forward_rows,
     }
     receipt_raw = canonical_json(receipt)
     atomic_write(backup_dir / "receipt.json", receipt_raw, 0o600)
@@ -928,10 +1014,22 @@ def verify() -> dict[str, Any]:
     if sha256_bytes(policy_raw) != receipt.get("policy_sha256"):
         raise InstallError("installed policy digest mismatch")
     checked: list[str] = []
+    unreachable: list[str] = []
     for row in receipt["configs"]:
         if not isinstance(row, dict) or not isinstance(row.get("path"), str):
             raise InstallError("invalid receipt config row")
-        path = resolve_ssd_path(Path(row["path"]))
+        # must_exist=False, then check explicitly: a permanently deleted or
+        # re-provisioned account's path is "absent", not "drift" -- there is
+        # nothing left to compare content against, so verify() must skip and
+        # report it rather than raising (independent Claude opus5/max
+        # review, 2026-08-17, round 3, R3-P1-A; see install()'s
+        # carried-forward comment and _receipt_rows()'s "absent" branch,
+        # which this mirrors without going through _receipt_rows() itself
+        # since verify() does not need backup bytes).
+        path = resolve_ssd_path(Path(row["path"]), must_exist=False)
+        if not path.exists() and not path.is_symlink():
+            unreachable.append(os.fspath(path))
+            continue
         raw = validate_owned_file(path, private=True)
         if sha256_bytes(raw) != row.get("after_sha256"):
             raise InstallError(f"hook config drift: {path}")
@@ -948,6 +1046,7 @@ def verify() -> dict[str, Any]:
         "policy_sha256": receipt["policy_sha256"],
         "volume_uuid": receipt["volume_uuid"],
         "configs": checked,
+        "unreachable": unreachable,
     }
 
 
@@ -971,6 +1070,15 @@ def uninstall() -> dict[str, Any]:
             "refusing uninstall because a config changed: "
             + ", ".join(os.fspath(row["path_obj"]) for row in drifted)
         )
+    # A row whose target path is genuinely gone (e.g. a permanently deleted
+    # or re-provisioned Codex account -- see install()'s carried-forward
+    # comment and _receipt_rows()'s "absent" branch) has nothing to revert:
+    # there is no file to restore pristine content into, and creating one
+    # would resurrect a config for an account that no longer exists. Report
+    # it separately as unreachable instead of writing to it or refusing the
+    # whole uninstall over it (independent Claude opus5/max review,
+    # 2026-08-17, round 3, R3-P1-A).
+    unreachable = [os.fspath(row["path_obj"]) for row in rows if row["state"] == "absent"]
     receipt_raw = canonical_json(receipt)
     atomic_write(
         PENDING_PATH,
@@ -979,7 +1087,7 @@ def uninstall() -> dict[str, Any]:
     )
     try:
         for row in rows:
-            if row["state"] in ("before", "both"):
+            if row["state"] in ("before", "both", "absent"):
                 continue
             atomic_write(row["path_obj"], row["backup_raw"], row["before_mode"])
             restored = validate_owned_file(row["path_obj"])
@@ -1001,11 +1109,17 @@ def uninstall() -> dict[str, Any]:
         if outcome.get("state") == "uninstalled":
             return {
                 "ok": True,
-                "restored": [os.fspath(row["path_obj"]) for row in rows],
+                "restored": [os.fspath(row["path_obj"]) for row in rows if row["state"] != "absent"],
+                "unreachable": unreachable,
                 "runtime_retained": True,
             }
         raise InstallError("uninstall failed; configs restored to their pre-uninstall state") from exc
-    return {"ok": True, "restored": [os.fspath(row["path_obj"]) for row in rows], "runtime_retained": True}
+    return {
+        "ok": True,
+        "restored": [os.fspath(row["path_obj"]) for row in rows if row["state"] != "absent"],
+        "unreachable": unreachable,
+        "runtime_retained": True,
+    }
 
 
 def plan() -> dict[str, Any]:
