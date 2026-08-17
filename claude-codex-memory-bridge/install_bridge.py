@@ -462,12 +462,18 @@ def _validate_receipt_shape(receipt: Any) -> dict[str, Any]:
     # a raw KeyError/TypeError out of verify()/uninstall() instead of the
     # clean InstallError every other failure in this file produces
     # (independent Claude opus5/max review, 2026-08-17, round 1, P2-2).
+    # round 2 added `release_id` to this check (independent Claude opus5/max
+    # review, 2026-08-17, round 2, R2-P2-B: `verify()` reads
+    # `receipt["release_id"]` unguarded, so a receipt missing only that
+    # field passed every check here and still bare-KeyError'd in verify()).
     if (
         not isinstance(receipt, dict)
         or receipt.get("schema") != RECEIPT_SCHEMA
         or receipt.get("bridge_id") != BRIDGE_ID
         or not isinstance(receipt.get("install_id"), str)
         or not receipt.get("install_id")
+        or not isinstance(receipt.get("release_id"), str)
+        or not receipt.get("release_id")
         or not isinstance(receipt.get("release_dir"), str)
         or not receipt.get("release_dir")
         or not isinstance(receipt.get("script_sha256"), str)
@@ -483,20 +489,44 @@ def _validate_receipt_shape(receipt: Any) -> dict[str, Any]:
     for raw_row in raw_rows:
         if not isinstance(raw_row, dict):
             raise InstallError("invalid receipt config row")
-        required_strings = ("path", "backup", "before_sha256", "after_sha256")
+        # `prev_*`/`after_backup` are new this round (see _receipt_rows() and
+        # install()): `prev_sha256`/`prev_mode`/`prev_backup` record the
+        # config's content at the *start* of the install transaction that
+        # produced this row, distinct from `before_*` (the true pristine,
+        # pre-bridge baseline, which round 1 made durable and inherited
+        # across re-installs). `after_backup` durably stores this
+        # transaction's target bytes so a fresh recovery process can finish
+        # or roll back an interrupted install without having to re-derive
+        # them (independent Claude opus5/max review, 2026-08-17, round 2,
+        # R2-P1-A -- see recover_pending_install()'s "kind == install"
+        # branch for why the round-1/round-2 single before_*/after_* pair
+        # made every interrupted *upgrade* install permanently
+        # unrecoverable).
+        required_strings = (
+            "path",
+            "backup",
+            "prev_backup",
+            "after_backup",
+            "before_sha256",
+            "prev_sha256",
+            "after_sha256",
+        )
         if any(not isinstance(raw_row.get(key), str) or not raw_row[key] for key in required_strings):
             raise InstallError("invalid receipt config row")
         if any(
             re.fullmatch(r"[0-9a-f]{64}", raw_row[key]) is None
-            for key in ("before_sha256", "after_sha256")
+            for key in ("before_sha256", "prev_sha256", "after_sha256")
         ):
             raise InstallError("invalid receipt config digest")
         before_mode = raw_row.get("before_mode")
+        prev_mode = raw_row.get("prev_mode")
         after_mode = raw_row.get("after_mode")
         if (
             not isinstance(before_mode, int)
+            or not isinstance(prev_mode, int)
             or not isinstance(after_mode, int)
             or before_mode & ~0o777
+            or prev_mode & ~0o777
             or after_mode != 0o600
         ):
             raise InstallError("invalid receipt config mode")
@@ -512,26 +542,59 @@ def _receipt_rows(receipt: dict[str, Any]) -> list[dict[str, Any]]:
         backup_raw = validate_owned_file(backup, private=True)
         if sha256_bytes(backup_raw) != raw_row["before_sha256"]:
             raise InstallError(f"transaction backup digest mismatch: {backup}")
+        prev_backup = resolve_ssd_path(Path(raw_row["prev_backup"]))
+        prev_backup_raw = validate_owned_file(prev_backup, private=True)
+        if sha256_bytes(prev_backup_raw) != raw_row["prev_sha256"]:
+            raise InstallError(f"transaction prev-backup digest mismatch: {prev_backup}")
+        after_backup = resolve_ssd_path(Path(raw_row["after_backup"]))
+        after_backup_raw = validate_owned_file(after_backup, private=True)
+        if sha256_bytes(after_backup_raw) != raw_row["after_sha256"]:
+            raise InstallError(f"transaction after-backup digest mismatch: {after_backup}")
+
         current = validate_owned_file(path)
         current_mode = _mode_bits(path)
         current_sha = sha256_bytes(current)
-        before_matches = current_sha == raw_row["before_sha256"] and current_mode == raw_row["before_mode"]
-        after_matches = current_sha == raw_row["after_sha256"] and current_mode == raw_row["after_mode"]
-        if before_matches and after_matches:
+        matches_before = current_sha == raw_row["before_sha256"] and current_mode == raw_row["before_mode"]
+        matches_prev = current_sha == raw_row["prev_sha256"] and current_mode == raw_row["prev_mode"]
+        matches_after = current_sha == raw_row["after_sha256"] and current_mode == raw_row["after_mode"]
+
+        # `state` (before/prev/after/both/drift computed against BEFORE) is
+        # used by uninstall()'s own revert-to-pristine logic -- unchanged in
+        # meaning from round 1/2. `install_state` (computed against PREV
+        # instead) is used by recover_pending_install()'s install-journal
+        # branch below: whether an in-flight install can be rolled back to
+        # its own transaction-start state, which for an upgrade is the
+        # previous, fully-working install -- not pristine.
+        if matches_before and matches_after:
             state = "both"
-        elif before_matches:
+        elif matches_before:
             state = "before"
-        elif after_matches:
+        elif matches_after:
             state = "after"
         else:
             state = "drift"
+
+        if matches_prev and matches_after:
+            install_state = "both"
+        elif matches_prev:
+            install_state = "prev"
+        elif matches_after:
+            install_state = "after"
+        else:
+            install_state = "drift"
+
         rows.append(
             {
                 **raw_row,
                 "path_obj": path,
                 "backup_obj": backup,
                 "backup_raw": backup_raw,
+                "prev_backup_obj": prev_backup,
+                "prev_backup_raw": prev_backup_raw,
+                "after_backup_obj": after_backup,
+                "after_backup_raw": after_backup_raw,
                 "state": state,
+                "install_state": install_state,
             }
         )
     return rows
@@ -579,21 +642,40 @@ def recover_pending_install() -> dict[str, Any]:
 
     if kind == "install":
         if latest_matches_this_receipt:
-            drifted = [row for row in rows if row["state"] not in ("after", "both")]
+            drifted = [row for row in rows if row["install_state"] not in ("after", "both")]
             if drifted:
                 raise InstallError("committed install journal has config drift")
             remove_file_durable(pending_path)
             return {"ok": True, "state": "committed", "install_id": receipt["install_id"]}
-        drifted = [row for row in rows if row["state"] == "drift"]
+        # Roll back to PREV (this transaction's own starting point), not to
+        # BEFORE (true pristine). For a first-ever install these are the
+        # same value, so this behaves exactly like round 1's already
+        # SIGKILL-verified rollback. They diverge on an upgrade: a config
+        # not yet rewritten by this transaction still holds the *previous*
+        # install's fully-working content, which is neither pristine nor
+        # this transaction's target -- classifying that against BEFORE (as
+        # round 1/round 2 did) misread ordinary, untouched mid-upgrade
+        # state as "drift" and refused every action (recover/verify/
+        # install/uninstall) forever, with `plan` the only one still
+        # reporting ok:true (independent Claude opus5/max review,
+        # 2026-08-17, round 2, R2-P1-A, reproduced with no crash, no race,
+        # and no privilege -- an ordinary write failure on one config was
+        # enough). Rolling back to PREV also fixes the secondary issue that
+        # review flagged: the round-1/round-2 version, when it did manage
+        # to complete a rollback after all configs were written, rolled all
+        # the way back to pristine -- silently uninstalling the previously-
+        # working install instead of just undoing the failed upgrade
+        # attempt.
+        drifted = [row for row in rows if row["install_state"] == "drift"]
         if drifted:
             raise InstallError("pending install cannot roll back because a config drifted")
         for row in reversed(rows):
-            if row["state"] != "after":
+            if row["install_state"] != "after":
                 continue
-            atomic_write(row["path_obj"], row["backup_raw"], row["before_mode"])
+            atomic_write(row["path_obj"], row["prev_backup_raw"], row["prev_mode"])
             restored = validate_owned_file(row["path_obj"])
             restored_mode = _mode_bits(row["path_obj"])
-            if sha256_bytes(restored) != row["before_sha256"] or restored_mode != row["before_mode"]:
+            if sha256_bytes(restored) != row["prev_sha256"] or restored_mode != row["prev_mode"]:
                 raise InstallError(f"transaction rollback verification failed: {row['path_obj']}")
         remove_file_durable(pending_path)
         return {"ok": True, "state": "rolled_back", "install_id": receipt["install_id"]}
@@ -641,12 +723,45 @@ def install() -> dict[str, Any]:
         for row in previous_receipt["configs"]:
             previous_rows_by_path[row["path"]] = row
 
+    # A path this machine's latest receipt already manages, but that
+    # discover_hook_configs() does not find *this* time, must not be
+    # silently dropped from the receipt: the next install to rediscover it
+    # (nothing on disk changes for a config install() never touches) would
+    # see no previous-receipt row for it and treat its current -- already
+    # bridged -- content as a fresh pristine baseline, permanently losing
+    # the real one. uninstall() would then leave that config's bridge
+    # handler in place forever while reporting ok:true (independent Codex
+    # sol/xhigh review, 2026-08-17, round 2, P1-R2-1, reproduced with a
+    # plain rename-then-restore of one account's hooks.json between two
+    # ordinary installs -- no crash, race, or privilege needed). Failing
+    # closed here is the safe direction; a path only *gaining* receipt
+    # coverage (a newly discovered account) is unaffected and already
+    # handled correctly below.
+    discovered_paths = {os.fspath(path) for path in configs}
+    missing_paths = sorted(set(previous_rows_by_path) - discovered_paths)
+    if missing_paths:
+        raise InstallError(
+            "the following previously-managed hook configs are no longer discoverable "
+            "and cannot be safely carried forward by install (run uninstall first): "
+            + ", ".join(missing_paths)
+        )
+
     originals: dict[Path, bytes] = {}
     updated: dict[Path, bytes] = {}
     original_modes: dict[Path, int] = {}
     baseline_raw: dict[Path, bytes] = {}
     baseline_sha: dict[Path, str] = {}
     baseline_mode: dict[Path, int] = {}
+    # "prev" -- this transaction's own starting point, as opposed to
+    # "baseline"/before, the permanent pristine one -- lets an interrupted
+    # install be rolled back to the last known-*working* state instead of
+    # all the way to pristine (see recover_pending_install()'s "kind ==
+    # install" branch; independent Claude opus5/max review, 2026-08-17,
+    # round 2, R2-P1-A). For a first-ever install these are identical.
+    prev_raw: dict[Path, bytes] = {}
+    prev_sha: dict[Path, str] = {}
+    prev_mode: dict[Path, int] = {}
+    prev_backup_source: dict[Path, Path | None] = {}
     for path in configs:
         raw = validate_owned_file(path)
         current_mode = _mode_bits(path)
@@ -657,10 +772,15 @@ def install() -> dict[str, Any]:
         previous_row = previous_rows_by_path.get(os.fspath(path))
         if previous_row is None:
             # Never touched by a previous install this receipt covers --
-            # its current content genuinely is the pristine baseline.
+            # its current content genuinely is the pristine baseline, and
+            # (trivially) also this transaction's own starting point.
             baseline_raw[path] = raw
             baseline_sha[path] = sha256_bytes(raw)
             baseline_mode[path] = current_mode
+            prev_raw[path] = raw
+            prev_sha[path] = baseline_sha[path]
+            prev_mode[path] = current_mode
+            prev_backup_source[path] = None
         else:
             if sha256_bytes(raw) != previous_row["after_sha256"] or current_mode != previous_row["after_mode"]:
                 raise InstallError(
@@ -675,17 +795,44 @@ def install() -> dict[str, Any]:
             baseline_sha[path] = previous_row["before_sha256"]
             baseline_mode[path] = previous_row["before_mode"]
 
+            prior_after_backup = resolve_ssd_path(Path(previous_row["after_backup"]))
+            prior_after_backup_raw = validate_owned_file(prior_after_backup, private=True)
+            if sha256_bytes(prior_after_backup_raw) != previous_row["after_sha256"]:
+                raise InstallError(
+                    f"prior after-backup digest mismatch, refusing to trust baseline: {prior_after_backup}"
+                )
+            prev_raw[path] = prior_after_backup_raw
+            prev_sha[path] = previous_row["after_sha256"]
+            prev_mode[path] = previous_row["after_mode"]
+            prev_backup_source[path] = prior_after_backup
+
     write_runtime(release)
     install_id = timestamp_id()
     backup_dir = RUNTIME_BASE / "backups" / install_id
     ensure_private_dir(RUNTIME_BASE / "backups")
     ensure_private_dir(backup_dir)
     backups: dict[Path, Path] = {}
+    after_backups: dict[Path, Path] = {}
+    prev_backups: dict[Path, Path] = {}
     for path in configs:
-        backup_name = f"{sha256_bytes(os.fspath(path).encode('utf-8'))}.json"
-        backup_path = backup_dir / backup_name
+        digest = sha256_bytes(os.fspath(path).encode("utf-8"))
+        backup_path = backup_dir / f"{digest}.json"
         atomic_write(backup_path, baseline_raw[path], 0o600)
         backups[path] = backup_path
+
+        after_backup_path = backup_dir / f"{digest}-after.json"
+        atomic_write(after_backup_path, updated[path], 0o600)
+        after_backups[path] = after_backup_path
+
+        # A first-ever path's "prev" backup is the same file as its
+        # pristine one (they hold identical bytes); an already-managed
+        # path's "prev" backup is simply a pointer to the previous
+        # install's own after-backup file -- old backup directories are
+        # never pruned (see plan()'s docs / opus's round-2 report), so it
+        # is still there and does not need to be recopied.
+        prev_backups[path] = (
+            backup_path if prev_backup_source[path] is None else prev_backup_source[path]
+        )
     receipt = {
         "schema": RECEIPT_SCHEMA,
         "bridge_id": BRIDGE_ID,
@@ -702,8 +849,12 @@ def install() -> dict[str, Any]:
                 "path": os.fspath(path),
                 "backup": os.fspath(backups[path]),
                 "before_sha256": baseline_sha[path],
-                "after_sha256": sha256_bytes(updated[path]),
                 "before_mode": baseline_mode[path],
+                "prev_backup": os.fspath(prev_backups[path]),
+                "prev_sha256": prev_sha[path],
+                "prev_mode": prev_mode[path],
+                "after_backup": os.fspath(after_backups[path]),
+                "after_sha256": sha256_bytes(updated[path]),
                 "after_mode": 0o600,
             }
             for path in configs
@@ -901,9 +1052,35 @@ def _acquire_exclusive_lock() -> int:
     # recover_pending_install() internally and flock() locks an *open file
     # description*, not the whole process; a second open+flock from the
     # same process on the same lock file would otherwise self-block.
+    #
+    # Round-2 regression fixed here (independent Claude opus5/max review,
+    # 2026-08-17, round 2, R2-P1-B + R2-P2-A): the first version of this
+    # function called `lock_path.parent.mkdir(mode=0o700, parents=True,
+    # exist_ok=True)`. `pathlib.Path.mkdir(parents=True)` does NOT apply
+    # `mode` to intermediate parent directories it creates along the way --
+    # only to the final target -- so on a machine where `.shared-runtime`
+    # does not exist yet (confirmed to be the real state of the actual
+    # target machine at review time), that directory was created at the
+    # default umask-derived mode (0o755, not 0o700), `ensure_private_dir()`
+    # then correctly refused it as unsafe on every subsequent call, and
+    # nothing ever chmods it back -- a fresh machine's very first `install`
+    # failed permanently and non-self-healingly. Building the chain one
+    # level at a time through the existing, already-proven
+    # `ensure_private_dir()` (the same helper write_runtime() uses for this
+    # exact directory) creates each level with an explicit, non-parents
+    # `mkdir(mode=0o700)`, so this can never happen; also guards the open()
+    # itself (it previously ran unguarded, reintroducing the class of bare
+    # OSError the earlier atomic_write() fix exists to eliminate) and adds
+    # O_NOFOLLOW, matching every other open in this file.
+    ensure_private_dir(RUNTIME_BASE.parent)
+    ensure_private_dir(RUNTIME_BASE)
     lock_path = RUNTIME_BASE / "installer.lock"
-    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        descriptor = os.open(
+            lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600
+        )
+    except OSError as exc:
+        raise InstallError(f"cannot open lock file: {lock_path}") from exc
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:

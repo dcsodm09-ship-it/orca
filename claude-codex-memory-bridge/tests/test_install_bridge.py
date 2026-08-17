@@ -155,14 +155,17 @@ class InstallBridgeTests(unittest.TestCase):
             backup_dir.mkdir(parents=True)
             config = root / "hooks.json"
             backup = backup_dir / "config.json"
+            after_backup = backup_dir / "config-after.json"
             before = b'{"hooks":{"UserPromptSubmit":[]}}\n'
             after = b'{"hooks":{"UserPromptSubmit":[{"hooks":[]}]}}\n'
             installer.atomic_write(config, after, 0o600)
             installer.atomic_write(backup, before, 0o600)
+            installer.atomic_write(after_backup, after, 0o600)
             receipt = {
                 "schema": installer.RECEIPT_SCHEMA,
                 "bridge_id": installer.BRIDGE_ID,
                 "install_id": "install-1",
+                "release_id": "release-1",
                 "release_dir": os.fspath(runtime / "releases" / "r1"),
                 "script_sha256": "a" * 64,
                 "policy_sha256": "b" * 64,
@@ -172,8 +175,15 @@ class InstallBridgeTests(unittest.TestCase):
                         "path": os.fspath(config),
                         "backup": os.fspath(backup),
                         "before_sha256": installer.sha256_bytes(before),
-                        "after_sha256": installer.sha256_bytes(after),
                         "before_mode": 0o644,
+                        # First-ever install: "prev" (this transaction's own
+                        # starting point) is the same as "before" (true
+                        # pristine) -- see install()'s comment.
+                        "prev_backup": os.fspath(backup),
+                        "prev_sha256": installer.sha256_bytes(before),
+                        "prev_mode": 0o644,
+                        "after_backup": os.fspath(after_backup),
+                        "after_sha256": installer.sha256_bytes(after),
                         "after_mode": 0o600,
                     }
                 ],
@@ -205,14 +215,17 @@ class InstallBridgeTests(unittest.TestCase):
             backup_dir.mkdir(parents=True)
             config = root / "hooks.json"
             backup = backup_dir / "config.json"
+            after_backup = backup_dir / "config-after.json"
             before = b'{"hooks":{"UserPromptSubmit":[]}}\n'
             after = b'{"hooks":{"UserPromptSubmit":[{"hooks":[]}]}}\n'
             installer.atomic_write(config, after, 0o600)
             installer.atomic_write(backup, before, 0o600)
+            installer.atomic_write(after_backup, after, 0o600)
             receipt = {
                 "schema": installer.RECEIPT_SCHEMA,
                 "bridge_id": installer.BRIDGE_ID,
                 "install_id": "install-2",
+                "release_id": "release-2",
                 "release_dir": os.fspath(runtime / "releases" / "r2"),
                 "script_sha256": "a" * 64,
                 "policy_sha256": "b" * 64,
@@ -222,8 +235,12 @@ class InstallBridgeTests(unittest.TestCase):
                         "path": os.fspath(config),
                         "backup": os.fspath(backup),
                         "before_sha256": installer.sha256_bytes(before),
-                        "after_sha256": installer.sha256_bytes(after),
                         "before_mode": 0o644,
+                        "prev_backup": os.fspath(backup),
+                        "prev_sha256": installer.sha256_bytes(before),
+                        "prev_mode": 0o644,
+                        "after_backup": os.fspath(after_backup),
+                        "after_sha256": installer.sha256_bytes(after),
                         "after_mode": 0o600,
                     }
                 ],
@@ -441,6 +458,90 @@ class InstallEndToEndTests(unittest.TestCase):
         self.assertEqual(self.main_config.read_bytes(), pristine_main)
         self.assertEqual(self.account_config.read_bytes(), pristine_account)
 
+    def test_interrupted_upgrade_install_recovers_to_the_previous_working_state(self) -> None:
+        # R2-P1-A (independent Claude opus5/max review, 2026-08-17, round
+        # 2): an interrupted UPGRADE install used to be classified as
+        # unrecoverable "drift" -- the not-yet-rewritten config still held
+        # the *previous* install's content, which matched neither the
+        # redefined before_* (now true pristine) nor this transaction's
+        # after_*. recover/verify/install/uninstall all refused forever,
+        # with only `plan` still (misleadingly) reporting ok:true, and the
+        # bridge stayed active in every config the whole time. No crash
+        # needed to trigger it -- an ordinary write failure partway through
+        # an upgrade was enough, which is what this test injects.
+        installer.install()
+        self.source_script.chmod(0o644)
+        self.source_script.write_bytes(b"#!/usr/bin/env python3\n# upgraded fixture hook script\n")
+        self.source_script.chmod(0o644)
+
+        real_atomic_write = installer.atomic_write
+        calls = {"n": 0}
+
+        def failing_atomic_write(path, raw, mode=0o600):
+            calls["n"] += 1
+            # Let the durable pre-write phase (backups, after-backups,
+            # receipt.json, the pending journal) through, then fail before
+            # either config's *live* content is rewritten -- disk is left
+            # holding the fully consistent, still-working v1 install, same
+            # as opus's real-SIGKILL repro.
+            if calls["n"] == 7:
+                raise installer.InstallError("simulated disk error")
+            return real_atomic_write(path, raw, mode)
+
+        with mock.patch.object(installer, "atomic_write", side_effect=failing_atomic_write):
+            with self.assertRaises(installer.InstallError):
+                installer.install()
+
+        # Both configs must still show the v1-installed bridge -- untouched,
+        # not reverted to pristine and not left half-upgraded.
+        v1_payload = json.loads(self.main_config.read_bytes())
+        handlers = v1_payload["hooks"]["UserPromptSubmit"]
+        self.assertEqual(len(handlers), 2)
+        self.assertTrue(installer.owned_handler(handlers[1]))
+
+        # Every tool action must still work -- this is the crux of R2-P1-A:
+        # before the fix, every one of these raised "config drifted" forever.
+        self.assertTrue(installer.verify()["ok"])
+        self.assertTrue(installer.plan()["ok"])
+        installer.uninstall()
+        pristine_payload = json.loads(self.main_config.read_bytes())
+        self.assertEqual(len(pristine_payload["hooks"]["UserPromptSubmit"]), 1)
+
+    def test_install_refuses_when_a_previously_managed_config_goes_undiscovered(self) -> None:
+        # P1-R2-1 (independent Codex sol/xhigh review, 2026-08-17, round
+        # 2): a config path covered by the latest receipt but not
+        # discovered by *this* install call (e.g. a Codex account's
+        # hooks.json briefly renamed away and back) used to be silently
+        # treated as a brand-new path the next time it reappeared, using
+        # its current -- already bridged -- content as the new "pristine"
+        # baseline. uninstall() would then never revert it, while
+        # reporting ok:true. Failing closed the moment a previously-known
+        # path goes missing is the safe direction; a later install with
+        # every previously-known path present again must succeed.
+        # discover_hook_configs() itself requires at least 2 configs, so a
+        # second account is needed here -- otherwise renaming the only
+        # account's hooks.json away trips that pre-existing guard instead
+        # of the one this test targets.
+        second_account = self.local_homes / "codex-accounts/acct-two/home/hooks.json"
+        second_account.parent.mkdir(parents=True)
+        self._write(second_account, self._base_hooks_json())
+        installer.install()
+        missing = self.account_config.parent / "hooks.json.missing"
+        self.account_config.rename(missing)
+        try:
+            with self.assertRaises(installer.InstallError) as ctx:
+                installer.install()
+            self.assertIn("no longer discoverable", str(ctx.exception))
+        finally:
+            missing.rename(self.account_config)
+        # The account config was never touched by the refused install, so
+        # a normal install now (with every path discoverable again) must
+        # succeed and remain fully uninstallable.
+        installer.install()
+        installer.uninstall()
+        payload = json.loads(self.account_config.read_bytes())
+        self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
+
     def test_verify_and_uninstall_report_not_installed_after_uninstall(self) -> None:
         # P2-4 (independent Claude opus5/max review, 2026-08-17, round 1):
         # latest-receipt.json used to never be cleared by uninstall() at
@@ -464,6 +565,41 @@ class InstallEndToEndTests(unittest.TestCase):
         target = unwritable_dir / "sub" / "file.json"
         with self.assertRaises(installer.InstallError):
             installer.atomic_write(target, b"{}\n", 0o600)
+
+    def test_main_install_succeeds_end_to_end_when_shared_runtime_does_not_yet_exist(self) -> None:
+        # R2-P1-B (independent Claude opus5/max review, 2026-08-17, round
+        # 2): `_acquire_exclusive_lock()`'s first version relied on
+        # `Path.mkdir(parents=True)`, which does not apply `mode` to
+        # intermediate directories it creates -- so on a machine where
+        # `.shared-runtime` does not exist yet (confirmed to be the real
+        # state of the actual target machine at review time -- this is
+        # what the very first real `install` on a fresh machine hits), it
+        # was created at the default umask mode (0o755, not 0o700),
+        # ensure_private_dir() then permanently refused it, and nothing
+        # ever chmods it back. This drives the real, unmocked main()
+        # end-to-end (not install() called directly, which every other
+        # test in this class does and which never exercises the lock at
+        # all) via a real argv, on a fixture where setUp() deliberately
+        # never creates `.shared-runtime` -- the exact fresh-machine shape
+        # this bug needed to reproduce.
+        self.assertFalse(self.runtime_base.exists())
+        argv = ["install_bridge.py", "install"]
+        with mock.patch.object(sys, "argv", argv):
+            exit_code = installer.main()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stat.S_IMODE(self.runtime_base.parent.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(self.runtime_base.stat().st_mode), 0o700)
+        payload = json.loads(self.main_config.read_bytes())
+        self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 2)
+        self.assertTrue(installer.owned_handler(payload["hooks"]["UserPromptSubmit"][1]))
+        # A second real `main()` install (idempotent re-install) and a
+        # real `main()` uninstall must also both succeed end to end.
+        with mock.patch.object(sys, "argv", argv):
+            self.assertEqual(installer.main(), 0)
+        with mock.patch.object(sys, "argv", ["install_bridge.py", "uninstall"]):
+            self.assertEqual(installer.main(), 0)
+        restored = json.loads(self.main_config.read_bytes())
+        self.assertEqual(len(restored["hooks"]["UserPromptSubmit"]), 1)
 
     def test_concurrent_installer_invocations_fail_the_lock_instead_of_interleaving(self) -> None:
         # P2-3 (independent Claude opus5/max review, 2026-08-17, round 1):
@@ -490,10 +626,23 @@ class InstallEndToEndTests(unittest.TestCase):
         # P2-2 (independent Claude opus5/max review, 2026-08-17, round 1):
         # a receipt row missing a required field used to raise a bare
         # KeyError/TypeError out of read_receipt()'s callers.
+        #
+        # This deletes the top-level "release_id" field specifically
+        # (independent Claude opus5/max review, 2026-08-17, round 2,
+        # R2-P3): an earlier version of this test deleted
+        # configs[0]["path"] instead, which round 1's own inline check in
+        # verify() (`if not isinstance(row.get("path"), str): raise ...`)
+        # already caught *before* this test's P2-2 fix was even added --
+        # so it passed against the pre-P2-2 baseline too and did not
+        # actually exercise _validate_receipt_shape() at all.
+        # "release_id" is read unguarded at verify()'s
+        # `receipt["release_id"]` and round 1's shape validator did not
+        # cover it (that gap was round 2's R2-P2-B, fixed alongside this
+        # test).
         installer.install()
         latest_path = self.runtime_base / "latest-receipt.json"
         receipt = json.loads(latest_path.read_bytes())
-        del receipt["configs"][0]["path"]
+        del receipt["release_id"]
         latest_path.chmod(0o600)
         latest_path.write_bytes(installer.canonical_json(receipt))
         latest_path.chmod(0o600)
