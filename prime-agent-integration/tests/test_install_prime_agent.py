@@ -4398,6 +4398,25 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 (("help", "mcp"), ["help", "mcp"]),
                 (("help", "auth"), ["help", "auth"]),
                 (("help", "--", "zzzzzzzzzzzz"), ["help", "--", "zzzzzzzzzzzz"]),
+                # Regression for independent review round 11, 2026-08-18, P1:
+                # round 10's fuzzy-matcher transcription measured string
+                # length with plain len() (Unicode code points), while
+                # upstream measures JS UTF-16 code units -- these disagree
+                # for any astral (non-BMP) character, so an emoji-suffixed
+                # near-miss like this one computed a fuzzy-MATCH in the old
+                # Python port (guards skipped) but a real MISS in the actual
+                # upstream Node CLI (a genuine unprotected session start).
+                # Round 12 removed fuzzy matching entirely in favor of exact
+                # membership checks, which have no length semantics at all,
+                # so this and any other near-miss now unconditionally guards.
+                (
+                    ("help", "status\U0001F600\U0001F600"),
+                    ["help", "status\U0001F600\U0001F600"],
+                ),
+                (
+                    ("help", "config\U0001F600\U0001F600"),
+                    ["help", "config\U0001F600\U0001F600"],
+                ),
             )
             for arguments, base in miss_cases:
                 with self.subTest(arguments=arguments, mode="miss-guarded"):
@@ -4438,6 +4457,78 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 with self.subTest(arguments=arguments, mode="match-unguarded"):
                     observed = argv_of(run_wrapper(arguments))
                     self.assertEqual(observed, list(arguments))
+
+    def test_is_help_command_request_uses_exact_match_only(self) -> None:
+        # Regression for independent review round 11, 2026-08-18, P1: round
+        # 10's fuzzy-matcher transcription had a real bug (Unicode
+        # code-point vs. JS UTF-16 code-unit length mismatch) that let an
+        # emoji-suffixed argument fuzzy-match a real topic in Python while
+        # missing upstream's own real matcher, skipping RESOURCE_GUARDS for
+        # what was actually an unprotected session start. Round 12 removed
+        # fuzzy matching entirely; this directly proves that removal at the
+        # function level (executing the actual generated launch-guard
+        # script's source in a fresh namespace, the same content
+        # managed_launch_guard_script() writes to disk -- is_help_command_
+        # request() lives inside that generated script, not as an
+        # install_prime_agent module-level attribute), not just via the
+        # wrapper-subprocess fixture in
+        # test_help_argument_resource_guards_depend_on_upstream_match above.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            (tool_root / "release" / "bin").mkdir(parents=True, mode=0o700)
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", tool_root / "release"),
+                mock.patch.object(installer, "STATE_DIR", tool_root / "state"),
+            ):
+                source = installer.managed_launch_guard_script(
+                    tool_root / "release" / "bin" / "node",
+                    tool_root / "release" / "cli.js",
+                ).decode("utf-8")
+        namespace: dict[str, object] = {"__name__": "generated_launch_guard"}
+        exec(compile(source, "<generated-launch-guard>", "exec"), namespace)  # noqa: S102
+
+        self.assertFalse(
+            "help_edit_distance" in namespace,
+            "fuzzy-matching helper must be fully removed, not just unused",
+        )
+        self.assertFalse(
+            "help_find_command_suggestion" in namespace,
+            "fuzzy-matching helper must be fully removed, not just unused",
+        )
+        self.assertFalse(
+            "help_child_command_names" in namespace,
+            "fuzzy-matching helper must be fully removed, not just unused",
+        )
+        is_help_command_request = namespace["is_help_command_request"]
+        # Exact matches (unchanged from round 10): bare help, top-level and
+        # child command paths, and upstream's own removed-command names.
+        for path in (
+            [],
+            ["package"],
+            ["package", "install"],
+            ["session", "export"],
+            ["app"],  # HELP_REMOVED_COMMAND_NAMES
+        ):
+            with self.subTest(path=path, expect=True):
+                self.assertTrue(is_help_command_request(path))
+        # Near-misses that round 10's fuzzy matcher would have passed
+        # through unguarded (small edit distance to a real topic) must now
+        # be treated as misses -- including the specific class of bug round
+        # 11 found (astral/non-BMP characters appended to a real topic name,
+        # which round 10's code-point-length fuzzy threshold miscalculated).
+        for path in (
+            ["statu"],  # 1-edit typo of "status"
+            ["statuss"],
+            ["zzzzzzzzzzzz"],
+            ["status\U0001F600\U0001F600"],
+            ["config\U0001F600\U0001F600"],
+            ["package\U0001F600\U0001F600\U0001F600"],
+        ):
+            with self.subTest(path=path, expect=False):
+                self.assertFalse(is_help_command_request(path))
 
     def test_session_export_requires_session_start_protection_by_default(
         self,

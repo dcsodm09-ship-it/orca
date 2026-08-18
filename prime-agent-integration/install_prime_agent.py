@@ -2514,15 +2514,39 @@ def resolve_upstream_public_command(arguments: list[str]) -> str | None:
     return None
 
 
-# Round 10, 2026-08-18 (independent review, P1): a faithful Python
-# re-implementation of the pinned v0.7.2 upstream's own COMMAND_SPECS /
-# REMOVED_COMMAND_NAMES / isHelpCommandRequest() / findCommandSuggestion() /
-# editDistance() (dist/cli/command-registry.js, read unminified). Needed
-# because -- unlike every other guard-placement decision in this script --
-# "help"'s own upstream dispatcher (runPublicCommand() in dist/cli/
-# public-command.js) treats `args[0] === "help" && isHelpCommandRequest(
-# args.slice(1))` as a single, all-or-nothing choice between two mutually
-# exclusive, INCOMPATIBLE argv shapes:
+# Round 10, 2026-08-18 (independent review, P1), REVISED round 12,
+# 2026-08-18 (independent review, P1): round 10 originally faithfully
+# transcribed the pinned v0.7.2 upstream's own isHelpCommandRequest() /
+# findCommandSuggestion() / editDistance() FUZZY matcher
+# (dist/cli/command-registry.js, read unminified) into Python. Round 11's
+# independent review found a real, exploitable divergence in that
+# transcription: upstream measures string length in JS UTF-16 code units,
+# the Python port used code-point length (plain len() on a str) -- these
+# disagree for any character outside the Basic Multilingual Plane (most
+# emoji), so e.g. "help status\U0001F600\U0001F600" computed a fuzzy-MATCH
+# in Python (guards skipped) but a MISS in the real upstream Node CLI (a
+# real, unprotected session start loading $PWD/.prime/agent/extensions/*.js)
+# -- reproduced end-to-end, zero opt-in, no settings.json required. This is
+# the second real bug the hand-reimplementation approach produced in as many
+# rounds (round 10 built it, round 11 found it wrong), so round 12
+# deliberately ABANDONS fuzzy/edit-distance matching entirely:
+# is_help_command_request() below now does EXACT, case-sensitive membership
+# checks only, against the same pinned COMMAND_SPECS / REMOVED_COMMAND_NAMES
+# set -- a finite string-set membership test has no length semantics, no
+# distance calculation, and therefore no room for this class of bug.
+# Traded away deliberately: upstream's "did you mean" fuzzy suggestion for a
+# genuine typo (e.g. "help satus" meaning "status") no longer passes
+# through unguarded the way upstream's own dispatcher would handle it --
+# it now gets RESOURCE_GUARDS applied like any other miss. This is safe and
+# low-cost: the guards only disable extension/skill/prompt-template
+# loading, which a help query does not functionally need, and the user
+# still reaches upstream's own "did you mean" output, just guarded.
+#
+# Unlike every other guard-placement decision in this script, "help"'s own
+# upstream dispatcher (runPublicCommand() in dist/cli/public-command.js)
+# treats `args[0] === "help" && isHelpCommandRequest(args.slice(1))` as a
+# single, all-or-nothing choice between two mutually exclusive, INCOMPATIBLE
+# argv shapes:
 #   * a MATCH (isHelpCommandRequest() true) short-circuits into
 #     printRequestedHelp(args.slice(1)), which walks args.slice(1) itself as
 #     a literal command PATH -- formatCommandHelp()/getCommandSpec() there
@@ -2601,46 +2625,12 @@ def help_command_spec_exists(path: tuple[str, ...]) -> bool:
     return path in HELP_COMMAND_PATHS
 
 
-def help_child_command_names(parent: tuple[str, ...]) -> list[str]:
-    depth = len(parent) + 1
-    return [
-        spec[-1]
-        for spec in HELP_COMMAND_PATHS
-        if len(spec) == depth and spec[: len(parent)] == parent
-    ]
-
-
-def help_edit_distance(left: str, right: str) -> int:
-    # Direct transcription of editDistance() (dist/cli/command-registry.js):
-    # single-row Wagner-Fischer Levenshtein distance.
-    previous = list(range(len(right) + 1))
-    for left_index in range(1, len(left) + 1):
-        diagonal = previous[0]
-        previous[0] = left_index
-        for right_index in range(1, len(right) + 1):
-            above = previous[right_index]
-            previous[right_index] = min(
-                previous[right_index] + 1,
-                previous[right_index - 1] + 1,
-                diagonal
-                + (0 if left[left_index - 1] == right[right_index - 1] else 1),
-            )
-            diagonal = above
-    return previous[len(right)]
-
-
-def help_find_command_suggestion(token: str, candidates: list[str]) -> str | None:
-    closest: tuple[str, int] | None = None
-    for candidate in candidates:
-        distance = help_edit_distance(token, candidate)
-        if closest is None or distance < closest[1]:
-            closest = (candidate, distance)
-    if closest is None or closest[1] > max(2, len(token) // 3):
-        return None
-    return closest[0]
-
-
 def is_help_command_request(path: list[str]) -> bool:
+    # Round 12, 2026-08-18: EXACT membership checks only -- no fuzzy/
+    # edit-distance matching (see the module comment above HELP_COMMAND_PATHS
+    # for why that approach was abandoned after round 11 found a real bug in
+    # round 10's fuzzy-matcher transcription). Any path not covered by one of
+    # these three exact checks is treated as a miss, full stop.
     path_tuple = tuple(path)
     if len(path_tuple) == 0 or help_command_spec_exists(path_tuple):
         return True
@@ -2648,9 +2638,7 @@ def is_help_command_request(path: list[str]) -> bool:
         return True
     if help_command_spec_exists(path_tuple[:1]):
         return True
-    parent = path_tuple[:-1]
-    candidates = help_child_command_names(parent)
-    return help_find_command_suggestion(path_tuple[-1], candidates) is not None
+    return False
 
 
 def insert_resource_guards_before_separator(
