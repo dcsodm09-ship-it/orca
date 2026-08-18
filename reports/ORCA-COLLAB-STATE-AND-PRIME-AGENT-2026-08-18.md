@@ -7,6 +7,29 @@
 
 ---
 
+## 0a. 两个流程可信度问题（必须先读）
+
+1. **Round 1-3 的"Codex sol/xhigh"结论不可信**。本机另一个并发会话（不同 session id）
+   独立验证：Workflow 工具的 `agent(prompt, {agentType:'codex-design'})` 会**静默
+   降级到 claude-haiku**，`meta.json` 照样记录 `agentType:"codex-design"`，但实际
+   跑的模型是 `claude-haiku-4-5-20251001`，全程零次 `mcp__codex-pool__pool_run`
+   调用——即没有真的把任务发给 Codex。这正是本报告第 1 节 round 1-3 使用的派发方式
+   （通过最早那个大 Workflow `wf_a7fc1fef-ad1` 内部的 `agentType:'codex-design'`）。
+   **好消息**：round 1-3 这三轮 Claude opus/max 那一路是真实的、独立跑的，且每一轮
+   都自己挑出过真实 P1，所以从未出现过"基于虚假双 GO 而误放行"的情况——真正靠得住的
+   Codex 独立复核，是从 round 4 起改走裸 `Agent` 工具/真正 Orca orchestration 之后
+   才开始的（round 5、7、9 成功，round 4、11 被内容策略拦截）。这个教训已经写进本机
+   记忆，以后凡是需要真 Codex 复核，一律走裸 `Agent` 工具或真正 Orca orchestration，
+   不再通过 Workflow 内部的 `agentType` 选项。
+2. **Round 13 的双复核目前只能先派 Codex 一路**。派 round 12 修复的下一个 Claude
+   opus/max 子 agent 时，命中了 Claude 账号的**每周用量上限**（重置时间：Asia/Taipei
+   18:00，本文写作时约还差 1 小时）。这不是临时性错误，重试没有意义。Round 12
+   （放弃模糊匹配、改成精确匹配）是我在额度耗尽后**自己直接改的**，不是子 agent 做的
+   ——已经跑过完整测试套件（88/88，两个解释器）并现场验证过修复前后的行为差异，但
+   还没有拿到任何独立第二方复核。Codex 走 Orca orchestration 起真实终端进程，不占用
+   Claude 账号配额，所以 Codex 这一路可以现在就派；Claude opus/max 这一路要等额度
+   重置后才能补上。**在两路都真正确认干净之前，这仍然是 NO-GO 状态，不装、不启用。**
+
 ## 0. 结论速览
 
 - **prime-agent-integration 未安装、不能安装**：即便本轮安全修复全部收敛，`sandbox_e2e.py`
@@ -368,6 +391,30 @@ Node 那边被判定"没命中"（落到真实的、未受保护的会话启动�
 不再尝试忠实复刻上游的模糊匹配算法，改成对一份有限、精确、上游真实存在的命令/主题
 名单做精确匹配，不命中就一律套保护（牺牲"打错字也能看到提示"这点体验，换掉"自己
 实现的匹配算法可能有 subtle bug"这整类风险——这类风险已经连续两轮真的咬到人了）。
+
+### Round 12：策略性简化（我自己直接改的，未经子 agent，未经复核）
+
+派给子 agent 的 round 12 修复任务执行到一半，命中了 Claude 账号每周用量上限（见上面
+"0a. 两个流程可信度问题"第 2 条），子 agent 被系统终止。**改由我自己在主对话线程里
+直接读代码、直接改**：`is_help_command_request()` 删掉了模糊匹配分支，只保留三条精确
+成员检查（裸 `help`、完整路径精确匹配 `HELP_COMMAND_PATHS`、首段精确匹配）；
+`help_edit_distance()`/`help_find_command_suggestion()`/`help_child_command_names()`
+三个函数整个删除（不再半吊子留着）。**验证方式**：把 HEAD（修复前）版本的
+`managed_launch_guard_script()` 生成内容单独 load 到一个隔离 namespace 里直接调用
+`is_help_command_request()`，现场确认 `status😀😀`/`config😀😀`/`package😀😀😀`
+三个 emoji 用例在修复前返回 `True`（bug 复现：被误判成真帮助主题）、修复后返回
+`False`；给 `test_help_argument_resource_guards_depend_on_upstream_match` 的
+miss_cases 加了同款 emoji 复现，另外新增一个直接单测
+`test_is_help_command_request_uses_exact_match_only`（同样是先生成真实 guard 脚本
+内容再 exec 到隔离 namespace 里测，不是测 install_prime_agent 模块本身的属性——这段
+逻辑活在生成脚本内容的字符串模板里，不是模块顶层代码）。88/88 测试通过（两个解释器），
+`py_compile` 干净，round 10 的 `session export`/`-p`/`--print` 修复重跑确认仍然成立。
+README 测试计数 80→88（这个数字其实从 round 8 起就一直没更新过，一直没人顾上）。
+已提交 `60adcbbc7a`。
+
+**Round 13 双复核**：Codex 这一路走 Orca orchestration 真实终端进程，不占用 Claude
+账号配额，现在就能派；Claude opus/max 这一路要等每周额度重置（Asia/Taipei 18:00）
+才能补上。
 
 `sandbox_e2e.py` 真实网络路径运行（未 mock，真实调用官方下载）在第一步即失败：
 
