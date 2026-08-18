@@ -479,6 +479,80 @@ def verify_unchanged_private_ssd_file(
         raise PrimeInstallError(f"managed file changed before use: {path}")
 
 
+def verify_unchanged_private_ssd_asset_digest(
+    path: Path,
+    expected_sha256: str,
+    expected_identity: tuple[int, int],
+    *,
+    max_bytes: int = MAX_TAR_EXPANDED_BYTES,
+) -> None:
+    """Digest-based counterpart of verify_unchanged_private_ssd_file(), for
+    managed assets too large to justify keeping a byte-exact in-memory copy
+    alive for the entire remainder of an install merely to re-compare
+    against later.
+
+    Re-checks the well-known path's (st_dev, st_ino) identity AND
+    recomputes its SHA-256 content digest RIGHT NOW, comparing both against
+    values captured at an earlier verification point -- immediately before
+    a subsequent consumer this installer does not control (a spawned `npm`
+    subprocess that independently re-reads the path from disk on its own)
+    is allowed to use it. This closes the exact same verify-then-use gap
+    verify_unchanged_private_ssd_file() closes for package.json/
+    package-lock.json, applied here to the locally patched tarballs
+    make_patched_asset() produces: those assets can be materially larger
+    than the few KB those two generated files are, so this compares a
+    digest captured once at creation time instead of retaining the full
+    tarball bytes in memory across the entire two-`npm`-invocation window.
+
+    Independent review round 16, 2026-08-18, P1: make_patched_asset()'s
+    output was the only downloaded-or-generated release asset this
+    installer ever fed to npm without ANY re-verification between
+    publication and consumption -- round 14 closed this identical gap for
+    the two DOWNLOADED release assets (safe_extract_main_asset(),
+    extract_node_toolchain()) via the same expected_sha256 +
+    read_private_file() pattern this function applies to the locally BUILT
+    patched tarball. See verify_patched_assets_unchanged() for the two call
+    sites in _install_locked() (immediately before `npm install
+    --package-lock-only` and immediately before `npm ci`).
+    """
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise PrimeInstallError(f"cannot inspect managed asset before use: {path}") from exc
+    if (before.st_dev, before.st_ino) != expected_identity:
+        raise PrimeInstallError(f"managed asset identity changed before use: {path}")
+    raw = read_private_ssd_file(path, max_bytes=max_bytes)
+    if sha256_bytes(raw) != expected_sha256:
+        raise PrimeInstallError(f"managed asset changed before use: {path}")
+
+
+def verify_patched_assets_unchanged(
+    assets_dir: Path,
+    patched_assets: dict[str, str],
+    patched_asset_identities: dict[str, tuple[int, int]],
+) -> None:
+    """Re-verify every locally patched tarball make_patched_asset() produced
+    is still exactly the content and inode identity captured right after
+    its own publication, immediately before each of the two npm
+    invocations in _install_locked() that independently re-read these
+    paths from RELEASE_DIR/assets on their own (`npm install
+    --package-lock-only`, which generates the lock, and `npm ci`, which
+    actually installs from it). Without this, a same-UID actor who swaps
+    one of these files after make_patched_asset() writes it but before
+    either npm invocation consumes it gets their content silently used --
+    the closure-hash check on the GENERATED lock cannot see the
+    difference on its own, since it validates what npm reports having
+    read, not what is on disk right now (independent review round 16,
+    2026-08-18, P1; see validate_generated_lock()'s own content-digest
+    check, added the same round, for the complementary fix that also binds
+    the closure validation itself to the real on-disk content).
+    """
+    for name, digest in patched_assets.items():
+        verify_unchanged_private_ssd_asset_digest(
+            assets_dir / name, digest, patched_asset_identities[name]
+        )
+
+
 def rename_noreplace(source: Path, destination: Path) -> None:
     """Atomically rename on Darwin while refusing to replace the destination."""
     libc = ctypes.CDLL(None, use_errno=True)
@@ -1601,7 +1675,7 @@ def make_patched_asset(
     expected_name: str,
     managed_name: str,
     output_name: str,
-) -> tuple[Path, str, dict[str, Any]]:
+) -> tuple[Path, str, dict[str, Any], tuple[int, int]]:
     safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", managed_name).strip("-")
     unpacked = RELEASE_DIR / f".unpacked-{safe_name}"
     # Must be freshly created, never a pre-existing directory: see
@@ -1778,8 +1852,21 @@ def make_patched_asset(
     patched_raw = buffer.getvalue()
     patched = assets_dir / output_name
     atomic_create_private_file(patched, patched_raw, 0o600)
+    # Captured immediately after atomic_create_private_file() itself already
+    # re-verified this exact identity as part of publication -- before
+    # shutil.rmtree(unpacked) below, and before returning control to the
+    # caller -- so the window between "this file is known-good" and "the
+    # caller has a value it can re-check later" is as narrow as this
+    # in-process call sequence allows. _install_locked() threads this
+    # identity, together with the digest returned below, through to
+    # verify_patched_assets_unchanged(), which re-verifies both immediately
+    # before each of the two npm invocations that independently re-read
+    # this path from disk (round 16, 2026-08-18, P1; see
+    # verify_unchanged_private_ssd_asset_digest()).
+    published_stat = patched.lstat()
+    published_identity = (published_stat.st_dev, published_stat.st_ino)
     shutil.rmtree(unpacked)
-    return patched, sha256_bytes(patched_raw), manifest
+    return patched, sha256_bytes(patched_raw), manifest, published_identity
 
 
 def resolved_local_asset(resolved: str) -> Path:
@@ -1796,6 +1883,34 @@ def resolved_local_asset(resolved: str) -> Path:
 
 
 def normalized_production_lock(generated: dict[str, Any]) -> bytes:
+    """Produce the canonical bytes GENERATED_LOCK_SHA256 is pinned against:
+    the exact generated package-lock.json npm produced, with only the
+    parts that are legitimately environment-dependent replaced by a fixed
+    placeholder, so the SAME closure reproduced on any darwin-arm64 machine
+    with the pinned Node/npm toolchain hashes to the SAME pinned constant.
+
+    Two things are normalized for the four locally patched assets
+    (`prime-agent` + the three `@earendil-works/pi-*` workspace packages):
+    "resolved" (a `file:` URL that literally embeds RELEASE_DIR's absolute
+    path) is genuinely path-dependent and must be normalized for the hash
+    to be portable at all. "integrity" is NOT path-dependent -- it is
+    npm's own content-derived digest of the local tarball -- but was
+    normalized to a fixed placeholder anyway, which made GENERATED_LOCK_SHA256
+    -- and therefore validate_generated_lock()'s top-level hash check --
+    unable to distinguish two DIFFERENT patched-tarball contents as long as
+    both had the same declared name/version (independent review round 16,
+    2026-08-18, P1). This function's normalization is left unchanged here
+    (recomputing GENERATED_LOCK_SHA256 against real content would require
+    an independent real-npm replay this installer's own test/review
+    environment cannot perform); instead validate_generated_lock() now
+    performs its own separate, real content-digest check for these same
+    four rows against the actual on-disk assets, using the SAME
+    freshly-verified digests _install_locked() already captures from
+    make_patched_asset() and re-verifies via verify_patched_assets_unchanged()
+    -- closing the gap this function's own placeholder leaves open without
+    touching what this function hashes or what GENERATED_LOCK_SHA256 is
+    pinned to.
+    """
     release_text = os.fspath(RELEASE_DIR)
     encoded_release = urllib.parse.quote(release_text, safe="/")
 
@@ -1831,7 +1946,40 @@ def normalized_production_lock(generated: dict[str, Any]) -> bytes:
     return canonical_json(normalized)
 
 
-def validate_generated_lock(raw: bytes, generated: dict[str, Any]) -> dict[str, Any]:
+def validate_generated_lock(
+    raw: bytes,
+    generated: dict[str, Any],
+    patched_asset_sha256: dict[str, str],
+) -> dict[str, Any]:
+    """`patched_asset_sha256` maps each locally patched asset's FILENAME
+    (assets_dir-relative, e.g. MAIN_PATCHED_ASSET) to the real SHA-256
+    digest _install_locked() captured from make_patched_asset() and just
+    re-verified, immediately before this call, via
+    verify_patched_assets_unchanged(). Required (no default) so a caller
+    can never silently skip binding this check to real content -- the same
+    fail-closed-by-construction discipline every other mandatory
+    verify-then-use parameter in this file already uses.
+
+    normalized_production_lock()'s closure-hash comparison below treats
+    every locally patched asset's "integrity" field as a fixed placeholder
+    (see that function's own docstring for why), which makes it, on its
+    own, unable to distinguish two DIFFERENT patched-tarball contents that
+    declare the same name/version/resolved path. The per-row check inside
+    the local-asset branch below is this function's OWN, separate defense
+    against exactly that: it independently re-reads the actual on-disk
+    asset right now and requires its SHA-256 match `patched_asset_sha256`
+    -- unconditionally, regardless of what (if anything) npm's own
+    generated lock says -- so a same-UID content swap is caught here even
+    though the closure hash above cannot see it (independent review round
+    16, 2026-08-18, P1). If npm's row DOES include an "integrity" value
+    (mirroring the registry-package branch's own, unconditional
+    requirement), it must be well-formed, but its presence is not itself
+    required: this installer's review/test environment cannot verify
+    whether real npm always populates "integrity" for a LOCAL tarball
+    `file:` dependency the way it always does for a registry dependency,
+    and the digest re-check above does not depend on that assumption
+    either way.
+    """
     del raw
     observed_sha256 = sha256_bytes(normalized_production_lock(generated))
     if observed_sha256 != GENERATED_LOCK_SHA256:
@@ -1860,6 +2008,11 @@ def validate_generated_lock(raw: bytes, generated: dict[str, Any]) -> dict[str, 
             for name, asset_name in WORKSPACE_ASSETS.items()
         },
     }
+    expected_asset_filenames = {path.name for path in local_assets.values()}
+    if set(patched_asset_sha256) != expected_asset_filenames:
+        raise PrimeInstallError(
+            "patched asset digest map does not match the managed local assets"
+        )
     checked = 0
     registry_checked = 0
     observed_local: set[str] = set()
@@ -1872,12 +2025,42 @@ def validate_generated_lock(raw: bytes, generated: dict[str, Any]) -> dict[str, 
         version = row.get("version")
         if name in local_assets:
             resolved = row.get("resolved")
+            # Whether npm's own generated lock includes a real "integrity"
+            # value for a LOCAL tarball `file:` dependency (as opposed to a
+            # registry dependency, which always has one) is not something
+            # this installer's own review/test environment can verify
+            # against a real npm run -- unlike the mandatory content-digest
+            # re-check a few lines below, which does not depend on that
+            # assumption at all. So presence is NOT required here (an
+            # incorrect assumption would fail every real install), but if
+            # npm DID include one, it must be well-formed -- mirroring the
+            # registry branch's own requirement below as defense in depth,
+            # never as the actual security boundary for this branch.
+            integrity = row.get("integrity")
+            if integrity is not None and (
+                not isinstance(integrity, str)
+                or not re.fullmatch(r"sha512-[A-Za-z0-9+/=]+", integrity)
+            ):
+                raise PrimeInstallError(f"generated managed asset identity drift: {name}")
             if version != VERSION or not isinstance(resolved, str):
                 raise PrimeInstallError(f"generated managed asset identity drift: {name}")
             actual_asset = resolved_local_asset(resolved)
             expected_asset = resolve_ssd(local_assets[name])
             if actual_asset != expected_asset:
                 raise PrimeInstallError(f"generated managed asset path drift: {name}")
+            # Real content-digest re-check, independent of the closure hash
+            # above (which cannot see this, since normalized_production_lock()
+            # normalizes this same field to a fixed placeholder before
+            # hashing -- see that function's docstring). Reads the actual
+            # on-disk bytes right now rather than trusting anything captured
+            # earlier, closing the gap where two different patched-tarball
+            # contents with the same declared name/version/resolved path
+            # would otherwise pass identically (independent review round
+            # 16, 2026-08-18, P1).
+            expected_digest = patched_asset_sha256[expected_asset.name]
+            actual_raw = read_private_ssd_file(actual_asset, max_bytes=MAX_TAR_EXPANDED_BYTES)
+            if sha256_bytes(actual_raw) != expected_digest:
+                raise PrimeInstallError(f"generated managed asset content drift: {name}")
             observed_local.add(name)
             checked += 1
             continue
@@ -3841,6 +4024,13 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     )
     patched_assets: dict[str, str] = {}
     patched_manifests: dict[str, dict[str, Any]] = {}
+    # Populated alongside patched_assets from each make_patched_asset() call
+    # below and re-verified, together with patched_assets' digests, by
+    # verify_patched_assets_unchanged() immediately before each of the two
+    # npm invocations that independently re-read these paths from disk on
+    # their own (round 16, 2026-08-18, P1; see
+    # verify_unchanged_private_ssd_asset_digest()).
+    patched_asset_identities: dict[str, tuple[int, int]] = {}
     workspace_order = (
         "@earendil-works/pi-ai",
         "@earendil-works/pi-tui",
@@ -3849,7 +4039,7 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     for managed_name in workspace_order:
         declaration = WORKSPACE_PACKAGES[managed_name]
         official_asset_name = str(declaration["official_asset"])
-        patched, digest, manifest = make_patched_asset(
+        patched, digest, manifest, identity = make_patched_asset(
             assets_dir / official_asset_name,
             ASSETS[official_asset_name],
             upstream_lock,
@@ -3860,8 +4050,9 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
         )
         patched_assets[patched.name] = digest
         patched_manifests[managed_name] = manifest
+        patched_asset_identities[patched.name] = identity
     main_asset_name = f"prime-agent-{VERSION}.tgz"
-    patched_asset, patched_sha, patched_manifest = make_patched_asset(
+    patched_asset, patched_sha, patched_manifest, patched_asset_identity = make_patched_asset(
         assets_dir / main_asset_name,
         ASSETS[main_asset_name],
         upstream_lock,
@@ -3872,6 +4063,7 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     )
     patched_assets[patched_asset.name] = patched_sha
     patched_manifests["prime-agent"] = patched_manifest
+    patched_asset_identities[patched_asset.name] = patched_asset_identity
     root_manifest = {
         "name": "orca-managed-prime-agent",
         "version": VERSION,
@@ -3889,6 +4081,13 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     # publication and each of the two npm reads below (independent review
     # round 5, 2026-08-18, P2-3; see verify_unchanged_private_ssd_file()).
     verify_unchanged_private_ssd_file(manifest_path, manifest_raw, manifest_identity)
+    # Same re-check, extended to the four locally patched tarballs
+    # themselves -- `npm install --package-lock-only` reads all four of
+    # them (via package.json's file: dependencies) to generate the lock
+    # below, so they need the identical verify-then-use re-check
+    # package.json just got, immediately before this same invocation
+    # (round 16, 2026-08-18, P1).
+    verify_patched_assets_unchanged(assets_dir, patched_assets, patched_asset_identities)
     run_npm(
         os.fspath(npm_cli),
         os.fspath(node),
@@ -3921,13 +4120,17 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     generated_lock = strict_json(generated_lock_raw)
     if not isinstance(generated_lock, dict):
         raise PrimeInstallError("generated lock is invalid")
-    closure = validate_generated_lock(generated_lock_raw, generated_lock)
+    closure = validate_generated_lock(generated_lock_raw, generated_lock, patched_assets)
     # Re-verify both package.json and the just-validated package-lock.json
     # are still exactly what was read/validated above, immediately before
     # `npm ci` independently re-reads both from RELEASE_DIR on its own
     # (same rationale as the "install" re-check above).
     verify_unchanged_private_ssd_file(manifest_path, manifest_raw, manifest_identity)
     verify_unchanged_private_ssd_file(lock_path, generated_lock_raw, package_lock_identity)
+    # Same re-check as before the "install" step above, immediately before
+    # `npm ci` independently re-reads all four patched tarballs from disk
+    # on its own to actually install them (round 16, 2026-08-18, P1).
+    verify_patched_assets_unchanged(assets_dir, patched_assets, patched_asset_identities)
     run_npm(
         os.fspath(npm_cli),
         os.fspath(node),

@@ -68,14 +68,20 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 },
             },
         )
+        patched_asset_sha256: dict[str, str] = {}
         for index, (name, asset_name) in enumerate(local_assets.items()):
-            (assets / asset_name).write_bytes(name.encode("utf-8"))
+            content = name.encode("utf-8")
+            asset_path = assets / asset_name
+            asset_path.write_bytes(content)
+            os.chmod(asset_path, 0o600)
+            patched_asset_sha256[asset_name] = installer.sha256_bytes(content)
             packages.setdefault(
                 f"node_modules/local-{index}",
                 {
                     "name": name,
                     "version": installer.VERSION,
                     "resolved": f"file:assets/{asset_name}",
+                    "integrity": "sha512-dGVzdA==",
                 },
             )
         generated.setdefault("lockfileVersion", 3)
@@ -88,7 +94,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
         ):
             expected = installer.sha256_bytes(installer.normalized_production_lock(generated))
             with mock.patch.object(installer, "GENERATED_LOCK_SHA256", expected):
-                return installer.validate_generated_lock(raw, generated)
+                return installer.validate_generated_lock(raw, generated, patched_asset_sha256)
 
     def test_package_name_from_nested_lock_path(self) -> None:
         self.assertEqual(
@@ -118,7 +124,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
         raw = installer.canonical_json(generated)
         with mock.patch.object(installer, "GENERATED_LOCK_SHA256", "0" * 64):
             with self.assertRaisesRegex(installer.PrimeInstallError, "lock hash mismatch"):
-                installer.validate_generated_lock(raw, generated)
+                installer.validate_generated_lock(raw, generated, {})
 
     def test_receipt_identity_pins_upstream_license(self) -> None:
         identity = installer.expected_receipt_identity()
@@ -147,8 +153,13 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             release = root / "release"
             assets = release / "assets"
             assets.mkdir(parents=True)
+            asset_content = b"asset"
+            patched_asset_sha256: dict[str, str] = {}
             for asset_name in (installer.MAIN_PATCHED_ASSET, *installer.WORKSPACE_ASSETS.values()):
-                (assets / asset_name).write_text("asset", encoding="utf-8")
+                asset_path = assets / asset_name
+                asset_path.write_bytes(asset_content)
+                os.chmod(asset_path, 0o600)
+                patched_asset_sha256[asset_name] = installer.sha256_bytes(asset_content)
             packages = {
                 "": {
                     "name": "orca-managed-prime-agent",
@@ -161,6 +172,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     "name": "prime-agent",
                     "version": installer.VERSION,
                     "resolved": f"file:assets/{installer.MAIN_PATCHED_ASSET}",
+                    "integrity": "sha512-dGVzdA==",
                 },
             }
             for index, (name, asset_name) in enumerate(installer.WORKSPACE_ASSETS.items()):
@@ -172,6 +184,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                         if index == 0
                         else f"file:assets/{asset_name}"
                     ),
+                    "integrity": "sha512-dGVzdA==",
                 }
             generated = {"lockfileVersion": 3, "packages": packages}
             raw = installer.canonical_json(generated)
@@ -185,7 +198,113 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 )
                 with mock.patch.object(installer, "GENERATED_LOCK_SHA256", expected):
                     with self.assertRaisesRegex(installer.PrimeInstallError, "local file"):
-                        installer.validate_generated_lock(raw, generated)
+                        installer.validate_generated_lock(
+                            raw, generated, patched_asset_sha256
+                        )
+
+    def test_validate_generated_lock_local_asset_content_drift_is_detected(self) -> None:
+        # Regression for independent review round 16, 2026-08-18, P1: the
+        # reviewer demonstrated that two DIFFERENT patched-tarball contents
+        # produce a BYTE-IDENTICAL normalized lock and closure hash, because
+        # normalized_production_lock() replaces "integrity" with a fixed
+        # placeholder for local assets before hashing, and (pre-fix)
+        # validate_generated_lock()'s local-asset branch never looked at
+        # "integrity" -- or at the asset's real content -- at all. A
+        # same-UID actor swapping a patched asset's on-disk content
+        # therefore got it silently pinned into the lock past this check.
+        #
+        # This test freezes every OTHER input -- the generated lock JSON,
+        # its raw bytes, and the pinned closure hash -- and varies ONLY the
+        # real on-disk content of one local asset, proving the two contents
+        # no longer both pass validate_generated_lock() even though the
+        # closure hash itself (deliberately left unchanged, see
+        # normalized_production_lock()'s own docstring) cannot tell them
+        # apart on its own.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "release"
+            assets = release / "assets"
+            assets.mkdir(parents=True, mode=0o700)
+            local_assets = {
+                "prime-agent": installer.MAIN_PATCHED_ASSET,
+                **installer.WORKSPACE_ASSETS,
+            }
+            legitimate_content = b"legitimate patched tarball bytes"
+            packages: dict[str, object] = {
+                "": {
+                    "name": "orca-managed-prime-agent",
+                    "version": installer.VERSION,
+                    "dependencies": {
+                        "prime-agent": f"file:assets/{installer.MAIN_PATCHED_ASSET}"
+                    },
+                },
+            }
+            patched_asset_sha256: dict[str, str] = {}
+            for index, (name, asset_name) in enumerate(local_assets.items()):
+                asset_path = assets / asset_name
+                asset_path.write_bytes(legitimate_content)
+                os.chmod(asset_path, 0o600)
+                patched_asset_sha256[asset_name] = installer.sha256_bytes(legitimate_content)
+                packages[f"node_modules/local-{index}"] = {
+                    "name": name,
+                    "version": installer.VERSION,
+                    "resolved": f"file:assets/{asset_name}",
+                    "integrity": "sha512-dGVzdA==",
+                }
+            generated = {"lockfileVersion": 3, "packages": packages}
+            raw = installer.canonical_json(generated)
+            count = len([path for path in packages if path])
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "GENERATED_LOCK_PACKAGE_COUNT", count),
+            ):
+                expected_lock_sha256 = installer.sha256_bytes(
+                    installer.normalized_production_lock(generated)
+                )
+                with mock.patch.object(
+                    installer, "GENERATED_LOCK_SHA256", expected_lock_sha256
+                ):
+                    # Sanity: with the legitimate content on disk and a
+                    # matching digest map, the check passes.
+                    result = installer.validate_generated_lock(
+                        raw, generated, patched_asset_sha256
+                    )
+                    self.assertEqual(result["lock_sha256"], expected_lock_sha256)
+
+                    # Swap ONE local asset's on-disk content for something
+                    # different, in place (same inode) so an identity-only
+                    # check would miss it. The `generated` dict, `raw`
+                    # bytes, and GENERATED_LOCK_SHA256 pin above are all
+                    # completely untouched.
+                    swapped_content = b"attacker-controlled substituted bytes"
+                    self.assertNotEqual(swapped_content, legitimate_content)
+                    main_asset_path = assets / installer.MAIN_PATCHED_ASSET
+                    with open(main_asset_path, "r+b") as handle:
+                        handle.seek(0)
+                        handle.write(swapped_content)
+                        handle.truncate()
+
+                    # The closure hash itself is provably unaffected:
+                    # recomputing it from the SAME `generated` dict (which
+                    # never encoded the swapped asset's real content to
+                    # begin with) gives the SAME pinned value either way --
+                    # this is the literal blind spot the reviewer found.
+                    self.assertEqual(
+                        installer.sha256_bytes(
+                            installer.normalized_production_lock(generated)
+                        ),
+                        expected_lock_sha256,
+                    )
+                    # But validate_generated_lock() AS A WHOLE must now
+                    # refuse, because its own independent content-digest
+                    # check catches what the closure hash cannot.
+                    with self.assertRaisesRegex(
+                        installer.PrimeInstallError, "content drift"
+                    ):
+                        installer.validate_generated_lock(
+                            raw, generated, patched_asset_sha256
+                        )
 
     def test_safe_extract_rejects_parent_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3323,7 +3442,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     side_effect=race_after_extraction,
                 ),
             ):
-                patched, _digest, _manifest = installer.make_patched_asset(
+                patched, _digest, _manifest, _identity = installer.make_patched_asset(
                     original_asset,
                     installer.sha256_file(original_asset),
                     {"packages": {}},
@@ -3565,7 +3684,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 ),
                 mock.patch.object(Path, "lstat", hooked_lstat),
             ):
-                patched, _digest, _manifest = installer.make_patched_asset(
+                patched, _digest, _manifest, _identity = installer.make_patched_asset(
                     original_asset,
                     installer.sha256_file(original_asset),
                     {"packages": {}},
@@ -5691,6 +5810,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                             "name": name,
                             "version": installer.VERSION,
                             "resolved": f"file:assets/{asset_name}",
+                            "integrity": "sha512-dGVzdA==",
                         }
                         for index, (name, asset_name) in enumerate(local_assets.items())
                     },
@@ -5736,10 +5856,12 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             ):
                 patched = assets_dir / output_name
                 installer.atomic_create_private_file(patched, b"stub-asset", 0o600)
+                published_stat = patched.lstat()
                 return (
                     patched,
                     installer.sha256_bytes(b"stub-asset"),
                     {"name": managed_name, "version": installer.VERSION},
+                    (published_stat.st_dev, published_stat.st_ino),
                 )
 
             def fake_safe_download(url, destination, expected_sha256, *, max_bytes=None):
@@ -5864,6 +5986,435 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             # only ever reaches finalize_pending_install(), never enable().
             self.assertFalse((user_home / ".local/bin/prime-agent").exists())
             self.assertFalse((user_home / ".local/bin/prime-agent").is_symlink())
+
+    def test_install_locked_detects_patched_asset_swap_before_first_npm_invocation(
+        self,
+    ) -> None:
+        # Regression for independent review round 16, 2026-08-18, P1: round
+        # 14 re-verified the two DOWNLOADED release assets (safe_extract_
+        # main_asset(), extract_node_toolchain()) immediately before parsing
+        # them, but make_patched_asset()'s output -- a THIRD, locally BUILT
+        # tarball -- was never re-verified between publication and the
+        # point `npm install --package-lock-only` / `npm ci` actually
+        # consume it. A same-UID actor who swaps one of these files' on-disk
+        # content anywhere in that window used to get it silently used, and
+        # because tree_digest() (the receipt's installed-tree fingerprint)
+        # runs AFTER install, verify() would have kept passing forever
+        # afterward.
+        #
+        # This test simulates that swap deterministically (matching this
+        # file's established convention for TOCTOU tests): a same-UID
+        # overwrite of an EARLIER-published workspace asset's on-disk
+        # content, injected as a side effect of make_patched_asset()
+        # creating the LAST asset (the main "prime-agent" one) -- i.e.
+        # entirely before either npm invocation has run at all -- via a
+        # real, unmocked run through install() -> _install_locked(). Only
+        # genuinely external effects (HTTPS downloads, the pinned node/npm
+        # subprocesses, and make_patched_asset()'s own tar-extraction
+        # machinery) are faked; run_npm() itself is wired to fail the test
+        # outright if it is ever reached, so this proves the swap is caught
+        # BEFORE any npm subprocess would have read it, not merely that npm
+        # later happens to fail for some other reason.
+        #
+        # Verified to FAIL against pre-fix (round-15 HEAD) code in an
+        # isolated scratch copy: pre-fix, make_patched_asset()'s digest was
+        # never re-checked anywhere, so this same swap was silently used and
+        # install() proceeded (until failing much later for unrelated
+        # reasons, or succeeding outright against a fuller fake).
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            user_home = root / "user"
+            user_home.mkdir(mode=0o700)
+
+            swapped_asset_name = str(
+                installer.WORKSPACE_PACKAGES["@earendil-works/pi-ai"]["patched_asset"]
+            )
+
+            def fake_make_patched_asset(
+                original_asset,
+                original_sha256,
+                upstream_lock,
+                assets_dir,
+                *,
+                expected_name,
+                managed_name,
+                output_name,
+            ):
+                patched = assets_dir / output_name
+                installer.atomic_create_private_file(patched, b"stub-asset", 0o600)
+                if managed_name == "prime-agent":
+                    # The three workspace assets are all created before the
+                    # main "prime-agent" asset (see _install_locked()'s
+                    # workspace_order) -- by the time this call fires, a
+                    # same-UID racer has had the entire workspace loop's
+                    # duration to act on an already-published asset. This
+                    # overwrites in place (same inode), the harder case an
+                    # identity-only check would miss.
+                    swapped_path = assets_dir / swapped_asset_name
+                    with open(swapped_path, "r+b") as handle:
+                        handle.seek(0)
+                        handle.write(b"attacker-controlled-content")
+                        handle.truncate()
+                published_stat = patched.lstat()
+                return (
+                    patched,
+                    installer.sha256_bytes(b"stub-asset"),
+                    {"name": managed_name, "version": installer.VERSION},
+                    (published_stat.st_dev, published_stat.st_ino),
+                )
+
+            def fake_safe_download(url, destination, expected_sha256, *, max_bytes=None):
+                if destination.name == "upstream-package-lock.json":
+                    payload = installer.canonical_json(
+                        {"lockfileVersion": 3, "packages": {}}
+                    )
+                else:
+                    payload = b"stub-download"
+                installer.atomic_create_private_file(destination, payload, 0o600)
+
+            def fail_if_run_npm_called(*args, **kwargs):
+                self.fail(
+                    "run_npm must not be invoked once a patched asset has "
+                    "been swapped -- the pre-invocation re-check must fail "
+                    "closed first"
+                )
+
+            fake_evidence = {
+                "volume_uuid": "TEST-UUID",
+                "node_version": installer.NODE_VERSION,
+                "npm_version": installer.NPM_VERSION,
+                "orca_support": {"test": "support"},
+            }
+            fake_node = release / "toolchain/bin/node"
+            fake_npm_cli = release / "toolchain/lib/node_modules/npm/bin/npm-cli.js"
+
+            with contextlib.ExitStack() as stack:
+                enter = stack.enter_context
+                enter(mock.patch.object(installer, "SSD_ROOT", root))
+                enter(mock.patch.object(installer, "TOOL_ROOT", tool_root))
+                enter(mock.patch.object(installer, "RELEASE_DIR", release))
+                enter(mock.patch.object(installer, "STATE_DIR", tool_root / "state"))
+                enter(
+                    mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home")
+                )
+                enter(mock.patch.object(installer, "USER_HOME", user_home))
+                enter(mock.patch.object(installer, "STATE_LINK", user_home / ".prime"))
+                enter(
+                    mock.patch.object(
+                        installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "RECEIPT_PATH",
+                        tool_root / "receipts" / f"v{installer.VERSION}.json",
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "PENDING_PATH", tool_root / "pending-install.json"
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "volume_uuid", return_value="TEST-UUID")
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "verify_orca_support",
+                        return_value={"test": "support"},
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "prime_agent_command_candidates", return_value=[]
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "preflight", return_value=fake_evidence)
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "extract_node_toolchain",
+                        return_value=(fake_node, fake_npm_cli),
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "exact_tool_version", return_value="stub"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "make_patched_asset",
+                        side_effect=fake_make_patched_asset,
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "run_npm", side_effect=fail_if_run_npm_called
+                    )
+                )
+
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "asset changed before use"
+                ):
+                    installer.install()
+
+            # Fails closed strictly before any pending journal or receipt
+            # is ever written.
+            self.assertFalse((tool_root / "pending-install.json").exists())
+            self.assertFalse(
+                (tool_root / "receipts" / f"v{installer.VERSION}.json").exists()
+            )
+
+    def test_install_locked_detects_patched_asset_swap_before_npm_ci(self) -> None:
+        # Regression for independent review round 16, 2026-08-18, P1;
+        # complements test_install_locked_detects_patched_asset_swap_before_first_npm_invocation
+        # by covering the SECOND window: a same-UID swap injected AFTER
+        # `npm install --package-lock-only` has already produced the lock
+        # AND validate_generated_lock() has already accepted it (including
+        # this round's own new content-digest check inside that function --
+        # see test_validate_generated_lock_local_asset_content_drift_is_detected
+        # for that check in isolation), but BEFORE `npm ci` -- the
+        # invocation that actually installs -- reads the same patched
+        # tarball again.
+        #
+        # This deliberately targets the narrowest possible window: the swap
+        # is injected as a side effect of validate_generated_lock() itself
+        # returning (wrapping the REAL function, not replacing it), so it
+        # lands strictly AFTER that function's own content check has
+        # already passed and strictly BEFORE _install_locked()'s dedicated
+        # pre-`npm ci` re-check (verify_patched_assets_unchanged()) runs --
+        # proving THAT specific re-check independently closes this window
+        # on its own, not merely benefiting from validate_generated_lock()
+        # having already looked at the (still-legitimate, at that point)
+        # content. `npm ci` is wired to fail the test outright if it is
+        # ever reached.
+        #
+        # Verified to FAIL against pre-fix (round-15 HEAD) code in an
+        # isolated scratch copy: pre-fix, nothing re-checked any patched
+        # asset between validate_generated_lock() and `npm ci`, so this
+        # swap was silently used by the simulated `npm ci` step.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            user_home = root / "user"
+            user_home.mkdir(mode=0o700)
+
+            local_assets = {
+                "prime-agent": installer.MAIN_PATCHED_ASSET,
+                **installer.WORKSPACE_ASSETS,
+            }
+            generated = {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {
+                        "name": "orca-managed-prime-agent",
+                        "version": installer.VERSION,
+                        "dependencies": {
+                            "prime-agent": f"file:assets/{installer.MAIN_PATCHED_ASSET}"
+                        },
+                    },
+                    **{
+                        f"node_modules/local-{index}": {
+                            "name": name,
+                            "version": installer.VERSION,
+                            "resolved": f"file:assets/{asset_name}",
+                            "integrity": "sha512-dGVzdA==",
+                        }
+                        for index, (name, asset_name) in enumerate(local_assets.items())
+                    },
+                },
+            }
+            with mock.patch.object(installer, "RELEASE_DIR", release):
+                expected_lock_sha256 = installer.sha256_bytes(
+                    installer.normalized_production_lock(generated)
+                )
+            generated_lock_raw = installer.canonical_json(generated)
+            swapped_asset_name = installer.MAIN_PATCHED_ASSET
+
+            def fake_run_npm(
+                npm_path, node_path, args, cwd, cache, install_home, install_tmp, timeout=300
+            ):
+                cwd = Path(cwd)
+                if args and args[0] == "install":
+                    lock_path = cwd / "package-lock.json"
+                    lock_path.write_bytes(generated_lock_raw)
+                    os.chmod(lock_path, 0o600)
+                elif args and args[0] == "ci":
+                    self.fail(
+                        "npm ci must not run once a patched asset has been "
+                        "swapped -- the pre-invocation re-check must fail "
+                        "closed first"
+                    )
+
+            real_validate_generated_lock = installer.validate_generated_lock
+
+            def swap_immediately_after_lock_validation(raw, generated_lock, patched_asset_sha256):
+                result = real_validate_generated_lock(
+                    raw, generated_lock, patched_asset_sha256
+                )
+                # A same-UID actor wins the exact window between
+                # validate_generated_lock() accepting the (still
+                # legitimate) content and _install_locked()'s dedicated
+                # pre-`npm ci` re-check running. In-place overwrite (same
+                # inode) -- the harder case an identity-only check would
+                # miss.
+                swapped_path = release / "assets" / swapped_asset_name
+                with open(swapped_path, "r+b") as handle:
+                    handle.seek(0)
+                    handle.write(b"attacker-controlled-content-for-ci")
+                    handle.truncate()
+                return result
+
+            def fake_make_patched_asset(
+                original_asset,
+                original_sha256,
+                upstream_lock,
+                assets_dir,
+                *,
+                expected_name,
+                managed_name,
+                output_name,
+            ):
+                patched = assets_dir / output_name
+                installer.atomic_create_private_file(patched, b"stub-asset", 0o600)
+                published_stat = patched.lstat()
+                return (
+                    patched,
+                    installer.sha256_bytes(b"stub-asset"),
+                    {"name": managed_name, "version": installer.VERSION},
+                    (published_stat.st_dev, published_stat.st_ino),
+                )
+
+            def fake_safe_download(url, destination, expected_sha256, *, max_bytes=None):
+                if destination.name == "upstream-package-lock.json":
+                    payload = installer.canonical_json(
+                        {"lockfileVersion": 3, "packages": {}}
+                    )
+                else:
+                    payload = b"stub-download"
+                installer.atomic_create_private_file(destination, payload, 0o600)
+
+            fake_evidence = {
+                "volume_uuid": "TEST-UUID",
+                "node_version": installer.NODE_VERSION,
+                "npm_version": installer.NPM_VERSION,
+                "orca_support": {"test": "support"},
+            }
+            fake_node = release / "toolchain/bin/node"
+            fake_npm_cli = release / "toolchain/lib/node_modules/npm/bin/npm-cli.js"
+
+            with contextlib.ExitStack() as stack:
+                enter = stack.enter_context
+                enter(mock.patch.object(installer, "SSD_ROOT", root))
+                enter(mock.patch.object(installer, "TOOL_ROOT", tool_root))
+                enter(mock.patch.object(installer, "RELEASE_DIR", release))
+                enter(mock.patch.object(installer, "STATE_DIR", tool_root / "state"))
+                enter(
+                    mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home")
+                )
+                enter(mock.patch.object(installer, "USER_HOME", user_home))
+                enter(mock.patch.object(installer, "STATE_LINK", user_home / ".prime"))
+                enter(
+                    mock.patch.object(
+                        installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "RECEIPT_PATH",
+                        tool_root / "receipts" / f"v{installer.VERSION}.json",
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "PENDING_PATH", tool_root / "pending-install.json"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_SHA256", expected_lock_sha256
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_PACKAGE_COUNT", len(local_assets)
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "volume_uuid", return_value="TEST-UUID")
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "verify_orca_support",
+                        return_value={"test": "support"},
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "prime_agent_command_candidates", return_value=[]
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "preflight", return_value=fake_evidence)
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "extract_node_toolchain",
+                        return_value=(fake_node, fake_npm_cli),
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "exact_tool_version", return_value="stub"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "make_patched_asset",
+                        side_effect=fake_make_patched_asset,
+                    )
+                )
+                enter(mock.patch.object(installer, "run_npm", side_effect=fake_run_npm))
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "validate_generated_lock",
+                        side_effect=swap_immediately_after_lock_validation,
+                    )
+                )
+
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "asset changed before use"
+                ):
+                    installer.install()
+
+            self.assertFalse((tool_root / "pending-install.json").exists())
+            self.assertFalse(
+                (tool_root / "receipts" / f"v{installer.VERSION}.json").exists()
+            )
 
     def test_verify_fails_closed_on_stale_lifecycle_lock_identity(self) -> None:
         # Regression for independent review round 5, 2026-08-18, P2-2:
