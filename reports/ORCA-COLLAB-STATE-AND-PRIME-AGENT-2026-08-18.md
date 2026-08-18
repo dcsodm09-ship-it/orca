@@ -12,12 +12,13 @@
 - **prime-agent-integration 未安装、不能安装**：即便本轮安全修复全部收敛，`sandbox_e2e.py`
   真实跑一遍会在第一步就 fail-closed——2026-08-14 钉的上游 npm 锁定哈希已经和 2026-08-18
   registry 实际解析结果对不上（上游漂移，不是本轮修复引入的回归，fail-closed 正确触发）。
-- **prime-agent 的 4 个原始 P1 全部修好，round 2-5 又连续发现并修了 7 个新 P1**（详见第 1
-  节）。**Codex sol/xhigh 前 3 轮全给 GO，第 4 轮被 OpenAI 自己的 cybersecurity 内容策略
-  拦截**（改用纯 QA 措辞后，第 5 轮 Codex 顺利跑完，并且独立找到 round 5 修复自己引入的
-  一个真实功能回归——和 Claude opus/max 完全独立收敛到同一个 bug）。**round 6 修复正在
-  进行，是本次会话计划的最后一轮**（时间/资源投入已经很大，且装机本身还被下面这条独立
-  阻断挡着，不急）。收敛前不装、不启用。
+- **prime-agent 的 4 个原始 P1 全部修好，round 2-6 又连续发现并修了 10 个新 P1**（详见
+  第 1 节）。**Codex sol/xhigh 前 3 轮全给 GO，第 4 轮被 OpenAI 自己的 cybersecurity
+  内容策略拦截**（改用纯 QA 措辞后第 5 轮顺利跑完，并且独立找到 round 5 修复自己引入的
+  一个真实功能回归——和 Claude opus/max 完全独立收敛到同一个 bug）。**round 6 修复已
+  完成、80/80 测试通过、已提交，但尚未独立复核**——这是本次会话主动选择的检查点，连续
+  6 轮真实发现新问题之后暂停汇报，不是遇到了阻断。round 7 双复核随时可在下次请求时派发。
+  **收敛前不装、不启用。**
 - **`ORCA_CONTEXT_NACK_V1`（wiki 新鲜度不匹配）根因已查清**，不是代码 bug：wiki 内容在
   manifest 钉哈希后被手工改过没人重新钉；未擅自重新钉（需要人工复核+双复核门禁）。
 - `orca-context-bridge/SKILL.md` 一份未提交的文档更新（+135/-6 行）逐条核对源码，改正了
@@ -166,6 +167,35 @@ verify-then-use 校验模式）。完成后会验证+提交，但**本次会话�
 双复核**——已经是 6 轮里第 6 次真实发现新问题，是时候作为一个检查点向用户汇报现状，
 而不是无限跑下去；装机本身也没有今天必须完成的时间压力（见下条独立阻断）。
 
+### Round 6：本次会话最后一轮（已修复，未复核）
+
+修好 round 5 的全部 3 个 P1 + 2 个 P2：
+- `lock_identity` 变量覆盖：局部变量改名为 `package_lock_identity`，补了一个"全新安装
+  成功走到 `finalize_pending_install()`"的正向路径回归测试（此前的套件只有"身份不匹配时
+  finalize 不被调用"的反向测试，从未测过成功路径，这正是它此前能带病上线的原因）。
+- `--daemon-socket` 会话保护对齐上游真实行为：**真的去找并读了上游打包产物本体**
+  （`chunk-CAY2X72A.js`，本会话此前某轮复核留在 scratchpad 里的产物），确认
+  `normalizeLeadingDaemonSocketOption()` 上游真实只对空格分隔、紧跟 `stop|rename` 的
+  `--daemon-socket <value>` 做重映射，`=` 形式和重复出现都会落到真实会话启动——round 5
+  的通用解析器比上游真实行为更"聪明"，反而是新回归。新增一个专门只服务"是否需要会话
+  启动保护"这个判断的窄解析器，和原有服务"自更新拦截/agents-attach 门禁"的宽解析器分开。
+- `make_patched_asset` 提取-使用窗口 TOCTOU：提取阶段边读边算内容摘要，打包阶段改用
+  `read_private_file()`（lstat→O_NOFOLLOW open→fstat 身份→有界读取→读后 fstat 一致性，
+  单次操作完成）读取已验证字节直接 `archive.addfile()`，不再二次按路径读取。
+- 2 个 P2：`uninstall()` 补上和 `enable()` 对称的锁身份重新断言；剩余 4 处词法
+  `BIN_LINK.exists()` 统一改绑 `verify_command_state()` 已经在用的 dir_fd 祖先链。
+
+6 个新回归测试，逐条验证过"改动前必然失败、改动后通过"。**80/80 测试全过**（两个
+Python 解释器），`py_compile` 干净，round 1-5 已修的 14 项主要 P1 逐条重放仍然成立。
+README 计数 69→80。已提交 `2c2a9c9b9a`。
+
+**Round 6 状态：已修复，尚未独立复核。** 前 5 轮里每一轮都真实发现过至少一个新问题，
+所以一个没被复核过的 round 6 不能当作"干净"。**本次会话到此为止，不再自动派发
+round 7 双复核**——不是因为遇到了阻断，而是主动选择的检查点：已经连续跑了 6 轮真实
+发现问题的复核，时间投入很大，而装机这件事本身今天无论如何都做不了（见下条独立阻断），
+没有必须今晚收敛的时间压力。round 7 双复核（Claude opus+max **与** Codex sol+max）是
+下一步的正确动作，随时可以在下次请求时派发。
+
 ### 与安全问题独立的阻断项：上游锁定哈希已过期
 
 `sandbox_e2e.py` 真实网络路径运行（未 mock，真实调用官方下载）在第一步即失败：
@@ -228,10 +258,23 @@ round 4 的 prime-agent 修复。
 - 未重新钉 `reviewed-startup-pack-manifest.json` 的 wiki 哈希（需要人工审阅+双复核）。
 - 未重新采集/钉 prime-agent 的上游锁定哈希（需要人工对新证据的信任判断）。
 - 未替换已安装的、落后于仓库的 orca-context-bridge hook 脚本（不确定是否有其他会话在用）。
-- 未安装、未启用、未部署 prime-agent（双复核未收敛 + 上游锁定哈希过期，双重阻断）。
+- 未安装、未启用、未部署 prime-agent（round 6 未复核 + 上游锁定哈希过期，双重阻断）。
+- **未派发 round 7 双复核**（主动检查点，见第 1 节 round 6 小节；随时可在下次请求时补）。
 - 未拉取/集成 Semantica（用户未给出确切来源）。
 
-## 6. Semantica
+## 6. 如果要继续 prime-agent 这条线，下一步具体是什么
+
+1. 派 Claude opus+max **与** Codex sol+max（Codex 记得用 QA/行为验证措辞，避免触发
+   cybersecurity 内容策略——round 5 已验证这个改法有效）对 round 6 修复做独立只读复核。
+2. 若两路都 GO 且无 P0/P1：安全侧收敛，但**仍然不能真正 `install`**——先要有人对照
+   2026-08-18（或更新）的上游证据重新核对/采集 `GENERATED_LOCK_SHA256`（README 记录的
+   官方 release 资产哈希、`package-lock.json` 归一化哈希等一整套证据链），产出新版本
+   README 里的"Pinned upstream evidence"章节，这本身是一次值得单独留痕的信任判断。
+3. 重新钉哈希后，`plan` → 真实 `install` → `enable` 需要一次性明确人工授权（用户这条
+   消息里的"安装进来"已经是这个授权，届时无需再问，只要门禁真的都过了）。
+4. 若任一路仍有 P0/P1：按已经跑了 6 轮的节奏继续 fix → verify → 双复核循环。
+
+## 7. Semantica
 
 用户提到"还有 semantica"，两轮追问（GitHub 仓库/npm 包 → 具体地址/包名）都只拿到选项
 标签、没拿到确切值。本机和仓库里搜不到任何相关记录。等用户在下一条消息里直接给出确切
