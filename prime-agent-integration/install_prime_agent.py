@@ -2537,10 +2537,21 @@ def resolve_upstream_public_command(arguments: list[str]) -> str | None:
 # Traded away deliberately: upstream's "did you mean" fuzzy suggestion for a
 # genuine typo (e.g. "help satus" meaning "status") no longer passes
 # through unguarded the way upstream's own dispatcher would handle it --
-# it now gets RESOURCE_GUARDS applied like any other miss. This is safe and
-# low-cost: the guards only disable extension/skill/prompt-template
-# loading, which a help query does not functionally need, and the user
-# still reaches upstream's own "did you mean" output, just guarded.
+# it now gets RESOURCE_GUARDS applied like any other miss. This is safe:
+# the guards disable extension/skill/prompt-template loading, so a hostile
+# project's extensions never load for this case either. It is NOT low-cost
+# in the way an earlier version of this comment claimed, though -- verified
+# directly (independent review round 13, 2026-08-18): once RESOURCE_GUARDS
+# are appended, upstream's own argv parser no longer recognizes the
+# resulting argv shape as a help lookup at all (the real unguarded output
+# for "help satus" is "Error: Unknown command: satus" + a real "Did you
+# mean" suggestion; guarded, upstream instead proceeds into a real,
+# protected session start/TUI). So a genuine near-miss like "help satus"
+# unexpectedly starts a guarded session instead of showing help text --
+# still safe (no extension code runs), just not upstream's actual help UX.
+# Documented here rather than "fixed" because reproducing upstream's exact
+# UX for this specific miss case would mean going back to some form of
+# fuzzy/near-match logic, which is exactly the risk this round removed.
 #
 # Unlike every other guard-placement decision in this script, "help"'s own
 # upstream dispatcher (runPublicCommand() in dist/cli/public-command.js)
