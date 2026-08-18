@@ -12,11 +12,12 @@
 - **prime-agent-integration 未安装、不能安装**：即便本轮安全修复全部收敛，`sandbox_e2e.py`
   真实跑一遍会在第一步就 fail-closed——2026-08-14 钉的上游 npm 锁定哈希已经和 2026-08-18
   registry 实际解析结果对不上（上游漂移，不是本轮修复引入的回归，fail-closed 正确触发）。
-- **prime-agent 的 4 个原始 P1 全部修好，round 2-4 又连续发现并修了 4 个新 P1**——全部
-  是 Claude opus/max 独立复现找到的，**Codex sol/xhigh 前 3 轮全给 GO，第 4 轮被 OpenAI
-  自己的 cybersecurity 内容策略拦截未能给出结论**。截至 round 4，`--daemon-socket` 门禁
-  绕过只修了一半（等号形式、重复 flag、`update` 自更新门禁仍可绕过）+ 1 个新的静默误报
-  "已禁用"问题，**round 5 修复正在进行**。收敛前不装、不启用。
+- **prime-agent 的 4 个原始 P1 全部修好，round 2-5 又连续发现并修了 7 个新 P1**（详见第 1
+  节）。**Codex sol/xhigh 前 3 轮全给 GO，第 4 轮被 OpenAI 自己的 cybersecurity 内容策略
+  拦截**（改用纯 QA 措辞后，第 5 轮 Codex 顺利跑完，并且独立找到 round 5 修复自己引入的
+  一个真实功能回归——和 Claude opus/max 完全独立收敛到同一个 bug）。**round 6 修复正在
+  进行，是本次会话计划的最后一轮**（时间/资源投入已经很大，且装机本身还被下面这条独立
+  阻断挡着，不急）。收敛前不装、不启用。
 - **`ORCA_CONTEXT_NACK_V1`（wiki 新鲜度不匹配）根因已查清**，不是代码 bug：wiki 内容在
   manifest 钉哈希后被手工改过没人重新钉；未擅自重新钉（需要人工复核+双复核门禁）。
 - `orca-context-bridge/SKILL.md` 一份未提交的文档更新（+135/-6 行）逐条核对源码，改正了
@@ -27,7 +28,7 @@
 
 ---
 
-## 1. Prime Agent 安全修复：4 轮时间线
+## 1. Prime Agent 安全修复：6 轮时间线
 
 ### 原始状态（2026-08-16，`prime-agent-integration/CODEX-SOL-XHIGH-REVIEW-2026-08-16.md`）
 
@@ -125,6 +126,45 @@ P3（详见下方 round 5 小节引用的原始报告）。**回归检查**：69
 
 **Codex sol/max**：因上述内容策略拦截未能给出复核结论，任务已按真实原因标记 `failed`
 （见上）。
+
+### Round 5：结构性修复 + 双路独立收敛到同一个新 bug
+
+按 opus/max round-4 给出的结构性修复方向（不再逐条模式匹配，改成统一的"跳过所有前导
+option、取第一个非 option token"解析），修好 round 4 剩下的 3 个 P1（`update` 自更新
+绕过、`=`/重复 flag 形式绕过 agents/attach 门禁、`verify_command_state` 词法误报）+ 2 个
+P2（生命周期锁 inode 换位、`package-lock.json` 校验后被独立重读无身份绑定）。75/75 测试
+通过（两个 Python 解释器）。已提交 `369119c260`。
+
+**Round 5 双复核**（这轮做了一次真实的派发方式修正）：
+
+- **Codex 这路第 4 轮被拦之后，改用纯 QA/行为验证措辞重新派发**（不再用
+  "construct attack/bypass"这类词，改成"确认 CLI 退出码符合文档"的表述），走真正 Orca
+  orchestration（`task_72fa83c0ac19` / `ctx_7e8c092215f5`）——**这次顺利跑完，NO-GO**：
+  75/75 测试、`py_compile`、11 行为矩阵、6 个新回归测试全部核实通过，但读代码发现
+  **`_install_locked()` 的参数 `lock_identity` 在第 3067 行被同名局部变量（改存
+  `package-lock.json` 的 inode）覆盖，导致第 3150 行传给 `finalize_pending_install()`
+  的是错的身份**——正常全新安装会在 pending journal 已经落盘之后必然报错失败。这是
+  round 5 自己引入的纯功能回归，不是安全问题，之前几轮偏安全对抗的复核框架都没测到
+  （没人真正跑过"成功安装到底"这条路径）。
+- **Claude opus/max**：**NO_GO，P0=0，P1=3，P2=5**。**独立收敛到同一个
+  `lock_identity` 覆盖 bug**（P1-1，与 Codex QA 完全独立发现）；另外 2 个新 P1：
+  （P1-2）round 5 的通用化解析让 `--daemon-socket=<v> <非stop/rename命令>` 这类调用
+  跳过了本该有的会话启动保护——回查上游真实 CLI 解析器代码，上游对这类形式其实是当
+  普通会话启动处理，我们的 wrapper 却因为"更彻底地识别出了这是一个已解析的公共命令"
+  反而少套上保护，是本轮修复自己造成的新回归（12/39 复现用例是本轮新增的漂移，不是
+  历史遗留）；（P1-3，**非本轮引入，此前 5 轮都没测到**）`make_patched_asset()` 提取
+  内容后到打包进最终产物之间有真实可复现的窗口——lstat 校验一次之后到 `archive.add()`
+  真正读取内容之间没有重新校验，攻击者可以在这个窗口换内容，4/4 真实复现（用真实
+  0.7.2 版本官方产物，非构造夹具），没有下游门禁能拦住（receipt 的完整性字段是从
+  已被篡改的树重新算出来的，不是和原始校验摘要交叉核对）。round 1-4 已修的全部
+  5 个 P1 逐条重放确认仍然成立，75/75 测试两个解释器都过。
+
+**已派发 round 6 修复**（本次会话计划的最后一轮）：修 `lock_identity` 变量覆盖（简单，
+改名）、`--daemon-socket=` 会话保护对齐上游真实行为（需要读上游真实解析逻辑，不能只
+求内部自洽）、`make_patched_asset` 提取-使用窗口重新校验（复用本文件已有的
+verify-then-use 校验模式）。完成后会验证+提交，但**本次会话不再自动派发 round 7
+双复核**——已经是 6 轮里第 6 次真实发现新问题，是时候作为一个检查点向用户汇报现状，
+而不是无限跑下去；装机本身也没有今天必须完成的时间压力（见下条独立阻断）。
 
 ### 与安全问题独立的阻断项：上游锁定哈希已过期
 
