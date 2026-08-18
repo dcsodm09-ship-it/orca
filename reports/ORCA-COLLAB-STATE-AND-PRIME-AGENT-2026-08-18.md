@@ -542,6 +542,34 @@ receipt 里记的就是攻击者的内容，之后 `verify()` 会永远通过，
 **已派发 round 16 修复**，专门补这最后一块——不会再碰已经确认关闭的插入机制
 那部分。
 
+### Round 16：补上 patched-asset 那半个 P1（已验证关闭，未独立复核）
+
+`make_patched_asset()` 现在发布文件后立刻捕获 `(st_dev, st_ino)` 身份（和已有的
+摘要一起返回）；`_install_locked()` 给全部 4 个补丁包捕获这个身份，在两处真正
+消费它们的 npm 调用（生成 lock 的 `npm install --package-lock-only`、真正安装的
+`npm ci`）之前都重新校验一遍（新增 `verify_patched_assets_unchanged()`/
+`verify_unchanged_private_ssd_asset_digest()`，复用 round 14 的
+`read_private_file()` 单次原子读取纪律）。`validate_generated_lock()` 现在要求
+传入 `patched_asset_sha256`，对本地资产分支独立重新读盘算摘要比对——这才是真正
+堵住闭包哈希盲区的安全边界，不依赖"真实 npm 是不是总会给本地 `file:` 依赖填
+`integrity` 字段"这个没法在这个沙箱环境里验证的假设。`normalized_production_lock()`
+本身的归一化行为没动（保留其原本用途，用注释解释了缺口是在别处补上的）。3 个新
+回归测试，逐条验证过修复前失败、修复后通过（含 2 个走真实 `install()→
+_install_locked()` 路径的端到端测试）。96/96 测试通过，round 14/15 的插入机制
+和下载资产复核回归测试重跑确认没受影响。README 计数 93→96。已提交 `fd6a683a4a`。
+
+### Round 17
+
+**Codex QA 这路完成，结论 PASS，无可复现 P0/P1。** 96/96 测试、`py_compile`
+干净；逐条追踪了 4 个补丁包创建后所有的读取点，确认修复覆盖了两个 npm 消费点和
+闭包校验点，没有遗漏的读取路径；独立构造两份不同内容验证过校验器现在真的会
+拒绝内容漂移（数值上归一化闭包哈希本身按设计仍然相等，但校验结果不再相等——
+这正是修复选择的方式：不改哈希本身，是独立重读比对）。指出一处"检查完到 npm
+真正打开文件之间"的窄窗口——和之前几轮已经承认过的"没法做到完全原子"是同一类
+已知残留，不是新问题。
+
+Claude opus/max 这一路仍在进行中。
+
 `sandbox_e2e.py` 真实网络路径运行（未 mock，真实调用官方下载）在第一步即失败：
 
 ```
