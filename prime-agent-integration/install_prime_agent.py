@@ -1223,7 +1223,7 @@ def exact_dependency_versions(manifest: dict[str, Any], upstream_lock: dict[str,
 
 def safe_extract_main_asset(
     asset: Path, destination: Path
-) -> tuple[Path, tuple[Path, ...], dict[Path, str]]:
+) -> tuple[Path, tuple[Path, ...], dict[Path, str], dict[Path, int]]:
     try:
         archive = tarfile.open(asset, "r:gz")
     except (OSError, tarfile.TarError) as exc:
@@ -1273,12 +1273,23 @@ def safe_extract_main_asset(
         # make_patched_asset(), independent dual review round 6, 2026-08-18,
         # P1).
         content_digests: dict[Path, str] = {}
+        # Mode recorded for each directory member AT THE MOMENT this loop
+        # itself creates it, keyed the same way as content_digests --
+        # make_patched_asset() later publishes each directory's tar entry
+        # from this walk-time record instead of re-resolving the path a
+        # second time (see its own comment, independent review round 7/8,
+        # 2026-08-18, P1). The value is always the literal 0o700 this call
+        # itself just passed to mkdir() -- not a value read back from a
+        # subsequent, independent lstat() -- so there is no second
+        # path-based lookup anywhere in this directory's publish path.
+        dir_modes: dict[Path, int] = {}
         for member, relative in sorted(
             selected, key=lambda item: (len(item[1].parts), os.fspath(item[1]))
         ):
             target = destination / relative
             if member.isdir():
                 target.mkdir(mode=0o700, parents=True, exist_ok=False)
+                dir_modes[relative.relative_to("package")] = 0o700
                 continue
             target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             source = archive.extractfile(member)
@@ -1352,7 +1363,14 @@ def safe_extract_main_asset(
         # mismatch here means this function's own logic is wrong, not that
         # the tree was tampered with.
         raise PrimeInstallError("Prime Agent extraction manifest/digest mismatch")
-    return package_dir, manifest, content_digests
+    expected_dir_keys = {
+        relative.relative_to("package") for member, relative in selected if member.isdir()
+    }
+    if set(dir_modes) != expected_dir_keys:
+        # Same self-consistency check as content_digests above, for the
+        # directory-mode record instead of file digests.
+        raise PrimeInstallError("Prime Agent extraction manifest/directory-mode mismatch")
+    return package_dir, manifest, content_digests, dir_modes
 
 
 def extract_node_toolchain(asset: Path, destination: Path) -> tuple[Path, Path]:
@@ -1554,7 +1572,7 @@ def make_patched_asset(
     # accept-existing behavior was unsafe here (independent review round 2,
     # 2026-08-18, P1).
     create_fresh_private_dir(unpacked)
-    package_dir, extracted_relative_paths, content_digests = safe_extract_main_asset(
+    package_dir, extracted_relative_paths, content_digests, dir_modes = safe_extract_main_asset(
         original_asset, unpacked
     )
     manifest_path = package_dir / "package.json"
@@ -1676,34 +1694,45 @@ def make_patched_asset(
                     continue
                 # A directory, per that same tarball-verified extraction
                 # manifest. Directories carry no content bytes for a
-                # same-UID racer to swap -- only entry metadata -- so unlike
-                # the regular-file branch above, this keeps the pre-existing
-                # lstat-immediately-before-archive.add() discipline rather
-                # than the stronger no-gap read used for file content;
-                # closing that narrower, metadata-only residual (a race
-                # between this lstat and archive.add()'s own internal lstat
-                # a few lines below) is out of scope for this fix (see round
-                # 6 report).
-                try:
-                    entry_info = path.lstat()
-                except OSError as exc:
+                # same-UID racer to swap, but archive.add() performs its own
+                # SECOND, entirely independent path-based lstat() internally
+                # when it builds the TarInfo it publishes -- no lstat()
+                # performed here beforehand closes that gap, because
+                # archive.add() re-resolves and re-inspects `path` itself,
+                # regardless of what any earlier check here found. A
+                # same-UID racer that swapped this path for a symlink to an
+                # arbitrary, possibly out-of-tree target in the window
+                # between any check here and that later, internal re-stat
+                # would have the published archive silently contain a
+                # symlink member in place of the intended directory entry --
+                # from a link-free, digest-verified source archive
+                # (independent review round 7/8, 2026-08-18, P1). Closed the
+                # same way read_private_file() closes the analogous gap for
+                # file content: never touch `path` again here at all. This
+                # directory's mode is the literal 0o700 value
+                # safe_extract_main_asset() itself passed to mkdir() when it
+                # originally created this exact path -- not a value read
+                # back from any lstat, here or there -- so archive.addfile()
+                # below publishes a fixed DIRTYPE member built entirely from
+                # that walk-time record, with no second path-based lookup
+                # and no archive.add() call anywhere in this branch.
+                mode = dir_modes.get(relative)
+                if mode is None:
+                    # Cannot happen given safe_extract_main_asset()'s own
+                    # manifest/dir_modes self-consistency check, which
+                    # already guarantees every directory in
+                    # extracted_relative_paths has a recorded mode; this is
+                    # defense-in-depth against this function's own logic
+                    # drifting from that invariant, not a same-UID-attacker
+                    # detection.
                     raise PrimeInstallError(
-                        f"extracted member vanished before publish: {relative}"
-                    ) from exc
-                if stat.S_ISLNK(entry_info.st_mode) or entry_info.st_uid != os.getuid():
-                    raise PrimeInstallError(
-                        f"unsafe extracted member before publish: {relative}"
+                        f"extracted directory missing from walk-time record: {relative}"
                     )
-                if not stat.S_ISDIR(entry_info.st_mode):
-                    raise PrimeInstallError(
-                        f"unexpected extracted member type before publish: {relative}"
-                    )
-                archive.add(
-                    path,
-                    arcname=os.fspath(arcname),
-                    recursive=False,
-                    filter=normalize,
-                )
+                tarinfo = tarfile.TarInfo(name=os.fspath(arcname))
+                tarinfo.type = tarfile.DIRTYPE
+                tarinfo.mode = mode
+                tarinfo.size = 0
+                archive.addfile(normalize(tarinfo))
     patched_raw = buffer.getvalue()
     patched = assets_dir / output_name
     atomic_create_private_file(patched, patched_raw, 0o600)
@@ -1955,13 +1984,51 @@ def managed_entrypoint_script(
 ) -> bytes:
     del node, cli
     launch_guard = launch_guard or (RELEASE_DIR / "bin/prime-agent-launch-guard.py")
+    # "config", "package", and unconditional "help" used to be classified
+    # session_start=0 here (skipping BOTH the $PWD/.prime/agent/settings.json
+    # gate and ORCA_PRIME_AGENT_RESOURCE_GUARD below) alongside genuinely
+    # session-free commands, but upstream's own handlers for two of them can
+    # still touch the launch project:
+    #   * handleConfigCommand()/handlePackageCommand() (shipped bundle,
+    #     dist/bundle/chunk-CAY2X72A.js) both call
+    #     SettingsManager.create(process.cwd(), agentDir), and "config"
+    #     additionally calls packageManager.resolve() with no onMissing
+    #     guard -- so a project-declared package source in a hostile $PWD/
+    #     .prime/agent/settings.json gets auto-installed and executed via
+    #     the project's own configured npm command, with neither protection
+    #     ever applying. Independent review reproduced this end-to-end
+    #     (real generated wrapper -> real generated launch guard -> real
+    #     pinned Node -> real prime-agent 0.7.2 bundle, offline): a hostile
+    #     .prime/agent/settings.json's configured command ran via plain
+    #     `prime-agent config` (independent review round 7/8, 2026-08-18,
+    #     P1 -- the highest-severity finding across every round so far).
+    #   * "help" is only genuinely safe when upstream's own
+    #     isHelpCommandRequest() (dist/bundle/chunk-PMFPRFOT.js) says so:
+    #     true unconditionally for BARE "help" with no further argument at
+    #     all (path.length === 0 short-circuits before any matching runs,
+    #     confirmed by reading that function directly, not assumed), but for
+    #     "help <anything>" it depends on an edit-distance fuzzy match
+    #     against known subcommand names -- any realistic miss (e.g.
+    #     "help tools", "help auth", "help mcp", a typo) falls through to
+    #     upstream's own continueWith(args): a full, unprotected session
+    #     start in $PWD. Reimplementing that exact fuzzy-match algorithm in
+    #     shell here would drift from upstream again -- the same
+    #     hand-maintained-list fragility this bug class keeps stemming from
+    #     -- so this wrapper does not attempt it. Only the exact,
+    #     upstream-confirmed-always-safe bare-"help" case keeps the
+    #     exemption, via a separate, argument-COUNT-based (not fuzzy
+    #     name-based) check just after the case statement below; "help"
+    #     with any argument now gets full session-start protection like an
+    #     ordinary command.
+    # Both now get the same $PWD/.prime/agent/settings.json gate and
+    # resource-guard treatment as an ordinary session start, by default;
+    # ORCA_PRIME_AGENT_ALLOW_PROJECT_SETTINGS=1 opts back into the previous,
+    # unprotected behavior for them, exactly like every other session-start
+    # command already requires for project settings review.
     public_commands = "|".join(
         (
-            "config",
             "doctor",
-            "help",
             "list",
-            "package",
             "rename",
             "schedule",
             "send",
@@ -2093,6 +2160,24 @@ def managed_entrypoint_script(
         'case "$managed_public_command" in',
         f"  {public_commands}|-h|--help|-v|--version) session_start=0 ;;",
         "esac",
+        # Bare `help` with NO further argument at all is the one form
+        # upstream's own isHelpCommandRequest() treats as real help
+        # unconditionally (path.length === 0 returns true immediately,
+        # before any fuzzy/candidate matching runs -- confirmed by reading
+        # dist/bundle/chunk-PMFPRFOT.js directly). "$#" here is the
+        # wrapper's OWN, still-unshifted positional parameter count --
+        # resolve_managed_command()/resolve_public_command() each shift only
+        # their own function-local copy of "$@" (see their own comments
+        # above), never the caller's -- so this checks exactly "the whole
+        # invocation was the single token help, nothing else", not merely
+        # "the first token was help". Every other help form (one or more
+        # further arguments, of any content) intentionally falls through to
+        # full session_start=1 protection instead of attempting to
+        # reproduce upstream's fuzzy match here (see the comment on
+        # public_commands above for why).
+        'if [ "$managed_public_command" = "help" ] && [ "$#" -eq 1 ]; then',
+        "  session_start=0",
+        "fi",
         'for managed_arg in "$@"; do',
         '  [ "$managed_arg" = "--" ] && break',
         '  case "$managed_arg" in',
@@ -2170,11 +2255,34 @@ RESOURCE_GUARDS = ("--no-extensions", "--no-skills", "--no-prompt-templates")
 # a future leading option is recognized by both generated parsers together.
 LEADING_COMMAND_OPTIONS = {LEADING_COMMAND_OPTIONS!r}
 RUNTIME_PUBLIC_COMMANDS = frozenset(("agents", "attach", "model"))
-# Mirrors the shell entrypoint's own "public_commands" set (see
-# managed_entrypoint_script()) -- the commands for which the entrypoint sets
-# session_start=0 and therefore should never export RESOURCE_GUARD_ENV=1 in
-# the first place. Checked here too as a hard safety net, not merely relying
-# on that upstream invariant continuing to hold: if RESOURCE_GUARD_ENV ever
+# Historically mirrored the shell entrypoint's own "public_commands" set
+# exactly; as of round 8, 2026-08-18 it deliberately no longer does. The two
+# lists now answer two DIFFERENT questions and have intentionally diverged:
+#   * managed_entrypoint_script()'s public_commands decides session_start --
+#     whether the $PWD/.prime/agent/settings.json gate and
+#     ORCA_PRIME_AGENT_RESOURCE_GUARD export apply at all. "config" and
+#     "package" were removed from that list in round 8 (P1: upstream's own
+#     handlers for both can still touch the launch project -- see
+#     managed_entrypoint_script()'s public_commands comment for the full
+#     finding) and now get full session-start protection.
+#   * RUNTIME_NO_GUARD_COMMANDS here decides a narrower, DIFFERENT question:
+#     given that ORCA_PRIME_AGENT_RESOURCE_GUARD=1 WAS exported (a genuine
+#     session start), should RESOURCE_GUARDS actually be spliced into this
+#     command's own argv? "config", "package", and "help" stay in this set
+#     even though two of them left public_commands, because inserting
+#     RESOURCE_GUARDS at the position this script's fallback branches use
+#     for them has never been verified against upstream's real argv
+#     acceptance for these three specific commands, and getting that
+#     placement wrong is exactly the round-3/4 argv-corruption bug class
+#     below. The settings-file gate (now applying to all three by default)
+#     is the actual fix for the round-8 finding; leaving these three out of
+#     guard-flag insertion is an intentional, separate, defense-in-depth
+#     choice, not an oversight -- round 8 confirmed this set already
+#     contained all three (so guarded_arguments() cannot corrupt their argv
+#     even now that config/package can reach it with RESOURCE_GUARD_ENV=1
+#     set) and left it unchanged.
+# Checked here as a hard safety net, not merely relying on the entrypoint's
+# own session_start invariant continuing to hold: if RESOURCE_GUARD_ENV ever
 # reached this script as "1" for one of these anyway, the prior fallback
 # branch below would have inserted RESOURCE_GUARDS between a leading
 # "--daemon-socket <value>" pair and the command token itself -- corrupting

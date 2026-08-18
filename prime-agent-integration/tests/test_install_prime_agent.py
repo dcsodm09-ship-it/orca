@@ -2606,6 +2606,141 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             self.assertEqual((outside / "sentinel").read_bytes(), b"do-not-touch")
             self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o755)
 
+    def test_safe_extract_main_asset_symlink_scan_catches_late_planted_symlink(
+        self,
+    ) -> None:
+        # Regression for a test-coverage gap independent review round 7,
+        # 2026-08-18 found: assert_tree_has_no_symlinks() (added round 2,
+        # 2026-08-18, P1, as the fail-closed check for a same-UID racer that
+        # plants a symlink somewhere in the extracted tree during the
+        # narrow in-process window create_fresh_private_dir() cannot itself
+        # close) had ZERO effective regression coverage -- the round-7
+        # reviewer deleted both of its call sites (here, and in
+        # extract_node_toolchain()) and the full suite still passed. The
+        # test that appeared to cover this,
+        # test_extract_node_toolchain_refuses_preexisting_destination_with_symlinked_subdir,
+        # actually fails earlier inside create_fresh_private_dir() (its
+        # `destination` pre-exists) and never reaches
+        # assert_tree_has_no_symlinks() at all.
+        #
+        # This test instead lets extraction complete completely normally --
+        # a symlink can never arrive via a tar member here (safe_extract_
+        # main_asset() rejects any member.issym()/islnk() outright, before
+        # ever writing it) -- and simulates a same-UID racer winning the
+        # narrow window between the extraction loop finishing and this
+        # function's own symlink scan starting, by hooking Path.rglob()
+        # itself: the FIRST (and, in this function, only) rglob("*") call
+        # made against the exact `package_dir` this call computes is where
+        # assert_tree_has_no_symlinks() begins its walk, so planting the
+        # symlink there -- immediately before delegating to the real
+        # rglob() -- places it exactly at the boundary of the race window
+        # the docstring describes, with no other check in between able to
+        # have caught it first (mirrors this file's established convention
+        # of injecting a same-UID race deterministically via a wrapped real
+        # call rather than real concurrent threads; see
+        # test_atomic_symlink_ancestor_swap_cannot_escape_verified_parent).
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            archive_path = root / "asset.tgz"
+            payload = installer.canonical_json(
+                {"name": "prime-agent", "version": installer.VERSION}
+            )
+            with tarfile.open(archive_path, "w:gz") as archive:
+                info = tarfile.TarInfo("package/package.json")
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+
+            destination = root / "out"
+            destination.mkdir(mode=0o700)
+            expected_package_dir = destination / "package"
+            outside_target = root / "outside-victim"
+            outside_target.mkdir(mode=0o700)
+
+            real_rglob = Path.rglob
+            planted = {"done": False}
+
+            def hooked_rglob(self: Path, pattern: str):
+                if (
+                    not planted["done"]
+                    and pattern == "*"
+                    and self == expected_package_dir
+                ):
+                    planted["done"] = True
+                    (self / "sneaky-symlink").symlink_to(outside_target)
+                return real_rglob(self, pattern)
+
+            with mock.patch.object(Path, "rglob", hooked_rglob):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "unexpected symlink in managed extraction tree",
+                ):
+                    installer.safe_extract_main_asset(archive_path, destination)
+            # The hook must actually have fired -- otherwise this test would
+            # trivially pass by never exercising the race at all.
+            self.assertTrue(planted["done"])
+
+    def test_extract_node_toolchain_symlink_scan_catches_late_planted_symlink(
+        self,
+    ) -> None:
+        # Companion to test_safe_extract_main_asset_symlink_scan_catches_
+        # late_planted_symlink, above, for extract_node_toolchain()'s OWN
+        # assert_tree_has_no_symlinks(destination) call -- the round-7
+        # coverage gap applied to both call sites, and
+        # test_extract_node_toolchain_refuses_preexisting_destination_with_symlinked_subdir
+        # (a pre-existing `destination`) only ever exercised
+        # create_fresh_private_dir()'s separate refusal, never this check.
+        # A symlink member is silently skipped (not written) by this
+        # function's own per-member loop, so -- as with the main-asset
+        # variant -- the only way a symlink reaches `destination` before
+        # this scan is a same-UID race; simulated the same deterministic
+        # way, by planting it the instant this function's own rglob("*")
+        # walk over `destination` begins.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ssd = root / "ssd"
+            ssd.mkdir(mode=0o700)
+            destination = ssd / "toolchain"
+            outside_target = root / "outside-victim"
+            outside_target.mkdir(mode=0o700)
+
+            expected_root = f"node-v{installer.NODE_VERSION}-darwin-arm64"
+            node_payload = b"#!/bin/sh\necho fake-node\n"
+            npm_payload = b"#!/usr/bin/env node\n// fake npm cli\n"
+            node_asset = root / "node.tgz"
+            with tarfile.open(node_asset, "w:gz") as archive:
+                info = tarfile.TarInfo(f"{expected_root}/bin/node")
+                info.mode = 0o755
+                info.size = len(node_payload)
+                archive.addfile(info, io.BytesIO(node_payload))
+                info = tarfile.TarInfo(f"{expected_root}/lib/node_modules/npm/bin/npm-cli.js")
+                info.mode = 0o644
+                info.size = len(npm_payload)
+                archive.addfile(info, io.BytesIO(npm_payload))
+
+            real_rglob = Path.rglob
+            planted = {"done": False}
+
+            def hooked_rglob(self: Path, pattern: str):
+                if (
+                    not planted["done"]
+                    and pattern == "*"
+                    and self == destination
+                ):
+                    planted["done"] = True
+                    (self / "sneaky-symlink").symlink_to(outside_target)
+                return real_rglob(self, pattern)
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", ssd),
+                mock.patch.object(Path, "rglob", hooked_rglob),
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "unexpected symlink in managed extraction tree",
+                ):
+                    installer.extract_node_toolchain(node_asset, destination)
+            self.assertTrue(planted["done"])
+
     def test_safe_extract_main_asset_manifest_excludes_untracked_files(self) -> None:
         # Regression for independent review round 2, 2026-08-18, P1: the
         # manifest safe_extract_main_asset() returns must list only the
@@ -2632,10 +2767,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             untracked_dir.mkdir(mode=0o700)
             (untracked_dir / "evil.js").write_bytes(b"attacker payload")
 
-            package_dir, manifest, digests = installer.safe_extract_main_asset(
+            package_dir, manifest, digests, dir_modes = installer.safe_extract_main_asset(
                 archive_path, destination
             )
             self.assertEqual(set(digests), {Path("package.json")})
+            self.assertEqual(dir_modes, {})
             self.assertEqual(
                 digests[Path("package.json")], installer.sha256_bytes(payload)
             )
@@ -2682,7 +2818,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             real_safe_extract_main_asset = installer.safe_extract_main_asset
 
             def race_after_extraction(asset: Path, destination: Path):
-                package_dir, manifest, digests = real_safe_extract_main_asset(
+                package_dir, manifest, digests, dir_modes = real_safe_extract_main_asset(
                     asset, destination
                 )
                 # The instant after extraction finishes and is verified, a
@@ -2690,7 +2826,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 # now-real (and no longer creatable-fresh) package
                 # directory.
                 (package_dir / "postinstall-evil.js").write_bytes(b"attacker payload")
-                return package_dir, manifest, digests
+                return package_dir, manifest, digests, dir_modes
 
             output_name = "prime-agent-orca-pinned-race-test.tgz"
             with (
@@ -2775,7 +2911,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             real_safe_extract_main_asset = installer.safe_extract_main_asset
 
             def swap_after_extraction(asset: Path, destination: Path):
-                package_dir, manifest, digests = real_safe_extract_main_asset(
+                package_dir, manifest, digests, dir_modes = real_safe_extract_main_asset(
                     asset, destination
                 )
                 # The instant after extraction finishes -- and this file's
@@ -2787,7 +2923,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 installer.atomic_write(
                     swapped, b"attacker-controlled payload\n", 0o600
                 )
-                return package_dir, manifest, digests
+                return package_dir, manifest, digests, dir_modes
 
             output_name = "prime-agent-orca-pinned-content-swap-test.tgz"
             with (
@@ -2816,6 +2952,158 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             # artifact, not even a partially-written one.
             self.assertFalse((assets / output_name).exists())
             self.assertEqual(list(assets.glob(f".{output_name}.*")), [])
+
+    def test_make_patched_asset_directory_entry_survives_symlink_swap_in_the_gap(
+        self,
+    ) -> None:
+        # Regression for independent review round 7/8, 2026-08-18, P1
+        # (independently confirmed by two reviewers): the directory branch
+        # of make_patched_asset()'s archiving loop used to lstat-validate a
+        # directory member and then publish it via archive.add(path, ...,
+        # recursive=False) -- but archive.add() performs its OWN, entirely
+        # separate, internal lstat() (via tarfile's gettarinfo(), which
+        # calls os.lstat(), not the earlier pathlib check) of `path` to
+        # actually build the TarInfo it writes. A same-UID racer that swaps
+        # the validated directory for a symlink to an arbitrary, possibly
+        # out-of-tree target in the gap between this function's own
+        # validating lstat() and that later, separate, internal
+        # archive.add() re-stat had the published archive silently contain
+        # a symlink member in place of the intended directory entry, from a
+        # link-free, digest-verified source archive.
+        #
+        # Verified against pre-fix (round-7 HEAD) code in an isolated
+        # scratch copy: injecting the swap any EARLIER than this exact gap
+        # (e.g. immediately after safe_extract_main_asset() returns, before
+        # the archiving loop even starts) is actually already caught by the
+        # pre-fix code's OWN lstat check -- S_ISLNK there correctly refuses
+        # it -- so a faithful regression test for this specific finding
+        # must land the swap exactly between that check and archive.add()'s
+        # own later, independent re-stat, not merely "at some point after
+        # extraction". This is simulated deterministically (matching this
+        # file's established convention for TOCTOU tests -- injecting a
+        # race as a side effect of a real call rather than using actual
+        # concurrent threads) by hooking Path.lstat() itself: the swap
+        # fires as a side effect of the SPECIFIC lstat() call this
+        # function's own directory-branch validation makes for this exact
+        # path (learned from safe_extract_main_asset()'s real, unmocked
+        # return value, not hardcoded), immediately after that call
+        # captures its own (still pre-swap) result -- so the validation
+        # step still sees a valid directory and proceeds, while archive.
+        # add()'s later, separate os.lstat() sees the now-swapped symlink.
+        #
+        # Fixed the same way round 6 already fixed the analogous gap for
+        # file CONTENT (read_private_file(): one atomic verify-then-use
+        # operation, no second path-based lookup): the directory branch no
+        # longer touches the path at all -- it publishes a fixed DIRTYPE
+        # TarInfo built entirely from the mode safe_extract_main_asset()
+        # itself recorded when it originally created this exact directory.
+        # Against the fix, this same hook is confirmed to never even fire
+        # (verified below): the vulnerable lstat() call the hook targets no
+        # longer exists in the directory branch at all, so there is
+        # structurally nothing left in this path for a same-UID racer to
+        # win a race against.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            assets = release / "assets"
+            assets.mkdir(parents=True, mode=0o700)
+            os.chmod(tool_root / "releases", 0o700)
+            os.chmod(release, 0o700)
+            os.chmod(assets, 0o700)
+
+            original_asset = root / "prime-agent-source.tgz"
+            manifest_payload = installer.canonical_json(
+                {"name": "prime-agent", "version": installer.VERSION}
+            )
+            with tarfile.open(original_asset, "w:gz") as archive:
+                info = tarfile.TarInfo("package/package.json")
+                info.size = len(manifest_payload)
+                archive.addfile(info, io.BytesIO(manifest_payload))
+                # An explicit, empty directory member -- a package-relative
+                # "dist" directory with nothing else inside it, so the race
+                # below can swap the whole directory for a symlink without
+                # needing to first relocate any file that lives under it.
+                dir_info = tarfile.TarInfo("package/dist")
+                dir_info.type = tarfile.DIRTYPE
+                dir_info.mode = 0o755
+                archive.addfile(dir_info)
+
+            outside_target = root / "outside-victim"
+            outside_target.mkdir(mode=0o700)
+            (outside_target / "sentinel").write_bytes(b"do-not-touch")
+
+            real_safe_extract_main_asset = installer.safe_extract_main_asset
+            package_dir_holder: dict[str, Path] = {}
+
+            def learn_package_dir(asset: Path, destination: Path):
+                result = real_safe_extract_main_asset(asset, destination)
+                package_dir_holder["path"] = result[0]
+                return result
+
+            real_lstat = Path.lstat
+            triggered = {"done": False}
+
+            def hooked_lstat(self: Path):
+                result = real_lstat(self)
+                expected = package_dir_holder.get("path")
+                if (
+                    expected is not None
+                    and not triggered["done"]
+                    and self == expected / "dist"
+                    and stat.S_ISDIR(result.st_mode)
+                ):
+                    triggered["done"] = True
+                    # The instant after this exact validating lstat() call
+                    # captured a valid-directory result (returned below,
+                    # unchanged), a same-UID racer removes the directory
+                    # and drops a symlink to an outside directory in its
+                    # place -- before any LATER, separate lookup of the
+                    # same path (e.g. archive.add()'s own internal
+                    # os.lstat()) would run.
+                    self.rmdir()
+                    self.symlink_to(outside_target)
+                return result
+
+            output_name = "prime-agent-orca-pinned-dir-swap-test.tgz"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(
+                    installer,
+                    "safe_extract_main_asset",
+                    side_effect=learn_package_dir,
+                ),
+                mock.patch.object(Path, "lstat", hooked_lstat),
+            ):
+                patched, _digest, _manifest = installer.make_patched_asset(
+                    original_asset,
+                    {"packages": {}},
+                    assets,
+                    expected_name="prime-agent",
+                    managed_name="prime-agent",
+                    output_name=output_name,
+                )
+
+            with tarfile.open(patched, "r:gz") as published:
+                member = published.getmember("package/dist")
+            # The published archive must still contain the correct DIRTYPE
+            # member -- never a symlink, regardless of what the same-UID
+            # racer swapped the on-disk path to in the meantime.
+            self.assertTrue(member.isdir())
+            self.assertFalse(member.issym())
+            self.assertEqual(member.linkname, "")
+            # The attacker's outside directory must never have been touched
+            # or read by the archiving loop.
+            self.assertEqual(
+                (outside_target / "sentinel").read_bytes(), b"do-not-touch"
+            )
+            # The fixed directory branch performs no path-based lstat() of
+            # its own at all -- confirm the hook (anchored to exactly the
+            # lstat() call the pre-fix code made here) genuinely never
+            # fired, rather than this test accidentally passing because the
+            # swap silently failed for an unrelated reason.
+            self.assertFalse(triggered["done"])
 
     def test_atomic_symlink_ancestor_swap_cannot_escape_verified_parent(self) -> None:
         # Regression for P1-2: ensure_local_link_parent() used to verify the
@@ -3403,7 +3691,19 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             # public command (there is nothing here for
             # normalizeLeadingDaemonSocketOption() to even consider) -- this
             # must still receive NO resource-guard flags, exactly as before
-            # round 6.
+            # round 6. As of round 8, "config" is no longer in the shell
+            # entrypoint's public_commands (see managed_entrypoint_script()),
+            # so session_start is now 1 here rather than 0 -- but `clean` has
+            # no .prime/agent/settings.json, so the settings gate this test
+            # isn't exercising still never fires, and "config" remains in
+            # RUNTIME_NO_GUARD_COMMANDS on the Python launch-guard side (see
+            # its own comment for why that's an intentionally separate
+            # question from public_commands membership), so guarded_
+            # arguments() still never splices RESOURCE_GUARDS into its argv
+            # either. Both observable assertions below are therefore
+            # unchanged by round 8; see
+            # test_config_package_help_require_session_start_protection_by_default
+            # for the settings-gate behavior change itself.
             bare_config_result = run_wrapper(("config", "get", "x"))
             self.assertEqual(bare_config_result.returncode, 0, bare_config_result.stderr)
             bare_config_payload = installer.strict_json(
@@ -3803,6 +4103,176 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             self.assertIsInstance(unguarded_payload, dict)
             assert isinstance(unguarded_payload, dict)
             self.assertEqual(unguarded_payload["argv"][1:], ["status"])
+
+    def test_config_package_help_require_session_start_protection_by_default(
+        self,
+    ) -> None:
+        # Regression for independent review round 7/8, 2026-08-18, P1 (the
+        # highest-severity finding across every round to date): "config",
+        # "package", and "help <argument>" were classified session_start=0
+        # in managed_entrypoint_script()'s public_commands, skipping BOTH
+        # the $PWD/.prime/agent/settings.json gate and
+        # ORCA_PRIME_AGENT_RESOURCE_GUARD, even though upstream's real
+        # handleConfigCommand()/handlePackageCommand() can still call
+        # SettingsManager.create(process.cwd(), agentDir) (and "config"
+        # additionally packageManager.resolve() with no onMissing guard),
+        # and "help <argument>" falls through to a real, unprotected
+        # session start for any argument upstream's own fuzzy help matcher
+        # does not recognize. A prior round of independent review
+        # reproduced this end-to-end with the real generated wrapper, real
+        # generated launch guard, real pinned Node, and the real
+        # prime-agent 0.7.2 bundle: a hostile .prime/agent/settings.json's
+        # configured command ran via plain `prime-agent config`.
+        #
+        # This test exercises the SAME generated wrapper + launch guard as
+        # real subprocesses (matching this file's established convention),
+        # with a lightweight Python stand-in for "node" that reports argv
+        # and the resource-guard env var, rather than the real upstream
+        # bundle -- see the separate, real-upstream-bundle end-to-end
+        # verification for proof that the underlying upstream RCE path
+        # this closes is genuine, not merely a shape-level argv test.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "release"
+            bin_dir = release / "bin"
+            bin_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(tool_root, 0o700)
+            os.chmod(release, 0o700)
+            node = bin_dir / "node"
+            cli = release / "cli.js"
+            node.write_text(
+                "#!/usr/bin/python3\n"
+                "import json, os, sys\n"
+                "print(json.dumps({\n"
+                "  'argv': sys.argv[1:],\n"
+                "  'resourceGuard': os.environ.get('ORCA_PRIME_AGENT_RESOURCE_GUARD'),\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            os.chmod(node, 0o700)
+            cli.write_text("// argument sentinel\n", encoding="utf-8")
+            os.chmod(cli, 0o600)
+            lifecycle_lock = tool_root / "lifecycle.lock"
+            lifecycle_lock.write_bytes(b"")
+            os.chmod(lifecycle_lock, 0o600)
+            guard = bin_dir / "prime-agent-launch-guard.py"
+            wrapper = bin_dir / "prime-agent"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", tool_root / "state"),
+            ):
+                guard.write_bytes(installer.managed_launch_guard_script(node, cli))
+                wrapper.write_bytes(
+                    installer.managed_entrypoint_script(node, cli, guard)
+                )
+            os.chmod(guard, 0o700)
+            os.chmod(wrapper, 0o700)
+            clean = root / "clean"
+            project = root / "project"
+            clean.mkdir(mode=0o700)
+            (project / ".prime/agent").mkdir(parents=True, mode=0o700)
+            (project / ".prime/agent/settings.json").write_text(
+                "{}", encoding="utf-8"
+            )
+
+            def run_wrapper(
+                arguments: tuple[str, ...],
+                *,
+                cwd: Path,
+                allow_settings: bool = False,
+            ) -> subprocess.CompletedProcess[str]:
+                environment = {
+                    "HOME": os.fspath(root),
+                    "PATH": "/usr/bin:/bin",
+                    "ORCA_PRIME_AGENT_RESOURCE_GUARD": "1",
+                }
+                if allow_settings:
+                    environment["ORCA_PRIME_AGENT_ALLOW_PROJECT_SETTINGS"] = "1"
+                return subprocess.run(
+                    [os.fspath(wrapper), *arguments],
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=environment,
+                )
+
+            # (a) THE FIX: config, package, and help-with-an-argument must
+            # now be blocked by the settings gate in a project carrying
+            # .prime/agent/settings.json, absent the opt-in env var --
+            # before round 8 every one of these incorrectly returned rc 0.
+            blocked_cases = (
+                ("config",),
+                ("config", "get", "x"),
+                ("package",),
+                ("package", "list"),
+                ("help", "mcp-servers"),
+                ("help", "auth"),
+                ("help", "tools", "list"),
+            )
+            for arguments in blocked_cases:
+                with self.subTest(arguments=arguments, mode="now-protected"):
+                    result = run_wrapper(arguments, cwd=project)
+                    self.assertEqual(result.returncode, 78, result.stderr)
+                    self.assertIn(
+                        "project .prime/agent/settings.json", result.stderr
+                    )
+
+            # (b) Bare `help` -- no further argument at all -- is the one
+            # form confirmed always safe upstream (isHelpCommandRequest()
+            # returns true unconditionally for a zero-length path, checked
+            # directly against dist/bundle/chunk-PMFPRFOT.js) and must stay
+            # fast-tracked even in this same project.
+            bare_help = run_wrapper(("help",), cwd=project)
+            self.assertEqual(bare_help.returncode, 0, bare_help.stderr)
+
+            # (c) Explicit opt-in restores the previous, unprotected
+            # behavior for all three -- proving (a) is really session_
+            # start's settings gate firing, not some unrelated failure.
+            for arguments in (("config",), ("package",), ("help", "auth")):
+                with self.subTest(arguments=arguments, mode="explicit-opt-in"):
+                    result = run_wrapper(
+                        arguments, cwd=project, allow_settings=True
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+            # (d) In a CLEAN cwd (no project settings file at all), config/
+            # package/help<arg> must still succeed, AND -- the round-3/4
+            # argv-corruption bug class this fix must not reopen -- their
+            # argv must arrive at the underlying CLI COMPLETELY UNCHANGED:
+            # confirms config/package/help remain in RUNTIME_NO_GUARD_
+            # COMMANDS on the Python launch-guard side even though they
+            # left public_commands on the shell side, so guarded_arguments()
+            # never splices RESOURCE_GUARDS into their argv (a position
+            # never verified safe for these three specific commands).
+            for arguments in (
+                ("config", "get", "x"),
+                ("package", "list"),
+                ("help", "auth"),
+            ):
+                with self.subTest(arguments=arguments, mode="clean-cwd-unguarded"):
+                    result = run_wrapper(arguments, cwd=clean)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    payload = installer.strict_json(result.stdout.encode("utf-8"))
+                    self.assertIsInstance(payload, dict)
+                    assert isinstance(payload, dict)
+                    self.assertEqual(payload["argv"][1:], list(arguments))
+                    # The launch guard always pops its own signal env var
+                    # before exec'ing the real CLI, regardless of whether
+                    # guards were inserted.
+                    self.assertIsNone(payload["resourceGuard"])
+
+            # (e) Commands UNAFFECTED by this fix (still in public_commands)
+            # remain session_start=0 -- no settings-gate block -- in the
+            # SAME project directory that now blocks config/package/help.
+            for cmd in ("status", "list", "doctor", "schedule", "shutdown"):
+                with self.subTest(command=cmd, mode="unaffected-still-public"):
+                    result = run_wrapper((cmd,), cwd=project)
+                    self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_verify_command_state_detects_ancestor_swap_to_directory_without_command(
         self,
