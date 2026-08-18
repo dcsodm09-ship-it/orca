@@ -219,7 +219,29 @@ Orca 编排层/orca-context-bridge 层分别对应哪种架构）见本次报告
 
 按用户规则"任一路存在可复现 P0/P1 都不得完成、合并、发布、安装或部署"——**本候选现在是 BLOCKED，不需要等 Claude opus/max 那一路结果，光 Codex 这一路的 4 个 P1 就已经阻断**。下一步：先修复上述四项、冻结新哈希，再对新候选重新走 Codex sol/max **与** Claude opus/max 双复核。全过程只读，未修改/安装/删除任何文件。
 
-**2026-08-18 更新（6 轮 fix→verify→双复核循环，`BLOCKED_DUAL_REVIEW` 状态延续）**：用户明确要求"装进来并完善"。原始 4 个 P1 全部修好，round 2-6 又连续发现并修了 10 个新 P1（4 个原始 + round1:1 + round2:2 + round3:2 + round4:0[Codex侧被内容策略拦截,未出结论] + round5:3[两路独立收敛到同一个 bug] + round6 修复但未复核）。Codex sol/xhigh 前 3 轮 GO，第 4 轮被 OpenAI 自己的 cybersecurity 内容策略拦截（改用纯 QA/行为验证措辞后第 5 轮恢复正常，且独立发现了 round 5 自己引入的一个功能回归）。**round 6 修复已完成、80/80 测试通过、已提交（commit `2c2a9c9b9a`），但尚未独立复核**——这是本次会话主动选择的检查点（连续 6 轮真实发现新问题后暂停汇报），不是遇到阻断；round 7 双复核随时可派发。**独立于安全复核之外的第二个阻断**：`sandbox_e2e.py` 真实网络路径运行发现上游 npm 锁定哈希（2026-08-14 钉的）已经和当前（2026-08-18）registry 解析结果不一致——即便安全复核收敛，今天也无法真正 `install`，需要人工对新证据重新核对/钉哈希。完整时间线、每轮具体发现、复现细节见 `reports/ORCA-COLLAB-STATE-AND-PRIME-AGENT-2026-08-18.md`。**候选状态：仍是 BLOCKED_DUAL_REVIEW（round 6 待复核）+ 新增 BLOCKED_HUMAN_AUTH（上游证据重新采集），未安装、未启用。**
+**2026-08-18 更新（6 轮 fix→verify→双复核循环，`BLOCKED_DUAL_REVIEW` 状态延续）**：用户明确要求"装进来并完善"。原始 4 个 P1 全部修好，round 2-6 又连续发现并修了 10 个新 P1（4 个原始 + round1:1 + round2:2 + round3:2 + round4:0[Codex侧被内容策略拦截,未出结论] + round5:3[两路独立收敛到同一个 bug] + round6 修复但未复核）。Codex sol/xhigh 前 3 轮 GO，第 4 轮被 OpenAI 自己的 cybersecurity 内容策略拦截（改用纯 QA/行为验证措辞后第 5 轮恢复正常，且独立发现了 round 5 自己引入的一个功能回归）。**round 6 修复已完成、80/80 测试通过、已提交（commit `2c2a9c9b9a`），但尚未独立复核**——这是本次会话主动选择的检查点（连续 6 轮真实发现新问题后暂停汇报），不是遇到阻断；round 7 双复核随时可派发。**独立于安全复核之外的第二个阻断**：`sandbox_e2e.py` 真实网络路径运行发现上游 npm 锁定哈希（2026-08-14 钉的）已经和当前（2026-08-18）registry 解析结果不一致——即便安全复核收敛，今天也无法真正 `install`，需要人工对新证据重新核对/钉哈希。完整时间线、每轮具体发现、复现细节见 `reports/ORCA-COLLAB-STATE-AND-PRIME-AGENT-2026-08-18.md`。
+
+**2026-08-18 续（round 7-17，DUAL_GO_REVIEW_COMPLETE）**：round 6 之后又连续 11 轮
+真实发现新问题——最严重的一次是 round 7（用户"继续"后派发）：`config`/`package`/
+`help <token>` 被错误归类为无需项目设置门禁保护，真实上游 v0.7.2 全链路端到端复现
+出任意代码执行（RCE）。这个向量此后被追了 7 轮（8-14）：settings.json 门禁绕过→
+不需要 settings.json 的第二条路→ round 10 算法移植引入的 Unicode bug→改用精确匹配→
+分类器之下的保护参数插入机制本身能被"末尾取值 flag"吞掉（round 3/4/10 起就存在，
+从没被真正测过）→ round 14 修好插入机制。**round 15：用 19.4 万种参数形态 + 85 次
+真实复现零绕过，独立确认这个追了 7 轮的 RCE 向量真正、结构性地关闭了**，同时发现
+一个不同类的新 P1（tarball 二次校验没覆盖本地生成的补丁包）→ round 16 修好→
+**round 17：Codex sol/max PASS + Claude opus/max GO，双路 0 P0 0 P1**（2 个低危 P2、
+3 个纯信息性 P3，opus/max 明确判定"这是安全侧合理的停止点"）。过程中还有一个流程
+可信度发现：本机另一并发会话独立验证 Workflow 工具的 `agentType:'codex-design'`
+会静默降级到 claude-haiku——这正是本候选最早 round 1-3 派"Codex"的方式，所以那三轮
+的"Codex GO"不可信（好在 opus/max 那路一直是真的，从未因此误放行）；round 4 起
+改走裸 `Agent` 工具/真正 Orca orchestration 之后的 Codex 复核才是真的。
+
+**候选状态：`DUAL_GO_REVIEW_COMPLETE`（安全修复本身，commit `fd6a683a4a`，17 轮
+收敛完成）+ 仍是 `BLOCKED_HUMAN_AUTH`（上游锁定哈希需要人工对新证据重新核对/钉，
+这是独立于安全复核之外的第二个阻断，17 轮修复复核全程都没有处理它）。是否真正
+执行 `install`/`enable` 仍需用户对"重新核对上游证据"这一步单独决定，本记录不代表
+已执行任何上线动作。**
 
 ## 8. 桌面 / 浏览器（2 项）
 
