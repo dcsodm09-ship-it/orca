@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -1075,6 +1076,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 mock.patch.object(installer, "STATE_DIR", tool_root / "state"),
                 mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home"),
                 mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                mock.patch.object(installer, "USER_HOME", user_home),
                 mock.patch.object(installer, "BIN_LINK", user_home / ".local/bin/prime-agent"),
                 mock.patch.object(installer, "RECEIPT_PATH", tool_root / "receipt.json"),
                 mock.patch.object(installer, "PENDING_PATH", tool_root / "pending.json"),
@@ -1106,6 +1108,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 mock.patch.object(installer, "STATE_DIR", state),
                 mock.patch.object(installer, "PROBE_HOME", probe),
                 mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                mock.patch.object(installer, "USER_HOME", user_home),
                 mock.patch.object(installer, "BIN_LINK", user_home / ".local/bin/prime-agent"),
                 mock.patch.object(installer, "RECEIPT_PATH", tool_root / "receipt.json"),
                 mock.patch.object(installer, "PENDING_PATH", tool_root / "pending.json"),
@@ -1164,6 +1167,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                         mock.patch.object(installer, "STATE_DIR", state),
                         mock.patch.object(installer, "PROBE_HOME", probe),
                         mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                        mock.patch.object(installer, "USER_HOME", user_home),
                         mock.patch.object(
                             installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
                         ),
@@ -1233,6 +1237,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                         mock.patch.object(installer, "STATE_DIR", state),
                         mock.patch.object(installer, "PROBE_HOME", probe),
                         mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                        mock.patch.object(installer, "USER_HOME", user_home),
                         mock.patch.object(
                             installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
                         ),
@@ -1299,6 +1304,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 mock.patch.object(installer, "STATE_DIR", state),
                 mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home"),
                 mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                mock.patch.object(installer, "USER_HOME", user_home),
                 mock.patch.object(
                     installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
                 ),
@@ -1362,6 +1368,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     mock.patch.object(installer, "STATE_DIR", tool_root / "state"),
                     mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home"),
                     mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                    mock.patch.object(installer, "USER_HOME", user_home),
                     mock.patch.object(
                         installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
                     ),
@@ -1426,6 +1433,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     mock.patch.object(installer, "STATE_DIR", state),
                     mock.patch.object(installer, "PROBE_HOME", probe),
                     mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                    mock.patch.object(installer, "USER_HOME", user_home),
                     mock.patch.object(
                         installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
                     ),
@@ -1626,6 +1634,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 mock.patch.object(installer, "STATE_DIR", tool_root / "state"),
                 mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home"),
                 mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                mock.patch.object(installer, "USER_HOME", user_home),
                 mock.patch.object(
                     installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
                 ),
@@ -1691,6 +1700,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 mock.patch.object(installer, "STATE_DIR", state),
                 mock.patch.object(installer, "PROBE_HOME", probe),
                 mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                mock.patch.object(installer, "USER_HOME", user_home),
                 mock.patch.object(installer, "BIN_LINK", user_home / ".local/bin/prime-agent"),
                 mock.patch.object(installer, "RECEIPT_PATH", receipt_path),
                 mock.patch.object(installer, "PENDING_PATH", pending),
@@ -1920,13 +1930,20 @@ class PrimeAgentInstallerTests(unittest.TestCase):
 
         with (
             mock.patch.object(installer, "load_receipt", return_value=receipt),
+            # Not under test here (see
+            # test_uninstall_reasserts_lifecycle_lock_identity_before_mutation
+            # for that): stub to a no-op so this test's real subject --
+            # process-appears-after-disable restore -- is unaffected by
+            # uninstall()'s round-6 lock re-assertion requiring a real,
+            # matching lifecycle.lock on disk.
+            mock.patch.object(installer, "assert_lifecycle_lock_path_identity"),
             mock.patch.object(installer, "verify_command_state", return_value=True),
             mock.patch.object(installer, "remove_exact_symlink", side_effect=removed),
             mock.patch.object(installer, "managed_process_ids", side_effect=scanned),
             mock.patch.object(installer, "atomic_symlink", side_effect=restored),
         ):
             with self.assertRaisesRegex(installer.PrimeInstallError, "command was restored"):
-                installer._uninstall_locked()
+                installer._uninstall_locked((0, 0))
         self.assertEqual(events, ["removed", "scanned", "restored"])
 
     def test_process_scan_detects_title_only_daemon(self) -> None:
@@ -1977,17 +1994,19 @@ class PrimeAgentInstallerTests(unittest.TestCase):
         receipt = {"bin_target": "/managed/prime-agent"}
         with (
             mock.patch.object(installer, "load_receipt", return_value=receipt),
+            mock.patch.object(installer, "assert_lifecycle_lock_path_identity"),
             mock.patch.object(installer, "verify_command_state", return_value=False),
             mock.patch.object(installer, "managed_process_ids", return_value=[4321]) as scan,
         ):
             with self.assertRaisesRegex(installer.PrimeInstallError, "still running"):
-                installer._uninstall_locked()
+                installer._uninstall_locked((0, 0))
         scan.assert_called_once_with(receipt)
 
     def test_uninstall_restores_command_after_indeterminate_process_scan(self) -> None:
         receipt = {"bin_target": "/managed/prime-agent"}
         with (
             mock.patch.object(installer, "load_receipt", return_value=receipt),
+            mock.patch.object(installer, "assert_lifecycle_lock_path_identity"),
             mock.patch.object(installer, "verify_command_state", return_value=True),
             mock.patch.object(installer, "remove_exact_symlink"),
             mock.patch.object(
@@ -1998,13 +2017,14 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             mock.patch.object(installer, "atomic_symlink") as restore,
         ):
             with self.assertRaisesRegex(installer.PrimeInstallError, "command was restored"):
-                installer._uninstall_locked()
+                installer._uninstall_locked((0, 0))
         restore.assert_called_once_with(Path(receipt["bin_target"]), installer.BIN_LINK)
 
     def test_uninstall_preserves_late_occupant_when_restore_fails(self) -> None:
         receipt = {"bin_target": "/managed/prime-agent"}
         with (
             mock.patch.object(installer, "load_receipt", return_value=receipt),
+            mock.patch.object(installer, "assert_lifecycle_lock_path_identity"),
             mock.patch.object(installer, "verify_command_state", return_value=True),
             mock.patch.object(installer, "remove_exact_symlink"),
             mock.patch.object(installer, "managed_process_ids", return_value=[4321]),
@@ -2015,7 +2035,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             ),
         ):
             with self.assertRaisesRegex(installer.PrimeInstallError, "not overwritten"):
-                installer._uninstall_locked()
+                installer._uninstall_locked((0, 0))
 
     def test_enable_cleanup_preserves_post_unlink_durability_error(self) -> None:
         receipt = {"bin_target": "/managed/prime-agent"}
@@ -2043,6 +2063,57 @@ class PrimeAgentInstallerTests(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn("removed but parent-directory durability is unconfirmed", message)
         self.assertNotIn("preserved for inspection", message)
+
+    def test_uninstall_reasserts_lifecycle_lock_identity_before_mutation(self) -> None:
+        # Regression for independent dual review round 6, 2026-08-18, P2:
+        # enable() (_enable_locked() -> verify(lock_identity)) re-asserts
+        # the lifecycle lock's identity before its first mutation, but
+        # uninstall() (_uninstall_locked()) omitted this entirely despite
+        # performing the riskiest mutation of the two -- removing the
+        # managed command link. Confirms a stale caller-supplied identity
+        # is detected and fails closed BEFORE remove_exact_symlink() is
+        # ever called (no mutation happens), while the correct, current
+        # identity lets the same operation proceed to that mutation.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            tool_root.mkdir(mode=0o700)
+            lock = tool_root / "lifecycle.lock"
+            lock.write_bytes(b"")
+            os.chmod(lock, 0o600)
+            real_identity = (lock.stat().st_dev, lock.stat().st_ino)
+            unrelated = root / "unrelated-file"
+            unrelated.write_bytes(b"")
+            stale_identity = (unrelated.stat().st_dev, unrelated.stat().st_ino)
+            receipt = {"bin_target": "/managed/prime-agent"}
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "load_receipt", return_value=receipt),
+                mock.patch.object(installer, "verify_command_state", return_value=True),
+                mock.patch.object(installer, "remove_exact_symlink") as remove,
+                mock.patch.object(installer, "managed_process_ids", return_value=[]),
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "lifecycle lock identity changed while held",
+                ):
+                    installer._uninstall_locked(stale_identity)
+                remove.assert_not_called()
+
+                remove.reset_mock()
+                # verify_command_state() is called again after the (mocked,
+                # no-op) removal, so it must now report disabled to reach a
+                # clean success return.
+                with mock.patch.object(
+                    installer,
+                    "verify_command_state",
+                    side_effect=[True, False],
+                ):
+                    result = installer._uninstall_locked(real_identity)
+                remove.assert_called_once()
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["command_disabled"])
 
     def test_exclusive_lifecycle_lock_refuses_in_flight_shared_launcher(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2561,8 +2632,12 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             untracked_dir.mkdir(mode=0o700)
             (untracked_dir / "evil.js").write_bytes(b"attacker payload")
 
-            package_dir, manifest = installer.safe_extract_main_asset(
+            package_dir, manifest, digests = installer.safe_extract_main_asset(
                 archive_path, destination
+            )
+            self.assertEqual(set(digests), {Path("package.json")})
+            self.assertEqual(
+                digests[Path("package.json")], installer.sha256_bytes(payload)
             )
 
             self.assertIn(Path("package.json"), manifest)
@@ -2607,13 +2682,15 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             real_safe_extract_main_asset = installer.safe_extract_main_asset
 
             def race_after_extraction(asset: Path, destination: Path):
-                package_dir, manifest = real_safe_extract_main_asset(asset, destination)
+                package_dir, manifest, digests = real_safe_extract_main_asset(
+                    asset, destination
+                )
                 # The instant after extraction finishes and is verified, a
                 # same-UID racer drops an extra file straight into the
                 # now-real (and no longer creatable-fresh) package
                 # directory.
                 (package_dir / "postinstall-evil.js").write_bytes(b"attacker payload")
-                return package_dir, manifest
+                return package_dir, manifest, digests
 
             output_name = "prime-agent-orca-pinned-race-test.tgz"
             with (
@@ -2638,6 +2715,107 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 names = published.getnames()
             self.assertIn("package/package.json", names)
             self.assertNotIn("package/postinstall-evil.js", names)
+
+    def test_make_patched_asset_detects_content_swap_before_archiving(self) -> None:
+        # Regression for independent dual review round 6, 2026-08-18, P1
+        # (pre-existing, not round-5-introduced): make_patched_asset()
+        # lstat-verified each extracted member's TYPE and OWNER immediately
+        # before archiving it, but never its CONTENT -- archive.add() then
+        # performed its own, entirely separate open()+read() of the same
+        # path to actually pull the bytes into the published tarball. A
+        # same-UID actor with a real window between the digest-verified
+        # extraction and that later, separate read (reviewer measured
+        # ~1.9s to ~27s per file in a real reproduction with a polling
+        # thread, 4/4 trials) could swap a file's content in that gap and
+        # have the swapped bytes archived into the artifact that becomes
+        # the shipped/executed "patched" output, with no downstream gate
+        # catching it (the receipt's integrity fields are computed from the
+        # already-tampered tree, not cross-checked against the original
+        # verified digest).
+        #
+        # safe_extract_main_asset() now captures each regular file's
+        # content digest while streaming it from the tarball-verified
+        # source, and make_patched_asset() re-verifies each file's bytes
+        # against that digest at the exact moment it reads them for
+        # archiving (via read_private_file(), whose returned bytes are
+        # archived directly -- there is no second, separate read of the
+        # path afterward) -- closing the gap entirely rather than merely
+        # narrowing it. Follows this file's established convention for
+        # testing a TOCTOU window (see
+        # test_make_patched_asset_ignores_files_injected_after_extraction):
+        # wrap the real safe_extract_main_asset() with a side_effect that
+        # swaps a file's content immediately after it returns (a
+        # deterministic stand-in for winning the race, not a mock of the
+        # archiving logic under test).
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            assets = release / "assets"
+            assets.mkdir(parents=True, mode=0o700)
+            os.chmod(tool_root / "releases", 0o700)
+            os.chmod(release, 0o700)
+            os.chmod(assets, 0o700)
+
+            original_asset = root / "prime-agent-source.tgz"
+            manifest_payload = installer.canonical_json(
+                {"name": "prime-agent", "version": installer.VERSION}
+            )
+            real_payload = (
+                b"real, digest-verified content straight from the release tarball\n"
+            )
+            with tarfile.open(original_asset, "w:gz") as archive:
+                info = tarfile.TarInfo("package/package.json")
+                info.size = len(manifest_payload)
+                archive.addfile(info, io.BytesIO(manifest_payload))
+                info = tarfile.TarInfo("package/dist/bundle.js")
+                info.size = len(real_payload)
+                archive.addfile(info, io.BytesIO(real_payload))
+
+            real_safe_extract_main_asset = installer.safe_extract_main_asset
+
+            def swap_after_extraction(asset: Path, destination: Path):
+                package_dir, manifest, digests = real_safe_extract_main_asset(
+                    asset, destination
+                )
+                # The instant after extraction finishes -- and this file's
+                # content has already been digest-verified against the real
+                # tarball -- a same-UID racer overwrites the already
+                # -extracted file's bytes in place, before
+                # make_patched_asset()'s archiving loop ever reaches it.
+                swapped = package_dir / "dist/bundle.js"
+                installer.atomic_write(
+                    swapped, b"attacker-controlled payload\n", 0o600
+                )
+                return package_dir, manifest, digests
+
+            output_name = "prime-agent-orca-pinned-content-swap-test.tgz"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(
+                    installer,
+                    "safe_extract_main_asset",
+                    side_effect=swap_after_extraction,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "extracted member content changed before publish",
+                ):
+                    installer.make_patched_asset(
+                        original_asset,
+                        {"packages": {}},
+                        assets,
+                        expected_name="prime-agent",
+                        managed_name="prime-agent",
+                        output_name=output_name,
+                    )
+            # Nothing was ever published from the tampered tree -- the
+            # attacker-controlled content must never reach a shipped
+            # artifact, not even a partially-written one.
+            self.assertFalse((assets / output_name).exists())
+            self.assertEqual(list(assets.glob(f".{output_name}.*")), [])
 
     def test_atomic_symlink_ancestor_swap_cannot_escape_verified_parent(self) -> None:
         # Regression for P1-2: ensure_local_link_parent() used to verify the
@@ -3147,9 +3325,20 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 78)
                     self.assertIn("effective-project settings review", result.stderr)
 
-            # Explicit opt-in: now succeeds, and resource-guard flags land
-            # immediately after the command and its own positional args --
-            # never between the socket value and the command token.
+            # Explicit opt-in: now succeeds. Guard-flag placement changed in
+            # round 6, 2026-08-18 (see resolve_upstream_public_command()):
+            # upstream's own normalizeLeadingDaemonSocketOption() never
+            # remaps a bare "--daemon-socket <value>" pair followed by
+            # "agents" (only stop/rename), so upstream actually treats this
+            # exact invocation as a real session start, not the "agents"
+            # command -- guards therefore land right after the (unstripped,
+            # from upstream's point of view) daemon-socket pair, not after
+            # "agents saved-session" the way a form upstream genuinely
+            # resolves to "agents" would place them (see the bare, no-prefix
+            # "agents"/"attach" case in
+            # test_wrapper_guards_runtime_commands_and_effective_project,
+            # which is unaffected by this and still places guards after the
+            # command).
             allowed = run_wrapper(
                 ("--daemon-socket", daemon_socket, "agents", "saved-session"),
                 allow_settings=True,
@@ -3163,18 +3352,25 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 [
                     "--daemon-socket",
                     daemon_socket,
-                    "agents",
-                    "saved-session",
                     "--no-extensions",
                     "--no-skills",
                     "--no-prompt-templates",
+                    "agents",
+                    "saved-session",
                 ],
             )
 
-            # A non-stop/rename public command (config) reached via
-            # --daemon-socket must never receive resource-guard flags at
-            # all -- and, being a public/non-session command, must run
-            # without the effective-project gate too.
+            # A non-stop/rename public command (config) reached via a bare
+            # "--daemon-socket <value>" pair is exactly the round-6 P1: real
+            # upstream does NOT remap this to "config" (only stop/rename),
+            # so upstream actually starts a real session here -- this
+            # invocation now correctly receives resource-guard flags (it did
+            # NOT before round 6, which was the bug: session_start was
+            # wrongly computed as 0, so ORCA_PRIME_AGENT_RESOURCE_GUARD was
+            # never even exported for the launch guard to see). Because
+            # `clean` has no .prime/agent/settings.json, the separate
+            # settings-file gate does not fire either way, so rc stays 0 --
+            # the observable difference is the inserted guard flags below.
             config_result = run_wrapper(
                 ("--daemon-socket", daemon_socket, "config", "get", "x")
             )
@@ -3186,9 +3382,57 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             assert isinstance(config_payload, dict)
             self.assertEqual(
                 config_payload["argv"][1:],
-                ["--daemon-socket", daemon_socket, "config", "get", "x"],
+                [
+                    "--daemon-socket",
+                    daemon_socket,
+                    "--no-extensions",
+                    "--no-skills",
+                    "--no-prompt-templates",
+                    "config",
+                    "get",
+                    "x",
+                ],
             )
+            # The launch guard always consumes (os.environ.pop) its own
+            # signal env var before exec'ing the real CLI, so it never
+            # leaks through regardless of whether guards were inserted.
             self.assertIsNone(config_payload["resourceGuard"])
+
+            # A bare "config" with NO daemon-socket prefix at all is
+            # genuinely, unambiguously resolved by upstream as the "config"
+            # public command (there is nothing here for
+            # normalizeLeadingDaemonSocketOption() to even consider) -- this
+            # must still receive NO resource-guard flags, exactly as before
+            # round 6.
+            bare_config_result = run_wrapper(("config", "get", "x"))
+            self.assertEqual(bare_config_result.returncode, 0, bare_config_result.stderr)
+            bare_config_payload = installer.strict_json(
+                bare_config_result.stdout.encode("utf-8")
+            )
+            self.assertIsInstance(bare_config_payload, dict)
+            assert isinstance(bare_config_payload, dict)
+            self.assertEqual(
+                bare_config_payload["argv"][1:], ["config", "get", "x"]
+            )
+            self.assertIsNone(bare_config_payload["resourceGuard"])
+
+            # The genuinely upstream-recognized bare "--daemon-socket
+            # <value> stop <id>" form is the one case upstream's own
+            # normalizeLeadingDaemonSocketOption() DOES remap -- this must
+            # still receive NO resource-guard flags and no effective-project
+            # gate, unaffected by round 6.
+            stop_result = run_wrapper(
+                ("--daemon-socket", daemon_socket, "stop", "agent-id")
+            )
+            self.assertEqual(stop_result.returncode, 0, stop_result.stderr)
+            stop_payload = installer.strict_json(stop_result.stdout.encode("utf-8"))
+            self.assertIsInstance(stop_payload, dict)
+            assert isinstance(stop_payload, dict)
+            self.assertEqual(
+                stop_payload["argv"][1:],
+                ["--daemon-socket", daemon_socket, "stop", "agent-id"],
+            )
+            self.assertIsNone(stop_payload["resourceGuard"])
 
     def test_leading_option_parser_covers_update_bypass_and_daemon_socket_forms(
         self,
@@ -3310,11 +3554,22 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 78, result.stderr)
                     self.assertIn("effective-project settings review", result.stderr)
 
-            # Guard-flag placement: with explicit opt-in, resource-guard
-            # flags must land immediately after the resolved command token
-            # (and its own positional args) for the "="-form and
-            # repeated-flag cases too -- never between a socket value and
-            # the command token.
+            # Guard-flag placement: with explicit opt-in, both requests
+            # succeed and resource-guard flags are present. Their exact
+            # position changed in round 6, 2026-08-18 (see
+            # resolve_upstream_public_command()): real upstream's own
+            # normalizeLeadingDaemonSocketOption() never recognizes the "="
+            # form at all, and never recognizes a repeated/second
+            # "--daemon-socket" occurrence either -- both forms are actually
+            # treated by upstream as a real session start (not the "agents"
+            # command), so guards now land right after the leading
+            # daemon-socket token(s) rather than after "agents extra", to
+            # match where a real session-start invocation with those same
+            # leading tokens would want them (see the bare, no-prefix
+            # "agents"/"attach" case in
+            # test_wrapper_guards_runtime_commands_and_effective_project,
+            # which IS genuinely resolved as "agents" by upstream and still
+            # places guards after the command there).
             equals_allowed = run_wrapper(
                 (f"--daemon-socket={daemon_socket}", "agents", "extra"),
                 allow_settings=True,
@@ -3329,11 +3584,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 equals_payload["argv"][1:],
                 [
                     f"--daemon-socket={daemon_socket}",
-                    "agents",
-                    "extra",
                     "--no-extensions",
                     "--no-skills",
                     "--no-prompt-templates",
+                    "agents",
+                    "extra",
                 ],
             )
 
@@ -3361,13 +3616,193 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     daemon_socket,
                     "--daemon-socket",
                     other_socket,
-                    "agents",
-                    "extra",
                     "--no-extensions",
                     "--no-skills",
                     "--no-prompt-templates",
+                    "agents",
+                    "extra",
                 ],
             )
+
+    def test_daemon_socket_session_start_matches_upstream_normalization(
+        self,
+    ) -> None:
+        # Regression for independent dual review round 6, 2026-08-18, P1
+        # (found independently by a Claude opus/max review and a separate
+        # Codex QA pass): round 5's generic --daemon-socket leading-option
+        # parsing correctly resolved managed_command for forms like
+        # "--daemon-socket=<v> status", but the wrapper's OWN session_start
+        # gate then treated that resolution as an already-resolved,
+        # protection-free public command. Real upstream (see
+        # dist/cli/public-command.js's normalizeLeadingDaemonSocketOption(),
+        # vendored bundle chunk-CAY2X72A.js around lines 17324-17436, read
+        # directly to confirm this) only ever remaps a bare, space-separated
+        # "--daemon-socket <value>" pair, and only when followed by exactly
+        # "stop" or "rename" -- the "=" form is never recognized at all, a
+        # repeated occurrence is never recognized, and a bare pair followed
+        # by any OTHER command (status, list, config, ...) is left
+        # completely alone and upstream actually starts a real interactive
+        # session in $PWD. This test proves the settings-file gate --
+        # session_start's real security consequence, not just argv shape --
+        # now fires for exactly those forms it previously silently skipped,
+        # for more than one public command, in both the space and "="
+        # forms, while the one form upstream genuinely recognizes
+        # (--daemon-socket <value> stop/rename) and the no-prefix form both
+        # remain fast-tracked exactly as before.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "release"
+            bin_dir = release / "bin"
+            bin_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(tool_root, 0o700)
+            os.chmod(release, 0o700)
+            node = bin_dir / "node"
+            cli = release / "cli.js"
+            node.write_text(
+                "#!/usr/bin/python3\n"
+                "import json, os, sys\n"
+                "print(json.dumps({\n"
+                "  'argv': sys.argv[1:],\n"
+                "  'resourceGuard': os.environ.get('ORCA_PRIME_AGENT_RESOURCE_GUARD'),\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            os.chmod(node, 0o700)
+            cli.write_text("// argument sentinel\n", encoding="utf-8")
+            os.chmod(cli, 0o600)
+            lifecycle_lock = tool_root / "lifecycle.lock"
+            lifecycle_lock.write_bytes(b"")
+            os.chmod(lifecycle_lock, 0o600)
+            guard = bin_dir / "prime-agent-launch-guard.py"
+            wrapper = bin_dir / "prime-agent"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", tool_root / "state"),
+            ):
+                guard.write_bytes(installer.managed_launch_guard_script(node, cli))
+                wrapper.write_bytes(
+                    installer.managed_entrypoint_script(node, cli, guard)
+                )
+            os.chmod(guard, 0o700)
+            os.chmod(wrapper, 0o700)
+            clean = root / "clean"
+            project = root / "project"
+            clean.mkdir(mode=0o700)
+            (project / ".prime/agent").mkdir(parents=True, mode=0o700)
+            (project / ".prime/agent/settings.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            daemon_socket = os.fspath(root / "daemon.sock")
+            other_socket = os.fspath(root / "daemon2.sock")
+
+            def run_wrapper(
+                arguments: tuple[str, ...],
+                *,
+                cwd: Path,
+                allow_settings: bool = False,
+            ) -> subprocess.CompletedProcess[str]:
+                environment = {
+                    "HOME": os.fspath(root),
+                    "PATH": "/usr/bin:/bin",
+                    "ORCA_PRIME_AGENT_RESOURCE_GUARD": "1",
+                }
+                if allow_settings:
+                    environment["ORCA_PRIME_AGENT_ALLOW_PROJECT_SETTINGS"] = "1"
+                return subprocess.run(
+                    [os.fspath(wrapper), *arguments],
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=environment,
+                )
+
+            # (a) Baseline/sanity: a bare public command with NO
+            # daemon-socket prefix at all is genuinely, unambiguously
+            # resolved by upstream, so the settings gate correctly never
+            # applies to it, in project cwd, unaffected by round 6.
+            for bare_arguments in (("status",), ("list",)):
+                with self.subTest(arguments=bare_arguments, mode="bare-command-unblocked"):
+                    result = run_wrapper(bare_arguments, cwd=project)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+            # (b)-(d) THE FIX: a bare-space-form, an "="-form, and a
+            # repeated-flag daemon-socket prefix in front of a non-stop/
+            # rename public command must now ALL be treated as a protected
+            # session start -- the settings gate must fire in project cwd,
+            # for more than one command. Before round 6 every one of these
+            # incorrectly returned rc 0 (the bug this test proves fixed).
+            blocked_cases = (
+                ("--daemon-socket", daemon_socket, "status"),
+                (f"--daemon-socket={daemon_socket}", "status"),
+                ("--daemon-socket", daemon_socket, "--daemon-socket", other_socket, "status"),
+                ("--daemon-socket", daemon_socket, "list"),
+                (f"--daemon-socket={daemon_socket}", "list"),
+            )
+            for arguments in blocked_cases:
+                with self.subTest(arguments=arguments, mode="session-start-now-protected"):
+                    result = run_wrapper(arguments, cwd=project)
+                    self.assertEqual(result.returncode, 78, result.stderr)
+                    self.assertIn(
+                        "project .prime/agent/settings.json", result.stderr
+                    )
+
+            # Explicit opt-in bypasses the settings gate for these same
+            # forms, proving the block above is really session_start's
+            # gate firing (and end-to-end plumbing all the way through),
+            # not some unrelated failure.
+            opted_in = run_wrapper(
+                ("--daemon-socket", daemon_socket, "status"),
+                cwd=project,
+                allow_settings=True,
+            )
+            self.assertEqual(opted_in.returncode, 0, opted_in.stderr)
+
+            # (e) The one form upstream's own normalizeLeadingDaemonSocketOption()
+            # genuinely recognizes (bare space form + stop/rename) remains
+            # fast-tracked -- no settings gate -- exactly as before round 6.
+            stop_result = run_wrapper(
+                ("--daemon-socket", daemon_socket, "stop", "agent-id"), cwd=project
+            )
+            self.assertEqual(stop_result.returncode, 0, stop_result.stderr)
+
+            # (f)-(g) End-to-end proof at the argv level, in a cwd with no
+            # project settings file to short-circuit on: the daemon-socket
+            # -prefixed, non-stop/rename form now receives resource-guard
+            # flags (it did not before round 6, because
+            # ORCA_PRIME_AGENT_RESOURCE_GUARD was never even exported), and
+            # the equivalent bare, no-prefix form still receives none.
+            guarded = run_wrapper(
+                ("--daemon-socket", daemon_socket, "status"), cwd=clean
+            )
+            self.assertEqual(guarded.returncode, 0, guarded.stderr)
+            guarded_payload = installer.strict_json(guarded.stdout.encode("utf-8"))
+            self.assertIsInstance(guarded_payload, dict)
+            assert isinstance(guarded_payload, dict)
+            self.assertEqual(
+                guarded_payload["argv"][1:],
+                [
+                    "--daemon-socket",
+                    daemon_socket,
+                    "--no-extensions",
+                    "--no-skills",
+                    "--no-prompt-templates",
+                    "status",
+                ],
+            )
+
+            unguarded = run_wrapper(("status",), cwd=clean)
+            self.assertEqual(unguarded.returncode, 0, unguarded.stderr)
+            unguarded_payload = installer.strict_json(
+                unguarded.stdout.encode("utf-8")
+            )
+            self.assertIsInstance(unguarded_payload, dict)
+            assert isinstance(unguarded_payload, dict)
+            self.assertEqual(unguarded_payload["argv"][1:], ["status"])
 
     def test_verify_command_state_detects_ancestor_swap_to_directory_without_command(
         self,
@@ -3429,6 +3864,72 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     "cannot inspect link parent",
                 ):
                     installer.verify_command_state(receipt)
+
+            # The real (relocated) link must still be exactly what was
+            # honestly created -- untouched by any of this.
+            real_relocated_link = relocated / "bin/prime-agent"
+            self.assertTrue(real_relocated_link.is_symlink())
+            self.assertEqual(os.readlink(real_relocated_link), os.fspath(target))
+
+    def test_bin_link_present_detects_ancestor_swap_to_empty_directory(self) -> None:
+        # Regression for independent dual review round 6, 2026-08-18, P2:
+        # quarantine_partial_release(), finalize_pending_install(),
+        # _install_locked(), and plan() all used to resolve BIN_LINK's mere
+        # EXISTENCE via the plain lexical `BIN_LINK.exists() or
+        # BIN_LINK.is_symlink()` -- unlike verify_command_state(), fixed for
+        # this exact issue in round 5. Same scenario as
+        # test_verify_command_state_detects_ancestor_swap_to_directory_without_command:
+        # a same-UID actor swaps ~/.local for a symlink to an empty
+        # attacker directory (containing no bin/prime-agent at all), so the
+        # old lexical checks silently see "nothing here" while the REAL
+        # managed link, reachable only through the true (pre-swap) ancestor
+        # chain, is still live -- letting quarantine_partial_release()
+        # proceed, or finalize_pending_install()/_install_locked() treat
+        # the command as safely disabled/absent, over activation state that
+        # is still actually present. bin_link_present() now uses the SAME
+        # dir_fd-chained ancestor walk verify_command_state() already uses
+        # and must fail closed here instead.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ssd = root / "ssd"
+            target = ssd / "target"
+            target.parent.mkdir(mode=0o700)
+            target.write_text("#!/bin/sh\n", encoding="utf-8")
+            os.chmod(target, 0o700)
+            user_home = root / "user"
+            real_bin = user_home / ".local/bin"
+            real_bin.mkdir(parents=True, mode=0o700)
+            link = real_bin / "prime-agent"
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", ssd),
+                mock.patch.object(installer, "USER_HOME", user_home),
+                mock.patch.object(installer, "BIN_LINK", link),
+            ):
+                # Sanity: genuinely absent (nothing created yet) still
+                # reports False, exactly like the lexical check it
+                # replaces.
+                self.assertFalse(installer.bin_link_present())
+
+                installer.atomic_symlink(target, link)
+                self.assertTrue(installer.bin_link_present())
+
+                real_local = user_home / ".local"
+                relocated = real_local.with_name(".local-relocated")
+                real_local.rename(relocated)
+                attacker_dir = root / "attacker-empty"
+                attacker_dir.mkdir(mode=0o700)
+                real_local.symlink_to(attacker_dir, target_is_directory=True)
+
+                # The attacker directory has NO bin/prime-agent at all --
+                # pre-fix, the lexical check this replaces silently
+                # returned False here instead of failing closed.
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "link parent is missing|unsafe link parent|"
+                    "cannot inspect link parent",
+                ):
+                    installer.bin_link_present()
 
             # The real (relocated) link must still be exactly what was
             # honestly created -- untouched by any of this.
@@ -3624,6 +4125,245 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             self.assertTrue(state_link.is_symlink())
             self.assertTrue(receipt_path.is_file())
             self.assertFalse(pending.exists())
+
+    def test_install_locked_reaches_finalize_with_correct_lock_identity(self) -> None:
+        # Regression for independent dual review round 6, 2026-08-18, P1
+        # (found independently by a Claude opus/max review and a separate
+        # Codex QA pass -- the highest-priority finding of that round):
+        # _install_locked(lock_identity) takes the managed lifecycle lock's
+        # identity as its only parameter and must pass that SAME value,
+        # unchanged, to `return finalize_pending_install(lock_identity)` at
+        # its very end. A local variable of the exact same name was
+        # reassigned partway through -- to RELEASE_DIR/package-lock.json's
+        # (st_dev, st_ino) identity, for a DIFFERENT verify-then-use check
+        # -- silently shadowing the parameter for the rest of the function,
+        # so that final call actually passed package-lock.json's identity.
+        # finalize_pending_install() then compared that against the REAL
+        # lifecycle lock's current identity and deterministically raised
+        # "managed lifecycle lock identity changed while held" on every
+        # single fresh install, AFTER the pending journal had already been
+        # durably written.
+        #
+        # This is deliberately NOT the same shape as
+        # test_finalize_pending_install_fails_closed_on_stale_lifecycle_lock_identity
+        # above: that test (and its sibling for verify()) hand-constructs an
+        # already-pending journal and calls finalize_pending_install()
+        # directly, so it never executes a single line of _install_locked()'s
+        # own body and could not have caught this -- exactly why it shipped
+        # un-caught (per the round-6 review). This test instead runs the
+        # REAL, unmodified install() -> _install_locked() code path end to
+        # end. Every step that is genuinely external (HTTPS downloads, the
+        # pinned node/npm subprocesses, npm itself) is replaced with a fake
+        # that still exercises every in-process check the surrounding,
+        # UNMODIFIED code performs (directory creation, manifest/lock
+        # writes, verify_unchanged_private_ssd_file() re-checks, tree_digest,
+        # sync_private_tree, receipt identity validation, and finally
+        # finalize_pending_install()'s own re-derivation and comparison of
+        # the lifecycle lock's current identity against whatever
+        # _install_locked() passed it) -- so the exact local-variable
+        # shadowing bug, if reintroduced, would make this test fail again.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            user_home = root / "user"
+            user_home.mkdir(mode=0o700)
+
+            # A minimal generated production lock that satisfies
+            # validate_generated_lock(): a root entry plus exactly the four
+            # local-asset rows (prime-agent + the three workspace
+            # packages), no registry dependencies at all.
+            local_assets = {
+                "prime-agent": installer.MAIN_PATCHED_ASSET,
+                **installer.WORKSPACE_ASSETS,
+            }
+            generated = {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {
+                        "name": "orca-managed-prime-agent",
+                        "version": installer.VERSION,
+                        "dependencies": {
+                            "prime-agent": f"file:assets/{installer.MAIN_PATCHED_ASSET}"
+                        },
+                    },
+                    **{
+                        f"node_modules/local-{index}": {
+                            "name": name,
+                            "version": installer.VERSION,
+                            "resolved": f"file:assets/{asset_name}",
+                        }
+                        for index, (name, asset_name) in enumerate(local_assets.items())
+                    },
+                },
+            }
+            with mock.patch.object(installer, "RELEASE_DIR", release):
+                expected_lock_sha256 = installer.sha256_bytes(
+                    installer.normalized_production_lock(generated)
+                )
+            generated_lock_raw = installer.canonical_json(generated)
+
+            def fake_run_npm(
+                npm_path, node_path, args, cwd, cache, install_home, install_tmp, timeout=300
+            ):
+                cwd = Path(cwd)
+                if args and args[0] == "install":
+                    lock_path = cwd / "package-lock.json"
+                    lock_path.write_bytes(generated_lock_raw)
+                    os.chmod(lock_path, 0o600)
+                elif args and args[0] == "ci":
+                    bundle = cwd / "node_modules/prime-agent/dist/bundle"
+                    bundle.mkdir(parents=True, mode=0o700)
+                    for ancestor in (
+                        cwd / "node_modules",
+                        cwd / "node_modules/prime-agent",
+                        cwd / "node_modules/prime-agent/dist",
+                        bundle,
+                    ):
+                        os.chmod(ancestor, 0o700)
+                    cli = bundle / "cli.js"
+                    cli.write_text("// fake cli\n", encoding="utf-8")
+                    os.chmod(cli, 0o600)
+
+            def fake_make_patched_asset(
+                original_asset,
+                upstream_lock,
+                assets_dir,
+                *,
+                expected_name,
+                managed_name,
+                output_name,
+            ):
+                patched = assets_dir / output_name
+                installer.atomic_create_private_file(patched, b"stub-asset", 0o600)
+                return (
+                    patched,
+                    installer.sha256_bytes(b"stub-asset"),
+                    {"name": managed_name, "version": installer.VERSION},
+                )
+
+            def fake_safe_download(url, destination, expected_sha256, *, max_bytes=None):
+                if destination.name == "upstream-package-lock.json":
+                    payload = installer.canonical_json(
+                        {"lockfileVersion": 3, "packages": {}}
+                    )
+                else:
+                    payload = b"stub-download"
+                installer.atomic_create_private_file(destination, payload, 0o600)
+
+            fake_evidence = {
+                "volume_uuid": "TEST-UUID",
+                "node_version": installer.NODE_VERSION,
+                "npm_version": installer.NPM_VERSION,
+                "orca_support": {"test": "support"},
+            }
+            fake_node = release / "toolchain/bin/node"
+            fake_npm_cli = release / "toolchain/lib/node_modules/npm/bin/npm-cli.js"
+
+            # A plain `with (...)` block with this many context managers
+            # trips CPython's compiler limit on statically nested blocks;
+            # ExitStack avoids that while patching the exact same set.
+            with contextlib.ExitStack() as stack:
+                enter = stack.enter_context
+                enter(mock.patch.object(installer, "SSD_ROOT", root))
+                enter(mock.patch.object(installer, "TOOL_ROOT", tool_root))
+                enter(mock.patch.object(installer, "RELEASE_DIR", release))
+                enter(mock.patch.object(installer, "STATE_DIR", tool_root / "state"))
+                enter(
+                    mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home")
+                )
+                enter(mock.patch.object(installer, "USER_HOME", user_home))
+                enter(mock.patch.object(installer, "STATE_LINK", user_home / ".prime"))
+                enter(
+                    mock.patch.object(
+                        installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "RECEIPT_PATH",
+                        tool_root / "receipts" / f"v{installer.VERSION}.json",
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "PENDING_PATH", tool_root / "pending-install.json"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_SHA256", expected_lock_sha256
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_PACKAGE_COUNT", len(local_assets)
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "volume_uuid", return_value="TEST-UUID")
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "verify_orca_support",
+                        return_value={"test": "support"},
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "prime_agent_command_candidates", return_value=[]
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "preflight", return_value=fake_evidence)
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "extract_node_toolchain",
+                        return_value=(fake_node, fake_npm_cli),
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "exact_tool_version", return_value="stub"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "make_patched_asset",
+                        side_effect=fake_make_patched_asset,
+                    )
+                )
+                enter(mock.patch.object(installer, "run_npm", side_effect=fake_run_npm))
+                result = installer.install()
+
+            # install() -> _install_locked() returns finalize_pending_install()'s
+            # result directly (the published receipt dict itself, not an
+            # {"ok": ...}-wrapped action result) -- reaching this line at
+            # all, with the pending journal now gone and a durable receipt
+            # published (asserted below), is itself proof
+            # finalize_pending_install() did not raise "managed lifecycle
+            # lock identity changed while held".
+            self.assertEqual(result["version"], installer.VERSION)
+            self.assertEqual(result["schema"], installer.RECEIPT_SCHEMA)
+            self.assertTrue((user_home / ".prime").is_symlink())
+            self.assertTrue(
+                (tool_root / "receipts" / f"v{installer.VERSION}.json").is_file()
+            )
+            self.assertFalse((tool_root / "pending-install.json").exists())
+            # The command link must stay disabled by default -- install()
+            # only ever reaches finalize_pending_install(), never enable().
+            self.assertFalse((user_home / ".local/bin/prime-agent").exists())
+            self.assertFalse((user_home / ".local/bin/prime-agent").is_symlink())
 
     def test_verify_fails_closed_on_stale_lifecycle_lock_identity(self) -> None:
         # Regression for independent review round 5, 2026-08-18, P2-2:

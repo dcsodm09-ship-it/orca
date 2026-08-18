@@ -1223,7 +1223,7 @@ def exact_dependency_versions(manifest: dict[str, Any], upstream_lock: dict[str,
 
 def safe_extract_main_asset(
     asset: Path, destination: Path
-) -> tuple[Path, tuple[Path, ...]]:
+) -> tuple[Path, tuple[Path, ...], dict[Path, str]]:
     try:
         archive = tarfile.open(asset, "r:gz")
     except (OSError, tarfile.TarError) as exc:
@@ -1260,6 +1260,19 @@ def safe_extract_main_asset(
             selected.append((member, relative))
         if regular_bytes > MAX_TAR_EXPANDED_BYTES:
             raise PrimeInstallError("Prime Agent archive expands beyond the approved limit")
+        # Content digest of each regular file's bytes, captured while they are
+        # streamed from the digest-verified tarball to disk -- keyed by the
+        # SAME package-relative path make_patched_asset() later iterates via
+        # its `extracted_relative_paths` manifest. This is the only point in
+        # the whole install where this installer has independent, tarball
+        # -derived proof of what a given extracted file's content is SUPPOSED
+        # to be; make_patched_asset() re-verifies each file against this
+        # digest immediately before archiving it, closing the verify-then-use
+        # gap a same-UID racer could otherwise exploit between this
+        # extraction and the later archive.add() re-read (see
+        # make_patched_asset(), independent dual review round 6, 2026-08-18,
+        # P1).
+        content_digests: dict[Path, str] = {}
         for member, relative in sorted(
             selected, key=lambda item: (len(item[1].parts), os.fspath(item[1]))
         ):
@@ -1276,6 +1289,7 @@ def safe_extract_main_asset(
             try:
                 mode = 0o700 if member.mode & 0o111 else 0o600
                 os.fchmod(descriptor, mode)
+                digest = hashlib.sha256()
                 with os.fdopen(descriptor, "wb", closefd=True) as output:
                     remaining = member.size
                     while remaining:
@@ -1283,6 +1297,7 @@ def safe_extract_main_asset(
                         if not chunk:
                             break
                         output.write(chunk)
+                        digest.update(chunk)
                         remaining -= len(chunk)
                     output.flush()
                     os.fsync(output.fileno())
@@ -1290,6 +1305,7 @@ def safe_extract_main_asset(
                     raise PrimeInstallError(f"short tar member: {member.name}")
                 os.replace(temp_path, target)
                 os.chmod(target, mode)
+                content_digests[relative.relative_to("package")] = digest.hexdigest()
             except BaseException:
                 try:
                     os.close(descriptor)
@@ -1326,7 +1342,17 @@ def safe_extract_main_asset(
             key=lambda item: (len(item.parts), os.fspath(item)),
         )
     )
-    return package_dir, manifest
+    expected_digest_keys = {
+        relative.relative_to("package") for member, relative in selected if member.isreg()
+    }
+    if set(content_digests) != expected_digest_keys:
+        # Every regular-file member must have a captured digest, and vice
+        # versa -- this is an internal self-consistency check on this
+        # function's own bookkeeping, not a same-UID-attacker detection; a
+        # mismatch here means this function's own logic is wrong, not that
+        # the tree was tampered with.
+        raise PrimeInstallError("Prime Agent extraction manifest/digest mismatch")
+    return package_dir, manifest, content_digests
 
 
 def extract_node_toolchain(asset: Path, destination: Path) -> tuple[Path, Path]:
@@ -1528,9 +1554,26 @@ def make_patched_asset(
     # accept-existing behavior was unsafe here (independent review round 2,
     # 2026-08-18, P1).
     create_fresh_private_dir(unpacked)
-    package_dir, extracted_relative_paths = safe_extract_main_asset(original_asset, unpacked)
+    package_dir, extracted_relative_paths, content_digests = safe_extract_main_asset(
+        original_asset, unpacked
+    )
     manifest_path = package_dir / "package.json"
-    manifest = strict_json(manifest_path.read_bytes())
+    manifest_relative = Path("package.json")
+    # Verified read, not a plain manifest_path.read_bytes(): compare against
+    # the digest safe_extract_main_asset() itself captured while streaming
+    # this exact file's bytes from the digest-verified tarball, so a same-UID
+    # swap between extraction and this parse is caught here instead of
+    # silently feeding attacker-controlled JSON into the manifest this
+    # function goes on to trust and republish.
+    try:
+        manifest_raw_initial = read_private_file(
+            manifest_path, max_bytes=MAX_TAR_EXPANDED_BYTES
+        )
+    except PrimeInstallError as exc:
+        raise PrimeInstallError("Prime Agent manifest is missing or unsafe") from exc
+    if sha256_bytes(manifest_raw_initial) != content_digests.get(manifest_relative):
+        raise PrimeInstallError("extracted Prime Agent manifest content changed before use")
+    manifest = strict_json(manifest_raw_initial)
     if (
         not isinstance(manifest, dict)
         or manifest.get("name") != expected_name
@@ -1539,7 +1582,16 @@ def make_patched_asset(
         raise PrimeInstallError("unexpected Prime Agent manifest identity")
     manifest["name"] = managed_name
     exact_dependency_versions(manifest, upstream_lock)
-    atomic_write(manifest_path, canonical_json(manifest), 0o600)
+    manifest_raw = canonical_json(manifest)
+    atomic_write(manifest_path, manifest_raw, 0o600)
+    # package.json's on-disk bytes were just intentionally rewritten above
+    # (managed_name substitution, exact_dependency_versions()) -- the
+    # extraction-time digest captured for this one path no longer describes
+    # what should be archived below. Replace it with a digest of exactly the
+    # bytes this function itself just published; every other path's digest
+    # still describes the untouched, tarball-verified content
+    # safe_extract_main_asset() wrote and this function never modifies.
+    content_digests[manifest_relative] = sha256_bytes(manifest_raw)
     # Built entirely in memory, then published through atomic_create_private_file
     # -- the same private-temp-file-then-no-clobber-rename discipline every
     # other managed write in this file uses (see e.g. safe_download() and
@@ -1557,6 +1609,15 @@ def make_patched_asset(
     # with rename_noreplace()'s RENAME_EXCL semantics, which fails loudly with
     # EEXIST -- never follows -- whether the occupant at `patched` is a
     # pre-existing regular file or a symlink.
+    def normalize(info: tarfile.TarInfo) -> tarfile.TarInfo:
+        info.uid = 0
+        info.gid = 0
+        info.uname = ""
+        info.gname = ""
+        info.mtime = 0
+        info.pax_headers = {}
+        return info
+
     buffer = io.BytesIO()
     with gzip.GzipFile(filename="", mode="wb", fileobj=buffer, mtime=0) as compressed:
         with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
@@ -1567,40 +1628,76 @@ def make_patched_asset(
             # (before extraction, during it, or in the window between
             # extraction finishing and this loop starting) that were never
             # part of the digest-verified original tarball (independent
-            # review round 2, 2026-08-18, P1). Each entry is also re-checked
-            # here, immediately before archiving, in case a same-UID racer
-            # replaced a legitimately-extracted path with something unsafe
-            # in that same window.
+            # review round 2, 2026-08-18, P1).
             for relative in extracted_relative_paths:
                 path = package_dir / relative
+                arcname = Path("package") / relative
+                expected_digest = content_digests.get(relative)
+                if expected_digest is not None:
+                    # A regular file, per the tarball-verified extraction
+                    # manifest (every regular-file member safe_extract_main_
+                    # asset() wrote has an entry in content_digests; nothing
+                    # else does). read_private_file() binds the lstat,
+                    # O_NOFOLLOW open, fstat-identity check, bounded read,
+                    # and post-read fstat-consistency check into ONE
+                    # verify-then-use operation with no gap between
+                    # verification and consumption; archive.addfile() below
+                    # publishes exactly the bytes it returned -- there is no
+                    # second, separate read of `path` from disk (unlike
+                    # archive.add(path, ...), which performs its own later,
+                    # independent open()+read() internally). This closes the
+                    # window a same-UID racer previously had to swap this
+                    # file's content between an early lstat-only check and
+                    # that later, separate tarfile-internal read (independent
+                    # dual review round 6, 2026-08-18, P1: reviewer
+                    # reproduced the swap in that window in 4/4 trials, with
+                    # the measured window ranging from ~1.9s to ~27s).
+                    try:
+                        raw = read_private_file(path, max_bytes=MAX_TAR_EXPANDED_BYTES)
+                    except PrimeInstallError as exc:
+                        raise PrimeInstallError(
+                            f"extracted member vanished or is unsafe before publish: {relative}"
+                        ) from exc
+                    if sha256_bytes(raw) != expected_digest:
+                        raise PrimeInstallError(
+                            f"extracted member content changed before publish: {relative}"
+                        )
+                    try:
+                        entry_info = path.lstat()
+                    except OSError as exc:
+                        raise PrimeInstallError(
+                            f"extracted member vanished before publish: {relative}"
+                        ) from exc
+                    tarinfo = tarfile.TarInfo(name=os.fspath(arcname))
+                    tarinfo.size = len(raw)
+                    tarinfo.mode = stat.S_IMODE(entry_info.st_mode)
+                    tarinfo.type = tarfile.REGTYPE
+                    archive.addfile(normalize(tarinfo), io.BytesIO(raw))
+                    continue
+                # A directory, per that same tarball-verified extraction
+                # manifest. Directories carry no content bytes for a
+                # same-UID racer to swap -- only entry metadata -- so unlike
+                # the regular-file branch above, this keeps the pre-existing
+                # lstat-immediately-before-archive.add() discipline rather
+                # than the stronger no-gap read used for file content;
+                # closing that narrower, metadata-only residual (a race
+                # between this lstat and archive.add()'s own internal lstat
+                # a few lines below) is out of scope for this fix (see round
+                # 6 report).
                 try:
                     entry_info = path.lstat()
                 except OSError as exc:
                     raise PrimeInstallError(
                         f"extracted member vanished before publish: {relative}"
                     ) from exc
-                if (
-                    stat.S_ISLNK(entry_info.st_mode)
-                    or entry_info.st_uid != os.getuid()
-                ):
+                if stat.S_ISLNK(entry_info.st_mode) or entry_info.st_uid != os.getuid():
                     raise PrimeInstallError(
                         f"unsafe extracted member before publish: {relative}"
                     )
-                if not stat.S_ISREG(entry_info.st_mode) and not stat.S_ISDIR(entry_info.st_mode):
+                if not stat.S_ISDIR(entry_info.st_mode):
                     raise PrimeInstallError(
                         f"unexpected extracted member type before publish: {relative}"
                     )
-                arcname = Path("package") / relative
-
-                def normalize(info: tarfile.TarInfo) -> tarfile.TarInfo:
-                    info.uid = 0
-                    info.gid = 0
-                    info.uname = ""
-                    info.gname = ""
-                    info.mtime = 0
-                    info.pax_headers = {}
-                    return info
-
                 archive.add(
                     path,
                     arcname=os.fspath(arcname),
@@ -1928,8 +2025,72 @@ def managed_entrypoint_script(
         '  printf "%s\\n" "prime-agent: self-update is disabled for the Orca-managed pinned release" >&2',
         "  exit 64",
         "fi",
+        # A SEPARATE, deliberately much narrower resolver, used ONLY to
+        # decide session_start -- reproducing upstream's own
+        # normalizeLeadingDaemonSocketOption() (dist/cli/public-command.js)
+        # EXACTLY rather than sharing resolve_managed_command()'s more
+        # thorough parse. Upstream only ever remaps a SINGLE bare,
+        # space-separated "--daemon-socket <value>" pair, and only when the
+        # token immediately after it is exactly "stop" or "rename"; the "="
+        # form is never recognized at all (regardless of what follows), a
+        # repeated/second occurrence is never recognized, and a bare pair
+        # followed by any other token (including a real public command name
+        # like "status") is also left alone. Every one of those forms upstream
+        # does NOT remap falls through to upstream's own default action: an
+        # ordinary interactive/background SESSION START in $PWD -- not the
+        # public command a more thorough parse would suggest.
+        # resolve_managed_command() above is intentionally MORE thorough than
+        # that (it also strips repeated occurrences and the "=" form) which
+        # is safe for the self-update block and the agents/attach gate above
+        # and below: over-matching there only ever DENIES an invocation
+        # upstream would actually have started as a session anyway, and that
+        # denial is itself one of the protections session_start=1 exists to
+        # apply. Session_start is the opposite question -- marking it 0 SKIPS
+        # the settings-block gate and ORCA_PRIME_AGENT_RESOURCE_GUARD=1 below
+        # -- so being more thorough than upstream there is exactly backwards:
+        # it means treating an invocation upstream will actually run as a
+        # real session start as though it were an already-resolved, harmless
+        # public command, and skipping the protections that session start
+        # needs. resolve_public_command() defaults to session_start=1
+        # (protected) for every form resolve_managed_command() would
+        # over-match, and only reports a resolved public command for exactly
+        # the forms upstream itself recognizes (independent dual review round
+        # 6, 2026-08-18, P1, found independently by a Claude opus/max review
+        # and a separate Codex QA pass: round 5's single shared resolver made
+        # session_start=0 -- skipping both protections -- whenever the
+        # shared, over-thorough parser found e.g. "status" after
+        # "--daemon-socket=<v>", or after "--daemon-socket <v>" followed by
+        # any command other than stop/rename, even though upstream's real
+        # parser leaves those forms alone and actually starts a full
+        # session).
+        "managed_public_command=\"\"",
+        "resolve_public_command() {",
+        # "--daemon-socket" is intentionally a literal here, NOT derived from
+        # LEADING_COMMAND_OPTIONS/leading_option_names like
+        # resolve_managed_command() above: this function models one
+        # SPECIFIC, bespoke upstream function's exact behavior (upstream's
+        # normalizeLeadingDaemonSocketOption() hardcodes "--daemon-socket"
+        # and stop/rename itself; it is not a generic leading-option
+        # mechanism). A future second entry in LEADING_COMMAND_OPTIONS would
+        # need its own upstream-behavior verification before this function
+        # could safely be generalized to loop over it -- silently doing so
+        # would reintroduce exactly the "assumed thorough parsing without
+        # verifying upstream's real behavior" bug class this fix corrects.
+        '  if [ "$#" -ge 3 ] && [ "$1" = "--daemon-socket" ]; then',
+        '    case "$3" in',
+        "      stop|rename)",
+        '        managed_public_command="$3"',
+        "        return",
+        "        ;;",
+        "    esac",
+        '    managed_public_command=""',
+        "    return",
+        "  fi",
+        '  managed_public_command="${1-}"',
+        "}",
+        'resolve_public_command "$@"',
         "session_start=1",
-        'case "$managed_command" in',
+        'case "$managed_public_command" in',
         f"  {public_commands}|-h|--help|-v|--version) session_start=0 ;;",
         "esac",
         'for managed_arg in "$@"; do',
@@ -2073,17 +2234,67 @@ def split_leading_options(arguments: list[str]) -> tuple[list[str], list[str]]:
     return prefix, remaining
 
 
+def resolve_upstream_public_command(arguments: list[str]) -> str | None:
+    """Reproduce upstream's own normalizeLeadingDaemonSocketOption()
+    (dist/cli/public-command.js) EXACTLY -- return the single command token
+    upstream will actually treat as an already-resolved public command for
+    this exact argv, or None when upstream will actually fall through to a
+    real session start instead.
+
+    Deliberately narrower than split_leading_options(): upstream only ever
+    remaps a SINGLE bare, space-separated "--daemon-socket <value>" pair --
+    literally arguments[0] == "--daemon-socket", never the "=" form -- and
+    only when the token immediately after that pair is exactly "stop" or
+    "rename"; every other form (a repeated/second occurrence, the "="
+    form, or a bare pair followed by any other token) is left completely
+    alone by upstream and actually starts a real session. "--daemon-socket"
+    is intentionally a literal here, not derived from
+    LEADING_COMMAND_OPTIONS, for the same reason the shell entrypoint's
+    resolve_public_command() hardcodes it: this models one specific,
+    bespoke upstream function's exact behavior, not a generic mechanism.
+
+    split_leading_options() is intentionally MORE thorough than this for
+    OUR OWN wrapper policy questions that only ever need to become MORE
+    restrictive when they over-match. guarded_arguments()'s "does this
+    invocation need RESOURCE_GUARDS" decision is the opposite: it must
+    default to inserting guards (protected) for every form upstream would
+    actually treat as a session start, so it asks this stricter question
+    instead (independent dual review round 6, 2026-08-18, P1 companion to
+    managed_entrypoint_script()'s session_start fix: the shared, more
+    thorough split_leading_options() previously made guarded_arguments()
+    skip inserting RESOURCE_GUARDS for the exact same forms upstream
+    actually treats as a session start, e.g. "--daemon-socket=<v> status"
+    or "--daemon-socket <v> status").
+    """
+    if (
+        len(arguments) >= 3
+        and arguments[0] == "--daemon-socket"
+        and arguments[2] in ("stop", "rename")
+    ):
+        return arguments[2]
+    if (
+        arguments
+        and arguments[0] not in LEADING_COMMAND_OPTIONS
+        and not any(arguments[0].startswith(name + "=") for name in LEADING_COMMAND_OPTIONS)
+    ):
+        return arguments[0]
+    return None
+
+
 def guarded_arguments(arguments: list[str]) -> list[str]:
     if os.environ.pop(RESOURCE_GUARD_ENV, None) != "1":
         return arguments
+    resolved_command = resolve_upstream_public_command(arguments)
     prefix, remaining = split_leading_options(arguments)
-    if remaining and remaining[0] in RUNTIME_NO_GUARD_COMMANDS:
+    if resolved_command is not None and resolved_command in RUNTIME_NO_GUARD_COMMANDS:
         # A non-session public command never receives resource-guard flags,
         # regardless of how it was invoked -- matches the entrypoint's own
         # session_start=0 treatment for these exactly (see
-        # RUNTIME_NO_GUARD_COMMANDS above).
+        # RUNTIME_NO_GUARD_COMMANDS above). resolved_command, not
+        # remaining[0], gates this: only a form upstream itself would
+        # actually resolve to this command may skip guards.
         return [*prefix, *remaining]
-    if remaining and remaining[0] in RUNTIME_PUBLIC_COMMANDS:
+    if resolved_command is not None and resolved_command in RUNTIME_PUBLIC_COMMANDS:
         try:
             separator = remaining.index("--")
         except ValueError:
@@ -2588,8 +2799,7 @@ def quarantine_partial_release() -> dict[str, Any]:
         or RECEIPT_PATH.is_symlink()
         or PENDING_PATH.exists()
         or PENDING_PATH.is_symlink()
-        or BIN_LINK.exists()
-        or BIN_LINK.is_symlink()
+        or bin_link_present()
         or STATE_LINK.exists()
         or STATE_LINK.is_symlink()
     ):
@@ -2892,7 +3102,7 @@ def finalize_pending_install(
     digest, entries = tree_digest(release)
     if digest != receipt.get("release_tree_sha256") or entries != receipt.get("release_tree_entries"):
         raise PrimeInstallError("Prime Agent pending release tree drifted")
-    if BIN_LINK.exists() or BIN_LINK.is_symlink():
+    if bin_link_present():
         raise PrimeInstallError("Prime Agent command path must remain disabled until enable")
     ensure_no_prime_agent_command()
     targets = ((STATE_LINK, state),)
@@ -2951,8 +3161,7 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     if (
         RECEIPT_PATH.exists()
         or RECEIPT_PATH.is_symlink()
-        or BIN_LINK.exists()
-        or BIN_LINK.is_symlink()
+        or bin_link_present()
     ):
         raise PrimeInstallError("managed Prime Agent path already exists; run verify or inspect before retry")
     if STATE_LINK.exists() or STATE_LINK.is_symlink():
@@ -3064,7 +3273,23 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     lock_path = RELEASE_DIR / "package-lock.json"
     generated_lock_raw = lock_path.read_bytes()
     lock_stat = lock_path.lstat()
-    lock_identity = (lock_stat.st_dev, lock_stat.st_ino)
+    # Deliberately NOT named `lock_identity`: this function's own parameter
+    # is ALSO named `lock_identity` and carries the managed LIFECYCLE lock's
+    # (st_dev, st_ino) identity all the way through to the
+    # finalize_pending_install(lock_identity) call at the end of this
+    # function. Reusing that name here for package-lock.json's identity used
+    # to silently rebind (shadow) the parameter for the remainder of this
+    # function, so the value finally reaching finalize_pending_install() was
+    # package-lock.json's identity, not the lifecycle lock's -- which
+    # finalize_pending_install() then compared against the REAL lifecycle
+    # lock path's current identity and deterministically raised "managed
+    # lifecycle lock identity changed while held" on every single successful
+    # install, after the pending journal had already been durably written
+    # (independent dual review round 6, 2026-08-18, P1: found independently
+    # by both a Claude opus/max review and a separate Codex QA pass). Keep
+    # this name distinct from the `lock_identity` parameter for the same
+    # reason `manifest_identity` above is not named `lock_identity` either.
+    package_lock_identity = (lock_stat.st_dev, lock_stat.st_ino)
     generated_lock = strict_json(generated_lock_raw)
     if not isinstance(generated_lock, dict):
         raise PrimeInstallError("generated lock is invalid")
@@ -3074,7 +3299,7 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     # `npm ci` independently re-reads both from RELEASE_DIR on its own
     # (same rationale as the "install" re-check above).
     verify_unchanged_private_ssd_file(manifest_path, manifest_raw, manifest_identity)
-    verify_unchanged_private_ssd_file(lock_path, generated_lock_raw, lock_identity)
+    verify_unchanged_private_ssd_file(lock_path, generated_lock_raw, package_lock_identity)
     run_npm(
         os.fspath(npm_cli),
         os.fspath(node),
@@ -3281,6 +3506,50 @@ def ensure_no_prime_agent_command() -> None:
             "an existing prime-agent command is visible to Orca; refusing install: "
             + ", ".join(os.fspath(path) for path in command_conflicts)
         )
+
+
+def bin_link_present() -> bool:
+    """dir_fd-bound counterpart of `BIN_LINK.exists() or BIN_LINK.is_symlink()`,
+    using the SAME open_verified_ancestor_chain_or_absent() walk
+    verify_command_state() already binds its own existence check to,
+    rather than the plain lexical Path methods.
+
+    A plain lexical existence check silently resolves through whatever an
+    ancestor (e.g. ~/.local) currently points to. A same-UID actor who has
+    interposed a symlink there could make BIN_LINK.exists()/.is_symlink()
+    report "absent" while the real managed link, reachable only through
+    the true, unswapped ancestor chain, is still present -- exactly the
+    class of bug fixed for verify_command_state() itself in round 5. The
+    callers here (quarantine_partial_release(), finalize_pending_install(),
+    _install_locked()'s pre-install conflict check, and plan()'s read-only
+    conflict report) all treat BIN_LINK being present as a reason to
+    refuse or flag; silently under-detecting it would let a fresh install
+    or an automatic quarantine proceed over -- or a plan report omit --
+    activation state that is still actually live (independent dual review
+    round 6, 2026-08-18, P2).
+
+    Any genuinely missing ancestor is "absent", exactly like the lexical
+    check it replaces; every OTHER ancestor-chain rejection (a symlinked
+    ancestor, wrong owner/mode, dir_fd support unavailable, ...) still
+    fails closed via the PrimeInstallError raised inside
+    open_verified_ancestor_chain_or_absent() rather than being reported as
+    absent.
+    """
+    parent_descriptor = open_verified_ancestor_chain_or_absent(BIN_LINK)
+    if parent_descriptor is None:
+        return False
+    try:
+        try:
+            os.stat(BIN_LINK.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise PrimeInstallError(
+                f"cannot inspect managed command link: {BIN_LINK}"
+            ) from exc
+        return True
+    finally:
+        os.close(parent_descriptor)
 
 
 def verify_command_state(receipt: dict[str, Any]) -> bool:
@@ -3523,8 +3792,16 @@ def verify(expected_lock_identity: tuple[int, int] | None = None) -> dict[str, A
     }
 
 
-def _uninstall_locked() -> dict[str, Any]:
+def _uninstall_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     receipt = load_receipt()
+    # enable() (_enable_locked() -> verify(lock_identity)) re-asserts the
+    # lifecycle lock's identity before its own first mutation; uninstall()
+    # used to omit this entirely despite performing the riskiest mutation
+    # of the two (removing the managed command link, with process-scan and
+    # restore-on-failure handling below) -- add the same re-assertion here,
+    # before that first mutation (independent dual review round 6,
+    # 2026-08-18, P2; see assert_lifecycle_lock_path_identity()).
+    assert_lifecycle_lock_path_identity(lifecycle_lock_path(), lock_identity)
     command_enabled = verify_command_state(receipt)
     target = Path(receipt["bin_target"])
     removed = False
@@ -3594,8 +3871,8 @@ def recover() -> dict[str, Any]:
 
 
 def uninstall() -> dict[str, Any]:
-    with exclusive_lifecycle_lock(create=False):
-        return _uninstall_locked()
+    with exclusive_lifecycle_lock(create=False) as (_lock_path, lock_identity):
+        return _uninstall_locked(lock_identity)
 
 
 def enable() -> dict[str, Any]:
@@ -3614,10 +3891,18 @@ def plan() -> dict[str, Any]:
             managed_session_dir(),
             RECEIPT_PATH,
             STATE_LINK,
-            BIN_LINK,
         )
         if path.exists() or path.is_symlink()
     ]
+    # BIN_LINK's existence is checked via the same dir_fd-chained ancestor
+    # walk quarantine_partial_release(), finalize_pending_install(), and
+    # _install_locked() use (bin_link_present()), not the lexical
+    # `path.exists() or path.is_symlink()` the loop above uses for the
+    # other paths -- those all live under TOOL_ROOT, which does not carry
+    # BIN_LINK's interposed-ancestor-under-USER_HOME threat model
+    # (independent dual review round 6, 2026-08-18, P2).
+    if bin_link_present():
+        conflicts.append(os.fspath(BIN_LINK))
     conflicts.extend(f"PATH:{path}" for path in prime_agent_command_candidates())
     recovery_conflicts = recovery_manifest_conflicts()
     conflicts.extend(recovery_conflicts)
