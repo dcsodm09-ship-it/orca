@@ -149,6 +149,30 @@ LINK_DIR_FD_SUPPORTED = (
     and os.unlink in os.supports_dir_fd
 )
 
+# The complete set of leading options Prime Agent v0.7.2 gives positional
+# meaning to ahead of the real command token (currently just
+# "--daemon-socket <value>" / "--daemon-socket=<value>", repeatable). This is
+# the single source of truth for that set: managed_entrypoint_script()'s
+# generated shell resolve_managed_command() function and
+# managed_launch_guard_script()'s generated Python split_leading_options()
+# function both derive their recognized-leading-option set from this one
+# Python-level constant, rather than each hardcoding the option name a
+# second time in its own generated script -- so a future leading option can
+# be added here once and both generated parsers pick it up together, instead
+# of independently drifting the way the ad hoc "$1 == '--daemon-socket' then
+# $3'"/"arguments[0] == '--daemon-socket'" checks they replace already had
+# (independent review round 5, 2026-08-18, P1: the prior ad hoc checks each
+# recognized only a single leading "--daemon-socket <value>" pair in
+# space-separated form, so the "=" form, a repeated/duplicate flag, or any
+# future new leading option silently bypassed the update self-block, the
+# agents/attach effective-project gate, and/or misplaced guard-flag
+# insertion). Both resolve_managed_command() (shell) and
+# split_leading_options() (Python) are themselves the ONE shared parsing
+# function within their respective generated script -- every security
+# decision that needs "the real command token" in that script uses their
+# result, never a fixed argv position or form-specific pattern match again.
+LEADING_COMMAND_OPTIONS: tuple[str, ...] = ("--daemon-socket",)
+
 
 class PrimeInstallError(Exception):
     pass
@@ -422,6 +446,37 @@ def read_private_ssd_file(path: Path, *, max_bytes: int = 4 * 1024 * 1024) -> by
     if path.is_symlink():
         raise PrimeInstallError(f"managed private file must not be a symlink: {path}")
     return read_private_file(resolve_ssd(path), max_bytes=max_bytes)
+
+
+def verify_unchanged_private_ssd_file(
+    path: Path, expected_raw: bytes, expected_identity: tuple[int, int]
+) -> None:
+    """Re-verify, right now, that a private SSD file at `path` still has
+    exactly the bytes and (st_dev, st_ino) inode identity captured at an
+    earlier verification point -- immediately before a subsequent consumer
+    this installer does not control (a spawned `npm` subprocess that
+    re-reads the path from disk on its own) is allowed to use it.
+
+    Closes the verify-then-use gap between an earlier read/hash/validate of
+    a generated file (RELEASE_DIR/package.json, RELEASE_DIR/package-lock.json)
+    and a later, independent re-read of the same path by that external
+    process: without this, a same-UID actor has the whole window between
+    those two reads to replace the file with different-but-still-parseable
+    content, and it would be trusted silently because only the FIRST read
+    was ever verified (independent review round 5, 2026-08-18, P2-3).
+    Follows the same identity-plus-content re-check idiom
+    remove_private_file_durable() already uses for its own verify-then-use
+    window before quarantining a file.
+    """
+    read_limit = max(4 * 1024 * 1024, len(expected_raw))
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise PrimeInstallError(f"cannot inspect managed file before use: {path}") from exc
+    if (before.st_dev, before.st_ino) != expected_identity:
+        raise PrimeInstallError(f"managed file identity changed before use: {path}")
+    if read_private_ssd_file(path, max_bytes=read_limit) != expected_raw:
+        raise PrimeInstallError(f"managed file changed before use: {path}")
 
 
 def rename_noreplace(source: Path, destination: Path) -> None:
@@ -952,6 +1007,45 @@ def verify_lifecycle_lock_file() -> Path:
     return path
 
 
+def assert_lifecycle_lock_path_identity(
+    path: Path, expected_identity: tuple[int, int]
+) -> None:
+    """Re-assert that `path` (the lifecycle lock's well-known location)
+    still resolves, right now, to the same (st_dev, st_ino) identity
+    captured when this process's lock fd was opened, validated, and
+    flock()'d.
+
+    flock(2) binds exclusivity to the OPEN FILE DESCRIPTION -- and
+    therefore to the inode held open at acquire time -- not to the path.
+    Nothing about continuing to hold an already-acquired fd detects a
+    same-UID actor renaming a brand-new file over that path afterwards: the
+    new file has no relationship to this process's flock at all, so a
+    second, independent actor opening the (now different) file at the same
+    path can acquire its own, equally "exclusive" flock on it while this
+    process still believes the well-known path is exclusively its own. This
+    process must therefore periodically re-assert, at points where a stale
+    lock's silent failure would matter most (see exclusive_lifecycle_lock()'s
+    acquisition, and the finalize_pending_install()/verify() re-checks
+    threaded through from it), that the path still names the inode it
+    originally acquired -- treating a mismatch as lock-integrity-violated
+    and failing closed rather than letting the caller silently proceed as
+    if exclusivity still held (independent review round 5, 2026-08-18,
+    P2-2).
+    """
+    try:
+        current = path.lstat()
+    except OSError as exc:
+        raise PrimeInstallError(
+            "managed lifecycle lock became unavailable while held"
+        ) from exc
+    if (current.st_dev, current.st_ino) != expected_identity:
+        raise PrimeInstallError(
+            "managed lifecycle lock identity changed while held; a same-UID "
+            "actor may have replaced the lock file, so this process's "
+            "exclusivity over it is no longer guaranteed"
+        )
+
+
 @contextmanager
 def exclusive_lifecycle_lock(*, create: bool) -> Any:
     if create:
@@ -964,6 +1058,7 @@ def exclusive_lifecycle_lock(*, create: bool) -> Any:
     if create:
         flags |= os.O_CREAT
     descriptor = -1
+    identity: tuple[int, int] | None = None
     try:
         descriptor = os.open(path, flags, 0o600)
         validate_lifecycle_lock_descriptor(path, descriptor)
@@ -973,6 +1068,14 @@ def exclusive_lifecycle_lock(*, create: bool) -> Any:
             raise PrimeInstallError(
                 "managed lifecycle is busy; command and state were left unchanged"
             ) from exc
+        opened = os.fstat(descriptor)
+        identity = (opened.st_dev, opened.st_ino)
+        # Close the (small, but real) race between the pre-flock identity
+        # check inside validate_lifecycle_lock_descriptor() above and
+        # flock() actually taking effect: re-assert, with the lock now
+        # held, that `path` still names the exact inode this fd is bound
+        # to, before any caller is allowed to treat the lock as acquired.
+        assert_lifecycle_lock_path_identity(path, identity)
     except OSError as exc:
         if descriptor >= 0:
             os.close(descriptor)
@@ -987,8 +1090,17 @@ def exclusive_lifecycle_lock(*, create: bool) -> Any:
             os.close(descriptor)
             descriptor = -1
         raise
+    if identity is None:
+        # Unreachable: every path above that could leave `identity` unset
+        # raises out of this function first. Checked explicitly (not via a
+        # bare `assert`, which `python -O`/`PYTHONOPTIMIZE=1` strip
+        # entirely) so this stays a real, always-enforced invariant rather
+        # than one this file's own PYTHONOPTIMIZE-awareness would flag as a
+        # future risk (see sandbox_e2e.py's __debug__ guard for the same
+        # concern applied to that script).
+        raise PrimeInstallError("cannot acquire managed lifecycle lock")
     try:
-        yield path
+        yield path, identity
     finally:
         if descriptor >= 0:
             try:
@@ -1762,33 +1874,61 @@ def managed_entrypoint_script(
             "stop",
         )
     )
+    leading_option_names = "|".join(LEADING_COMMAND_OPTIONS)
+    leading_option_value_forms = "|".join(
+        f"{name}=*" for name in LEADING_COMMAND_OPTIONS
+    )
     lines = [
         "#!/bin/sh",
         "set -eu",
         "unset ORCA_PRIME_AGENT_RESOURCE_GUARD",
-        'if [ "${1-}" = "update" ]; then',
+        # A real "skip every recognized leading option, take the first
+        # non-option token" parse, not ad hoc pattern matching on a fixed
+        # argv position/form. Defined as a shell function (not inline) so
+        # `shift` operates on the function's own copy of the positional
+        # parameters -- leaving the caller's "$@" untouched -- and every
+        # security-relevant decision in this script that needs "the real
+        # command token" (the update self-block below, the session_start
+        # public-command case, and the agents/attach effective-project deny
+        # gate) reads the SAME managed_command this one function computed,
+        # instead of each re-deriving it from a fixed position (independent
+        # review round 5, 2026-08-18, FIX 1: the prior ad hoc
+        # `[ "${1-}" = "update" ]` / `[ "$managed_command" = "--daemon-socket" ]
+        # && [ "$#" -ge 3 ]` checks each recognized only bare "update" at $1
+        # and a single space-separated "--daemon-socket <value>" pair at
+        # $1/$2, so `--daemon-socket <sock> update` bypassed the self-update
+        # block entirely, and the "=" form or a repeated/duplicate
+        # "--daemon-socket" flag bypassed the agents/attach gate and
+        # miscomputed session_start for every other public command).
+        "managed_command=\"\"",
+        "resolve_managed_command() {",
+        "  while [ \"$#\" -gt 0 ]; do",
+        "    case \"$1\" in",
+        f"      {leading_option_names})",
+        "        if [ \"$#\" -ge 2 ]; then",
+        "          shift 2",
+        "        else",
+        '          managed_command="$1"',
+        "          return",
+        "        fi",
+        "        ;;",
+        f"      {leading_option_value_forms})",
+        "        shift",
+        "        ;;",
+        "      *)",
+        '        managed_command="$1"',
+        "        return",
+        "        ;;",
+        "    esac",
+        "  done",
+        '  managed_command=""',
+        "}",
+        'resolve_managed_command "$@"',
+        'if [ "$managed_command" = "update" ]; then',
         '  printf "%s\\n" "prime-agent: self-update is disabled for the Orca-managed pinned release" >&2',
         "  exit 64",
         "fi",
         "session_start=1",
-        'managed_command="${1-}"',
-        # Prime Agent v0.7.2 gives a leading "--daemon-socket <value>" pair
-        # positional meaning ahead of the real command token. Remap
-        # managed_command to that real token ($3) for every public command
-        # form here, not only stop/rename -- both the agents/attach
-        # effective-project deny gate below and the session_start
-        # computation above key off managed_command, so recognizing only
-        # stop/rename left every other public command (config, doctor,
-        # help, list, package, schedule, send, session, shutdown, status)
-        # -- and, more seriously, agents/attach themselves -- unrecognized
-        # whenever they were invoked as `--daemon-socket <sock> <command>`,
-        # silently bypassing the agents/attach gate and leaving session_start
-        # wrongly 1 for the others (independent review round 3/4,
-        # 2026-08-18, P1: "--daemon-socket <sock> agents"/"... attach ..."
-        # ran with no ORCA_PRIME_AGENT_ALLOW_PROJECT_SETTINGS=1 requirement).
-        'if [ "$managed_command" = "--daemon-socket" ] && [ "$#" -ge 3 ]; then',
-        '  managed_command="$3"',
-        "fi",
         'case "$managed_command" in',
         f"  {public_commands}|-h|--help|-v|--version) session_start=0 ;;",
         "esac",
@@ -1863,6 +2003,11 @@ NODE = {os.fspath(node)!r}
 CLI = {os.fspath(cli)!r}
 RESOURCE_GUARD_ENV = "ORCA_PRIME_AGENT_RESOURCE_GUARD"
 RESOURCE_GUARDS = ("--no-extensions", "--no-skills", "--no-prompt-templates")
+# Single source of truth shared with managed_entrypoint_script()'s generated
+# shell resolve_managed_command() -- both derive from install_prime_agent.py's
+# module-level LEADING_COMMAND_OPTIONS constant (see its docstring there) so
+# a future leading option is recognized by both generated parsers together.
+LEADING_COMMAND_OPTIONS = {LEADING_COMMAND_OPTIONS!r}
 RUNTIME_PUBLIC_COMMANDS = frozenset(("agents", "attach", "model"))
 # Mirrors the shell entrypoint's own "public_commands" set (see
 # managed_entrypoint_script()) -- the commands for which the entrypoint sets
@@ -1900,17 +2045,38 @@ def fail(message: str) -> int:
     return 78
 
 
+def split_leading_options(arguments: list[str]) -> tuple[list[str], list[str]]:
+    """Skip every recognized leading option, in whatever form it appears
+    (bare "--opt value" or "--opt=value", repeated any number of times),
+    and return (leading_prefix, remaining_arguments) so every caller that
+    needs "the real command token" reads remaining[0] -- never a fixed
+    argv position or a single hardcoded form -- exactly mirroring the
+    shell entrypoint's own resolve_managed_command() (independent review
+    round 5, 2026-08-18, FIX 1: the prior one-shot
+    "arguments[0] == '--daemon-socket'" check missed the "=" form and any
+    repeated/duplicate occurrence, corrupting guard-flag placement for
+    those forms).
+    """
+    prefix: list[str] = []
+    remaining = list(arguments)
+    while remaining:
+        head = remaining[0]
+        if head in LEADING_COMMAND_OPTIONS and len(remaining) >= 2:
+            prefix.extend(remaining[:2])
+            remaining = remaining[2:]
+            continue
+        if any(head.startswith(name + "=") for name in LEADING_COMMAND_OPTIONS):
+            prefix.append(head)
+            remaining = remaining[1:]
+            continue
+        break
+    return prefix, remaining
+
+
 def guarded_arguments(arguments: list[str]) -> list[str]:
     if os.environ.pop(RESOURCE_GUARD_ENV, None) != "1":
         return arguments
-    prefix: list[str] = []
-    remaining = arguments
-    if len(arguments) >= 2 and arguments[0] == "--daemon-socket":
-        # Prime Agent v0.7.2 gives this leading option positional meaning for
-        # daemon administration. Keep the option/value pair first even when
-        # the remaining runtime invocation needs managed resource guards.
-        prefix = arguments[:2]
-        remaining = arguments[2:]
+    prefix, remaining = split_leading_options(arguments)
     if remaining and remaining[0] in RUNTIME_NO_GUARD_COMMANDS:
         # A non-session public command never receives resource-guard flags,
         # regardless of how it was invoked -- matches the entrypoint's own
@@ -2051,8 +2217,25 @@ def require_link_dir_fd_support() -> None:
         )
 
 
+class _AncestorComponentAbsent(Exception):
+    """Internal signal used only within open_verified_directory_component()/
+    open_verified_ancestor_chain_or_absent(): the named component simply
+    does not exist. Kept distinct from PrimeInstallError so a walk that
+    tolerates absence (see open_verified_ancestor_chain_or_absent()) can
+    tell mere absence -- the ordinary "nothing has ever been installed
+    here" state -- apart from every OTHER rejection this same walk enforces
+    (a symlinked ancestor, wrong owner/mode, a non-directory component,
+    ...), which must still fail closed rather than being folded into
+    "absent" (independent review round 5, 2026-08-18, P1-3)."""
+
+
 def open_verified_directory_component(
-    parent_descriptor: int, name: str, display_path: Path, *, create_missing: bool
+    parent_descriptor: int,
+    name: str,
+    display_path: Path,
+    *,
+    create_missing: bool,
+    missing_ok: bool = False,
 ) -> int:
     """Open path component `name` strictly relative to the already-open,
     already-verified directory descriptor `parent_descriptor` (an
@@ -2072,11 +2255,20 @@ def open_verified_directory_component(
     that walk could still redirect the final open into an attacker
     directory. Chaining dir_fd-relative opens the whole way from USER_HOME
     closes that gap for every ancestor, not only the last one.)
+
+    `missing_ok` (only meaningful together with create_missing=False) makes
+    a genuinely missing component raise the internal _AncestorComponentAbsent
+    signal instead of PrimeInstallError, for open_verified_ancestor_chain_or_absent()
+    to translate into "this link legitimately does not exist yet" -- every
+    other failure mode below is unaffected and still raises PrimeInstallError
+    regardless of `missing_ok`.
     """
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(name, flags, dir_fd=parent_descriptor)
     except FileNotFoundError as exc:
+        if not create_missing and missing_ok:
+            raise _AncestorComponentAbsent(display_path) from exc
         if not create_missing:
             raise PrimeInstallError(f"link parent is missing: {display_path}") from exc
         try:
@@ -2157,6 +2349,70 @@ def open_verified_ancestor_chain(link: Path, *, create_missing: bool) -> int:
             next_descriptor = open_verified_directory_component(
                 current_descriptor, part, display_path, create_missing=create_missing
             )
+            os.close(current_descriptor)
+            current_descriptor = next_descriptor
+        return current_descriptor
+    except BaseException:
+        try:
+            os.close(current_descriptor)
+        except OSError:
+            pass
+        raise
+
+
+def open_verified_ancestor_chain_or_absent(link: Path) -> int | None:
+    """Same dir_fd-chained ancestor walk as
+    open_verified_ancestor_chain(link, create_missing=False), except a
+    genuinely missing component -- an ancestor, or link's own immediate
+    parent, that simply does not exist -- returns None instead of raising,
+    because that is the ordinary "nothing has ever been installed here"
+    state. Every OTHER rejection the shared walk enforces (a symlinked
+    ancestor, wrong owner/mode, a non-directory component, dir_fd support
+    unavailable, link outside USER_HOME, ...) still raises PrimeInstallError
+    and is never folded into "absent".
+
+    Used by verify_command_state() to bind BIN_LINK's existence check to
+    the SAME verified ancestor chain used for its content/identity
+    verification (verify_link() -> verify_link_parent_descriptor()),
+    instead of Path.is_symlink()/Path.exists(), which resolve through
+    whatever an ancestor currently points to and can therefore report the
+    managed link both disabled and absent -- while the real link, reachable
+    only through the true, unswapped ancestor chain, is still live -- the
+    instant a same-UID actor swaps an ancestor directory (e.g. ~/.local) for
+    a symlink to a directory that does not contain bin/prime-agent
+    (independent review round 5, 2026-08-18, P1-3: verify_command_state()
+    and its uninstall call site resolved BIN_LINK's existence purely
+    lexically, so that swap made uninstall silently report
+    command_disabled=true/already_disabled=true while the managed link was
+    untouched).
+    """
+    require_link_dir_fd_support()
+    lexical_home = USER_HOME.absolute()
+    try:
+        relative = link.parent.absolute().relative_to(lexical_home)
+    except ValueError as exc:
+        raise PrimeInstallError(f"link path is outside the user home: {link}") from exc
+    try:
+        current_descriptor = os.open(lexical_home, os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise PrimeInstallError(f"cannot open user home: {lexical_home}") from exc
+    display_path = lexical_home
+    try:
+        for part in relative.parts:
+            display_path = display_path / part
+            try:
+                next_descriptor = open_verified_directory_component(
+                    current_descriptor,
+                    part,
+                    display_path,
+                    create_missing=False,
+                    missing_ok=True,
+                )
+            except _AncestorComponentAbsent:
+                os.close(current_descriptor)
+                return None
             os.close(current_descriptor)
             current_descriptor = next_descriptor
         return current_descriptor
@@ -2595,7 +2851,9 @@ def validate_receipt_identity(receipt: Any) -> dict[str, Any]:
     return receipt
 
 
-def finalize_pending_install() -> dict[str, Any]:
+def finalize_pending_install(
+    expected_lock_identity: tuple[int, int] | None = None,
+) -> dict[str, Any]:
     if not PENDING_PATH.exists() and not PENDING_PATH.is_symlink():
         raise PrimeInstallError("pending Prime Agent install journal is missing")
     journal_raw = read_private_ssd_file(PENDING_PATH)
@@ -2614,6 +2872,13 @@ def finalize_pending_install() -> dict[str, Any]:
         raise PrimeInstallError("installed Orca Prime Agent support changed during recovery")
     if os.fspath(verify_lifecycle_lock_file()) != receipt.get("lifecycle_lock"):
         raise PrimeInstallError("Prime Agent lifecycle lock identity drifted")
+    if expected_lock_identity is not None:
+        # A critical use point reached while the caller's exclusive
+        # lifecycle lock is (or should still be) held: re-assert the lock
+        # path still names the exact inode acquired at lock time, closing
+        # the same-UID inode-swap TOCTOU (independent review round 5,
+        # 2026-08-18, P2-2; see assert_lifecycle_lock_path_identity()).
+        assert_lifecycle_lock_path_identity(lifecycle_lock_path(), expected_lock_identity)
     release = verify_private_ssd_dir(RELEASE_DIR)
     state = validate_pristine_managed_home(STATE_DIR, "Prime Agent pending state")
     validate_pristine_managed_home(PROBE_HOME, "Prime Agent pending probe home")
@@ -2649,15 +2914,15 @@ def finalize_pending_install() -> dict[str, Any]:
     return receipt
 
 
-def _recover_locked() -> dict[str, Any]:
+def _recover_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     resumed = resume_incomplete_quarantine()
     if resumed is not None:
         return resumed
     if PENDING_PATH.exists() or PENDING_PATH.is_symlink():
-        receipt = finalize_pending_install()
+        receipt = finalize_pending_install(lock_identity)
         return {"ok": True, "state": "committed", "version": receipt["version"]}
     if RECEIPT_PATH.exists() or RECEIPT_PATH.is_symlink():
-        verification = verify()
+        verification = verify(lock_identity)
         return {
             "ok": True,
             "state": "already_committed",
@@ -2672,11 +2937,11 @@ def _recover_locked() -> dict[str, Any]:
     return {"ok": True, "state": "none"}
 
 
-def _install_locked() -> dict[str, Any]:
+def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     ensure_no_prime_agent_command()
     resume_incomplete_quarantine()
     if PENDING_PATH.exists() or PENDING_PATH.is_symlink():
-        return finalize_pending_install()
+        return finalize_pending_install(lock_identity)
     evidence = preflight()
     if any(
         path.exists() or path.is_symlink()
@@ -2776,9 +3041,17 @@ def _install_locked() -> dict[str, Any]:
         "private": True,
         "dependencies": {"prime-agent": f"file:assets/{MAIN_PATCHED_ASSET}"},
     }
-    atomic_create_private_file(
-        RELEASE_DIR / "package.json", canonical_json(root_manifest), 0o600
-    )
+    manifest_path = RELEASE_DIR / "package.json"
+    manifest_raw = canonical_json(root_manifest)
+    atomic_create_private_file(manifest_path, manifest_raw, 0o600)
+    manifest_stat = manifest_path.lstat()
+    manifest_identity = (manifest_stat.st_dev, manifest_stat.st_ino)
+    # Re-verify package.json is still exactly what was just published,
+    # immediately before each npm invocation that independently re-reads it
+    # from RELEASE_DIR on its own -- closing the verify-then-use gap between
+    # publication and each of the two npm reads below (independent review
+    # round 5, 2026-08-18, P2-3; see verify_unchanged_private_ssd_file()).
+    verify_unchanged_private_ssd_file(manifest_path, manifest_raw, manifest_identity)
     run_npm(
         os.fspath(npm_cli),
         os.fspath(node),
@@ -2788,11 +3061,20 @@ def _install_locked() -> dict[str, Any]:
         install_home,
         install_tmp,
     )
-    generated_lock_raw = (RELEASE_DIR / "package-lock.json").read_bytes()
+    lock_path = RELEASE_DIR / "package-lock.json"
+    generated_lock_raw = lock_path.read_bytes()
+    lock_stat = lock_path.lstat()
+    lock_identity = (lock_stat.st_dev, lock_stat.st_ino)
     generated_lock = strict_json(generated_lock_raw)
     if not isinstance(generated_lock, dict):
         raise PrimeInstallError("generated lock is invalid")
     closure = validate_generated_lock(generated_lock_raw, generated_lock)
+    # Re-verify both package.json and the just-validated package-lock.json
+    # are still exactly what was read/validated above, immediately before
+    # `npm ci` independently re-reads both from RELEASE_DIR on its own
+    # (same rationale as the "install" re-check above).
+    verify_unchanged_private_ssd_file(manifest_path, manifest_raw, manifest_identity)
+    verify_unchanged_private_ssd_file(lock_path, generated_lock_raw, lock_identity)
     run_npm(
         os.fspath(npm_cli),
         os.fspath(node),
@@ -2865,7 +3147,7 @@ def _install_locked() -> dict[str, Any]:
         "probe_agent_dir": os.fspath(probe_agent_dir),
     }
     write_pending_install(receipt)
-    return finalize_pending_install()
+    return finalize_pending_install(lock_identity)
 
 
 def load_receipt() -> dict[str, Any]:
@@ -3002,18 +3284,43 @@ def ensure_no_prime_agent_command() -> None:
 
 
 def verify_command_state(receipt: dict[str, Any]) -> bool:
+    # BIN_LINK's existence/kind is resolved through the SAME dir_fd-chained,
+    # non-symlinked ancestor walk verify_link() uses -- never through
+    # Path.is_symlink()/Path.exists(), which silently resolve through a
+    # since-swapped ancestor and would let this function agree with
+    # prime_agent_command_candidates() (also PATH/lexical) that the command
+    # is both disabled and absent while the real managed link, reachable
+    # only via the true ancestor chain, is still live (independent review
+    # round 5, 2026-08-18, P1-3). A genuinely missing parent (nothing has
+    # ever been installed under it) is the only case treated as "absent";
+    # every other ancestor-chain failure -- a symlinked ancestor above all
+    # -- fails closed via the PrimeInstallError raised inside
+    # open_verified_ancestor_chain_or_absent()/open_verified_directory_component()
+    # rather than being reported as disabled.
     target = Path(receipt["bin_target"])
     candidates = prime_agent_command_candidates()
-    if BIN_LINK.is_symlink():
+    parent_descriptor = open_verified_ancestor_chain_or_absent(BIN_LINK)
+    if parent_descriptor is None:
+        if candidates:
+            raise PrimeInstallError(f"Prime Agent is disabled but another command resolves: {candidates}")
+        return False
+    try:
+        try:
+            info = os.stat(BIN_LINK.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            if candidates:
+                raise PrimeInstallError(f"Prime Agent is disabled but another command resolves: {candidates}")
+            return False
+        except OSError as exc:
+            raise PrimeInstallError(f"cannot inspect managed command link: {BIN_LINK}") from exc
+    finally:
+        os.close(parent_descriptor)
+    if stat.S_ISLNK(info.st_mode):
         verify_link(BIN_LINK, target)
         if candidates != [BIN_LINK.absolute()]:
             raise PrimeInstallError(f"Prime Agent command resolution is ambiguous: {candidates}")
         return True
-    if BIN_LINK.exists():
-        raise PrimeInstallError("Prime Agent command path is occupied by a non-symlink")
-    if candidates:
-        raise PrimeInstallError(f"Prime Agent is disabled but another command resolves: {candidates}")
-    return False
+    raise PrimeInstallError("Prime Agent command path is occupied by a non-symlink")
 
 
 def process_arguments_contain_identity(arguments: str, identity: str) -> bool:
@@ -3141,7 +3448,7 @@ def run_version_probe(receipt: dict[str, Any]) -> str:
     return VERSION
 
 
-def verify() -> dict[str, Any]:
+def verify(expected_lock_identity: tuple[int, int] | None = None) -> dict[str, Any]:
     evidence = preflight()
     receipt = load_receipt()
     if evidence["volume_uuid"] != receipt.get("volume_uuid"):
@@ -3150,6 +3457,15 @@ def verify() -> dict[str, Any]:
         raise PrimeInstallError("installed Orca Prime Agent support drifted")
     if os.fspath(verify_lifecycle_lock_file()) != receipt.get("lifecycle_lock"):
         raise PrimeInstallError("Prime Agent lifecycle lock identity drifted")
+    if expected_lock_identity is not None:
+        # Only supplied when verify() is reached while an ancestor caller's
+        # exclusive lifecycle lock is still held (_recover_locked(),
+        # _enable_locked()): re-assert the lock path still names the exact
+        # inode acquired at lock time (independent review round 5,
+        # 2026-08-18, P2-2; see assert_lifecycle_lock_path_identity()). The
+        # standalone top-level `verify` action never holds this lock at all
+        # and always passes None here, unchanged from before this fix.
+        assert_lifecycle_lock_path_identity(lifecycle_lock_path(), expected_lock_identity)
     release = verify_private_ssd_dir(Path(receipt["release_dir"]))
     state = validate_runtime_state(Path(receipt["state_dir"]))
     validate_pristine_managed_home(Path(receipt["probe_home"]), "Prime Agent probe home")
@@ -3246,8 +3562,8 @@ def _uninstall_locked() -> dict[str, Any]:
     }
 
 
-def _enable_locked() -> dict[str, Any]:
-    verification = verify()
+def _enable_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
+    verification = verify(lock_identity)
     if verification["command_enabled"]:
         return {"ok": True, "command_enabled": True, "already_enabled": True}
     receipt = load_receipt()
@@ -3268,13 +3584,13 @@ def _enable_locked() -> dict[str, Any]:
 
 
 def install() -> dict[str, Any]:
-    with exclusive_lifecycle_lock(create=True):
-        return _install_locked()
+    with exclusive_lifecycle_lock(create=True) as (_lock_path, lock_identity):
+        return _install_locked(lock_identity)
 
 
 def recover() -> dict[str, Any]:
-    with exclusive_lifecycle_lock(create=True):
-        return _recover_locked()
+    with exclusive_lifecycle_lock(create=True) as (_lock_path, lock_identity):
+        return _recover_locked(lock_identity)
 
 
 def uninstall() -> dict[str, Any]:
@@ -3283,8 +3599,8 @@ def uninstall() -> dict[str, Any]:
 
 
 def enable() -> dict[str, Any]:
-    with exclusive_lifecycle_lock(create=False):
-        return _enable_locked()
+    with exclusive_lifecycle_lock(create=False) as (_lock_path, lock_identity):
+        return _enable_locked(lock_identity)
 
 
 def plan() -> dict[str, Any]:

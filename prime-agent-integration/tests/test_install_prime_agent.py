@@ -1590,7 +1590,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     with self.assertRaisesRegex(
                         installer.PrimeInstallError, "unresolved or unknown"
                     ):
-                        installer._recover_locked()
+                        installer._recover_locked((0, 0))
                 finalize.assert_not_called()
                 verify.assert_not_called()
                 quarantine.assert_not_called()
@@ -1723,7 +1723,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     installer.PrimeInstallError, "existing prime-agent command"
                 ):
-                    installer._install_locked()
+                    installer._install_locked((0, 0))
             scan.assert_called_once_with()
             finalize.assert_not_called()
             preflight.assert_not_called()
@@ -2039,7 +2039,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             ),
         ):
             with self.assertRaises(installer.PrimeInstallError) as raised:
-                installer._enable_locked()
+                installer._enable_locked((0, 0))
         message = str(raised.exception)
         self.assertIn("removed but parent-directory durability is unconfirmed", message)
         self.assertNotIn("preserved for inspection", message)
@@ -3189,6 +3189,570 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 ["--daemon-socket", daemon_socket, "config", "get", "x"],
             )
             self.assertIsNone(config_payload["resourceGuard"])
+
+    def test_leading_option_parser_covers_update_bypass_and_daemon_socket_forms(
+        self,
+    ) -> None:
+        # Regression for independent review round 5, 2026-08-18 (fixing
+        # round 4's partial fix): the entrypoint's command-token detection
+        # was ad hoc pattern matching on a fixed argv position/form
+        # ("$1 == '--daemon-socket'" then take "$3", space-separated only),
+        # not a real "skip every recognized leading option, take the first
+        # non-option token" parse. That left THREE bugs: (P1-1) the
+        # self-update block checked bare "${1-}" directly, never the
+        # resolved command token at all, so
+        # "--daemon-socket <sock> update" was never blocked; (P1-2) the
+        # "--daemon-socket=<value>" single-token form and a
+        # repeated/duplicate "--daemon-socket" flag were not recognized by
+        # either the shell entrypoint or the Python launch guard, so those
+        # forms bypassed the agents/attach effective-project gate; (P2-1)
+        # guard-flag insertion for those same unrecognized forms landed in
+        # the wrong place. Both generated scripts now share ONE parsing
+        # function apiece (resolve_managed_command() / split_leading_options())
+        # driven by the same LEADING_COMMAND_OPTIONS constant. Verified
+        # here with real generated scripts run as real subprocesses -- not
+        # by reading the script text.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "release"
+            bin_dir = release / "bin"
+            bin_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(tool_root, 0o700)
+            os.chmod(release, 0o700)
+            node = bin_dir / "node"
+            cli = release / "cli.js"
+            node.write_text(
+                "#!/usr/bin/python3\n"
+                "import json, os, sys\n"
+                "print(json.dumps({\n"
+                "  'argv': sys.argv[1:],\n"
+                "  'resourceGuard': os.environ.get('ORCA_PRIME_AGENT_RESOURCE_GUARD'),\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            os.chmod(node, 0o700)
+            cli.write_text("// argument sentinel\n", encoding="utf-8")
+            os.chmod(cli, 0o600)
+            lifecycle_lock = tool_root / "lifecycle.lock"
+            lifecycle_lock.write_bytes(b"")
+            os.chmod(lifecycle_lock, 0o600)
+            guard = bin_dir / "prime-agent-launch-guard.py"
+            wrapper = bin_dir / "prime-agent"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", tool_root / "state"),
+            ):
+                guard.write_bytes(installer.managed_launch_guard_script(node, cli))
+                wrapper.write_bytes(
+                    installer.managed_entrypoint_script(node, cli, guard)
+                )
+            os.chmod(guard, 0o700)
+            os.chmod(wrapper, 0o700)
+            clean = root / "clean"
+            clean.mkdir(mode=0o700)
+            daemon_socket = os.fspath(root / "daemon.sock")
+            other_socket = os.fspath(root / "daemon2.sock")
+
+            def run_wrapper(
+                arguments: tuple[str, ...], *, allow_settings: bool = False
+            ) -> subprocess.CompletedProcess[str]:
+                environment = {
+                    "HOME": os.fspath(root),
+                    "PATH": "/usr/bin:/bin",
+                    "ORCA_PRIME_AGENT_RESOURCE_GUARD": "1",
+                }
+                if allow_settings:
+                    environment["ORCA_PRIME_AGENT_ALLOW_PROJECT_SETTINGS"] = "1"
+                return subprocess.run(
+                    [os.fspath(wrapper), *arguments],
+                    cwd=clean,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=environment,
+                )
+
+            # Self-update block: bare, space-separated daemon-socket, and
+            # "="-form daemon-socket must ALL be blocked with rc 64.
+            for arguments in (
+                ("update",),
+                ("--daemon-socket", daemon_socket, "update"),
+                (f"--daemon-socket={daemon_socket}", "update"),
+            ):
+                with self.subTest(arguments=arguments, mode="update-block"):
+                    result = run_wrapper(arguments)
+                    self.assertEqual(result.returncode, 64, result.stderr)
+                    self.assertIn("self-update is disabled", result.stderr)
+
+            # agents/attach effective-project gate: bare, space-separated,
+            # "="-form, and repeated/duplicate daemon-socket must ALL be
+            # blocked with rc 78 absent the opt-in env var.
+            for arguments in (
+                ("agents",),
+                ("attach", "saved-session"),
+                ("--daemon-socket", daemon_socket, "agents"),
+                (f"--daemon-socket={daemon_socket}", "agents"),
+                (f"--daemon-socket={daemon_socket}", "attach", "saved-session"),
+                (
+                    "--daemon-socket",
+                    daemon_socket,
+                    "--daemon-socket",
+                    other_socket,
+                    "agents",
+                ),
+            ):
+                with self.subTest(arguments=arguments, mode="agents-attach-block"):
+                    result = run_wrapper(arguments)
+                    self.assertEqual(result.returncode, 78, result.stderr)
+                    self.assertIn("effective-project settings review", result.stderr)
+
+            # Guard-flag placement: with explicit opt-in, resource-guard
+            # flags must land immediately after the resolved command token
+            # (and its own positional args) for the "="-form and
+            # repeated-flag cases too -- never between a socket value and
+            # the command token.
+            equals_allowed = run_wrapper(
+                (f"--daemon-socket={daemon_socket}", "agents", "extra"),
+                allow_settings=True,
+            )
+            self.assertEqual(equals_allowed.returncode, 0, equals_allowed.stderr)
+            equals_payload = installer.strict_json(
+                equals_allowed.stdout.encode("utf-8")
+            )
+            self.assertIsInstance(equals_payload, dict)
+            assert isinstance(equals_payload, dict)
+            self.assertEqual(
+                equals_payload["argv"][1:],
+                [
+                    f"--daemon-socket={daemon_socket}",
+                    "agents",
+                    "extra",
+                    "--no-extensions",
+                    "--no-skills",
+                    "--no-prompt-templates",
+                ],
+            )
+
+            repeated_allowed = run_wrapper(
+                (
+                    "--daemon-socket",
+                    daemon_socket,
+                    "--daemon-socket",
+                    other_socket,
+                    "agents",
+                    "extra",
+                ),
+                allow_settings=True,
+            )
+            self.assertEqual(repeated_allowed.returncode, 0, repeated_allowed.stderr)
+            repeated_payload = installer.strict_json(
+                repeated_allowed.stdout.encode("utf-8")
+            )
+            self.assertIsInstance(repeated_payload, dict)
+            assert isinstance(repeated_payload, dict)
+            self.assertEqual(
+                repeated_payload["argv"][1:],
+                [
+                    "--daemon-socket",
+                    daemon_socket,
+                    "--daemon-socket",
+                    other_socket,
+                    "agents",
+                    "extra",
+                    "--no-extensions",
+                    "--no-skills",
+                    "--no-prompt-templates",
+                ],
+            )
+
+    def test_verify_command_state_detects_ancestor_swap_to_directory_without_command(
+        self,
+    ) -> None:
+        # Regression for independent review round 5, 2026-08-18, P1-3:
+        # verify_command_state() used to resolve BIN_LINK's mere EXISTENCE
+        # via Path.is_symlink()/Path.exists() -- purely lexical checks that
+        # silently follow whatever an ancestor currently resolves to.
+        # Unlike test_verify_link_rejects_interposed_ancestor_symlink's
+        # honestly-shaped-decoy scenario (where the attacker directory DOES
+        # contain its own bin/prime-agent, so the old lexical
+        # is_symlink() check still found something and fell through to
+        # verify_link()'s own, already-fixed ancestor check), this is the
+        # review's exact still-open scenario: the attacker directory
+        # contains NOTHING at all. Both is_symlink() and exists() then see
+        # "nothing here", so verify_command_state() used to silently return
+        # False ("disabled"/"absent") -- and _uninstall_locked() would
+        # report command_disabled=true/already_disabled=true -- while the
+        # REAL managed link, reachable only through the true (pre-swap)
+        # ancestor chain, was untouched and still live. Must now fail
+        # closed instead.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ssd = root / "ssd"
+            target = ssd / "target"
+            target.parent.mkdir(mode=0o700)
+            target.write_text("#!/bin/sh\n", encoding="utf-8")
+            os.chmod(target, 0o700)
+            user_home = root / "user"
+            real_bin = user_home / ".local/bin"
+            real_bin.mkdir(parents=True, mode=0o700)
+            link = real_bin / "prime-agent"
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", ssd),
+                mock.patch.object(installer, "USER_HOME", user_home),
+                mock.patch.object(installer, "BIN_LINK", link),
+                mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}),
+            ):
+                installer.atomic_symlink(target, link)
+                receipt = {"bin_target": os.fspath(target)}
+                # Sanity: the honestly created link verifies as enabled
+                # before the ancestor is swapped.
+                self.assertTrue(installer.verify_command_state(receipt))
+
+                real_local = user_home / ".local"
+                relocated = real_local.with_name(".local-relocated")
+                real_local.rename(relocated)
+                attacker_dir = root / "attacker-empty"
+                attacker_dir.mkdir(mode=0o700)
+                real_local.symlink_to(attacker_dir, target_is_directory=True)
+
+                # The attacker directory has NO bin/prime-agent at all --
+                # pre-fix, this silently returned False instead of failing
+                # closed.
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "link parent is missing|unsafe link parent|"
+                    "cannot inspect link parent",
+                ):
+                    installer.verify_command_state(receipt)
+
+            # The real (relocated) link must still be exactly what was
+            # honestly created -- untouched by any of this.
+            real_relocated_link = relocated / "bin/prime-agent"
+            self.assertTrue(real_relocated_link.is_symlink())
+            self.assertEqual(os.readlink(real_relocated_link), os.fspath(target))
+
+    def test_lifecycle_lock_reacquire_after_inode_swap_is_detected(self) -> None:
+        # Regression for independent review round 5, 2026-08-18, P2-2:
+        # flock(2) binds exclusivity to the inode held open at acquire
+        # time, not to the path. Real repro of the review's exact
+        # scenario: A acquires the lock, a same-UID actor renames a fresh
+        # file over lifecycle.lock's well-known path while A still holds
+        # its original fd, and C then independently acquires its OWN
+        # "exclusive" lock against the swapped path -- demonstrating that
+        # C's acquisition genuinely succeeds on its own terms (this is
+        # flock()'s real per-inode behavior, not something the acquiring
+        # side alone can prevent) while A's own re-check against the
+        # identity it captured at acquire time must now detect the swap
+        # and fail closed, instead of A silently continuing as if it still
+        # held exclusive protection over the well-known path.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+            ):
+                lock_a = installer.exclusive_lifecycle_lock(create=True)
+                path_a, identity_a = lock_a.__enter__()
+                try:
+                    self.assertEqual(path_a, tool_root / "lifecycle.lock")
+                    self.assertIsInstance(identity_a, tuple)
+                    self.assertEqual(len(identity_a), 2)
+
+                    # Same-UID actor renames a fresh file over the lock path.
+                    fresh = tool_root / ".fresh-lock"
+                    fresh.write_bytes(b"")
+                    os.chmod(fresh, 0o600)
+                    os.replace(fresh, path_a)
+
+                    # C: an independent acquisition against the swapped
+                    # path succeeds on its own terms.
+                    lock_c = installer.exclusive_lifecycle_lock(create=False)
+                    path_c, identity_c = lock_c.__enter__()
+                    try:
+                        self.assertEqual(path_c, path_a)
+                        self.assertNotEqual(identity_c, identity_a)
+                    finally:
+                        lock_c.__exit__(None, None, None)
+
+                    # A's own re-check against the identity captured at its
+                    # acquire time must now detect the swap and fail closed.
+                    with self.assertRaisesRegex(
+                        installer.PrimeInstallError,
+                        "identity changed while held",
+                    ):
+                        installer.assert_lifecycle_lock_path_identity(
+                            path_a, identity_a
+                        )
+                finally:
+                    lock_a.__exit__(None, None, None)
+
+    def test_finalize_pending_install_fails_closed_on_stale_lifecycle_lock_identity(
+        self,
+    ) -> None:
+        # Regression for independent review round 5, 2026-08-18, P2-2:
+        # finalize_pending_install() is a critical use point reached while
+        # an ancestor caller's exclusive lifecycle lock is (or should
+        # still be) held. Confirms a caller-supplied identity that no
+        # longer matches the real, current lifecycle lock (as if the lock
+        # file had been swapped for a fresh inode while held) is detected
+        # and fails closed BEFORE any managed state is touched, while the
+        # correct, current identity still lets the exact same operation
+        # succeed -- pre-fix, finalize_pending_install() accepted no such
+        # parameter at all and could not detect this.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            state = tool_root / "state"
+            probe_home = tool_root / "probe-home"
+            session_dir = tool_root / "sessions"
+            user_home = root / "user"
+            receipt_path = tool_root / "receipts" / f"v{installer.VERSION}.json"
+            pending = tool_root / "pending-install.json"
+            for path in (release / "bin", user_home, receipt_path.parent):
+                path.mkdir(parents=True, mode=0o700, exist_ok=True)
+            os.chmod(release, 0o700)
+            settings = self.create_managed_home(
+                state, session_dir=tool_root / "sessions"
+            )
+            self.create_managed_home(probe_home, session_dir=tool_root / "sessions")
+            session_dir.mkdir(mode=0o700)
+            entrypoint = release / "bin" / "prime-agent"
+            entrypoint.write_text("#!/bin/sh\n", encoding="utf-8")
+            os.chmod(entrypoint, 0o700)
+            launch_guard = release / "bin" / "prime-agent-launch-guard.py"
+            launch_guard.write_text("#!/usr/bin/python3\n", encoding="utf-8")
+            os.chmod(launch_guard, 0o700)
+            lifecycle_lock = tool_root / "lifecycle.lock"
+            lifecycle_lock.write_bytes(b"")
+            os.chmod(lifecycle_lock, 0o600)
+            unrelated = root / "unrelated-file"
+            unrelated.write_bytes(b"")
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                digest, entries = installer.tree_digest(release)
+            state_link = user_home / ".prime"
+            bin_link = user_home / ".local/bin/prime-agent"
+            receipt = {
+                "schema": installer.RECEIPT_SCHEMA,
+                "version": installer.VERSION,
+                "tag_commit": installer.TAG_COMMIT,
+                "volume_uuid": "TEST-UUID",
+                "release_dir": os.fspath(release),
+                "state_dir": os.fspath(state),
+                "state_link": os.fspath(state_link),
+                "bin_link": os.fspath(bin_link),
+                "bin_target": os.fspath(entrypoint),
+                "launch_guard": os.fspath(launch_guard),
+                "lifecycle_lock": os.fspath(lifecycle_lock),
+                "node_target": os.fspath(release / "toolchain/bin/node"),
+                "npm_target": os.fspath(
+                    release / "toolchain/lib/node_modules/npm/bin/npm-cli.js"
+                ),
+                "probe_home": os.fspath(probe_home),
+                "probe_agent_dir": os.fspath(probe_home / "agent"),
+                "session_dir": os.fspath(session_dir),
+                "asset_sha256": installer.ASSETS,
+                "node_asset_sha256": installer.NODE_ASSET_SHA256,
+                "upstream_lock_sha256": installer.LOCK_SHA256,
+                "license_sha256": installer.LICENSE_SHA256,
+                "production_lock_sha256": installer.GENERATED_LOCK_SHA256,
+                "patched_manifest_names": sorted(("prime-agent", *installer.WORKSPACE_PACKAGES)),
+                "closure": {
+                    "lock_sha256": installer.GENERATED_LOCK_SHA256,
+                    "packages_checked": installer.GENERATED_LOCK_PACKAGE_COUNT,
+                    "registry_packages_checked": installer.GENERATED_LOCK_PACKAGE_COUNT - 4,
+                },
+                "node_version": installer.NODE_VERSION,
+                "npm_version": installer.NPM_VERSION,
+                "lifecycle_scripts_executed": False,
+                "daemon_started": False,
+                "credentials_configured": False,
+                "command_default_enabled": False,
+                "project_settings_default_allowed": False,
+                "project_executable_resources_default_allowed": False,
+                "telemetry_default_enabled": False,
+                "telemetry_settings": os.fspath(settings),
+                "release_tree_sha256": digest,
+                "release_tree_entries": entries,
+                "orca_support": {"test": "support"},
+            }
+            installer.atomic_write(
+                pending,
+                installer.canonical_json(
+                    {"schema": installer.JOURNAL_SCHEMA, "receipt": receipt}
+                ),
+                0o600,
+            )
+            real_identity = (
+                lifecycle_lock.stat().st_dev,
+                lifecycle_lock.stat().st_ino,
+            )
+            stale_identity = (unrelated.stat().st_dev, unrelated.stat().st_ino)
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", state),
+                mock.patch.object(installer, "PROBE_HOME", probe_home),
+                mock.patch.object(installer, "USER_HOME", user_home),
+                mock.patch.object(installer, "STATE_LINK", state_link),
+                mock.patch.object(installer, "BIN_LINK", bin_link),
+                mock.patch.object(installer, "RECEIPT_PATH", receipt_path),
+                mock.patch.object(installer, "PENDING_PATH", pending),
+                mock.patch.object(installer, "volume_uuid", return_value="TEST-UUID"),
+                mock.patch.object(
+                    installer, "verify_orca_support", return_value={"test": "support"}
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "lifecycle lock identity changed while held",
+                ):
+                    installer.finalize_pending_install(stale_identity)
+                self.assertTrue(pending.is_file())
+                self.assertFalse(receipt_path.exists())
+                self.assertFalse(state_link.exists())
+
+                first = installer.finalize_pending_install(real_identity)
+            self.assertEqual(first["version"], installer.VERSION)
+            self.assertTrue(state_link.is_symlink())
+            self.assertTrue(receipt_path.is_file())
+            self.assertFalse(pending.exists())
+
+    def test_verify_fails_closed_on_stale_lifecycle_lock_identity(self) -> None:
+        # Regression for independent review round 5, 2026-08-18, P2-2:
+        # verify() is reached while an ancestor caller's exclusive
+        # lifecycle lock is still held (_recover_locked(),
+        # _enable_locked()). Confirms a stale caller-supplied identity is
+        # detected and fails closed at this critical use point, strictly
+        # before any of the heavier release/state checks that follow it in
+        # verify() ever run -- while the correct identity lets execution
+        # proceed past this check (proven by it then failing on a
+        # DIFFERENT, later check this fixture deliberately leaves unmet).
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            tool_root.mkdir(mode=0o700)
+            lifecycle_lock = tool_root / "lifecycle.lock"
+            lifecycle_lock.write_bytes(b"")
+            os.chmod(lifecycle_lock, 0o600)
+            real_identity = (
+                lifecycle_lock.stat().st_dev,
+                lifecycle_lock.stat().st_ino,
+            )
+            unrelated = root / "unrelated-file"
+            unrelated.write_bytes(b"")
+            stale_identity = (unrelated.stat().st_dev, unrelated.stat().st_ino)
+            evidence = {"volume_uuid": "TEST-UUID", "orca_support": {"test": "support"}}
+            receipt = {
+                "volume_uuid": "TEST-UUID",
+                "orca_support": {"test": "support"},
+                "lifecycle_lock": os.fspath(lifecycle_lock),
+                "release_dir": os.fspath(root / "nonexistent-release"),
+            }
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "preflight", return_value=evidence),
+                mock.patch.object(installer, "load_receipt", return_value=receipt),
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "lifecycle lock identity changed while held",
+                ):
+                    installer.verify(stale_identity)
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "private directory is unavailable"
+                ):
+                    installer.verify(real_identity)
+
+    def test_verify_unchanged_private_ssd_file_detects_swap_between_verify_and_use(
+        self,
+    ) -> None:
+        # Regression for independent review round 5, 2026-08-18, P2-3:
+        # _install_locked() used to read+validate RELEASE_DIR/package.json
+        # and RELEASE_DIR/package-lock.json once, then let independently
+        # spawned `npm` subprocesses re-read those SAME paths from disk on
+        # their own, with no identity binding between the verifying read
+        # and the later consuming read. Real repro: publish a file,
+        # capture (raw bytes, dev+inode) exactly as _install_locked() now
+        # does immediately after publication/validation, then have a
+        # same-UID actor replace the file at that exact path with a
+        # DIFFERENT-but-still-valid-looking file -- both via a rename (new
+        # inode) and via an in-place overwrite (same inode, different
+        # bytes) -- and confirm the fix detects both instead of letting a
+        # downstream consumer silently read the swapped content.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "release"
+            release.mkdir(mode=0o700)
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                # Case 1: rename-swap (different inode, different content).
+                manifest_path = release / "package-a.json"
+                original = installer.canonical_json(
+                    {"name": "orca-managed-prime-agent", "version": "1.0.0"}
+                )
+                installer.atomic_create_private_file(manifest_path, original, 0o600)
+                manifest_stat = manifest_path.lstat()
+                identity = (manifest_stat.st_dev, manifest_stat.st_ino)
+
+                # Sanity: immediately after publication, with nothing
+                # changed, the re-check passes.
+                installer.verify_unchanged_private_ssd_file(
+                    manifest_path, original, identity
+                )
+
+                swapped = installer.canonical_json(
+                    {"name": "orca-managed-prime-agent", "version": "9.9.9"}
+                )
+                swap_path = release / ".swap-package-a.json"
+                swap_path.write_bytes(swapped)
+                os.chmod(swap_path, 0o600)
+                os.replace(swap_path, manifest_path)
+
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "changed before use"
+                ):
+                    installer.verify_unchanged_private_ssd_file(
+                        manifest_path, original, identity
+                    )
+
+                # Case 2: in-place overwrite (same inode, different
+                # content) -- the identity check alone would miss this;
+                # the content re-check must catch it.
+                manifest_path_b = release / "package-b.json"
+                original_b = installer.canonical_json(
+                    {"name": "orca-managed-prime-agent", "version": "1.0.0"}
+                )
+                installer.atomic_create_private_file(manifest_path_b, original_b, 0o600)
+                stat_b = manifest_path_b.lstat()
+                identity_b = (stat_b.st_dev, stat_b.st_ino)
+                installer.verify_unchanged_private_ssd_file(
+                    manifest_path_b, original_b, identity_b
+                )
+                overwritten = installer.canonical_json(
+                    {"name": "orca-managed-prime-agent", "version": "2.0.0"}
+                )
+                with open(manifest_path_b, "r+b") as handle:
+                    handle.seek(0)
+                    handle.write(overwritten)
+                    handle.truncate()
+                after_stat_b = manifest_path_b.lstat()
+                self.assertEqual(
+                    (after_stat_b.st_dev, after_stat_b.st_ino), identity_b
+                )
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "changed before use"
+                ):
+                    installer.verify_unchanged_private_ssd_file(
+                        manifest_path_b, original_b, identity_b
+                    )
 
 
 if __name__ == "__main__":
