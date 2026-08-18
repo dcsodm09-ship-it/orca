@@ -477,6 +477,40 @@ bug（不是只堵住了 round 11 报的那一个具体案例）：emoji、组�
 
 **已派发 round 14 修复**，两个 P1 都优先处理。
 
+### Round 14：修保护参数插入机制 + tarball 二次校验（已验证关闭，未独立复核）
+
+保护参数插入函数 `insert_resource_guards_before_separator()`（追加到末尾）换成
+`insert_resource_guards_before_first_flag()`（插在 remaining 参数里第一个
+`-` 开头 token 之前，没有的话才退回到末尾）——按构造，插入点前面那个 token
+永远不可能是个会取值的选项，所以保护 flag 不可能被当成别人的值吃掉。逐条读了
+上游真实 `dist/cli/public-command.js` 确认这个位置对所有受影响的调用形态都
+安全（不会拆散 `model`/`list`、`session`/`export` 这类必须相邻的 token）。
+**真实端到端验证**：把锁定产物里真实、未改动的 `dist/cli/args.js` +
+`public-command.js` 解出来，在真实锁定的 Node 下跑，修复前后各测 28 个代表性
+用例——**21/28 修复前可绕过，0/28 修复后可绕过**，合法取值（如 `--model gpt4`）
+照常保留。`safe_extract_main_asset()`/`extract_node_toolchain()` 现在都要求
+传入 `expected_sha256`，复用已有的 `read_private_file()`（单次原子操作：
+lstat→O_NOFOLLOW open→身份→读取→读后一致性重检）重新读盘、重新算哈希、比对
+钉住的摘要，再把这些已验证字节喂给 `tarfile.open(fileobj=io.BytesIO(...))`，
+不再二次按路径打开。顺带修了 2 个 P2：launch guard 在 `flock` 成功后补上和
+安装器那侧同款的 inode 身份重新断言；新增 `validate_exec_target()` 给
+`NODE`/`CLI`（真正会被执行的两条路径）套上和 `LOCK` 同等严格的校验。
+5 个新回归测试，逐条验证过修复前失败、修复后通过。93/93 测试通过（三个
+解释器）。已提交 `6622ff6d55`。
+
+### Round 15
+
+**Codex QA 这路（走 Orca orchestration）完成，结论 PASS，无可复现 P0/P1。**
+93/93 测试、`py_compile` 干净，用真实锁定产物做的反向对照全部符合预期（含
+round 13 那个"末尾取值 flag 吞掉保护参数"的场景，现在正确不再被绕过）；
+`expected_sha256` 校验路径逐条静态审计，确认所有下载资产的解压调用都走了
+重新校验，没有遗漏。发现 README 计数又漂移了（88→已改正为 93）、`NODE`/
+`CLI` 校验和真正 `subprocess.run` 之间仍有一段很窄的"路径会被重新解析"的
+残留窗口（生成的 guard 脚本自己代码注释里已经写明，不是本轮新发现）、一次
+瞬时 SIGTERM 抖动（单测重跑即过，判定为机器负载导致，非确定性复现）。
+
+Claude opus/max 这一路仍在进行中。
+
 `sandbox_e2e.py` 真实网络路径运行（未 mock，真实调用官方下载）在第一步即失败：
 
 ```

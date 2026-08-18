@@ -192,7 +192,7 @@ temporary Extreme SSD directory:
 /usr/bin/python3 tests/sandbox_e2e.py
 ```
 
-The current unit suite has 88 tests, including deterministic runtime-command and
+The current unit suite has 93 tests, including deterministic runtime-command and
 resume/session guards, launch-lock, PATH, private npm probe, ancestor and
 durable-tree ordering, pending-journal and receipt publication races,
 leading-daemon-socket grammar, late-occupant, process-scan, unresolved-manifest,
