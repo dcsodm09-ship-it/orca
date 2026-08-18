@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
 import json
 import os
+import shlex
 import stat
 import subprocess
 import tarfile
@@ -194,10 +196,13 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 payload = b"bad"
                 info.size = len(payload)
                 archive.addfile(info, io.BytesIO(payload))
+            os.chmod(archive_path, 0o600)
             destination = root / "out"
             destination.mkdir()
             with self.assertRaises(installer.PrimeInstallError):
-                installer.safe_extract_main_asset(archive_path, destination)
+                installer.safe_extract_main_asset(
+                    archive_path, destination, installer.sha256_file(archive_path)
+                )
             self.assertFalse((root / "escape").exists())
 
     def test_tree_digest_changes_with_file_content(self) -> None:
@@ -775,6 +780,168 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     self.assertIn(
                         "fixed to managed Extreme SSD", blocked_session_dir.stderr
                     )
+
+    def test_guard_placement_survives_trailing_value_hungry_flag(self) -> None:
+        # Regression for independent review round 13/14, 2026-08-18, P1-A:
+        # guarded_arguments()'s previous append-near-the-end placement
+        # appended RESOURCE_GUARDS after the user's own full argv (or
+        # before a trailing "--"). Real upstream parseArgs() (dist/cli/
+        # args.js, verified directly against the pinned v0.7.2 bundle)
+        # unconditionally consumes the token immediately after 17 different
+        # value-taking options as that option's OWN value, with no check on
+        # what the next token looks like -- so whenever the user's own last
+        # real token was one of those options with a missing/empty value
+        # (the realistic trigger: a shell expanding an unset variable, e.g.
+        # `model list --model $UNSET_VAR`), the first appended guard flag
+        # was silently consumed as that option's value instead of ever being
+        # scanned as its own flag, defeating --no-extensions entirely and
+        # loading a hostile project's extensions with zero opt-in (60
+        # confirmed reproductions in the round-13 finding, against a real
+        # generated wrapper + real generated launch guard + real pinned
+        # Node + the real prime-agent-0.7.2.tgz bundle). This test proves
+        # the FIX -- guards now land immediately before the first
+        # flag-looking token instead of at the very end -- via the same
+        # real generated wrapper + real generated launch guard subprocess
+        # fixture every other guard-placement test in this file uses,
+        # observing the actual argv the launch guard would hand to NODE/CLI.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "release"
+            bin_dir = release / "bin"
+            bin_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(tool_root, 0o700)
+            os.chmod(release, 0o700)
+            node = bin_dir / "node"
+            cli = release / "cli.js"
+            node.write_text(
+                "#!/usr/bin/python3\n"
+                "import json, os, sys\n"
+                "print(json.dumps({\n"
+                "  'argv': sys.argv[1:],\n"
+                "  'resourceGuard': os.environ.get('ORCA_PRIME_AGENT_RESOURCE_GUARD'),\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            os.chmod(node, 0o700)
+            cli.write_text("// argument sentinel\n", encoding="utf-8")
+            os.chmod(cli, 0o600)
+            lifecycle_lock = tool_root / "lifecycle.lock"
+            lifecycle_lock.write_bytes(b"")
+            os.chmod(lifecycle_lock, 0o600)
+            guard = bin_dir / "prime-agent-launch-guard.py"
+            wrapper = bin_dir / "prime-agent"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", tool_root / "state"),
+            ):
+                guard.write_bytes(installer.managed_launch_guard_script(node, cli))
+                wrapper.write_bytes(
+                    installer.managed_entrypoint_script(node, cli, guard)
+                )
+            os.chmod(guard, 0o700)
+            os.chmod(wrapper, 0o700)
+            # Deliberately NO .prime/agent/settings.json -- proving
+            # RESOURCE_GUARDS, not the settings gate, is what protects this.
+            clean = root / "clean-no-settings-json"
+            clean.mkdir(mode=0o700)
+
+            def run_wrapper(
+                arguments: tuple[str, ...],
+            ) -> subprocess.CompletedProcess[str]:
+                environment = {
+                    "HOME": os.fspath(root),
+                    "PATH": "/usr/bin:/bin",
+                    # "agents"/"attach" carry a separate effective-project
+                    # settings-review gate (independent of RESOURCE_GUARDS
+                    # placement, which is what this test exercises); opt in
+                    # so those cases reach the launch guard at all. Harmless
+                    # for every other command in `cases` below.
+                    "ORCA_PRIME_AGENT_ALLOW_PROJECT_SETTINGS": "1",
+                }
+                return subprocess.run(
+                    [os.fspath(wrapper), *arguments],
+                    cwd=clean,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=environment,
+                )
+
+            def argv_of(result: subprocess.CompletedProcess[str]) -> list[object]:
+                self.assertEqual(result.returncode, 0, result.stderr)
+                payload = installer.strict_json(result.stdout.encode("utf-8"))
+                self.assertIsInstance(payload, dict)
+                assert isinstance(payload, dict)
+                self.assertIsNone(payload["resourceGuard"])
+                argv = payload["argv"]
+                self.assertIsInstance(argv, list)
+                assert isinstance(argv, list)
+                return argv[1:]
+
+            guards = [
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+            ]
+            # A representative sample of the 17 real value-taking upstream
+            # options (dist/cli/args.js), each left with a missing/empty
+            # trailing value -- the realistic `--model "$UNSET_VAR"` shape --
+            # across every RUNTIME_PUBLIC_COMMANDS member plus the "help"
+            # MISS case. The fixed placement must land the guards BEFORE the
+            # trailing flag, never after it (which is exactly what let the
+            # first guard get silently swallowed as that flag's own value
+            # pre-fix).
+            cases = (
+                (("model", "list", "--model"), ["model", "list"]),
+                (("model", "list", "--provider"), ["model", "list"]),
+                (("model", "list", "--api-key"), ["model", "list"]),
+                (("model", "list", "--theme"), ["model", "list"]),
+                (("model", "list", "--tools"), ["model", "list"]),
+                (("model", "list", "-t"), ["model", "list"]),
+                (("model", "list", "--thinking"), ["model", "list"]),
+                (("model", "list", "--extension"), ["model", "list"]),
+                (("session", "export", "/tmp/x", "--model"), ["session", "export", "/tmp/x"]),
+                (("attach", "myagent", "--model"), ["attach", "myagent"]),
+                (("agents", "--model"), ["agents"]),
+                (("help", "zzzzzzzzzzzz", "--model"), ["help", "zzzzzzzzzzzz"]),
+            )
+            for arguments, prefix in cases:
+                with self.subTest(arguments=arguments):
+                    observed = argv_of(run_wrapper(arguments))
+                    trailing_flag = arguments[len(prefix):]
+                    self.assertEqual(
+                        observed,
+                        [*prefix, *guards, *trailing_flag],
+                        f"guards must land before the trailing flag {trailing_flag!r}, "
+                        "not after it (where a real upstream value-taking option "
+                        "would silently swallow the first guard as its own value)",
+                    )
+
+            # Companion positive check: the SAME options with a real,
+            # non-empty value must still parse that value correctly (no
+            # functional regression) while still carrying every guard.
+            legit_cases = (
+                (
+                    ("model", "list", "--model", "gpt4"),
+                    ["model", "list", *guards, "--model", "gpt4"],
+                ),
+                (
+                    ("session", "export", "/tmp/x", "/tmp/y"),
+                    ["session", "export", "/tmp/x", "/tmp/y", *guards],
+                ),
+                (
+                    ("attach", "myagent"),
+                    ["attach", "myagent", *guards],
+                ),
+            )
+            for arguments, expected in legit_cases:
+                with self.subTest(arguments=arguments, mode="legit"):
+                    observed = argv_of(run_wrapper(arguments))
+                    self.assertEqual(observed, expected)
 
     def test_atomic_create_private_file_never_clobbers_and_rolls_back(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2169,7 +2336,21 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             lock = tool_root / "lifecycle.lock"
             lock.write_bytes(b"")
             os.chmod(lock, 0o600)
+            # `ready` doubles as the CLI argument the generated launch guard
+            # itself now validates (round 13/14, 2026-08-18, P2:
+            # validate_exec_target()) before ever exec'ing NODE/CLI -- it
+            # must therefore already exist, as a real, private (0600)
+            # regular file, before the guard runs at all, unlike before that
+            # validation existed (when this fixture let fake_node itself
+            # create the file as its own readiness signal). Pre-seed it with
+            # non-empty placeholder content instead, and treat fake_node's
+            # `: > "$1"` truncating it back to empty as the readiness signal
+            # -- still proof positive that NODE actually launched and
+            # received the right argv[1], just no longer entangled with
+            # CLI's own existence requirement.
             ready = root / "ready"
+            ready.write_bytes(b"not-yet-truncated-by-fake-node")
+            os.chmod(ready, 0o600)
             fake_node = root / "fake-node"
             fake_node.write_text(
                 '#!/bin/sh\n: > "$1"\nsleep 2\n', encoding="utf-8"
@@ -2193,13 +2374,13 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             )
             try:
                 for _ in range(200):
-                    if ready.exists():
+                    if ready.stat().st_size == 0:
                         break
                     child.poll()
                     if child.returncode is not None:
                         self.fail("generated launch guard exited before readiness")
                     time.sleep(0.01)
-                self.assertTrue(ready.exists())
+                self.assertEqual(ready.stat().st_size, 0)
                 with (
                     mock.patch.object(installer, "SSD_ROOT", root),
                     mock.patch.object(installer, "TOOL_ROOT", tool_root),
@@ -2209,6 +2390,167 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                             self.fail("exclusive lock must not overlap launch guard")
             finally:
                 child.wait(timeout=5)
+
+    def test_launch_guard_refuses_to_exec_a_symlinked_cli(self) -> None:
+        # Regression for independent review round 13/14, 2026-08-18, P2:
+        # the generated launch guard used to hand NODE and CLI to
+        # subprocess.run() with zero validation, unlike LOCK (~15 lines of
+        # symlink/containment/ownership/mode checks) just above it in the
+        # same script. A same-UID actor who replaced CLI with a symlink to
+        # an arbitrary target at any point between this script being
+        # generated and this exact invocation running would have had that
+        # target silently exec'd as CLI. validate_exec_target() now applies
+        # the same rigor LOCK already gets to both NODE and CLI immediately
+        # before they are used. This is a real end-to-end run of the actual
+        # generated launch guard script (no mocking of the check under
+        # test): NODE is a real, valid, executable sentinel that would
+        # write a marker file if it ever actually ran; CLI is a real
+        # symlink pointing outside SSD_ROOT. Confirms the guard fails
+        # closed BEFORE NODE ever executes -- proven by the marker never
+        # appearing, not merely by the exit code.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            tool_root.mkdir(mode=0o700)
+            lock = tool_root / "lifecycle.lock"
+            lock.write_bytes(b"")
+            os.chmod(lock, 0o600)
+
+            marker = root / "node-actually-ran"
+            node = root / "node"
+            node.write_text(
+                f'#!/bin/sh\n: > {shlex.quote(os.fspath(marker))}\n',
+                encoding="utf-8",
+            )
+            os.chmod(node, 0o700)
+
+            outside = root.parent / f"{root.name}-cli-victim"
+            outside.write_text("// attacker-controlled target\n", encoding="utf-8")
+            try:
+                cli = root / "cli.js"
+                cli.symlink_to(outside)
+
+                guard = root / "launch-guard.py"
+                with (
+                    mock.patch.object(installer, "SSD_ROOT", root),
+                    mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                ):
+                    guard.write_bytes(installer.managed_launch_guard_script(node, cli))
+                os.chmod(guard, 0o700)
+
+                result = subprocess.run(
+                    ["/usr/bin/python3", "-B", os.fspath(guard)],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                    env={"PYTHONDONTWRITEBYTECODE": "1"},
+                )
+                self.assertEqual(result.returncode, 78, result.stderr)
+                self.assertIn("managed exec target", result.stderr)
+                self.assertIn("symlink", result.stderr)
+                self.assertFalse(
+                    marker.exists(), "NODE must never have run against a symlinked CLI"
+                )
+            finally:
+                outside.unlink()
+
+    def test_launch_guard_reasserts_lock_identity_after_flock(self) -> None:
+        # Regression for independent review round 13/14, 2026-08-18, P2:
+        # flock(2) binds exclusivity to the OPEN FILE DESCRIPTION -- and
+        # therefore to the inode held open at acquire time -- not to the
+        # path. The generated launch guard used to acquire its shared
+        # flock() and then trust LOCK's path forever after, never
+        # re-checking that the path still names the SAME inode once the
+        # lock was actually held; a same-UID actor who renamed a brand-new
+        # file over LOCK's path in the narrow window between the pre-flock
+        # identity check and flock() actually taking effect would have gone
+        # completely undetected, exactly the class of race the installer
+        # side's own assert_lifecycle_lock_path_identity() already guards
+        # against for its own callers. This directly proves the generated
+        # script's own after-flock re-check fires, by exec'ing the real
+        # generated source into a namespace (same technique as
+        # test_is_help_command_request_uses_exact_match_only) and calling
+        # its real main() with the SECOND os.lstat(LOCK) call -- the new
+        # post-flock re-assertion this round adds -- intercepted to report
+        # a different inode than the one this process's own fd is bound to,
+        # while the FIRST (pre-existing, pre-flock) os.lstat(LOCK) call
+        # still sees the real, untampered lock so this test isolates
+        # exactly the new check, not the old one.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            tool_root.mkdir(mode=0o700)
+            lock = tool_root / "lifecycle.lock"
+            lock.write_bytes(b"")
+            os.chmod(lock, 0o600)
+            node = root / "node"
+            node.write_text("#!/bin/sh\necho should-not-run\n", encoding="utf-8")
+            os.chmod(node, 0o700)
+            cli = root / "cli.js"
+            cli.write_text("// cli\n", encoding="utf-8")
+            os.chmod(cli, 0o600)
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+            ):
+                source = installer.managed_launch_guard_script(node, cli).decode(
+                    "utf-8"
+                )
+            namespace: dict[str, object] = {"__name__": "generated_launch_guard"}
+            exec(compile(source, "<generated-launch-guard>", "exec"), namespace)  # noqa: S102
+
+            real_lstat = os.lstat
+            real_flock = fcntl.flock
+            real_lock_identity = real_lstat(lock)
+
+            class FakeStatResult:
+                st_dev = real_lock_identity.st_dev
+                st_ino = real_lock_identity.st_ino + 1  # deliberately different
+
+            # Gate the fake identity on fcntl.flock() having actually been
+            # called (and returned) already, rather than on a raw call
+            # count: os.path.realpath()'s own internal implementation calls
+            # os.lstat() on LOCK too (to resolve any symlink components)
+            # BEFORE main()'s own explicit `before = os.lstat(LOCK)` line, so
+            # counting raw invocations would race against an implementation
+            # detail of realpath() itself. Tying the swap to "after flock()
+            # was actually called" instead ties it to the real program
+            # point this test targets -- the FIRST os.lstat(LOCK) call after
+            # flock() returns is main()'s own new post-flock re-assertion,
+            # and nothing else in main() calls os.lstat(LOCK) after flock()
+            # returns.
+            flock_called = {"done": False}
+
+            def fake_flock(fd, operation):
+                result = real_flock(fd, operation)
+                flock_called["done"] = True
+                return result
+
+            def fake_lstat(path, *args, **kwargs):
+                if flock_called["done"] and os.fspath(path) == os.fspath(lock):
+                    # Simulate a same-UID racer having swapped the file in
+                    # the window right after flock() took effect.
+                    return FakeStatResult()
+                return real_lstat(path, *args, **kwargs)
+
+            buffer = io.StringIO()
+            with (
+                mock.patch("os.lstat", side_effect=fake_lstat),
+                mock.patch("fcntl.flock", side_effect=fake_flock),
+                mock.patch.object(sys, "argv", ["prime-agent-launch-guard.py"]),
+                contextlib.redirect_stderr(buffer),
+            ):
+                returncode = namespace["main"]()
+
+            self.assertTrue(flock_called["done"])
+            self.assertEqual(returncode, 78)
+            self.assertIn("identity changed while held", buffer.getvalue())
+            # NODE must never have been reached -- the re-assertion must
+            # fire strictly before subprocess.run([NODE, CLI, ...]).
+            self.assertNotIn("should-not-run", buffer.getvalue())
 
     def test_pending_install_commits_with_command_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2447,6 +2789,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 info = tarfile.TarInfo("package/package.json")
                 info.size = len(manifest_payload)
                 archive.addfile(info, io.BytesIO(manifest_payload))
+            os.chmod(original_asset, 0o600)
 
             # A victim file OUTSIDE the mocked SSD root, plus a symlink at the
             # exact predictable output path make_patched_asset is about to
@@ -2467,6 +2810,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     ):
                         installer.make_patched_asset(
                             original_asset,
+                            installer.sha256_file(original_asset),
                             {"packages": {}},
                             assets,
                             expected_name="prime-agent",
@@ -2514,6 +2858,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 info = tarfile.TarInfo("package/package.json")
                 info.size = len(manifest_payload)
                 archive.addfile(info, io.BytesIO(manifest_payload))
+            os.chmod(original_asset, 0o600)
 
             # Attacker pre-plants the deterministic unpack directory, with a
             # file that was never part of the real, digest-verified
@@ -2536,6 +2881,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 with self.assertRaisesRegex(installer.PrimeInstallError, "cannot create"):
                     installer.make_patched_asset(
                         original_asset,
+                        installer.sha256_file(original_asset),
                         {"packages": {}},
                         assets,
                         expected_name="prime-agent",
@@ -2594,10 +2940,13 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 info.mode = 0o644
                 info.size = len(npm_payload)
                 archive.addfile(info, io.BytesIO(npm_payload))
+            os.chmod(node_asset, 0o600)
 
             with mock.patch.object(installer, "SSD_ROOT", ssd):
                 with self.assertRaises(installer.PrimeInstallError):
-                    installer.extract_node_toolchain(node_asset, destination)
+                    installer.extract_node_toolchain(
+                        node_asset, destination, installer.sha256_file(node_asset)
+                    )
 
             # Nothing under the attacker's directory may have been written
             # to, or have had its permissions changed, because the
@@ -2649,6 +2998,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 info = tarfile.TarInfo("package/package.json")
                 info.size = len(payload)
                 archive.addfile(info, io.BytesIO(payload))
+            os.chmod(archive_path, 0o600)
 
             destination = root / "out"
             destination.mkdir(mode=0o700)
@@ -2674,7 +3024,9 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     installer.PrimeInstallError,
                     "unexpected symlink in managed extraction tree",
                 ):
-                    installer.safe_extract_main_asset(archive_path, destination)
+                    installer.safe_extract_main_asset(
+                        archive_path, destination, installer.sha256_file(archive_path)
+                    )
             # The hook must actually have fired -- otherwise this test would
             # trivially pass by never exercising the race at all.
             self.assertTrue(planted["done"])
@@ -2716,6 +3068,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 info.mode = 0o644
                 info.size = len(npm_payload)
                 archive.addfile(info, io.BytesIO(npm_payload))
+            os.chmod(node_asset, 0o600)
 
             real_rglob = Path.rglob
             planted = {"done": False}
@@ -2738,8 +3091,138 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     installer.PrimeInstallError,
                     "unexpected symlink in managed extraction tree",
                 ):
-                    installer.extract_node_toolchain(node_asset, destination)
+                    installer.extract_node_toolchain(
+                        node_asset, destination, installer.sha256_file(node_asset)
+                    )
             self.assertTrue(planted["done"])
+
+    def test_safe_extract_main_asset_rejects_disk_content_swapped_after_download(
+        self,
+    ) -> None:
+        # Regression for independent review round 13/14, 2026-08-18, P1-B:
+        # safe_download() verifies downloaded bytes IN MEMORY against a
+        # pinned digest and then writes them to disk; safe_extract_main_
+        # asset() used to re-open that exact same on-disk path via
+        # tarfile.open(asset, "r:gz") -- by PATH, a second time -- with NO
+        # digest re-check at that point. A same-UID actor with a window
+        # between that verified write and this later, independent open
+        # (which can span the rest of preflight, every other safe_download()
+        # call, and Node/npm version probing) could swap the file for
+        # different-but-still-well-formed tarball content and have it
+        # extract -- and, via the eventual patched-asset `npm ci`, execute
+        # -- completely unnoticed.
+        #
+        # This fakes the OUTCOME of a real safe_download() call (write
+        # digest-verified bytes to disk, exactly as safe_download() itself
+        # does -- a private, 0600, owner-only regular file) and then
+        # simulates a same-UID racer overwriting those exact on-disk bytes
+        # in place before extraction runs, with a DIFFERENT but still
+        # well-formed tarball -- so a pre-fix run would actually extract the
+        # tampered content successfully instead of merely crashing on
+        # garbage bytes, which is what makes this a real silent-compromise
+        # finding and not just a crash.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            asset = root / "prime-agent-source.tgz"
+
+            def build_tarball(payload: bytes) -> bytes:
+                buffer = io.BytesIO()
+                with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+                    info = tarfile.TarInfo("package/package.json")
+                    info.size = len(payload)
+                    archive.addfile(info, io.BytesIO(payload))
+                return buffer.getvalue()
+
+            original_manifest = installer.canonical_json(
+                {"name": "prime-agent", "version": installer.VERSION}
+            )
+            original_bytes = build_tarball(original_manifest)
+            expected_sha256 = installer.sha256_bytes(original_bytes)
+
+            # Step 1: exactly what a real safe_download() call leaves behind
+            # -- digest-verified bytes written to disk as a private, 0600,
+            # owner-only regular file.
+            asset.write_bytes(original_bytes)
+            os.chmod(asset, 0o600)
+
+            # Step 2: a same-UID racer swaps the file's content in place,
+            # after the verified write and strictly before extraction --
+            # different content (a DIFFERENT valid manifest identity), not
+            # just corrupted bytes, so a pre-fix run would extract it as if
+            # it were the real, verified release.
+            tampered_manifest = installer.canonical_json(
+                {"name": "prime-agent", "version": installer.VERSION, "malicious": True}
+            )
+            tampered_bytes = build_tarball(tampered_manifest)
+            self.assertNotEqual(installer.sha256_bytes(tampered_bytes), expected_sha256)
+            with open(asset, "wb") as handle:
+                handle.write(tampered_bytes)
+            os.chmod(asset, 0o600)
+
+            destination = root / "out"
+            destination.mkdir(mode=0o700)
+            with self.assertRaisesRegex(
+                installer.PrimeInstallError,
+                "changed on disk before extraction",
+            ):
+                installer.safe_extract_main_asset(asset, destination, expected_sha256)
+            # Nothing from the tampered tarball may have been extracted.
+            self.assertFalse((destination / "package").exists())
+
+    def test_extract_node_toolchain_rejects_disk_content_swapped_after_download(
+        self,
+    ) -> None:
+        # Companion to test_safe_extract_main_asset_rejects_disk_content_
+        # swapped_after_download, above, for extract_node_toolchain()'s
+        # identical TOCTOU gap against the pinned Node.js toolchain asset --
+        # a same-UID swap of the actual Node/npm runtime that later gets
+        # executed is at least as severe as swapping the Prime Agent release
+        # tarball itself.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ssd = root / "ssd"
+            ssd.mkdir(mode=0o700)
+            asset = root / "node.tgz"
+            expected_root = f"node-v{installer.NODE_VERSION}-darwin-arm64"
+
+            def build_node_tarball(node_payload: bytes) -> bytes:
+                buffer = io.BytesIO()
+                with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+                    info = tarfile.TarInfo(f"{expected_root}/bin/node")
+                    info.mode = 0o755
+                    info.size = len(node_payload)
+                    archive.addfile(info, io.BytesIO(node_payload))
+                    npm_payload = b"#!/usr/bin/env node\n// fake npm cli\n"
+                    info = tarfile.TarInfo(
+                        f"{expected_root}/lib/node_modules/npm/bin/npm-cli.js"
+                    )
+                    info.mode = 0o644
+                    info.size = len(npm_payload)
+                    archive.addfile(info, io.BytesIO(npm_payload))
+                return buffer.getvalue()
+
+            original_bytes = build_node_tarball(b"#!/bin/sh\necho real-node\n")
+            expected_sha256 = installer.sha256_bytes(original_bytes)
+            asset.write_bytes(original_bytes)
+            os.chmod(asset, 0o600)
+
+            # Same-UID racer swaps the pinned Node runtime for a DIFFERENT,
+            # still well-formed, tarball after the verified write.
+            tampered_bytes = build_node_tarball(b"#!/bin/sh\necho attacker-controlled\n")
+            self.assertNotEqual(installer.sha256_bytes(tampered_bytes), expected_sha256)
+            with open(asset, "wb") as handle:
+                handle.write(tampered_bytes)
+            os.chmod(asset, 0o600)
+
+            destination = ssd / "toolchain"
+            with mock.patch.object(installer, "SSD_ROOT", ssd):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "changed on disk before extraction",
+                ):
+                    installer.extract_node_toolchain(asset, destination, expected_sha256)
+            # Nothing from the tampered archive may have been extracted.
+            self.assertFalse((destination / "bin" / "node").exists())
 
     def test_safe_extract_main_asset_manifest_excludes_untracked_files(self) -> None:
         # Regression for independent review round 2, 2026-08-18, P1: the
@@ -2760,6 +3243,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 info = tarfile.TarInfo("package/package.json")
                 info.size = len(payload)
                 archive.addfile(info, io.BytesIO(payload))
+            os.chmod(archive_path, 0o600)
 
             destination = root / "out"
             destination.mkdir(mode=0o700)
@@ -2768,7 +3252,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             (untracked_dir / "evil.js").write_bytes(b"attacker payload")
 
             package_dir, manifest, digests, dir_modes = installer.safe_extract_main_asset(
-                archive_path, destination
+                archive_path, destination, installer.sha256_file(archive_path)
             )
             self.assertEqual(set(digests), {Path("package.json")})
             self.assertEqual(dir_modes, {})
@@ -2814,12 +3298,13 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 info = tarfile.TarInfo("package/package.json")
                 info.size = len(manifest_payload)
                 archive.addfile(info, io.BytesIO(manifest_payload))
+            os.chmod(original_asset, 0o600)
 
             real_safe_extract_main_asset = installer.safe_extract_main_asset
 
-            def race_after_extraction(asset: Path, destination: Path):
+            def race_after_extraction(asset: Path, destination: Path, expected_sha256: str):
                 package_dir, manifest, digests, dir_modes = real_safe_extract_main_asset(
-                    asset, destination
+                    asset, destination, expected_sha256
                 )
                 # The instant after extraction finishes and is verified, a
                 # same-UID racer drops an extra file straight into the
@@ -2840,6 +3325,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             ):
                 patched, _digest, _manifest = installer.make_patched_asset(
                     original_asset,
+                    installer.sha256_file(original_asset),
                     {"packages": {}},
                     assets,
                     expected_name="prime-agent",
@@ -2907,12 +3393,13 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 info = tarfile.TarInfo("package/dist/bundle.js")
                 info.size = len(real_payload)
                 archive.addfile(info, io.BytesIO(real_payload))
+            os.chmod(original_asset, 0o600)
 
             real_safe_extract_main_asset = installer.safe_extract_main_asset
 
-            def swap_after_extraction(asset: Path, destination: Path):
+            def swap_after_extraction(asset: Path, destination: Path, expected_sha256: str):
                 package_dir, manifest, digests, dir_modes = real_safe_extract_main_asset(
-                    asset, destination
+                    asset, destination, expected_sha256
                 )
                 # The instant after extraction finishes -- and this file's
                 # content has already been digest-verified against the real
@@ -2941,6 +3428,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 ):
                     installer.make_patched_asset(
                         original_asset,
+                        installer.sha256_file(original_asset),
                         {"packages": {}},
                         assets,
                         expected_name="prime-agent",
@@ -3028,6 +3516,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 dir_info.type = tarfile.DIRTYPE
                 dir_info.mode = 0o755
                 archive.addfile(dir_info)
+            os.chmod(original_asset, 0o600)
 
             outside_target = root / "outside-victim"
             outside_target.mkdir(mode=0o700)
@@ -3036,8 +3525,8 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             real_safe_extract_main_asset = installer.safe_extract_main_asset
             package_dir_holder: dict[str, Path] = {}
 
-            def learn_package_dir(asset: Path, destination: Path):
-                result = real_safe_extract_main_asset(asset, destination)
+            def learn_package_dir(asset: Path, destination: Path, expected_sha256: str):
+                result = real_safe_extract_main_asset(asset, destination, expected_sha256)
                 package_dir_holder["path"] = result[0]
                 return result
 
@@ -3078,6 +3567,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             ):
                 patched, _digest, _manifest = installer.make_patched_asset(
                     original_asset,
+                    installer.sha256_file(original_asset),
                     {"packages": {}},
                     assets,
                     expected_name="prime-agent",
@@ -5236,6 +5726,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
 
             def fake_make_patched_asset(
                 original_asset,
+                original_sha256,
                 upstream_lock,
                 assets_dir,
                 *,

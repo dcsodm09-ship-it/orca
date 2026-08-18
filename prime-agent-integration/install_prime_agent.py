@@ -1222,11 +1222,33 @@ def exact_dependency_versions(manifest: dict[str, Any], upstream_lock: dict[str,
 
 
 def safe_extract_main_asset(
-    asset: Path, destination: Path
+    asset: Path, destination: Path, expected_sha256: str
 ) -> tuple[Path, tuple[Path, ...], dict[Path, str], dict[Path, int]]:
+    # Round 13/14, 2026-08-18 (independent review, P1-B): safe_download()
+    # verifies downloaded bytes IN MEMORY against `expected_sha256` and then
+    # writes them to `asset` on disk; without a re-check here, this function
+    # used to re-open `asset` from disk by PATH with no digest re-check at
+    # all, leaving the entire window between that earlier verified write and
+    # this later open -- which can span the rest of preflight, every other
+    # safe_download() call, and Node/npm version probing -- open for a
+    # same-UID actor to swap the on-disk file for different-but-still-valid
+    # tarball content that would then extract and (via the patched asset's
+    # eventual `npm ci`) execute without ever being caught. read_private_file()
+    # closes this the same way it closes every other verify-then-use gap in
+    # this file: ONE atomic open-by-path, read the whole content through that
+    # single fd, and (via its own before/after inode+size+mtime check) fail
+    # closed if the file changed during the read itself -- so there is no
+    # second, independent filesystem access for an attacker to win a race
+    # against. The freshly re-read, re-hashed bytes -- not a second
+    # tarfile.open(asset, ...) by path -- are what tarfile actually parses
+    # below, eliminating the TOCTOU window entirely rather than merely
+    # narrowing it.
+    raw = read_private_file(asset, max_bytes=MAX_DOWNLOAD_BYTES)
+    if sha256_bytes(raw) != expected_sha256:
+        raise PrimeInstallError(f"Prime Agent tarball changed on disk before extraction: {asset.name}")
     try:
-        archive = tarfile.open(asset, "r:gz")
-    except (OSError, tarfile.TarError) as exc:
+        archive = tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz")
+    except tarfile.TarError as exc:
         raise PrimeInstallError("cannot open Prime Agent tarball") from exc
     with archive:
         members = archive.getmembers()
@@ -1373,16 +1395,30 @@ def safe_extract_main_asset(
     return package_dir, manifest, content_digests, dir_modes
 
 
-def extract_node_toolchain(asset: Path, destination: Path) -> tuple[Path, Path]:
+def extract_node_toolchain(asset: Path, destination: Path, expected_sha256: str) -> tuple[Path, Path]:
     expected_root = f"node-v{NODE_VERSION}-darwin-arm64"
     # Must be freshly created, never a pre-existing directory: see
     # create_fresh_private_dir's docstring for why ensure_private_dir()'s
     # accept-existing behavior was unsafe here (independent review round 2,
     # 2026-08-18, P1).
     create_fresh_private_dir(destination)
+    # Round 13/14, 2026-08-18 (independent review, P1-B): same TOCTOU gap as
+    # safe_extract_main_asset() (see its comment for the full finding) --
+    # safe_download() verified this exact asset in memory, but this function
+    # used to re-open it from disk by PATH afterward with no digest re-check,
+    # so a same-UID actor could swap the pinned Node.js toolchain tarball for
+    # one that still passes every structural check below but runs attacker
+    # code the moment `node`/`npm-cli.js` are executed. Re-read (one atomic
+    # open-by-path via read_private_file(), which itself fails closed if the
+    # file changes mid-read) and re-hash immediately before parsing, and feed
+    # tarfile the freshly verified bytes directly -- never a second,
+    # independently raceable tarfile.open(asset, ...) by path.
+    raw = read_private_file(asset, max_bytes=MAX_NODE_DOWNLOAD_BYTES)
+    if sha256_bytes(raw) != expected_sha256:
+        raise PrimeInstallError(f"Node.js archive changed on disk before extraction: {asset.name}")
     try:
-        archive = tarfile.open(asset, "r:gz")
-    except (OSError, tarfile.TarError) as exc:
+        archive = tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz")
+    except tarfile.TarError as exc:
         raise PrimeInstallError("cannot open pinned Node.js archive") from exc
     with archive:
         members = archive.getmembers()
@@ -1558,6 +1594,7 @@ def exact_tool_version(
 
 def make_patched_asset(
     original_asset: Path,
+    original_sha256: str,
     upstream_lock: dict[str, Any],
     assets_dir: Path,
     *,
@@ -1572,8 +1609,13 @@ def make_patched_asset(
     # accept-existing behavior was unsafe here (independent review round 2,
     # 2026-08-18, P1).
     create_fresh_private_dir(unpacked)
+    # original_sha256 is the SAME pinned digest safe_download() already
+    # verified `original_asset`'s bytes against at download time (ASSETS[...]);
+    # threading it through here lets safe_extract_main_asset() re-verify the
+    # on-disk file immediately before parsing it, closing the round-13/14 P1-B
+    # TOCTOU gap (see that function's own comment for the full finding).
     package_dir, extracted_relative_paths, content_digests, dir_modes = safe_extract_main_asset(
-        original_asset, unpacked
+        original_asset, unpacked, original_sha256
     )
     manifest_path = package_dir / "package.json"
     manifest_relative = Path("package.json")
@@ -2369,28 +2411,50 @@ RUNTIME_PUBLIC_COMMANDS = frozenset(("agents", "attach", "model", "session"))
 #     dispatcher (runPublicCommand() in dist/cli/public-command.js) requires
 #     each command's own name to be literally remaining[0] (module the
 #     narrow daemon-socket-prefix cases resolve_upstream_public_command()
-#     itself models), so RESOURCE_GUARDS must land AFTER the whole
-#     command+its own arguments, never spliced in the middle -- the
-#     separator-aware placement just below does exactly that (right before
-#     a trailing "--" if present, else at the very end). "session" joined
-#     this set in round 10, 2026-08-18 (independent review, P1): verified
-#     directly against upstream's rewriteNestedCommand()/
-#     splitOperandsAndOptions() (dist/cli/public-command.js) that this same
-#     append-after-everything placement is safe for "session" too --
-#     splitOperandsAndOptions() buckets every dash-prefixed token from the
-#     FIRST one onward as "options" regardless of how many there are or
-#     what precedes them, and parseArgs() (dist/cli/args.js) recognizes
-#     RESOURCE_GUARDS by exact string equality scanned across the whole
-#     argv, not by position -- so appending them after "session export
-#     <path>" (or before a trailing "--") never disturbs the "session"/
-#     "export" token adjacency rewriteNestedCommand() itself requires, and
-#     a legitimate `session export <path>` still exits via the early
-#     `if (parsed.export)` branch in main.js exactly as before, guards or
-#     not. "help" deliberately did NOT join this set -- see
-#     is_help_command_request() and guarded_arguments() below for why a
-#     naive append-after-everything placement is UNSAFE for "help"
-#     specifically (it silently turns a legitimate `help <realtopic>` into
-#     an "Unknown command" error) and what this script does instead.
+#     itself models), so RESOURCE_GUARDS must land somewhere AFTER
+#     remaining[0], never before it or spliced between it and a fixed
+#     literal token upstream itself requires immediately after it (e.g.
+#     "list" for "model", "export" for "session", the agent name for
+#     "attach"). "session" joined this set in round 10, 2026-08-18
+#     (independent review, P1): verified directly against upstream's
+#     rewriteNestedCommand()/splitOperandsAndOptions() (dist/cli/
+#     public-command.js) that "session"/"export" token adjacency is
+#     preserved by the current placement.
+#
+#     Round 13/14, 2026-08-18 (independent review, P1-A -- the sixth round
+#     to touch this general area, after 3, 4, 6, 8, and 10): the ACTUAL
+#     placement used to be append-after-everything (right before a trailing
+#     "--" if present, else at the very end), on the theory that
+#     parseArgs() "recognizes RESOURCE_GUARDS by exact string equality
+#     scanned across the whole argv, not by position". That theory is true
+#     but incomplete -- it ignores that upstream's real parseArgs()
+#     (dist/cli/args.js) unconditionally consumes the token immediately
+#     AFTER 17 different value-taking options as that option's OWN value
+#     (`args[++i]`, no check on what the next token looks like), so
+#     whenever the user's own last real token was one of those 17 options
+#     with a missing/empty value (trivially reachable via plain shell
+#     expansion of an unset variable, e.g. `model list --model
+#     $UNSET_VAR`), the first appended guard flag was consumed as THAT
+#     option's value instead of ever being scanned as its own token --
+#     RESOURCE_GUARDS silently did nothing, and a hostile project's
+#     extensions loaded (60 confirmed reproductions, real generated wrapper
+#     -> real generated launch guard -> real pinned Node -> the real
+#     prime-agent-0.7.2.tgz bundle). The fix, in
+#     insert_resource_guards_before_first_flag() just below (see its own
+#     docstring for the full per-command verification): splice
+#     RESOURCE_GUARDS in right before the FIRST token (scanning from
+#     remaining[1] onward) that starts with "-", instead of at the very
+#     end. The token immediately preceding that insertion point is, by
+#     construction, never itself a flag -- so it can never treat a guard as
+#     its own value -- and this placement still lands after every fixed
+#     literal token ("list"/"export"/the agent name) each command requires
+#     immediately following remaining[0], so none of those adjacency
+#     requirements are disturbed either. "help" deliberately did NOT join
+#     this set -- see is_help_command_request() and guarded_arguments()
+#     below for why ANY guard insertion (not just the old placement) is
+#     UNSAFE for a help MATCH specifically (it silently turns a legitimate
+#     `help <realtopic>` into an "Unknown command" error) and what this
+#     script does instead.
 #   * RUNTIME_NO_GUARD_COMMANDS just below answers the same "where" question
 #     for the remaining public commands, differently: NOWHERE. "config" and
 #     "package" stay in this set because inserting RESOURCE_GUARDS at the
@@ -2584,15 +2648,16 @@ def resolve_upstream_public_command(arguments: list[str]) -> str | None:
 # guarded_arguments() below computes is_help_command_request() on the
 # ORIGINAL, unmodified topic (remaining[1:], before any guard insertion) and
 # only ever inserts guards for a confirmed miss, using the same
-# separator-aware ("--"-respecting) placement RUNTIME_PUBLIC_COMMANDS uses.
-# That placement is safe for the miss case specifically because parseArgs()
-# (dist/cli/args.js) recognizes every flag it accepts by exact string
-# equality scanned across the WHOLE argv, never by position -- so where
-# exactly the guard tokens land relative to "help"/the miss argument(s)
-# doesn't change what parseArgs() extracts from either, only whether they
-# land before a "--" (which flips parseArgs() into treating everything
-# after it as a literal positional message, guard flags included, silently
-# defeating them) matters.
+# first-flag-boundary placement RUNTIME_PUBLIC_COMMANDS uses (round 13/14,
+# 2026-08-18: replaced the previous append-near-the-end / before-a-trailing-
+# "--" placement -- see insert_resource_guards_before_first_flag()'s
+# docstring for why that placement let a trailing value-hungry flag on the
+# miss argument, e.g. "help --model", swallow the first guard token as its
+# own value). That placement is safe for the miss case specifically because
+# remaining[0] is always "help" here and everything after it reaches the
+# same order-agnostic general parseArgs() as "agents" does -- and because
+# the token immediately before the insertion point is, by construction,
+# never itself a flag that could consume a guard as its value.
 #
 # This is pinned to v0.7.2's real COMMAND_SPECS; an upstream version bump
 # that adds/renames/removes a command or subcommand needs this table
@@ -2652,19 +2717,106 @@ def is_help_command_request(path: list[str]) -> bool:
     return False
 
 
-def insert_resource_guards_before_separator(
+def insert_resource_guards_before_first_flag(
     prefix: list[str], remaining: list[str]
 ) -> list[str]:
-    try:
-        separator = remaining.index("--")
-    except ValueError:
-        separator = len(remaining)
-    return [
-        *prefix,
-        *remaining[:separator],
-        *RESOURCE_GUARDS,
-        *remaining[separator:],
-    ]
+    """Splice RESOURCE_GUARDS into `remaining` immediately before the first
+    token, scanning from remaining[1] onward, that starts with "-" -- a real
+    flag or a literal "--" end-of-options separator alike -- or at the very
+    end of `remaining` if no such token exists. remaining[0] is always the
+    already-resolved command token itself (see resolve_upstream_public_
+    command()) and is never scanned or touched.
+
+    Round 13/14, 2026-08-18 (independent review, P1-A): this REPLACES the
+    previous append-near-the-end / before-a-trailing-"--" placement, which
+    had a real, structural bug predating even that placement's own
+    introduction. Verified directly against the real pinned v0.7.2
+    dist/cli/args.js: parseArgs() is a positional scanner that
+    UNCONDITIONALLY consumes the very next argv token as a value for 17
+    different value-taking options (exhaustively verified against the real
+    source, not assumed): --mode, --daemon-socket, --provider, --model,
+    --api-key, --cwd, --system-prompt, --append-system-prompt, --fork,
+    --session-dir, --models, --tools/-t, --thinking, --extension/-e,
+    --skill, --prompt-template, --theme (a further handful,
+    e.g. --resume/-r, --print/-p, --autonomous-gate*, --goal*, either check
+    the next token's own leading "-" first or use upstream's own
+    hasRequiredOptionValue() to refuse a "--"-prefixed next token as a
+    value, so they were never actually vulnerable to this). Appending
+    RESOURCE_GUARDS near the end of the user's own argv meant that whenever
+    the user's own last real token was one of those 17 options with a
+    missing/empty value (the realistic, non-adversarial trigger: a shell
+    expanding an unset variable, e.g. `model list --model $UNSET_VAR`
+    leaving a literal trailing "--model"), the first appended guard flag
+    ("--no-extensions") was silently consumed AS THAT OPTION'S VALUE
+    instead of ever being reached as its own token -- the remaining two
+    guards then landed as harmless stray tokens, and --no-extensions never
+    took effect: a hostile project's $PWD/.prime/agent/extensions loaded
+    with zero opt-in (60 confirmed reproductions across all 17 flag names,
+    real generated wrapper -> real generated launch guard -> real pinned
+    Node v24.19.0 -> the real prime-agent-0.7.2.tgz bundle). The module
+    comments this replaces asserted parseArgs() "recognizes RESOURCE_GUARDS
+    by exact string equality scanned across the whole argv, never by
+    position" -- that specific claim is true (confirmed directly against
+    args.js) but incomplete: it says nothing about a guard token never
+    being *reached* as its own `arg` in the scan at all, which is exactly
+    what happens when a preceding value-taking option's `args[++i]`
+    consumes it first. Placement, not recognition, was always the gap.
+
+    Placing RESOURCE_GUARDS immediately before the first flag-looking token
+    instead is safe because the token immediately preceding the insertion
+    point (whenever the insertion point isn't remaining[1] itself) is, by
+    construction of this left-to-right scan, never itself a token starting
+    with "-" -- i.e. never a flag, value-taking or otherwise -- so it can
+    never treat the first inserted guard as its own consumed value. None of
+    the three guard flags (--no-extensions/--no-skills/--no-prompt-
+    templates) themselves consume a following token either (confirmed
+    against args.js: all three are plain boolean sets, no `args[++i]`), so
+    inserting them anywhere among a command's own flags never perturbs
+    THEIR adjacency either. This holds for every one of
+    RUNTIME_PUBLIC_COMMANDS's own structural requirements, each verified
+    directly against the real dist/cli/public-command.js:
+      * "agents": args.slice(1) (everything after "agents") reaches the
+        general parseArgs() with no operand/option ordering requirement at
+        all -- parseArgs() is a pure left-to-right scan indifferent to
+        whether a flag or a positional message comes first -- so any
+        placement within args.slice(1) that isn't itself swallowed is safe,
+        this one included.
+      * "attach": upstream requires rest[0] (remaining[1] here) to be the
+        literal agent name -- never itself a flag in any invocation that
+        was going to succeed anyway, since upstream independently rejects
+        agent.startsWith("-") regardless of guard placement -- and requires
+        every token after it (`options`) to be flags only
+        (hasPositionalArguments(options) rejects any operand there).
+        Scanning from remaining[1] onward finds the agent name first, skips
+        it (never dash-prefixed), and lands the guards as the FIRST element
+        of `options` -- before any of the user's own attach flags, so they
+        can never be swallowed by one.
+      * "model"/"session": rewriteNestedCommand() requires remaining[1] to
+        be the literal subcommand token ("list"/"export") and
+        splitOperandsAndOptions() requires every operand (0-1 for model,
+        1-2 for session) to precede every option, split on the first
+        dash-prefixed token. Scanning from remaining[1] onward skips the
+        literal subcommand (never dash-prefixed) and any real operand
+        (never dash-prefixed, by the operand/option split's own
+        definition), landing guards exactly at the operand/option boundary
+        upstream itself computes -- preserving the true operand count
+        (never turning a legitimate `model list <search>` into an "Unknown
+        model command" usage error the way naively prepending right after
+        "list" would) and never appearing after a trailing value-hungry
+        flag the way the old append-at-the-end placement did.
+    The identical reasoning covers the "help" MISS call site below:
+    remaining[0] is always "help" there too, and a miss falls through to
+    the same order-agnostic general parseArgs() as "agents".
+
+    A literal "--" is itself a "-"-prefixed token, so this scan naturally
+    stops there too whenever no other flag precedes it -- subsuming the
+    previous separator-respecting behavior as the case where no other flag
+    exists ahead of the separator, while fixing the case where one does.
+    """
+    for index in range(1, len(remaining)):
+        if remaining[index].startswith("-"):
+            return [*prefix, *remaining[:index], *RESOURCE_GUARDS, *remaining[index:]]
+    return [*prefix, *remaining, *RESOURCE_GUARDS]
 
 
 def guarded_arguments(arguments: list[str]) -> list[str]:
@@ -2688,11 +2840,14 @@ def guarded_arguments(arguments: list[str]) -> list[str]:
             # corrupt the specific help text upstream prints -- passthrough.
             return [*prefix, *remaining]
         # MISS: falls through to a real, unprotected session start upstream
-        # -- insert guards using the same separator-aware placement as
-        # RUNTIME_PUBLIC_COMMANDS below (safe here because parseArgs()
-        # recognizes RESOURCE_GUARDS by exact string equality regardless of
-        # position, as long as they land before any "--").
-        return insert_resource_guards_before_separator(prefix, remaining)
+        # -- insert guards using the same first-flag-boundary placement as
+        # RUNTIME_PUBLIC_COMMANDS below (safe here because remaining[0] is
+        # always "help" and everything after it reaches the same
+        # order-agnostic general parseArgs(); see
+        # insert_resource_guards_before_first_flag()'s docstring for why
+        # this placement -- unlike the old append-near-the-end one -- can
+        # never be swallowed as some other flag's value).
+        return insert_resource_guards_before_first_flag(prefix, remaining)
     if resolved_command is not None and resolved_command in RUNTIME_NO_GUARD_COMMANDS:
         # A non-session public command never receives resource-guard flags,
         # regardless of how it was invoked -- matches the entrypoint's own
@@ -2702,8 +2857,54 @@ def guarded_arguments(arguments: list[str]) -> list[str]:
         # actually resolve to this command may skip guards.
         return [*prefix, *remaining]
     if resolved_command is not None and resolved_command in RUNTIME_PUBLIC_COMMANDS:
-        return insert_resource_guards_before_separator(prefix, remaining)
+        return insert_resource_guards_before_first_flag(prefix, remaining)
     return [*prefix, *RESOURCE_GUARDS, *remaining]
+
+
+def validate_exec_target(path: str, root: str) -> str | None:
+    # Round 13/14, 2026-08-18 (independent review, P2): NODE and CLI are the
+    # two paths that matter MOST in this whole script -- they are what
+    # actually gets exec'd -- yet, unlike LOCK just above (~15 lines of
+    # symlink/containment/ownership/mode validation), they used to be handed
+    # to subprocess.run() completely unvalidated. A same-UID actor who
+    # replaced either path (symlink, or a swapped regular file) at any point
+    # between this script being generated and this exact invocation running
+    # would have had that replacement silently exec'd. Applies the identical
+    # checks LOCK already gets: no symlink anywhere in the resolved path,
+    # resolves inside SSD_ROOT, and (once resolved) is a regular,
+    # current-uid-owned file with no group/other permission bits -- matching
+    # the exact mode extract_node_toolchain()/safe_extract_main_asset()
+    # themselves always write (0o700 for the executable NODE, 0o600 or
+    # 0o700 for CLI/its own dependencies). Returns an error message on
+    # failure, or None when `path` is safe to exec -- mirroring this
+    # script's own fail()-based idiom (a plain return value, not an
+    # exception type this standalone generated script never defines)
+    # rather than introducing a new error-handling convention.
+    #
+    # This still leaves the same small, structural residual gap LOCK's own
+    # descriptor-bound flock() does NOT have: subprocess.run() ultimately
+    # re-resolves `path` by name a second time to exec it, so a same-UID
+    # racer that wins the narrow window between this check returning and
+    # that later, independent exec could still swap the target underneath
+    # it. Fully closing that would mean exec'ing through an already-open,
+    # already-validated file descriptor (e.g. Darwin's /dev/fd/<n>) instead
+    # of a path at all -- a larger structural change than this P2-scoped
+    # addition, documented here rather than silently left unmentioned.
+    if os.path.realpath(path) != os.path.abspath(path):
+        return f"managed exec target contains a symlink: {{path}}"
+    if os.path.commonpath((root, os.path.realpath(path))) != root:
+        return f"managed exec target escaped the Extreme SSD: {{path}}"
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return f"managed exec target is missing: {{path}}"
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_mode & 0o077
+    ):
+        return f"managed exec target is unsafe: {{path}}"
+    return None
 
 
 def main() -> int:
@@ -2725,6 +2926,29 @@ def main() -> int:
         ):
             return fail("managed lifecycle lock is unsafe")
         fcntl.flock(descriptor, fcntl.LOCK_SH)
+        # Round 13/14, 2026-08-18 (independent review, P2): re-assert, right
+        # now that the lock is actually held, that LOCK still names the
+        # exact inode this fd's flock() bound to -- mirroring the
+        # installer side's own assert_lifecycle_lock_path_identity(), which
+        # exists for exactly this purpose (flock(2) binds exclusivity to the
+        # OPEN FILE DESCRIPTION, not to the path; nothing about already
+        # holding the fd detects a same-UID actor renaming a brand-new file
+        # over LOCK afterward, which would let a second, independent actor
+        # acquire its own "exclusive" flock on that new file while this
+        # process still believes the well-known path is exclusively its
+        # own). Closes the same small-but-real race
+        # exclusive_lifecycle_lock() itself already closes on the installer
+        # side, between the pre-flock identity check above and flock()
+        # actually taking effect.
+        after_flock = os.lstat(LOCK)
+        if (after_flock.st_dev, after_flock.st_ino) != (opened.st_dev, opened.st_ino):
+            return fail("managed lifecycle lock identity changed while held")
+        node_error = validate_exec_target(NODE, root)
+        if node_error is not None:
+            return fail(node_error)
+        cli_error = validate_exec_target(CLI, root)
+        if cli_error is not None:
+            return fail(cli_error)
         completed = subprocess.run(
             [NODE, CLI, *guarded_arguments(sys.argv[1:])], check=False
         )
@@ -3596,7 +3820,9 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
         NODE_ASSET_SHA256,
         max_bytes=MAX_NODE_DOWNLOAD_BYTES,
     )
-    node, npm_cli = extract_node_toolchain(assets_dir / NODE_ASSET, RELEASE_DIR / "toolchain")
+    node, npm_cli = extract_node_toolchain(
+        assets_dir / NODE_ASSET, RELEASE_DIR / "toolchain", NODE_ASSET_SHA256
+    )
     exact_tool_version(
         [os.fspath(node), "--version"],
         NODE_VERSION,
@@ -3622,8 +3848,10 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     )
     for managed_name in workspace_order:
         declaration = WORKSPACE_PACKAGES[managed_name]
+        official_asset_name = str(declaration["official_asset"])
         patched, digest, manifest = make_patched_asset(
-            assets_dir / str(declaration["official_asset"]),
+            assets_dir / official_asset_name,
+            ASSETS[official_asset_name],
             upstream_lock,
             assets_dir,
             expected_name=str(declaration["source_name"]),
@@ -3632,8 +3860,10 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
         )
         patched_assets[patched.name] = digest
         patched_manifests[managed_name] = manifest
+    main_asset_name = f"prime-agent-{VERSION}.tgz"
     patched_asset, patched_sha, patched_manifest = make_patched_asset(
-        assets_dir / f"prime-agent-{VERSION}.tgz",
+        assets_dir / main_asset_name,
+        ASSETS[main_asset_name],
         upstream_lock,
         assets_dir,
         expected_name="prime-agent",
