@@ -327,6 +327,26 @@ class InstallBridgeTests(unittest.TestCase):
         ).encode("utf-8")
         self.assertFalse(installer._contains_owned_handler(unrelated))
 
+    def test_contains_owned_handler_does_not_crash_on_a_huge_json_integer(self) -> None:
+        # Round-12 fix (2026-08-18, independent Claude opus5/max review,
+        # round 11, R11-P1-A): CPython >= 3.9.14/3.10.7/3.11 caps int<->str
+        # conversion at 4300 digits, and json.loads() raises a bare
+        # ValueError (not json.JSONDecodeError) for an integer literal
+        # longer than that. _safe_parse_strict_utf8()'s except clause missed
+        # it even though the sibling function added in the same commit
+        # (_lenient_parse_last_key_wins()) already caught it -- an internal
+        # inconsistency in the round-11 patch. On an interpreter without the
+        # limit this content just parses normally to a definitive False
+        # (structurally proven not ours, no marker present either way) --
+        # the property under test ("does not crash") holds regardless of
+        # interpreter, which is why this doesn't need a version guard.
+        huge_int = "7" * 4301
+        poison = (
+            '{"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", '
+            '"command": "/usr/local/bin/other-tool"}]}]}, "nonce": ' + huge_int + "}"
+        ).encode()
+        self.assertFalse(installer._contains_owned_handler(poison))
+
 
 class InstallEndToEndTests(unittest.TestCase):
     # plan()/install()/verify()/uninstall() were entirely uncovered by the
@@ -1137,39 +1157,82 @@ class InstallEndToEndTests(unittest.TestCase):
         staged_dir.rename(account_dir)
         installer.uninstall()
 
-    def test_uninstall_tolerates_an_unrecognizable_file_inside_its_own_runtime_tree(self) -> None:
-        # Round-11 self-check (2026-08-18, round-2 pressure-test finding):
-        # closing the RUNTIME_BASE blind spot above by simply walking in
-        # created a new lockout -- a single oversized or unparseable-under-
-        # every-supported-encoding file happening to be named "hooks.json"
-        # anywhere under RUNTIME_BASE (whose backups/releases directories
-        # are, by this file's own design, never pruned and accumulate for
-        # the tool's whole lifetime) would permanently hard-block both
-        # uninstall() and recover_pending_install() with no self-healing
-        # path, since nothing in this tool ever removes RUNTIME_BASE
-        # content. Because every real file the bridge itself ever writes
-        # there is never named literally "hooks.json", and RUNTIME_BASE is
-        # 0o700/uid-exclusive, this ambiguity is deliberately tolerated
-        # (treated as "nothing found there") specifically inside
-        # RUNTIME_BASE -- unlike the equivalent case elsewhere under
-        # local-homes, which stays fail-closed (see the sibling test
-        # immediately below).
+    def test_uninstall_still_fails_closed_on_a_marker_bearing_file_inside_its_own_runtime_tree(self) -> None:
+        # Round-12 correction (2026-08-18, independent Claude opus5/max
+        # review, round 11, R11-P1-A): round 11 tolerated ANY unparseable-
+        # but-marker-suspicious file under RUNTIME_BASE, on the theory that
+        # every real file the bridge itself writes there is never named
+        # literally "hooks.json" so the ambiguity was assumed low-value.
+        # That reasoning conflated two different situations: a genuine
+        # ABSENCE of evidence (still tolerated -- see the sibling
+        # oversized/unreadable tests below) and POSITIVE evidence (a raw
+        # match on this tool's own --bridge-id marker) that the content
+        # merely couldn't be structurally verified. Tolerating the latter
+        # let a live, valid, plain-UTF-8, merely-oversized relocated handler
+        # under RUNTIME_BASE be silently abandoned -- exactly the failure
+        # mode this whole round's fix exists to close -- so a Stage-2 marker
+        # hit is no longer tolerated anywhere, in or out of RUNTIME_BASE.
         installer.install()
         stray_dir = self.runtime_base / "backups/misc-staging/stray"
         stray_dir.mkdir(parents=True)
         stray_config = stray_dir / "hooks.json"
         # Not valid JSON under any supported encoding, but contains the
-        # literal marker text as incidental byte padding -- exactly the
-        # ambiguous-content shape _contains_owned_handler()'s Stage 2 would
-        # otherwise fail closed on.
+        # literal marker text as incidental byte padding -- Stage 2 fires on
+        # this and must refuse, not silently pass, even inside RUNTIME_BASE.
         stray_config.write_bytes(
             b"not valid json padding " * 3000 + f"--bridge-id {installer.BRIDGE_ID}".encode() + b" more padding"
         )
-        self.assertGreater(stray_config.stat().st_size, 65_536)  # past the structural-detection size bound
+        self.assertLess(stray_config.stat().st_size, installer.MAX_MANAGED_FILE_BYTES)
 
-        result = installer.uninstall()
-        self.assertTrue(result["ok"])
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.uninstall()
+        self.assertIn("cannot rule out", str(ctx.exception))
+        self.assertIn(os.fspath(stray_config), str(ctx.exception))
+        self.assertTrue((self.runtime_base / "latest-receipt.json").exists())
         self.assertFalse(installer.PENDING_PATH.exists())
+
+    def test_uninstall_catches_a_large_valid_relocated_handler_inside_its_own_runtime_tree(self) -> None:
+        # Round-12 fix (2026-08-18, independent Claude opus5/max review,
+        # round 11, R11-P1-B): a live, owned, relocated config inside
+        # RUNTIME_BASE was silently abandoned whenever it exceeded
+        # _STRUCTURAL_DETECTION_MAX_BYTES (65536 bytes) -- padding an
+        # otherwise perfectly ordinary, plain, canonical-JSON hooks.json
+        # (no encoding trick, no malformation) past that bound made
+        # uninstall() return ok:true and delete latest-receipt.json while
+        # the orphan handler stayed executable on disk. _contains_owned_
+        # handler() is now called with MAX_MANAGED_FILE_BYTES (not the
+        # smaller default) as its structural-detection bound for RUNTIME_BASE
+        # candidates specifically, so a genuine relocated handler of this
+        # size gets a definitive, structurally-verified True instead of
+        # falling through to the ambiguous marker-only stage at all.
+        installer.install()
+        account_dir = self.account_config.parent.parent
+        staged_dir = self.runtime_base / "backups/misc-staging/padded-account"
+        staged_dir.parent.mkdir(parents=True, exist_ok=True)
+        account_dir.rename(staged_dir)
+        self.addCleanup(lambda: staged_dir.exists() and staged_dir.rename(account_dir))
+        relocated_config = staged_dir / "home/hooks.json"
+        payload = json.loads(relocated_config.read_bytes())
+        # An ordinary, plausible padding shape (extra operator-notes data),
+        # not a contrived encoding trick -- stays plain, valid, canonical
+        # JSON with the owned handler untouched.
+        payload["_operator_notes"] = ["padding"] * 20_000
+        padded = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode()
+        self.assertGreater(len(padded), 65_536)
+        self.assertLess(len(padded), installer.MAX_MANAGED_FILE_BYTES)
+        relocated_config.write_bytes(padded)
+
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.uninstall()
+        self.assertIn("does not track", str(ctx.exception))
+        self.assertTrue((self.runtime_base / "latest-receipt.json").exists())
+        self.assertFalse(installer.PENDING_PATH.exists())
+        self.assertEqual(relocated_config.read_bytes(), padded)
+
+        del payload["_operator_notes"]
+        relocated_config.write_bytes(installer.canonical_json(payload))
+        staged_dir.rename(account_dir)
+        installer.uninstall()
 
     def test_uninstall_tolerates_an_oversized_file_inside_its_own_runtime_tree(self) -> None:
         # Round-11 self-check (2026-08-18, final-check pressure test,
@@ -1206,6 +1269,28 @@ class InstallEndToEndTests(unittest.TestCase):
         stray_config.write_bytes(b'{"hooks":{"UserPromptSubmit":[]}}\n')
         os.chmod(stray_config, 0o000)
         self.addCleanup(lambda: stray_config.exists() and os.chmod(stray_config, 0o600))
+
+        result = installer.uninstall()
+        self.assertTrue(result["ok"])
+        self.assertFalse(installer.PENDING_PATH.exists())
+
+    def test_uninstall_tolerates_an_unsearchable_directory_inside_its_own_runtime_tree(self) -> None:
+        # Round-12 fix (2026-08-18, independent Claude opus5/max review,
+        # round 11, R11-P2-A): the RUNTIME_BASE tolerance wrapped
+        # _read_for_detection()/_contains_owned_handler() but not
+        # _is_regular_file(), which sat outside every try block in the loop.
+        # A directory that is readable (os.walk()'s own scandir() succeeds,
+        # so the onerror callback never fires) but not searchable -- mode
+        # 0o400 or 0o600, missing the execute bit -- makes the later
+        # stat(<dir>/hooks.json) call inside _is_regular_file() fail with
+        # EACCES, which used to escape this loop entirely unwrapped and
+        # hard-block uninstall()/recover_pending_install()/install().
+        installer.install()
+        stray_dir = self.runtime_base / "backups/misc-staging/unsearchable"
+        stray_dir.mkdir(parents=True)
+        (stray_dir / "hooks.json").write_bytes(b'{"hooks":{"UserPromptSubmit":[]}}\n')
+        os.chmod(stray_dir, 0o400)
+        self.addCleanup(lambda: stray_dir.exists() and os.chmod(stray_dir, 0o700))
 
         result = installer.uninstall()
         self.assertTrue(result["ok"])

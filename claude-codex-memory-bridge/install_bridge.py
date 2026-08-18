@@ -429,11 +429,18 @@ def _safe_parse_strict_utf8(raw: bytes) -> Any:
     # Workflow design round, 2026-08-18, round 2 pressure-test P1: an earlier version of this
     # detection path only caught JSONDecodeError, letting RecursionError escape this module's
     # "must never be left to raise past this function" contract for _contains_owned_handler()).
+    # Also explicitly catches ValueError to match _lenient_parse_last_key_wins()'s own except
+    # clause below (independent Claude opus5/max review, 2026-08-18, round 11, R11-P1-A: CPython
+    # >= 3.9.14/3.10.7/3.11 caps int<->str conversion at 4300 digits, and an integer literal
+    # longer than that makes json.loads() raise a bare ValueError, not json.JSONDecodeError --
+    # this function's own except clause missed it even though the sibling function added in the
+    # same commit already caught it, an internal inconsistency in the round-11 patch). See
+    # _contains_owned_handler()'s own broader except-Exception wrapper around Stage 1 as a whole
+    # for why this specific catch is defense-in-depth, not the only thing standing between an
+    # unenumerated exception type and a bare traceback.
     try:
         return strict_json(raw)
-    except InstallError:
-        return _NOT_PARSED
-    except RecursionError:
+    except (InstallError, RecursionError, ValueError):
         return _NOT_PARSED
 
 
@@ -520,14 +527,16 @@ def _raw_bytes_contain_bridge_marker(raw: bytes) -> bool:
     return False
 
 
-def _attempt_structural_detection(raw: bytes) -> bool | None:
+def _attempt_structural_detection(raw: bytes, *, max_bytes: int) -> bool | None:
     # Layers 0+1 combined: the expensive structural parse-and-shape-check path (real JSON
     # parsing, plus -- on any successful parse -- owned_handler()'s per-handler shlex.split()
-    # calls), attempted only when `raw` is within _STRUCTURAL_DETECTION_MAX_BYTES. Returns None
-    # when nothing here resolved a definitive answer, whether because `raw` was too large to
-    # attempt at all, or because every attempt within budget failed to produce a recognizable
-    # payload -- the caller (_contains_owned_handler()) treats both the same way, falling through
-    # to the cheap marker-only Layer 2.
+    # calls), attempted only when `raw` is within `max_bytes` (the caller picks the bound --
+    # see _contains_owned_handler()'s and _find_untracked_owned_configs()'s own comments for why
+    # a candidate under RUNTIME_BASE gets a much larger one). Returns None when nothing here
+    # resolved a definitive answer, whether because `raw` was too large to attempt at all, or
+    # because every attempt within budget failed to produce a recognizable payload -- the caller
+    # (_contains_owned_handler()) treats both the same way, falling through to the cheap
+    # marker-only Layer 2.
     #
     #   Layer 0 (_safe_parse_strict_utf8): the canonical interpretation. Succeeding at all --
     #   regardless of whether the parsed value then matches our shape -- is dispositive: bytes
@@ -544,10 +553,10 @@ def _attempt_structural_detection(raw: bytes) -> bool | None:
     #   unrelated hooks.json that happened to mention the marker text in an unrelated field --
     #   e.g. a migration-history note, or another handler's own log-message argument -- was
     #   wrongly escalated to InstallError even though it had already been conclusively proven not
-    #   to contain an owned handler; only reachable in practice for a document within
-    #   _STRUCTURAL_DETECTION_MAX_BYTES -- see _find_untracked_owned_configs()'s own comment for
-    #   the accepted, documented residual gap above that bound).
-    if len(raw) > _STRUCTURAL_DETECTION_MAX_BYTES:
+    #   to contain an owned handler; only reachable in practice for a document within `max_bytes`
+    #   -- see _find_untracked_owned_configs()'s own comment for the accepted, documented residual
+    #   gap above the bound it uses outside RUNTIME_BASE).
+    if len(raw) > max_bytes:
         return None
     payload = _safe_parse_strict_utf8(raw)
     if payload is not _NOT_PARSED:
@@ -562,7 +571,7 @@ def _attempt_structural_detection(raw: bytes) -> bool | None:
     return None
 
 
-def _contains_owned_handler(raw: bytes) -> bool:
+def _contains_owned_handler(raw: bytes, *, structural_max_bytes: int = _STRUCTURAL_DETECTION_MAX_BYTES) -> bool:
     # Used only to inspect content this tool did NOT write (the
     # untracked-owned-handler safety scan below) -- unlike install()'s own
     # use of owned_handler() (always preceded by update_hook_config()'s
@@ -594,7 +603,23 @@ def _contains_owned_handler(raw: bytes) -> bool:
     #
     #   Stage 1 (_attempt_structural_detection): Layers 0+1, see that
     #   function's own comment -- the precise, structurally-verified answer,
-    #   attempted only up to _STRUCTURAL_DETECTION_MAX_BYTES.
+    #   attempted only up to `structural_max_bytes` (round 11 default:
+    #   _STRUCTURAL_DETECTION_MAX_BYTES; _find_untracked_owned_configs()
+    #   passes MAX_MANAGED_FILE_BYTES -- the largest byte size that could
+    #   ever reach this function at all, since _read_for_detection() already
+    #   refuses anything bigger -- for a candidate under RUNTIME_BASE, since
+    #   the round-11 default bound was what let a genuine, valid,
+    #   plain-UTF-8, merely-large relocated handler under RUNTIME_BASE go
+    #   unresolved by Stage 1 and fall to Stage 2 in the first place;
+    #   independent Claude opus5/max review, 2026-08-18, round 11, R11-P1-B).
+    #   Wrapped in a broad except so an unenumerated exception from the
+    #   parsing chain (R11-P1-A: CPython's int-string-conversion ValueError,
+    #   already caught explicitly by _safe_parse_strict_utf8() and
+    #   _lenient_parse_last_key_wins() below -- this is defense-in-depth for
+    #   whatever the *next* interpreter-specific parser exception turns out
+    #   to be, not a replacement for those explicit catches) degrades to
+    #   "Stage 1 inconclusive", exactly like a genuine parse failure, rather
+    #   than escaping this function as a bare traceback.
     #
     #   Stage 2 (_raw_bytes_contain_bridge_marker): reached whenever Stage 1
     #   returned None -- either genuinely ambiguous (no attempt, across
@@ -605,12 +630,22 @@ def _contains_owned_handler(raw: bytes) -> bool:
     #   closed with InstallError (raising, not returning True: this stage
     #   never actually confirmed a structural match, so it must not report
     #   a false positive detection either -- only escalate the ambiguity to
-    #   the caller, which _find_untracked_owned_configs() further tempers
-    #   for content specifically inside RUNTIME_BASE -- see that function's
-    #   own comment); no hit means a genuine, if softer, negative and
-    #   returns False, matching this function's original conservative
-    #   default for content nothing here can identify as ours.
-    result = _attempt_structural_detection(raw)
+    #   the caller). Unlike Stage 1's own inconclusive result, a Stage 2 hit
+    #   is POSITIVE evidence (the exact marker this tool's own handlers
+    #   carry, found in the raw bytes) rather than an absence of
+    #   information, so -- as of round 12 -- _find_untracked_owned_configs()
+    #   no longer tempers this particular raise for RUNTIME_BASE candidates
+    #   the way it does for a genuine absence-of-evidence fault (unlistable
+    #   directory, unreadable/oversized file): tolerating THIS raise there
+    #   was exactly R11-P1-B, silently discarding positive evidence of a
+    #   live handler the round's own fix exists to catch. No hit means a
+    #   genuine, if softer, negative and returns False, matching this
+    #   function's original conservative default for content nothing here
+    #   can identify as ours.
+    try:
+        result = _attempt_structural_detection(raw, max_bytes=structural_max_bytes)
+    except Exception:
+        result = None
     if result is not None:
         return result
     if _raw_bytes_contain_bridge_marker(raw):
@@ -660,43 +695,67 @@ def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
     # InstallError instead (independent Claude opus5/max review,
     # 2026-08-17, round 8, R8-P1-C for the ENOENT-tolerant half, R8-P2-B
     # for the EACCES-must-not-be-silent half) -- EXCEPT specifically inside
-    # RUNTIME_BASE, where an unlistable directory, an unreadable or
-    # oversized file (_read_for_detection()'s own raises), AND an
-    # unparseable-but-marker-suspicious file (_contains_owned_handler()'s
-    # own Stage 2) all instead degrade to "nothing found there", same as ENOENT
-    # (self-check Workflow, 2026-08-18, round 2 pressure-test: RUNTIME_BASE's
-    # backups/releases directories are never pruned -- this file's own
-    # design, documented at their creation sites -- and accumulate for the
-    # tool's entire lifetime, so an ordinary, non-adversarial permission
-    # fault or an oversized/corrupted stray file there -- a stray quarantine
-    # flag, imperfect backup/restore tooling, a UID mismatch after moving
-    # the external SSD between machines (this repo's whole operating
-    # domain) -- becomes steadily more likely over time and, if still
-    # fail-closed here, would permanently hard-block BOTH uninstall() and
-    # recover_pending_install() (the tool's own crash-recovery path) with no
-    # self-healing action available, since RUNTIME_BASE content is never
-    # pruned by this tool. Two things make this narrower "nothing found
-    # there" policy the right trade-off specifically for RUNTIME_BASE,
-    # unlike every other subtree: (1) every real file this tool ever writes
-    # there is deliberately never named literally "hooks.json"
-    # (grep-confirmed against every atomic_write() call site; atomic_write()'s
-    # own mkstemp()-based temp-file naming means no transient bare
-    # "hooks.json" ever appears mid-write either), so an unlistable
-    # subdirectory or an unrecognizable file here can only ever be hiding
-    # non-candidate files -- never the one filename this scan is actually
-    # looking for; and (2) RUNTIME_BASE and everything under it is created
-    # exclusively by ensure_private_dir()/atomic_write() at mode
-    # 0o700/0o600 under this process's own uid, so a THIRD PARTY managing to
-    # place unreadable or unrecognizable content here already requires a
-    # level of access (the same uid, or root) that makes this scan's
-    # fail-closed protection close to worthless as a defense against them
-    # anyway. Trading that narrow, low-value blind spot for keeping the
-    # tool's own recovery path from becoming permanently unusable is the
-    # better default. The equivalent ambiguity OUTSIDE RUNTIME_BASE (a large
-    # or unparseable-but-marker-suspicious third-party file elsewhere under
-    # local-homes) is deliberately left fail-closed, same as before -- now
-    # with the offending path included in the error, so an operator hitting
-    # that rarer case can actually locate and act on it.
+    # RUNTIME_BASE, where an unlistable directory, an unsearchable directory
+    # (_is_regular_file()'s own raise), and an unreadable or oversized file
+    # (_read_for_detection()'s own raises) all instead degrade to "nothing
+    # found there", same as ENOENT (self-check Workflow, 2026-08-18, round 2
+    # pressure-test: RUNTIME_BASE's backups/releases directories are never
+    # pruned -- this file's own design, documented at their creation sites
+    # -- and accumulate for the tool's entire lifetime, so an ordinary,
+    # non-adversarial permission fault or an oversized stray file there -- a
+    # stray quarantine flag, imperfect backup/restore tooling, a UID
+    # mismatch after moving the external SSD between machines (this repo's
+    # whole operating domain) -- becomes steadily more likely over time and,
+    # if still fail-closed here, would permanently hard-block BOTH
+    # uninstall() and recover_pending_install() (the tool's own
+    # crash-recovery path) with no self-healing action available, since
+    # RUNTIME_BASE content is never pruned by this tool.
+    #
+    # Round 12 narrowing (independent Claude opus5/max review, 2026-08-18,
+    # round 11, R11-P1-B): this tolerance covers only genuine ABSENCE of
+    # evidence -- we could not even determine whether the path is a regular
+    # file, or could not even read its bytes. It does NOT extend to
+    # _contains_owned_handler()'s own raise (its Stage 2: the raw bytes were
+    # read successfully and structurally matched this tool's marker, but
+    # could not be structurally verified) -- that is POSITIVE evidence of a
+    # possible live handler, not an absence of information, and tolerating
+    # it here was exactly R11-P1-B: a live, valid, plain-UTF-8 relocated
+    # handler padded past the structural-detection size bound was silently
+    # abandoned, the identical end-state this whole round exists to
+    # prevent. To make that raise rare rather than routine for a genuine
+    # relocated account, _contains_owned_handler() is called below with
+    # MAX_MANAGED_FILE_BYTES (not the smaller _STRUCTURAL_DETECTION_MAX_BYTES
+    # default) as its structural-detection bound specifically for candidates
+    # under RUNTIME_BASE -- the largest size _read_for_detection() could ever
+    # hand it at all -- so a genuine relocated handler of any size this tool
+    # would ever accept gets a definitive, structurally-verified answer
+    # instead of falling through to the ambiguous marker-only stage; see
+    # _contains_owned_handler()'s own comment for the measured cost (tens of
+    # milliseconds, and only ever paid for a file actually named
+    # "hooks.json" under RUNTIME_BASE, which real bridge operation never
+    # produces).
+    #
+    # Two things make the narrower "nothing found there" policy the right
+    # trade-off specifically for RUNTIME_BASE, unlike every other subtree:
+    # (1) every real file this tool ever writes there is deliberately never
+    # named literally "hooks.json" (grep-confirmed against every
+    # atomic_write() call site; atomic_write()'s own mkstemp()-based
+    # temp-file naming means no transient bare "hooks.json" ever appears
+    # mid-write either), so an unlistable/unsearchable subdirectory or an
+    # unreadable file here can only ever be hiding non-candidate files --
+    # never the one filename this scan is actually looking for; and (2)
+    # RUNTIME_BASE and everything under it is created exclusively by
+    # ensure_private_dir()/atomic_write() at mode 0o700/0o600 under this
+    # process's own uid, so a THIRD PARTY managing to place unreadable
+    # content here already requires a level of access (the same uid, or
+    # root) that makes this scan's fail-closed protection close to
+    # worthless as a defense against them anyway. Trading that narrow,
+    # low-value blind spot for keeping the tool's own recovery path from
+    # becoming permanently unusable is the better default. The equivalent
+    # absence-of-evidence fault OUTSIDE RUNTIME_BASE, and a Stage-2 marker
+    # hit anywhere (in or out of RUNTIME_BASE), are both deliberately left
+    # fail-closed, with the offending path included in the error, so an
+    # operator hitting either case can actually locate and act on it.
     try:
         root = resolve_ssd_path(LOCAL_HOMES_ROOT, must_exist=False)
     except InstallError:
@@ -720,7 +779,28 @@ def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
     for dirpath, _dirnames, _filenames in os.walk(root, onerror=_raise_on_unlistable_directory, followlinks=False):
         current = Path(dirpath)
         candidate = current / "hooks.json"
-        if not _is_regular_file(candidate):
+        # _is_regular_file(candidate): absence-of-evidence tolerance too --
+        # a directory that is listable but not searchable (missing the
+        # execute bit) makes the stat() inside _is_regular_file() fail with
+        # EACCES even though os.walk()'s own scandir() succeeded, so the
+        # onerror callback above never sees it (independent Claude opus5/max
+        # review, 2026-08-18, round 11, R11-P2-A: this call used to sit
+        # outside every try block in this loop, so that specific shape hard-
+        # blocked uninstall()/recover_pending_install()/install() even
+        # though the round's own stated invariant is that every fault class
+        # in RUNTIME_BASE degrades gracefully). Broad `except Exception`,
+        # not `except InstallError`, here and on the _read_for_detection()
+        # call below: both are absence-of-evidence calls (can we determine
+        # this is a file; can we read it), so any failure of either --
+        # enumerated or not -- means "no information", the same fail-open
+        # verdict regardless of exactly which exception type surfaced it.
+        try:
+            is_candidate = _is_regular_file(candidate)
+        except Exception as exc:
+            if _is_under_runtime_root(current):
+                continue
+            raise InstallError(f"{exc} (at {candidate})") from exc
+        if not is_candidate:
             continue
         try:
             resolved = resolve_ssd_path(candidate)
@@ -734,25 +814,26 @@ def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
         # trust the file enough to rewrite it -- see that function's own
         # comment and R9-P1-B. None means "not a file we can identify"; any
         # other failure (cannot open/read, oversized, identity changed
-        # mid-read) raises InstallError, handled by the same RUNTIME_BASE
-        # tolerance / path-annotated re-raise as _contains_owned_handler()'s
-        # own ambiguous-content raise just below -- both calls share one
-        # try block for exactly that reason (self-check Workflow, 2026-08-18,
-        # round-11 final-check pressure test: an earlier version of this fix
-        # wrapped only the _contains_owned_handler() call, so an oversized
-        # file or an ordinary permission fault -- e.g. a UID mismatch after
-        # moving the external SSD between machines -- on a candidate under
-        # RUNTIME_BASE still hard-locked uninstall()/recover_pending_install()/
-        # install() via this earlier, unwrapped call, exactly the failure
-        # mode this whole block exists to close).
+        # mid-read) is absence-of-evidence, same tolerance/re-raise policy
+        # as _is_regular_file() above.
         try:
             candidate_raw = _read_for_detection(resolved)
-            if candidate_raw is None:
-                continue
-            owned = _contains_owned_handler(candidate_raw)
-        except InstallError as exc:
+        except Exception as exc:
             if _is_under_runtime_root(resolved):
                 continue
+            raise InstallError(f"{exc} (at {candidate_str})") from exc
+        if candidate_raw is None:
+            continue
+        # _contains_owned_handler()'s own raise is POSITIVE evidence (its
+        # Stage 2 marker hit), never absence-of-evidence -- always re-raise
+        # with the path, regardless of RUNTIME_BASE (round 12, R11-P1-B; see
+        # the long comment above this loop). The larger structural-detection
+        # bound for RUNTIME_BASE candidates is what keeps this raise rare
+        # for a genuine relocated account rather than routine.
+        structural_max_bytes = MAX_MANAGED_FILE_BYTES if _is_under_runtime_root(resolved) else _STRUCTURAL_DETECTION_MAX_BYTES
+        try:
+            owned = _contains_owned_handler(candidate_raw, structural_max_bytes=structural_max_bytes)
+        except Exception as exc:
             raise InstallError(f"{exc} (at {candidate_str})") from exc
         if owned:
             untracked_owned.append(candidate_str)
