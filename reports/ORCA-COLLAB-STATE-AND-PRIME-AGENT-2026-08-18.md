@@ -249,6 +249,46 @@ Round 6 的 5 项修复逐条用"突变测试"（在临时副本里撤销修复�
 
 **已派发 round 8 修复**，RCE 优先。
 
+### Round 8：RCE 修复（已验证关闭，未独立复核）
+
+把 `config`/`package`/`help <参数>` 从"无需保护"名单里去掉，默认和其它会话启动命令
+一样套 `$PWD/.prime/agent/settings.json` 门禁（同一个 opt-in 环境变量）；`help` 单独
+处理——直接读了上游真实的 `isHelpCommandRequest()` 源码，确认裸 `help`（零参数）上游
+本来就无条件安全，只让这一种情况继续免检，其余 `help <任何参数>` 一律套保护，没有
+去重新实现一份自己的模糊匹配算法（那样只会重蹈"手工维护名单"这同一类坑）。目录项
+TOCTOU 用和 round 6 处理普通文件同样的纪律解决：提取阶段就把目录 mode 记下来，打包
+阶段直接用记录构造 `TarInfo` 发布，不再有第二次按路径查询。**用全新写的脚本（不是
+照搬 round 7 的复现脚本）跑了一次真实端到端验证**：真实生成的 wrapper → 真实生成的
+launch guard → 真实锁定的 Node → 真实 `prime-agent-0.7.2.tgz`，修复前 11 项里 4 项
+失败（恶意 `npmCommand` 真的写了标记文件），修复后 11/11 全部通过。84/84 单测通过
+（两个解释器）。已提交 `b4a9d65fd8`。**已派发 round 9 双复核**——这是本轮周期里最
+严重的发现，在没有独立确认之前，不能只凭修复方之的说法当作已关闭。
+
+### Round 9
+
+**Codex QA（走正规 Orca orchestration，`task_611955b3d21f`/`ctx_86246f304217`）已完成**：
+84/84 测试两个解释器全过、`py_compile` 干净、4 个新回归测试逐条确认非空跑。用真实
+0.7.2 官方产物 + 锁定 Node 做的探针确认：**不开任何 opt-in 的基线现在是安全的**——
+`config`/`package`/`help <参数>` 在有恶意 `.prime/agent/settings.json` 的目录下默认
+被拦（rc 78），marker 没被消费；`status`（我验收表里又猜错的一行，和 round 7 一样是
+我自己预设错误，不是代码 bug——上游真实源码里 `status` 就是 `runPs`，本来就不碰
+project settings）保持公共命令、不受影响。**系统性核对了整份"无需保护"名单**
+（`doctor, list, rename, schedule, send, session, shutdown, status, stop`）对照上游
+0.7.2 真实源码逐条确认没有同类问题（高置信度，注明上游版本升级后需要重新核对）。
+
+**但抓到一个新的真实契约不一致**：README 承诺"资源禁用参数（`--no-extensions` 等）
+由独立于设置门禁的另一个 opt-in（`ORCA_PRIME_AGENT_ALLOW_PROJECT_RESOURCES`）单独
+控制"，但 `config`/`package`/`help` 因为（round 8 特意保留、为了不破坏它们的参数）
+仍在 `RUNTIME_NO_GUARD_COMMANDS` 名单里，**一旦用户为它们打开了设置门禁的
+opt-in（`ORCA_PRIME_AGENT_ALLOW_PROJECT_SETTINGS=1`），资源保护会跟着一起失效，不
+需要单独打开资源那个 opt-in**——真实复现：只开设置 opt-in、不开资源 opt-in，
+`help mcp-servers` 探针里项目扩展的 marker 真的被执行了。**不开任何 opt-in 的默认
+状态仍然安全**（设置门禁先挡住），只有在用户已经主动为这三个命令开了设置 opt-in
+之后，两道本该独立的防线才会一起松动。严重度低于 round 8 的 RCE（需要用户先主动
+opt-in），但确实是文档承诺和实现不一致，值得修。
+
+Claude opus/max 这路仍在进行中。
+
 `sandbox_e2e.py` 真实网络路径运行（未 mock，真实调用官方下载）在第一步即失败：
 
 ```
