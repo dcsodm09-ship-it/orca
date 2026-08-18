@@ -12,13 +12,14 @@
 - **prime-agent-integration 未安装、不能安装**：即便本轮安全修复全部收敛，`sandbox_e2e.py`
   真实跑一遍会在第一步就 fail-closed——2026-08-14 钉的上游 npm 锁定哈希已经和 2026-08-18
   registry 实际解析结果对不上（上游漂移，不是本轮修复引入的回归，fail-closed 正确触发）。
-- **prime-agent 的 4 个原始 P1 全部修好，round 2-6 又连续发现并修了 10 个新 P1**（详见
-  第 1 节）。**Codex sol/xhigh 前 3 轮全给 GO，第 4 轮被 OpenAI 自己的 cybersecurity
-  内容策略拦截**（改用纯 QA 措辞后第 5 轮顺利跑完，并且独立找到 round 5 修复自己引入的
-  一个真实功能回归——和 Claude opus/max 完全独立收敛到同一个 bug）。**round 6 修复已
-  完成、80/80 测试通过、已提交，但尚未独立复核**——这是本次会话主动选择的检查点，连续
-  6 轮真实发现新问题之后暂停汇报，不是遇到了阻断。round 7 双复核随时可在下次请求时派发。
-  **收敛前不装、不启用。**
+- **prime-agent 的 4 个原始 P1 全部修好，round 2-7 又连续发现并修了 13 个新 P1**
+  （详见第 1 节）。**用户"继续"后派发的 round 7 是本会话最严重的一次发现——一个真实的
+  任意代码执行（RCE）：`prime-agent config`/`package`/`help <token>` 被错误归类为
+  "无需项目设置门禁保护"，用真实上游 v0.7.2 全链路端到端复现，恶意
+  `.prime/agent/settings.json` 里的命令真的跑起来了**。Codex sol/xhigh 前 3 轮 GO，
+  第 4 轮被 OpenAI cybersecurity 内容策略拦截（改用 QA 措辞后第 5、7 轮恢复正常，且
+  round 7 独立收敛确认了一个和 opus/max 相同的目录项 TOCTOU）。**round 8 修复
+  （RCE 优先）已派发，进行中。收敛前不装、不启用。**
 - **`ORCA_CONTEXT_NACK_V1`（wiki 新鲜度不匹配）根因已查清**，不是代码 bug：wiki 内容在
   manifest 钉哈希后被手工改过没人重新钉；未擅自重新钉（需要人工复核+双复核门禁）。
 - `orca-context-bridge/SKILL.md` 一份未提交的文档更新（+135/-6 行）逐条核对源码，改正了
@@ -216,7 +217,37 @@ symlink（tar 类型 `b'2'`），子文件仍是普通文件——即一个不�
 行为特意做出的设计决定，代码和测试彼此一致，只是我预设的验收表把两种场景想成了对称
 关系。
 
-Claude opus/max 这路仍在进行中。
+**Claude opus/max 这路完成，结论 NO_GO，P0=0，P1=3，P2=1——本次会话 7 轮里最严重的一次
+发现：一个真实的任意代码执行（RCE）。**
+
+Round 6 的 5 项修复逐条用"突变测试"（在临时副本里撤销修复，确认原始 bug 真的回来了，
+不是读 diff 猜）验证仍然成立。新发现：
+
+- **P1-1（RCE）**：`managed_entrypoint_script()` 里的 `public_commands` 名单
+  （:1960）把 `config`、`package`、`help` 三个命令当作"不影响会话/无需保护"处理，但
+  上游真实代码里这三个命令其实都会读 `$PWD/.prime/agent/settings.json`——`config` 还会
+  在没有 `onMissing` 兜底的情况下对项目声明的包源自动执行安装。**用真实链路端到端复现
+  成功**：真实生成的 wrapper → 真实生成的 launch guard → 锁定的 Node 24.19.0 → 真实
+  `prime-agent-0.7.2.tgz`，全程离线。`prime-agent "介绍一下这个仓库"` 正确拦截
+  （rc 78），但 `prime-agent config` 在一个放了恶意 `.prime/agent/settings.json` 的
+  目录里执行，**攻击者的 `/bin/sh -c ...` 真的跑起来了**。
+- **P1-2（同类，RCE 面更广）**：`help <token>` 也被无条件当作安全命令——但上游只有在
+  自己的模糊匹配算法判定这是"真的在问帮助"时才安全，`help tools`、`help auth`、
+  `help mcp`、`help skills`、`help init`、`help commands` 等大量看起来合理的输入都会
+  落到真实会话启动。同样端到端复现成功：`prime-agent help zzzzzzzzzzzz` 在恶意目录下
+  执行了 `$PWD/.prime/agent/extensions/evil.js`。
+- **P1-3（与 Codex round-7 独立收敛）**：确认 `make_patched_asset` 的目录项 TOCTOU
+  是真的，独立复现成立，和 Codex 的发现是同一个 bug。
+- **P2**：`assert_tree_has_no_symlinks()`（round 2 修的一个 P1 的防线）**现在零有效
+  测试覆盖**——直接删掉两处调用点，全套件照样绿；名义上覆盖它的测试实际在更早的
+  `create_fresh_private_dir()` 里就先失败退出了，根本没跑到这条防线。这条防线本身是
+  真实生效的（拦住了 opus 自己的一次探测），只是没人测过它会不会被误删。
+
+根因诊断很干净：P1-1/P1-2 是同一个根因——line 1960 那份"不影响会话的命令"名单是手工
+维护的，12 条里有 3 条判断错了。修复方向应该和 round 6 处理 `--daemon-socket` 时一样：
+从上游真实行为推导分类，而不是继续手工维护一份名单。
+
+**已派发 round 8 修复**，RCE 优先。
 
 `sandbox_e2e.py` 真实网络路径运行（未 mock，真实调用官方下载）在第一步即失败：
 
