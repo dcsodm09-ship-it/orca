@@ -4241,18 +4241,35 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
 
             # (d) In a CLEAN cwd (no project settings file at all), config/
-            # package/help<arg> must still succeed, AND -- the round-3/4
-            # argv-corruption bug class this fix must not reopen -- their
-            # argv must arrive at the underlying CLI COMPLETELY UNCHANGED:
-            # confirms config/package/help remain in RUNTIME_NO_GUARD_
+            # package/help<matched-topic> must still succeed, AND -- the
+            # round-3/4 argv-corruption bug class this fix must not reopen
+            # -- their argv must arrive at the underlying CLI COMPLETELY
+            # UNCHANGED: confirms config/package remain in RUNTIME_NO_GUARD_
             # COMMANDS on the Python launch-guard side even though they
             # left public_commands on the shell side, so guarded_arguments()
             # never splices RESOURCE_GUARDS into their argv (a position
-            # never verified safe for these three specific commands).
+            # never verified safe for these two specific commands).
+            #
+            # "help", "auth" moved OUT of this list in round 10, 2026-08-18
+            # (independent review, P1): "auth" is not a real command name
+            # upstream's isHelpCommandRequest() recognizes (exact or fuzzy),
+            # so this was actually a MISS case that upstream falls through
+            # to a real, unprotected session start for -- see
+            # test_help_argument_resource_guards_depend_on_upstream_match
+            # below for full round-10 MISS-case coverage (this is exactly
+            # the test-coverage gap round 9 flagged: this fixture never
+            # built a no-settings.json project with a planted extension, so
+            # this assertion's "argv is unchanged" claim for a MISS case
+            # went unnoticed as actually being the bug, not the fix).
+            # "help", "package" replaces it here as a genuine MATCH case
+            # (upstream's own isHelpCommandRequest(["package"]) is
+            # trivially true via getCommandSpec(path.slice(0,1))), keeping
+            # this fixture's own "argv survives completely unchanged"
+            # coverage for a command that legitimately belongs in this list.
             for arguments in (
                 ("config", "get", "x"),
                 ("package", "list"),
-                ("help", "auth"),
+                ("help", "package"),
             ):
                 with self.subTest(arguments=arguments, mode="clean-cwd-unguarded"):
                     result = run_wrapper(arguments, cwd=clean)
@@ -4273,6 +4290,437 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 with self.subTest(command=cmd, mode="unaffected-still-public"):
                     result = run_wrapper((cmd,), cwd=project)
                     self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_help_argument_resource_guards_depend_on_upstream_match(
+        self,
+    ) -> None:
+        # Regression for independent review round 10, 2026-08-18, P1 (round
+        # 9 found round 8's fix incomplete): round 8 made "help <argument>"
+        # session_start=1 (settings gate applies), but
+        # managed_launch_guard_script()'s guarded_arguments() still treated
+        # EVERY "help <argument>" identically via RUNTIME_NO_GUARD_COMMANDS
+        # -- no RESOURCE_GUARDS ever spliced in, match or miss. That is only
+        # safe for a MATCH (upstream's printRequestedHelp() always returns
+        # HANDLED before ever reaching extension loading); a MISS falls
+        # through upstream's own continueWith(args) to a REAL, unprotected
+        # session start with "help"/the argument as positional chat
+        # messages -- and, crucially, this needs NO settings.json to exist
+        # at all, unlike round 8's config/package finding: this test
+        # exercises that exact no-settings.json gap round 9 flagged the
+        # existing coverage as missing. See the separate real-upstream-
+        # bundle end-to-end verification for proof the underlying RCE this
+        # closes is genuine (a planted .prime/agent/extensions/evil.js
+        # actually executes pre-fix and does not post-fix), not merely an
+        # argv-shape test.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "release"
+            bin_dir = release / "bin"
+            bin_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(tool_root, 0o700)
+            os.chmod(release, 0o700)
+            node = bin_dir / "node"
+            cli = release / "cli.js"
+            node.write_text(
+                "#!/usr/bin/python3\n"
+                "import json, os, sys\n"
+                "print(json.dumps({\n"
+                "  'argv': sys.argv[1:],\n"
+                "  'resourceGuard': os.environ.get('ORCA_PRIME_AGENT_RESOURCE_GUARD'),\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            os.chmod(node, 0o700)
+            cli.write_text("// argument sentinel\n", encoding="utf-8")
+            os.chmod(cli, 0o600)
+            lifecycle_lock = tool_root / "lifecycle.lock"
+            lifecycle_lock.write_bytes(b"")
+            os.chmod(lifecycle_lock, 0o600)
+            guard = bin_dir / "prime-agent-launch-guard.py"
+            wrapper = bin_dir / "prime-agent"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", tool_root / "state"),
+            ):
+                guard.write_bytes(installer.managed_launch_guard_script(node, cli))
+                wrapper.write_bytes(
+                    installer.managed_entrypoint_script(node, cli, guard)
+                )
+            os.chmod(guard, 0o700)
+            os.chmod(wrapper, 0o700)
+            # Deliberately NO .prime/agent/settings.json anywhere -- proving
+            # RESOURCE_GUARDS, not the settings gate, is what protects a
+            # help-miss here.
+            clean = root / "clean-no-settings-json"
+            clean.mkdir(mode=0o700)
+            self.assertFalse((clean / ".prime/agent/settings.json").exists())
+
+            def run_wrapper(
+                arguments: tuple[str, ...],
+            ) -> subprocess.CompletedProcess[str]:
+                environment = {
+                    "HOME": os.fspath(root),
+                    "PATH": "/usr/bin:/bin",
+                }
+                return subprocess.run(
+                    [os.fspath(wrapper), *arguments],
+                    cwd=clean,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=environment,
+                )
+
+            def argv_of(result: subprocess.CompletedProcess[str]) -> list[object]:
+                self.assertEqual(result.returncode, 0, result.stderr)
+                payload = installer.strict_json(result.stdout.encode("utf-8"))
+                self.assertIsInstance(payload, dict)
+                assert isinstance(payload, dict)
+                self.assertIsNone(payload["resourceGuard"])
+                argv = payload["argv"]
+                self.assertIsInstance(argv, list)
+                assert isinstance(argv, list)
+                return argv[1:]
+
+            # MISS cases: upstream's own isHelpCommandRequest() (verified
+            # directly against the pinned v0.7.2 sources) does not
+            # recognize any of these as a real command, exact or fuzzy --
+            # RESOURCE_GUARDS must be spliced in, appended after the whole
+            # "help <argument>" (or before a trailing "--", so parseArgs()
+            # doesn't swallow them into a positional message).
+            miss_cases = (
+                (("help", "zzzzzzzzzzzz"), ["help", "zzzzzzzzzzzz"]),
+                (("help", "tols"), ["help", "tols"]),
+                (("help", "mcp"), ["help", "mcp"]),
+                (("help", "auth"), ["help", "auth"]),
+                (("help", "--", "zzzzzzzzzzzz"), ["help", "--", "zzzzzzzzzzzz"]),
+            )
+            for arguments, base in miss_cases:
+                with self.subTest(arguments=arguments, mode="miss-guarded"):
+                    observed = argv_of(run_wrapper(arguments))
+                    if "--" in base:
+                        separator = base.index("--")
+                        expected = (
+                            base[:separator]
+                            + ["--no-extensions", "--no-skills", "--no-prompt-templates"]
+                            + base[separator:]
+                        )
+                    else:
+                        expected = base + [
+                            "--no-extensions",
+                            "--no-skills",
+                            "--no-prompt-templates",
+                        ]
+                    self.assertEqual(observed, expected)
+
+            # MATCH cases: upstream's own isHelpCommandRequest() recognizes
+            # every one of these (exact top-level or child command path) --
+            # printRequestedHelp() always returns HANDLED before extension
+            # loading, so argv must arrive COMPLETELY UNCHANGED. Appending
+            # RESOURCE_GUARDS here would corrupt the literal command PATH
+            # formatCommandHelp()/getCommandSpec() require an exact-length
+            # match against, turning a legitimate help lookup into an
+            # "Unknown command" error -- exactly the regression this test
+            # guards against.
+            match_cases = (
+                ("help", "package"),
+                ("help", "package", "install"),
+                ("help", "session"),
+                ("help", "session", "export"),
+                ("help", "model", "list"),
+                ("help", "schedule", "add"),
+            )
+            for arguments in match_cases:
+                with self.subTest(arguments=arguments, mode="match-unguarded"):
+                    observed = argv_of(run_wrapper(arguments))
+                    self.assertEqual(observed, list(arguments))
+
+    def test_session_export_requires_session_start_protection_by_default(
+        self,
+    ) -> None:
+        # Regression for independent review round 10, 2026-08-18, P1 (round
+        # 9 found round 8's fix incomplete): "session" was still classified
+        # session_start=0 in managed_entrypoint_script()'s public_commands,
+        # so `session export ""` skipped BOTH the settings gate and
+        # RESOURCE_GUARD_ENV entirely. Upstream's rewriteNestedCommand()
+        # unconditionally sets result.export = args[++i] for the internal
+        # "--export" flag "session export" rewrites to, and an empty string
+        # is falsy at main.js's later `if (parsed.export)` early-exit gate,
+        # so control falls through into a real, unprotected session start
+        # -- a completely realistic trigger via plain shell expansion of an
+        # unset variable (`session export "$UNSET_VAR"`), no adversarial
+        # argv construction needed. "session" now gets the same
+        # settings-gate + RESOURCE_GUARD_ENV treatment as an ordinary
+        # session-start command (config/package's round-8 treatment), and
+        # managed_launch_guard_script()'s guarded_arguments() places
+        # RESOURCE_GUARDS after the whole "session export <value>" (or
+        # before a trailing "--") -- verified directly against upstream's
+        # rewriteNestedCommand()/splitOperandsAndOptions() to not disturb
+        # the "session"/"export" token adjacency those functions require,
+        # so a legitimate `session export <path>` still reaches upstream's
+        # real exportFromFile() and exits before ever touching
+        # SettingsManager or extension loading, guards or not.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "release"
+            bin_dir = release / "bin"
+            bin_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(tool_root, 0o700)
+            os.chmod(release, 0o700)
+            node = bin_dir / "node"
+            cli = release / "cli.js"
+            node.write_text(
+                "#!/usr/bin/python3\n"
+                "import json, os, sys\n"
+                "print(json.dumps({\n"
+                "  'argv': sys.argv[1:],\n"
+                "  'resourceGuard': os.environ.get('ORCA_PRIME_AGENT_RESOURCE_GUARD'),\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            os.chmod(node, 0o700)
+            cli.write_text("// argument sentinel\n", encoding="utf-8")
+            os.chmod(cli, 0o600)
+            lifecycle_lock = tool_root / "lifecycle.lock"
+            lifecycle_lock.write_bytes(b"")
+            os.chmod(lifecycle_lock, 0o600)
+            guard = bin_dir / "prime-agent-launch-guard.py"
+            wrapper = bin_dir / "prime-agent"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", tool_root / "state"),
+            ):
+                guard.write_bytes(installer.managed_launch_guard_script(node, cli))
+                wrapper.write_bytes(
+                    installer.managed_entrypoint_script(node, cli, guard)
+                )
+            os.chmod(guard, 0o700)
+            os.chmod(wrapper, 0o700)
+            clean = root / "clean"
+            project = root / "project"
+            clean.mkdir(mode=0o700)
+            (project / ".prime/agent").mkdir(parents=True, mode=0o700)
+            (project / ".prime/agent/settings.json").write_text(
+                "{}", encoding="utf-8"
+            )
+
+            def run_wrapper(
+                arguments: tuple[str, ...],
+                *,
+                cwd: Path,
+                allow_settings: bool = False,
+            ) -> subprocess.CompletedProcess[str]:
+                environment = {
+                    "HOME": os.fspath(root),
+                    "PATH": "/usr/bin:/bin",
+                }
+                if allow_settings:
+                    environment["ORCA_PRIME_AGENT_ALLOW_PROJECT_SETTINGS"] = "1"
+                return subprocess.run(
+                    [os.fspath(wrapper), *arguments],
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=environment,
+                )
+
+            # (a) THE FIX: "session ..." (any operand, empty or not) is now
+            # blocked by the settings gate in a project carrying
+            # .prime/agent/settings.json, absent the opt-in env var. Before
+            # round 10 this incorrectly returned rc 0.
+            for arguments in (
+                ("session", "export", ""),
+                ("session", "export", "/some/real/path"),
+                ("session",),
+            ):
+                with self.subTest(arguments=arguments, mode="now-protected"):
+                    result = run_wrapper(arguments, cwd=project)
+                    self.assertEqual(result.returncode, 78, result.stderr)
+                    self.assertIn(
+                        "project .prime/agent/settings.json", result.stderr
+                    )
+
+            # (b) Explicit opt-in restores the previous, unprotected
+            # settings-gate behavior.
+            opted_in = run_wrapper(
+                ("session", "export", ""), cwd=project, allow_settings=True
+            )
+            self.assertEqual(opted_in.returncode, 0, opted_in.stderr)
+
+            # (c) In a CLEAN cwd (no settings.json at all -- the round-9 gap
+            # that a settings-file gate alone can never close), both the
+            # exploit form and legitimate usage must now carry
+            # RESOURCE_GUARDS, appended after the whole "session export
+            # <value>", with the "session"/"export" adjacency
+            # rewriteNestedCommand() requires left completely intact.
+            for arguments in (
+                ("session", "export", ""),
+                ("session", "export", "/some/real/path"),
+            ):
+                with self.subTest(arguments=arguments, mode="clean-cwd-guarded"):
+                    result = run_wrapper(arguments, cwd=clean)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    payload = installer.strict_json(result.stdout.encode("utf-8"))
+                    self.assertIsInstance(payload, dict)
+                    assert isinstance(payload, dict)
+                    self.assertEqual(
+                        payload["argv"][1:],
+                        [
+                            *arguments,
+                            "--no-extensions",
+                            "--no-skills",
+                            "--no-prompt-templates",
+                        ],
+                    )
+                    self.assertIsNone(payload["resourceGuard"])
+
+    def test_print_flag_anywhere_forces_session_start_protection(self) -> None:
+        # Regression for independent review round 10, 2026-08-18, P2:
+        # upstream's own shouldStartDaemonEarly() (dist/cli/daemon-launch.js)
+        # spawns a detached background daemon whenever
+        # `args.includes("--print") || args.includes("-p")` is true --
+        # checked with a literal, position- and "--"-agnostic array-
+        # membership test, BEFORE this wrapper's own public/no-guard
+        # command classification could possibly matter (maybeStartDaemonEarly()
+        # runs before runPublicCommand()/parseArgs() in upstream's own
+        # cli-main.js). Reproduced with "status -p", "list -p",
+        # "doctor --print", "stop -p abc", "send bot -p",
+        # "shutdown --force -p", and "schedule add ... -- -p run" all
+        # spawning a daemon (bare "status" does not), inheriting this
+        # wrapper's own launch cwd. The spawned daemon's own argv is
+        # hardcoded by upstream to "--mode daemon --daemon-socket <path>"
+        # only -- RESOURCE_GUARDS can never reach it no matter what this
+        # wrapper does (a documented, accepted residual gap, P2 not P1) --
+        # but the $PWD/.prime/agent/settings.json gate below is entirely
+        # this wrapper's own, and now fires for any invocation upstream
+        # would treat this way, closing the "hostile settings.json
+        # short-circuits the daemon early-spawn before this wrapper's own
+        # public-command classification would otherwise have gated it"
+        # vector.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "release"
+            bin_dir = release / "bin"
+            bin_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(tool_root, 0o700)
+            os.chmod(release, 0o700)
+            node = bin_dir / "node"
+            cli = release / "cli.js"
+            node.write_text(
+                "#!/usr/bin/python3\n"
+                "import json, os, sys\n"
+                "print(json.dumps({\n"
+                "  'argv': sys.argv[1:],\n"
+                "  'resourceGuard': os.environ.get('ORCA_PRIME_AGENT_RESOURCE_GUARD'),\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            os.chmod(node, 0o700)
+            cli.write_text("// argument sentinel\n", encoding="utf-8")
+            os.chmod(cli, 0o600)
+            lifecycle_lock = tool_root / "lifecycle.lock"
+            lifecycle_lock.write_bytes(b"")
+            os.chmod(lifecycle_lock, 0o600)
+            guard = bin_dir / "prime-agent-launch-guard.py"
+            wrapper = bin_dir / "prime-agent"
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", tool_root / "state"),
+            ):
+                guard.write_bytes(installer.managed_launch_guard_script(node, cli))
+                wrapper.write_bytes(
+                    installer.managed_entrypoint_script(node, cli, guard)
+                )
+            os.chmod(guard, 0o700)
+            os.chmod(wrapper, 0o700)
+            clean = root / "clean"
+            project = root / "project"
+            clean.mkdir(mode=0o700)
+            (project / ".prime/agent").mkdir(parents=True, mode=0o700)
+            (project / ".prime/agent/settings.json").write_text(
+                "{}", encoding="utf-8"
+            )
+
+            def run_wrapper(
+                arguments: tuple[str, ...], *, cwd: Path
+            ) -> subprocess.CompletedProcess[str]:
+                environment = {"HOME": os.fspath(root), "PATH": "/usr/bin:/bin"}
+                return subprocess.run(
+                    [os.fspath(wrapper), *arguments],
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=environment,
+                )
+
+            # (a) THE FIX: every one of these previously reached the
+            # underlying CLI (and, upstream, spawned an early daemon) even
+            # in a project carrying a hostile settings.json. All must now
+            # be blocked by the settings gate absent the opt-in env var.
+            print_cases = (
+                ("status", "-p"),
+                ("list", "-p"),
+                ("doctor", "--print"),
+                ("stop", "-p", "abc"),
+                ("send", "bot", "-p"),
+                ("shutdown", "--force", "-p"),
+                ("schedule", "add", "a", "b", "--", "-p", "run"),
+            )
+            for arguments in print_cases:
+                with self.subTest(arguments=arguments, mode="print-now-protected"):
+                    result = run_wrapper(arguments, cwd=project)
+                    self.assertEqual(result.returncode, 78, result.stderr)
+                    self.assertIn(
+                        "project .prime/agent/settings.json", result.stderr
+                    )
+
+            # (b) Sanity/control: the SAME base commands without -p/--print
+            # remain unaffected (still session_start=0, no settings-gate
+            # block) in the identical project directory -- proving (a) is
+            # really the -p/--print detection firing, not some unrelated
+            # tightening of these commands.
+            control_cases = (
+                ("status",),
+                ("list",),
+                ("doctor",),
+                ("stop", "abc"),
+                ("send", "bot", "hi"),
+                ("shutdown", "--force"),
+            )
+            for arguments in control_cases:
+                with self.subTest(arguments=arguments, mode="control-unaffected"):
+                    result = run_wrapper(arguments, cwd=project)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+            # (c) In a CLEAN cwd, argv reaching the underlying CLI stays
+            # COMPLETELY UNCHANGED for these -- they remain in
+            # RUNTIME_NO_GUARD_COMMANDS (their own dispatch never accepts
+            # or needs RESOURCE_GUARDS), so forcing session_start=1 here
+            # must not corrupt their argv even though RESOURCE_GUARD_ENV is
+            # now exported for them.
+            for arguments in print_cases:
+                with self.subTest(arguments=arguments, mode="clean-cwd-argv-intact"):
+                    result = run_wrapper(arguments, cwd=clean)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    payload = installer.strict_json(result.stdout.encode("utf-8"))
+                    self.assertIsInstance(payload, dict)
+                    assert isinstance(payload, dict)
+                    self.assertEqual(payload["argv"][1:], list(arguments))
+                    self.assertIsNone(payload["resourceGuard"])
 
     def test_verify_command_state_detects_ancestor_swap_to_directory_without_command(
         self,

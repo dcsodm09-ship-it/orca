@@ -2025,6 +2025,50 @@ def managed_entrypoint_script(
     # ORCA_PRIME_AGENT_ALLOW_PROJECT_SETTINGS=1 opts back into the previous,
     # unprotected behavior for them, exactly like every other session-start
     # command already requires for project settings review.
+    #
+    # Round 10, 2026-08-18 (independent review, P1 x2 -- round 9 found round
+    # 8's fix above incomplete): "session" was still classified
+    # session_start=0 here, and "help <argument>" -- despite already being
+    # session_start=1 via the block above -- was still exempted from
+    # RESOURCE_GUARDS entirely by managed_launch_guard_script()'s
+    # RUNTIME_NO_GUARD_COMMANDS. Neither needs a hostile settings.json to be
+    # exploitable, unlike round 8's config/package finding: a project's own
+    # .prime/agent/extensions/*.js loads whenever extension discovery is not
+    # explicitly disabled, and RESOURCE_GUARDS (--no-extensions/--no-skills/
+    # --no-prompt-templates) is what disables it, gate or no gate. Two
+    # concrete, reproduced triggers, both requiring zero opt-in and no
+    # settings.json at all:
+    #   * `prime-agent help <anything upstream's fuzzy matcher misses>`
+    #     (e.g. "help zzzzzzzzzzzz", "help tols", "help mcp", "help auth",
+    #     "help -- zzzzzzzzzzzz") -- isHelpCommandRequest() (dist/cli/
+    #     command-registry.js) returns false, runPublicCommand() (dist/cli/
+    #     public-command.js) falls through its switch's default case to
+    #     continueWith(args), and the untouched args (still literally
+    #     starting with "help") reach parseArgs() as a real session start
+    #     with "help"/the argument(s) becoming ordinary positional chat
+    #     messages -- WITH extension discovery still enabled, because
+    #     RUNTIME_NO_GUARD_COMMANDS suppressed RESOURCE_GUARDS for every
+    #     "help" invocation, match or miss alike.
+    #   * `prime-agent session export ""` -- upstream's rewriteNestedCommand()
+    #     unconditionally sets result.export = args[++i] for "--export"
+    #     (the internal flag "session export" rewrites to), and an empty
+    #     string is falsy at main.js's later `if (parsed.export)` gate, so
+    #     control falls through past the early-exit export branch into the
+    #     same full, unprotected session start -- a completely realistic
+    #     trigger via plain shell expansion of an unset variable
+    #     ("session export "$UNSET_VAR""), no adversarial argv needed. This
+    #     one WAS session_start=0 here (in public_commands, directly above),
+    #     so it skipped the settings gate too, not just RESOURCE_GUARDS.
+    # "session" is removed from public_commands below so it gets the same
+    # settings-gate + RESOURCE_GUARD_ENV treatment as an ordinary
+    # session-start command (mirroring config/package's round-8 fix); the
+    # matching RESOURCE_GUARDS placement fix for both "session" and
+    # "help <argument>" lives in managed_launch_guard_script()'s
+    # guarded_arguments() (RUNTIME_PUBLIC_COMMANDS now includes "session",
+    # and "help" gets bespoke MATCH/MISS-aware placement -- see that
+    # function's comments for why a naive placement identical to
+    # RUNTIME_PUBLIC_COMMANDS's would silently corrupt a legitimate
+    # `help <realtopic>` instead of just protecting a miss).
     public_commands = "|".join(
         (
             "doctor",
@@ -2032,7 +2076,6 @@ def managed_entrypoint_script(
             "rename",
             "schedule",
             "send",
-            "session",
             "shutdown",
             "status",
             "stop",
@@ -2178,6 +2221,56 @@ def managed_entrypoint_script(
         'if [ "$managed_public_command" = "help" ] && [ "$#" -eq 1 ]; then',
         "  session_start=0",
         "fi",
+        # FIX 2, round 10, 2026-08-18 (independent review, P2): upstream's
+        # own maybeStartDaemonEarly()/shouldStartDaemonEarly() (dist/cli/
+        # daemon-launch.js) runs BEFORE any subcommand-specific dispatch --
+        # before runPublicCommand(), before parseArgs(), before this
+        # wrapper's own public/no-guard classification could possibly
+        # matter -- and shouldStartDaemonEarly() spawns a detached daemon
+        # whenever `args.includes("--print") || args.includes("-p")` is
+        # true, full stop, checked with a literal, POSITION- and
+        # "--"-AGNOSTIC array-membership test (confirmed by reading that
+        # function directly): reproduced with "status -p", "list -p",
+        # "doctor --print", "stop -p abc", "send bot -p",
+        # "shutdown --force -p", and "schedule add ... -- -p run" all
+        # spawning a daemon even though bare "status" etc. do not, and even
+        # though "--" precedes "-p" in the schedule case. The spawned
+        # daemon's cwd defaults to process.cwd() (this wrapper's own launch
+        # cwd) and its own argv is hardcoded by upstream to just
+        # "--mode daemon --daemon-socket <path>" -- none of this wrapper's
+        # RESOURCE_GUARDS or the invoking command's own flags are ever
+        # forwarded to it, by upstream's own design (the daemon is a
+        # long-lived, shared background service, not scoped to any single
+        # invocation). That means RESOURCE_GUARDS genuinely CANNOT reach
+        # the daemon process itself no matter what this wrapper does here --
+        # a documented, accepted residual gap (P2, not P1: no escalation to
+        # code execution from the daemon itself has been demonstrated,
+        # unlike FIX 1 above). What this wrapper CAN still do, and does
+        # here, is make sure the $PWD/.prime/agent/settings.json gate below
+        # still fires for any invocation upstream would treat this way --
+        # closing the "hostile settings.json short-circuits the daemon
+        # early-spawn before this wrapper's own public-command
+        # classification would otherwise have gated it" vector, the same
+        # way round 8's config/package fix and FIX 1 above do for their own
+        # commands. Deliberately simpler than upstream's exact predicate
+        # (which also exempts --mode daemon and a handful of
+        # EARLY_LAUNCH_EXCLUDED_FLAGS like --help/--version/--list-models/
+        # --export from early-spawn): this only ever makes session_start
+        # MORE protective than upstream's own daemon-early-spawn decision
+        # would strictly require, never less, and every one of those
+        # exempted combinations is already an unrealistic, non-adversarial
+        # edge case not worth the added shell complexity to special-case
+        # here. Deliberately does NOT `break` on "--" the way the
+        # --session-dir/--resume/--cwd loops below do -- upstream's own
+        # check does not respect "--" either, so neither can this one
+        # without reopening exactly the gap it closes.
+        'for managed_arg in "$@"; do',
+        '  case "$managed_arg" in',
+        "    -p|--print)",
+        "      session_start=1",
+        "      ;;",
+        "  esac",
+        "done",
         'for managed_arg in "$@"; do',
         '  [ "$managed_arg" = "--" ] && break',
         '  case "$managed_arg" in',
@@ -2254,7 +2347,7 @@ RESOURCE_GUARDS = ("--no-extensions", "--no-skills", "--no-prompt-templates")
 # module-level LEADING_COMMAND_OPTIONS constant (see its docstring there) so
 # a future leading option is recognized by both generated parsers together.
 LEADING_COMMAND_OPTIONS = {LEADING_COMMAND_OPTIONS!r}
-RUNTIME_PUBLIC_COMMANDS = frozenset(("agents", "attach", "model"))
+RUNTIME_PUBLIC_COMMANDS = frozenset(("agents", "attach", "model", "session"))
 # Historically mirrored the shell entrypoint's own "public_commands" set
 # exactly; as of round 8, 2026-08-18 it deliberately no longer does. The two
 # lists now answer two DIFFERENT questions and have intentionally diverged:
@@ -2264,23 +2357,57 @@ RUNTIME_PUBLIC_COMMANDS = frozenset(("agents", "attach", "model"))
 #     "package" were removed from that list in round 8 (P1: upstream's own
 #     handlers for both can still touch the launch project -- see
 #     managed_entrypoint_script()'s public_commands comment for the full
-#     finding) and now get full session-start protection.
-#   * RUNTIME_NO_GUARD_COMMANDS here decides a narrower, DIFFERENT question:
+#     finding) and now get full session-start protection; "session" was
+#     removed in round 10 for the same reason (see that comment's round-10
+#     paragraph -- "session export """ falls through to a real,
+#     unprotected session start).
+#   * RUNTIME_PUBLIC_COMMANDS here decides a narrower, DIFFERENT question:
 #     given that ORCA_PRIME_AGENT_RESOURCE_GUARD=1 WAS exported (a genuine
-#     session start), should RESOURCE_GUARDS actually be spliced into this
-#     command's own argv? "config", "package", and "help" stay in this set
-#     even though two of them left public_commands, because inserting
-#     RESOURCE_GUARDS at the position this script's fallback branches use
-#     for them has never been verified against upstream's real argv
-#     acceptance for these three specific commands, and getting that
-#     placement wrong is exactly the round-3/4 argv-corruption bug class
-#     below. The settings-file gate (now applying to all three by default)
-#     is the actual fix for the round-8 finding; leaving these three out of
-#     guard-flag insertion is an intentional, separate, defense-in-depth
-#     choice, not an oversight -- round 8 confirmed this set already
-#     contained all three (so guarded_arguments() cannot corrupt their argv
-#     even now that config/package can reach it with RESOURCE_GUARD_ENV=1
-#     set) and left it unchanged.
+#     session start), WHERE should RESOURCE_GUARDS actually be spliced into
+#     this command's own argv so upstream's real parser still accepts it?
+#     "agents"/"attach"/"model" answer this the same way: upstream's own
+#     dispatcher (runPublicCommand() in dist/cli/public-command.js) requires
+#     each command's own name to be literally remaining[0] (module the
+#     narrow daemon-socket-prefix cases resolve_upstream_public_command()
+#     itself models), so RESOURCE_GUARDS must land AFTER the whole
+#     command+its own arguments, never spliced in the middle -- the
+#     separator-aware placement just below does exactly that (right before
+#     a trailing "--" if present, else at the very end). "session" joined
+#     this set in round 10, 2026-08-18 (independent review, P1): verified
+#     directly against upstream's rewriteNestedCommand()/
+#     splitOperandsAndOptions() (dist/cli/public-command.js) that this same
+#     append-after-everything placement is safe for "session" too --
+#     splitOperandsAndOptions() buckets every dash-prefixed token from the
+#     FIRST one onward as "options" regardless of how many there are or
+#     what precedes them, and parseArgs() (dist/cli/args.js) recognizes
+#     RESOURCE_GUARDS by exact string equality scanned across the whole
+#     argv, not by position -- so appending them after "session export
+#     <path>" (or before a trailing "--") never disturbs the "session"/
+#     "export" token adjacency rewriteNestedCommand() itself requires, and
+#     a legitimate `session export <path>` still exits via the early
+#     `if (parsed.export)` branch in main.js exactly as before, guards or
+#     not. "help" deliberately did NOT join this set -- see
+#     is_help_command_request() and guarded_arguments() below for why a
+#     naive append-after-everything placement is UNSAFE for "help"
+#     specifically (it silently turns a legitimate `help <realtopic>` into
+#     an "Unknown command" error) and what this script does instead.
+#   * RUNTIME_NO_GUARD_COMMANDS just below answers the same "where" question
+#     for the remaining public commands, differently: NOWHERE. "config" and
+#     "package" stay in this set because inserting RESOURCE_GUARDS at the
+#     position this script's fallback branch would use for them has never
+#     been verified against upstream's real argv acceptance for those two
+#     specific commands, and getting that placement wrong is exactly the
+#     round-3/4 argv-corruption bug class below; the settings-file gate
+#     (applying to both by default since round 8) is the actual fix for the
+#     round-8 finding, and leaving these two out of guard-flag insertion
+#     remains an intentional, separate, defense-in-depth choice, not an
+#     oversight. The rest (doctor/list/rename/schedule/send/shutdown/status/
+#     stop) genuinely never read $PWD/.prime/agent/settings.json or load
+#     extensions at all -- see managed_entrypoint_script()'s public_commands
+#     for the daemon-socket commands they dispatch to instead -- so
+#     RESOURCE_GUARDS would be a no-op for them even if inserted, and this
+#     set just documents that instead of guessing a placement for flags
+#     that would never do anything anyway.
 # Checked here as a hard safety net, not merely relying on the entrypoint's
 # own session_start invariant continuing to hold: if RESOURCE_GUARD_ENV ever
 # reached this script as "1" for one of these anyway, the prior fallback
@@ -2295,13 +2422,11 @@ RUNTIME_NO_GUARD_COMMANDS = frozenset(
     (
         "config",
         "doctor",
-        "help",
         "list",
         "package",
         "rename",
         "schedule",
         "send",
-        "session",
         "shutdown",
         "status",
         "stop",
@@ -2389,11 +2514,186 @@ def resolve_upstream_public_command(arguments: list[str]) -> str | None:
     return None
 
 
+# Round 10, 2026-08-18 (independent review, P1): a faithful Python
+# re-implementation of the pinned v0.7.2 upstream's own COMMAND_SPECS /
+# REMOVED_COMMAND_NAMES / isHelpCommandRequest() / findCommandSuggestion() /
+# editDistance() (dist/cli/command-registry.js, read unminified). Needed
+# because -- unlike every other guard-placement decision in this script --
+# "help"'s own upstream dispatcher (runPublicCommand() in dist/cli/
+# public-command.js) treats `args[0] === "help" && isHelpCommandRequest(
+# args.slice(1))` as a single, all-or-nothing choice between two mutually
+# exclusive, INCOMPATIBLE argv shapes:
+#   * a MATCH (isHelpCommandRequest() true) short-circuits into
+#     printRequestedHelp(args.slice(1)), which walks args.slice(1) itself as
+#     a literal command PATH -- formatCommandHelp()/getCommandSpec() there
+#     require an EXACT path-LENGTH match, so appending anything after the
+#     real topic (RESOURCE_GUARDS included) turns a legitimate
+#     "help package" into "Unknown command: package --no-extensions
+#     --no-skills --no-prompt-templates" instead of printing package's help
+#     text (confirmed by tracing formatCommandHelp/getCommandSpec directly,
+#     not assumed). printRequestedHelp() always returns HANDLED without
+#     ever reaching SettingsManager or extension loading, so this case
+#     needs NO guards at all -- a pure passthrough, like
+#     RUNTIME_NO_GUARD_COMMANDS, is both safe and the only way to keep the
+#     real help text intact.
+#   * a MISS (isHelpCommandRequest() false) falls through runPublicCommand's
+#     switch default to continueWith(args) -- the FULL, unmodified args
+#     (still literally starting with the word "help") reach parseArgs() as
+#     a real, unprotected session start, with "help" and its argument(s)
+#     becoming ordinary positional chat messages. Before this round,
+#     RUNTIME_NO_GUARD_COMMANDS treated this identically to the match case
+#     (no guards, ever) -- so any argument upstream's fuzzy matcher misses
+#     (e.g. "help zzzzzzzzzzzz", "help tols", "help mcp", "help auth")
+#     reached a real session start with extension discovery fully enabled,
+#     in any project, no settings.json required at all.
+# guarded_arguments() below computes is_help_command_request() on the
+# ORIGINAL, unmodified topic (remaining[1:], before any guard insertion) and
+# only ever inserts guards for a confirmed miss, using the same
+# separator-aware ("--"-respecting) placement RUNTIME_PUBLIC_COMMANDS uses.
+# That placement is safe for the miss case specifically because parseArgs()
+# (dist/cli/args.js) recognizes every flag it accepts by exact string
+# equality scanned across the WHOLE argv, never by position -- so where
+# exactly the guard tokens land relative to "help"/the miss argument(s)
+# doesn't change what parseArgs() extracts from either, only whether they
+# land before a "--" (which flips parseArgs() into treating everything
+# after it as a literal positional message, guard flags included, silently
+# defeating them) matters.
+#
+# This is pinned to v0.7.2's real COMMAND_SPECS; an upstream version bump
+# that adds/renames/removes a command or subcommand needs this table
+# re-verified against the new dist/cli/command-registry.js, exactly like
+# every other version-pinned assumption in this file.
+HELP_COMMAND_PATHS = frozenset(
+    (
+        ("agents",),
+        ("attach",),
+        ("config",),
+        ("doctor",),
+        ("help",),
+        ("list",),
+        ("model",),
+        ("model", "list"),
+        ("package",),
+        ("package", "install"),
+        ("package", "list"),
+        ("package", "remove"),
+        ("package", "update"),
+        ("rename",),
+        ("schedule",),
+        ("schedule", "add"),
+        ("schedule", "cancel"),
+        ("schedule", "list"),
+        ("send",),
+        ("session",),
+        ("session", "export"),
+        ("shutdown",),
+        ("status",),
+        ("stop",),
+        ("update",),
+    )
+)
+HELP_REMOVED_COMMAND_NAMES = frozenset(
+    ("app", "daemon", "install", "manage", "remove", "uninstall")
+)
+
+
+def help_command_spec_exists(path: tuple[str, ...]) -> bool:
+    return path in HELP_COMMAND_PATHS
+
+
+def help_child_command_names(parent: tuple[str, ...]) -> list[str]:
+    depth = len(parent) + 1
+    return [
+        spec[-1]
+        for spec in HELP_COMMAND_PATHS
+        if len(spec) == depth and spec[: len(parent)] == parent
+    ]
+
+
+def help_edit_distance(left: str, right: str) -> int:
+    # Direct transcription of editDistance() (dist/cli/command-registry.js):
+    # single-row Wagner-Fischer Levenshtein distance.
+    previous = list(range(len(right) + 1))
+    for left_index in range(1, len(left) + 1):
+        diagonal = previous[0]
+        previous[0] = left_index
+        for right_index in range(1, len(right) + 1):
+            above = previous[right_index]
+            previous[right_index] = min(
+                previous[right_index] + 1,
+                previous[right_index - 1] + 1,
+                diagonal
+                + (0 if left[left_index - 1] == right[right_index - 1] else 1),
+            )
+            diagonal = above
+    return previous[len(right)]
+
+
+def help_find_command_suggestion(token: str, candidates: list[str]) -> str | None:
+    closest: tuple[str, int] | None = None
+    for candidate in candidates:
+        distance = help_edit_distance(token, candidate)
+        if closest is None or distance < closest[1]:
+            closest = (candidate, distance)
+    if closest is None or closest[1] > max(2, len(token) // 3):
+        return None
+    return closest[0]
+
+
+def is_help_command_request(path: list[str]) -> bool:
+    path_tuple = tuple(path)
+    if len(path_tuple) == 0 or help_command_spec_exists(path_tuple):
+        return True
+    if path_tuple[0] in HELP_REMOVED_COMMAND_NAMES:
+        return True
+    if help_command_spec_exists(path_tuple[:1]):
+        return True
+    parent = path_tuple[:-1]
+    candidates = help_child_command_names(parent)
+    return help_find_command_suggestion(path_tuple[-1], candidates) is not None
+
+
+def insert_resource_guards_before_separator(
+    prefix: list[str], remaining: list[str]
+) -> list[str]:
+    try:
+        separator = remaining.index("--")
+    except ValueError:
+        separator = len(remaining)
+    return [
+        *prefix,
+        *remaining[:separator],
+        *RESOURCE_GUARDS,
+        *remaining[separator:],
+    ]
+
+
 def guarded_arguments(arguments: list[str]) -> list[str]:
     if os.environ.pop(RESOURCE_GUARD_ENV, None) != "1":
         return arguments
     resolved_command = resolve_upstream_public_command(arguments)
     prefix, remaining = split_leading_options(arguments)
+    if resolved_command == "help":
+        # remaining[0] is always the literal "help" token whenever
+        # resolved_command is "help": resolve_upstream_public_command()
+        # only ever resolves to "help" via its second branch (arguments[0]
+        # itself -- its daemon-socket branch only ever resolves to "stop"
+        # or "rename"), and that branch's own guard condition
+        # ("arguments[0] not in LEADING_COMMAND_OPTIONS and ...") is exactly
+        # the condition under which split_leading_options()'s loop leaves
+        # remaining unchanged (breaks on its very first iteration), so
+        # remaining[0] == arguments[0] == "help" here always.
+        if is_help_command_request(remaining[1:]):
+            # MATCH: printRequestedHelp() will short-circuit before ever
+            # reaching extension loading, and inserting anything here would
+            # corrupt the specific help text upstream prints -- passthrough.
+            return [*prefix, *remaining]
+        # MISS: falls through to a real, unprotected session start upstream
+        # -- insert guards using the same separator-aware placement as
+        # RUNTIME_PUBLIC_COMMANDS below (safe here because parseArgs()
+        # recognizes RESOURCE_GUARDS by exact string equality regardless of
+        # position, as long as they land before any "--").
+        return insert_resource_guards_before_separator(prefix, remaining)
     if resolved_command is not None and resolved_command in RUNTIME_NO_GUARD_COMMANDS:
         # A non-session public command never receives resource-guard flags,
         # regardless of how it was invoked -- matches the entrypoint's own
@@ -2403,16 +2703,7 @@ def guarded_arguments(arguments: list[str]) -> list[str]:
         # actually resolve to this command may skip guards.
         return [*prefix, *remaining]
     if resolved_command is not None and resolved_command in RUNTIME_PUBLIC_COMMANDS:
-        try:
-            separator = remaining.index("--")
-        except ValueError:
-            separator = len(remaining)
-        return [
-            *prefix,
-            *remaining[:separator],
-            *RESOURCE_GUARDS,
-            *remaining[separator:],
-        ]
+        return insert_resource_guards_before_separator(prefix, remaining)
     return [*prefix, *RESOURCE_GUARDS, *remaining]
 
 
