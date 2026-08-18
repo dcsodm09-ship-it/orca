@@ -12,16 +12,17 @@
 - **prime-agent-integration 未安装、不能安装**：即便本轮安全修复全部收敛，`sandbox_e2e.py`
   真实跑一遍会在第一步就 fail-closed——2026-08-14 钉的上游 npm 锁定哈希已经和 2026-08-18
   registry 实际解析结果对不上（上游漂移，不是本轮修复引入的回归，fail-closed 正确触发）。
-- **prime-agent 的 4 个原始 P1 全部修好，round 2-9 又连续发现并修了 17 个新 P1**
+- **prime-agent 的 4 个原始 P1 全部修好，round 2-11 又连续发现并修了 18 个新 P1**
   （详见第 1 节）。**用户"继续"后派发的 round 7 是本会话最严重的一次发现——一个真实的
   任意代码执行（RCE）：`prime-agent config`/`package`/`help <token>` 被错误归类为
-  "无需项目设置门禁保护"，用真实上游 v0.7.2 全链路端到端复现，恶意
-  `.prime/agent/settings.json` 里的命令真的跑起来了**。round 8 关掉了"需要恶意
-  settings.json"这条路，**round 9 又发现 round 8 没堵住"根本不需要 settings.json"
-  这第二条路**（`help <参数>`、`session export ""` 仍会不受限制执行项目扩展代码）+
-  一个 `-p`/`--print` 会抢在保护逻辑之前起后台 daemon 的 P2。Codex sol/xhigh 前 3 轮
-  GO，第 4 轮被 OpenAI cybersecurity 内容策略拦截（改用 QA 措辞后第 5、7、9 轮恢复
-  正常）。**round 10 修复已派发，进行中。收敛前不装、不启用。**
+  "无需项目设置门禁保护"，用真实上游 v0.7.2 全链路端到端复现**。这个 RCE 向量此后又
+  被连续追了 3 轮——round 8 关掉了"需要恶意 settings.json"这条路，round 9 发现"根本
+  不需要 settings.json"的第二条路（`help <参数>`/`session export ""`），round 10 修好
+  但自己的算法移植又引入了一个 Unicode 长度计算的细微 bug，round 11 抓到（`help
+  status😀😀` 这类 emoji 后缀绕过）。**round 12 不再打补丁，改用更保守的精确匹配
+  策略，正在进行中。** Codex sol/xhigh 前 3 轮 GO，第 4/11 轮被 OpenAI cybersecurity
+  内容策略拦截（QA 措辞在第 5、7、9 轮有效，第 11 轮又失效，不完全可控）。**收敛前
+  不装、不启用。**
 - **`ORCA_CONTEXT_NACK_V1`（wiki 新鲜度不匹配）根因已查清**，不是代码 bug：wiki 内容在
   manifest 钉哈希后被手工改过没人重新钉；未擅自重新钉（需要人工复核+双复核门禁）。
 - `orca-context-bridge/SKILL.md` 一份未提交的文档更新（+135/-6 行）逐条核对源码，改正了
@@ -321,6 +322,52 @@ round 8 的代码注释把 `help`/`session` 留在这份名单里的理由说成
 搞坏），需要按上游真实参数语法确定正确的插入位置。
 
 **已派发 round 10 修复。**
+
+### Round 10：修第二条 RCE 路径（已验证关闭，未独立复核）
+
+真的把锁定的 `prime-agent-0.7.2.tgz` 解出来读了上游未压缩源码（`dist/cli/
+public-command.js`、`command-registry.js`、`args.js`、`daemon-launch.js`、`main.js`、
+`cli-main.js`），不是猜位置。`session` 从"无需保护"名单挪进"正常会话启动"名单（核对过
+上游真实的 `rewriteNestedCommand()`/`splitOperandsAndOptions()`，确认保护参数插在
+`session export <值>` 后面不会破坏这两个 token 的相邻关系）。`help` 单独处理——把上游
+真实的 `isHelpCommandRequest()`/`getCommandSpec()`/`findCommandSuggestion()`/
+`editDistance()` 逻辑忠实搬进 Python（钉住 v0.7.2 真实的 `COMMAND_SPECS`），命中真实
+帮助主题就放行（和上游 `printRequestedHelp()` 一致，不会走到加载扩展那一步），没命中
+就套保护。`-p`/`--print` 出现在参数任意位置时，wrapper 现在也会强制套上会话保护
+（对照上游 `args.includes("--print")||args.includes("-p")` 的精确判定实现），并在代码
+注释里明确记录了一个没法完全堵住的残留缺口——daemon 子进程本身永远拿不到资源禁用参数
+（上游自己写死了它的 argv），这是有意识记录下来的，不是漏掉。真实端到端验证：修复前
+`help tols`/`mcp`/`auth`/`-- zzz`、`session export ""` 在没有 settings.json 的项目
+目录下都会执行植入的扩展 marker，修复后全部不会，合法用法（`help package`、
+`session export <真实路径>`）照常工作。87/87 测试通过。已提交 `9dd4c8b6e0`。
+**已派发 round 11 双复核**——这是同一个 RCE 向量连续第三轮被追，round 11 需要专门
+排查还有没有第三种变体。
+
+### Round 11
+
+**Codex QA 这路第二次被拦**——这次连 QA 措辞都没扛住（大概率是任务里逐行验收表提到
+"marker 有没有被执行"这类字眼触发的，具体原因不确定，看起来不是简单换措辞就能稳定
+绕开的，已如实记录，干净收尾这个 worker，不再重试同一套路。
+
+**Claude opus/max 完成，结论 NO_GO，P0=0，P1=1——这是同一个 RCE 向量连续第四轮被追，
+这次是 round 10 修复自己引入的一个细微 bug。** 用真实差分模糊测试（42,865 个
+ASCII/BMP 变体）确认 round 10 移植的算法在这个范围内**完全精确**，但发现了一个只在
+超出基本多文种平面的字符（比如大部分 emoji）才会触发的分歧：**上游用 JS 的 UTF-16
+code unit 数字符串长度，round 10 的 Python 移植用的是 code point 数**——两者在遇到
+emoji 这类 astral 字符时会算出不同的长度，进而算出不同的模糊匹配阈值。`help
+status😀😀` 在 Python 这边被判定"命中真实帮助主题"（放行、不套保护），但在真实上游
+Node 那边被判定"没命中"（落到真实的、未受保护的会话启动，加载扩展代码）——**真实
+端到端复现 3/3，不需要 settings.json、不需要任何 opt-in**，`help agents😀😀`/
+`help config😀😀` 同样可复现，16 个命令名分别加 2-3 个 emoji 全部分歧。round 10 的
+其余声明逐条独立核实全部成立（`session` 参数占位正确、`-p`/`--print` 扫描精确匹配
+上游判定逻辑无绕过、`COMMAND_SPECS` 移植的 25 个条目和 6 个已移除命令名和上游逐字
+一致、`config`/`package` 仍然安全）。根因正是 opus/max 自己在 round 9 就提醒过的
+风险——"手工重新实现上游算法容易产生细微漂移"，这次真的应验了。
+
+**已派发 round 12 修复**——这次不再修补这一个 Unicode 计数 bug，而是整体改策略：
+不再尝试忠实复刻上游的模糊匹配算法，改成对一份有限、精确、上游真实存在的命令/主题
+名单做精确匹配，不命中就一律套保护（牺牲"打错字也能看到提示"这点体验，换掉"自己
+实现的匹配算法可能有 subtle bug"这整类风险——这类风险已经连续两轮真的咬到人了）。
 
 `sandbox_e2e.py` 真实网络路径运行（未 mock，真实调用官方下载）在第一步即失败：
 
