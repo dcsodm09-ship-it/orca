@@ -12,14 +12,16 @@
 - **prime-agent-integration 未安装、不能安装**：即便本轮安全修复全部收敛，`sandbox_e2e.py`
   真实跑一遍会在第一步就 fail-closed——2026-08-14 钉的上游 npm 锁定哈希已经和 2026-08-18
   registry 实际解析结果对不上（上游漂移，不是本轮修复引入的回归，fail-closed 正确触发）。
-- **prime-agent 的 4 个原始 P1 全部修好，round 2-7 又连续发现并修了 13 个新 P1**
+- **prime-agent 的 4 个原始 P1 全部修好，round 2-9 又连续发现并修了 17 个新 P1**
   （详见第 1 节）。**用户"继续"后派发的 round 7 是本会话最严重的一次发现——一个真实的
   任意代码执行（RCE）：`prime-agent config`/`package`/`help <token>` 被错误归类为
   "无需项目设置门禁保护"，用真实上游 v0.7.2 全链路端到端复现，恶意
-  `.prime/agent/settings.json` 里的命令真的跑起来了**。Codex sol/xhigh 前 3 轮 GO，
-  第 4 轮被 OpenAI cybersecurity 内容策略拦截（改用 QA 措辞后第 5、7 轮恢复正常，且
-  round 7 独立收敛确认了一个和 opus/max 相同的目录项 TOCTOU）。**round 8 修复
-  （RCE 优先）已派发，进行中。收敛前不装、不启用。**
+  `.prime/agent/settings.json` 里的命令真的跑起来了**。round 8 关掉了"需要恶意
+  settings.json"这条路，**round 9 又发现 round 8 没堵住"根本不需要 settings.json"
+  这第二条路**（`help <参数>`、`session export ""` 仍会不受限制执行项目扩展代码）+
+  一个 `-p`/`--print` 会抢在保护逻辑之前起后台 daemon 的 P2。Codex sol/xhigh 前 3 轮
+  GO，第 4 轮被 OpenAI cybersecurity 内容策略拦截（改用 QA 措辞后第 5、7、9 轮恢复
+  正常）。**round 10 修复已派发，进行中。收敛前不装、不启用。**
 - **`ORCA_CONTEXT_NACK_V1`（wiki 新鲜度不匹配）根因已查清**，不是代码 bug：wiki 内容在
   manifest 钉哈希后被手工改过没人重新钉；未擅自重新钉（需要人工复核+双复核门禁）。
 - `orca-context-bridge/SKILL.md` 一份未提交的文档更新（+135/-6 行）逐条核对源码，改正了
@@ -287,7 +289,38 @@ opt-in（`ORCA_PRIME_AGENT_ALLOW_PROJECT_SETTINGS=1`），资源保护会跟着�
 之后，两道本该独立的防线才会一起松动。严重度低于 round 8 的 RCE（需要用户先主动
 opt-in），但确实是文档承诺和实现不一致，值得修。
 
-Claude opus/max 这路仍在进行中。
+**Claude opus/max 这路完成，结论 NO_GO，P0=0，P1=2，P2=1——round 8 的 RCE 修复不完整。**
+
+round 7 的 RCE（针对"有恶意 `settings.json`"这条路）、round 8 的目录项 TOCTOU、裸
+`help` 无条件安全的说法，逐条独立验证（自己去读了上游真实源码的三处调用点，不是照抄
+round 8 的说法），确认真正修复。但发现 **round 8 的修复方向本身有个漏洞**：
+
+- **P1-1**：`help <参数>` 仍然默认（**不需要任何 opt-in、不需要 settings.json 存在**）
+  执行 `.prime/agent/extensions/*.js`——因为 round 8 特意把 `help` 留在
+  `RUNTIME_NO_GUARD_COMMANDS`（"不加保护参数"名单）里，理由是"settings.json 门禁才是
+  真正的防线"，但这个理由有洞：**门禁只在 `settings.json` 真的存在时才生效**，而一个
+  恶意项目根本不需要 `settings.json` 就能放 `.prime/agent/extensions/evil.js`——真正
+  能挡住这种情况的是资源禁用参数（`--no-extensions` 等），而 `help` 现在完全拿不到
+  这层保护。真实复现：`help zzzzzzzzzzzz`、`help tols`、`help mcp` 等在**没有
+  settings.json、没有任何 opt-in** 的项目目录下，执行了扩展代码。
+- **P1-2**：`session export ""`（空字符串——上游代码无条件把 `args[++i]` 赋给
+  `result.export`，空字符串在后面 `if (parsed.export)` 判断里是 falsy，于是继续走进
+  完整运行时路径）同样会不受限制地执行扩展代码。**这个触发条件非常现实**：shell 里对
+  一个未设置的变量做展开（`session export "$UNSET_VAR"`）天然就会产生空字符串，不需要
+  刻意构造恶意参数。
+- **P2**：`-p`/`--print` 出现在参数任意位置时，上游会在 wrapper 自己的公共命令分类/
+  保护逻辑跑之前就抢先起一个后台 daemon（`status -p`、`doctor --print`、
+  `stop -p abc` 等全部复现），且这个 daemon 的 spawn 完全没有转发资源禁用参数——
+  连普通已受保护的会话启动也是如此。复现了 daemon 会被起来、cwd 继承自恶意目录，
+  但没能证明能从这个 daemon 本身升级到代码执行，所以定 P2 不是 P1。
+
+根因和 round 8 一样：`RUNTIME_NO_GUARD_COMMANDS` 是第三份手工维护的命令分类名单，
+round 8 的代码注释把 `help`/`session` 留在这份名单里的理由说成"有意为之的独立纵深
+防御"，但对这两个命令来说这根本不是纵深防御的第二层——是**唯一剩下的那层防线被自己
+关掉了**。修复不能简单粗暴地把保护参数加进去（占位不对会把 `help zzz` 这类调用的语义
+搞坏），需要按上游真实参数语法确定正确的插入位置。
+
+**已派发 round 10 修复。**
 
 `sandbox_e2e.py` 真实网络路径运行（未 mock，真实调用官方下载）在第一步即失败：
 
