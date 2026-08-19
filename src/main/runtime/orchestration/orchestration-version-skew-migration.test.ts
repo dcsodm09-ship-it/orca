@@ -426,6 +426,60 @@ describe('OrchestrationDb version-skew migration', () => {
     expect(remaining[0]?.id).toBe('legacy_p_2')
   })
 
+  // Why (round 14, fix for a real bug an independent review found and reproduced): a plain
+  // highest-rowid tie-break could keep a 'revoked' duplicate over a 'committed' one - the one
+  // status that is BY DEFINITION unrepairable (commitLegacyCompatibilityPrincipal permanently
+  // refuses a revoked principal), directly undermining round 13's own "must not make a
+  // repairable state unrepairable" fix. The revoked row here has the HIGHER rowid (inserted
+  // second) specifically to prove the fix doesn't just fall back to highest-rowid regardless.
+  it('prefers a non-revoked legacy coordinator principal over a revoked one when deduping', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'orca-db-version-skew-dup-coordinator-revoked-'))
+    const dbPath = join(tempDir, 'orchestration.db')
+    const seed = new OrchestrationDb(dbPath)
+    const run = seed.createRun({
+      objective: 'dup coordinator revoked-tiebreak repro',
+      coordinatorHandle: 'term_coord',
+      coordinatorPaneKey: 'tab_coord:22222222-2222-4222-9222-222222222222'
+    })
+    seed.close()
+    const raw = new Database(dbPath)
+    raw.exec('DROP INDEX idx_legacy_principal_coordinator')
+    const insertPrincipal = raw.prepare(
+      `INSERT INTO legacy_compatibility_principals (
+         id, run_id, dispatch_id, role, host_scope, terminal_handle, pane_key,
+         launch_token_hash, process_incarnation, status
+       ) VALUES (?, ?, NULL, 'coordinator', '{}', ?, ?, ?, NULL, ?)`
+    )
+    insertPrincipal.run(
+      'legacy_p_committed',
+      run.id,
+      'term_coord_committed',
+      'tab_committed:leaf',
+      'hash_committed',
+      'committed'
+    )
+    // Inserted AFTER (so it would win a plain highest-rowid tie-break) but revoked.
+    insertPrincipal.run(
+      'legacy_p_revoked',
+      run.id,
+      'term_coord_revoked',
+      'tab_revoked:leaf',
+      'hash_revoked',
+      'revoked'
+    )
+    raw.pragma(`user_version = ${SCHEMA_VERSION}`)
+    raw.close()
+
+    db = new OrchestrationDb(dbPath)
+
+    const rawAfter = (db as unknown as { db: Database.Database }).db
+    const remaining = rawAfter
+      .prepare("SELECT id, status FROM legacy_compatibility_principals WHERE role = 'coordinator'")
+      .all() as { id: string; status: string }[]
+    expect(remaining).toHaveLength(1)
+    expect(remaining[0]).toMatchObject({ id: 'legacy_p_committed', status: 'committed' })
+  })
+
   // Why (round 12): the v29 tasks CHECK-constraint probe is a distinct fact from the
   // terminal_reason/replacement_task_id columns the generic matrix already covers (both are
   // added in the SAME rebuild, but the resolver needs to check the CHECK independently - see

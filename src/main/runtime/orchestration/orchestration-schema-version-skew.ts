@@ -115,7 +115,9 @@ const POST_V6_INDEXES = [
 // legacy_compatibility_principals's own table-level UNIQUE(role, run_id, dispatch_id) does not
 // cover the coordinator case, since SQLite treats every NULL dispatch_id as distinct. Missing
 // them wouldn't misjudge completeness in a way that crashes, but would silently let
-// getLegacyCompatibilityPrincipal's .get() pick an arbitrary one of several duplicates.
+// getLegacyCoordinatorPrincipal / commitLegacyCompatibilityPrincipal's own `existing` lookup
+// each pick an arbitrary one of several duplicates (round 14 correction: not
+// getLegacyCompatibilityPrincipal, which looks up by primary key and is fully deterministic).
 // Why round 13 also touched migrate-legacy-contract-storage.ts, not just this file: adding these
 // 2 entries here changed a database with pre-existing duplicate principals from "boots
 // degraded" to "rewinds to 6, then throws forever on this exact CREATE UNIQUE INDEX re-running

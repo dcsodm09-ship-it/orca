@@ -57,16 +57,41 @@ export function migrateLegacyContractStorage(this: OrchestrationDb): void {
     -- duplicate coordinator/worker principals (only reachable via external corruption/repair
     -- tooling, never via normal writes - commitLegacyCompatibilityPrincipal's own SELECT-then-
     -- INSERT is serialized under BEGIN IMMEDIATE) used to boot in a silently-degraded state
-    -- (getLegacyCompatibilityPrincipal's .get() picks one of several arbitrarily). Once this
-    -- migration's own idempotent re-run started being trusted as a completeness signal (the
-    -- schema-version-skew probe added in round 12), that database instead hit this exact
-    -- CREATE UNIQUE INDEX on its own leftover duplicates and threw, permanently: a completeness
-    -- check that diagnoses a repairable state correctly must not also make it unrepairable.
-    -- Keep the most recently written row per (run_id, role='coordinator') and per
-    -- (dispatch_id, role='worker') group; this is deliberately a "most recent wins" tie-break,
-    -- not a judgment about which principal was semantically more valid - there is no timestamp
-    -- column on this table to do better, and any single deterministic winner is strictly an
-    -- improvement over refusing to boot at all.
+    -- (getLegacyCoordinatorPrincipal / commitLegacyCompatibilityPrincipal's own "existing"
+    -- lookup can each pick a different one of several arbitrarily). Once this migration's own
+    -- idempotent re-run started being trusted as a completeness signal (the schema-version-skew
+    -- probe added in round 12), that database instead hit this exact CREATE UNIQUE INDEX on its
+    -- own leftover duplicates and threw, permanently: a completeness check that diagnoses a
+    -- repairable state correctly must not also make it unrepairable.
+    -- Why round 14 also added the 2 DELETEs directly below (fix for a real bug an independent
+    -- review found and reproduced): a plain MAX(rowid) tie-break could keep a 'revoked'
+    -- duplicate over a 'committed'/'settled' one, which is the one status that is BY DEFINITION
+    -- unrepairable (commitLegacyCompatibilityPrincipal permanently refuses a revoked principal)
+    -- - directly undermining this fix's own stated purpose. Prefer any non-revoked row over a
+    -- revoked one first; only once a group is either all-non-revoked or all-revoked does the
+    -- MAX(rowid) tie-break below decide among the (now status-homogeneous) remainder - there is
+    -- still no timestamp column to do better than that.
+    -- Why "highest rowid", not "most recently inserted" (round 14 accuracy note, an independent
+    -- review found this claim overstated): SQLite does not guarantee implicit rowids track
+    -- insertion order across VACUUM or explicit-rowid repair tooling - MAX(rowid) is still a
+    -- fully deterministic tie-break (the same row wins every time this migration re-runs), just
+    -- not provably "the newest one" in every conceivable corrupted-database scenario.
+    DELETE FROM legacy_compatibility_principals
+      WHERE role = 'coordinator' AND status = 'revoked'
+        AND EXISTS (
+          SELECT 1 FROM legacy_compatibility_principals other
+          WHERE other.role = 'coordinator'
+            AND other.run_id = legacy_compatibility_principals.run_id
+            AND other.status != 'revoked'
+        );
+    DELETE FROM legacy_compatibility_principals
+      WHERE role = 'worker' AND status = 'revoked'
+        AND EXISTS (
+          SELECT 1 FROM legacy_compatibility_principals other
+          WHERE other.role = 'worker'
+            AND other.dispatch_id = legacy_compatibility_principals.dispatch_id
+            AND other.status != 'revoked'
+        );
     DELETE FROM legacy_compatibility_principals
       WHERE role = 'coordinator'
         AND rowid NOT IN (
@@ -82,6 +107,12 @@ export function migrateLegacyContractStorage(this: OrchestrationDb): void {
           GROUP BY dispatch_id
         );
 
+    -- Why these 2 indexes are safe to create here, unlike most of this file's other artifacts
+    -- (round 14 accuracy note, an independent review found this dependency undocumented): they
+    -- exist ONLY via this migration, never via createTables()'s current-schema CREATE ... IF NOT
+    -- EXISTS pass (which runs before migrate() and would otherwise throw on the very duplicates
+    -- the DELETEs above exist to clear, bypassing the repair entirely) - if either index is ever
+    -- added to createTables() too, the DELETEs above must move there as well, or be run first.
     CREATE UNIQUE INDEX IF NOT EXISTS idx_legacy_principal_coordinator
       ON legacy_compatibility_principals(run_id)
       WHERE role = 'coordinator';
