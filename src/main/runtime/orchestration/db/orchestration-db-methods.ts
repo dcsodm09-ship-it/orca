@@ -40,6 +40,7 @@ import type { LegacyCoordinatorMailTakeoverMethods } from './runs/legacy-coordin
 import type { AdoptLegacyRunMethods } from './schema/adopt-legacy-run'
 import type { BackfillLegacyQuestionThreadsMethods } from './schema/backfill-legacy-question-threads'
 import type { CreateTablesMethods } from './schema/create-tables'
+import type { DedupeLegacyCompatibilityPrincipalsMethods } from './schema/dedupe-legacy-compatibility-principals'
 import type { MigrateLegacyContractStorageMethods } from './schema/migrate-legacy-contract-storage'
 import type { SchemaMigrateMethods } from './schema/migrate'
 import type { SchemaColumnProbesMethods } from './schema/schema-column-probes'
@@ -64,6 +65,7 @@ export type OrchestrationDbMethods = CreateTablesMethods &
   SchemaMigrateMethods &
   SchemaColumnProbesMethods &
   MigrateLegacyContractStorageMethods &
+  DedupeLegacyCompatibilityPrincipalsMethods &
   BackfillLegacyQuestionThreadsMethods &
   AdoptLegacyRunMethods &
   MutationReceiptStoreMethods &

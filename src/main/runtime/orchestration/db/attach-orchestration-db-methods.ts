@@ -40,6 +40,7 @@ import { attachLegacyCoordinatorMailTakeover } from './runs/legacy-coordinator-m
 import { attachAdoptLegacyRun } from './schema/adopt-legacy-run'
 import { attachBackfillLegacyQuestionThreads } from './schema/backfill-legacy-question-threads'
 import { attachCreateTables } from './schema/create-tables'
+import { attachDedupeLegacyCompatibilityPrincipals } from './schema/dedupe-legacy-compatibility-principals'
 import { attachMigrateLegacyContractStorage } from './schema/migrate-legacy-contract-storage'
 import { attachSchemaMigrate } from './schema/migrate'
 import { attachSchemaColumnProbes } from './schema/schema-column-probes'
@@ -65,6 +66,7 @@ export function attachOrchestrationDbMethods(ctor: { prototype: object }): void 
   attachSchemaMigrate(ctor)
   attachSchemaColumnProbes(ctor)
   attachMigrateLegacyContractStorage(ctor)
+  attachDedupeLegacyCompatibilityPrincipals(ctor)
   attachBackfillLegacyQuestionThreads(ctor)
   attachAdoptLegacyRun(ctor)
   attachMutationReceiptStore(ctor)

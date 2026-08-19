@@ -434,6 +434,14 @@ describe('OrchestrationDb version-skew migration', () => {
   // refuses a revoked principal), directly undermining round 13's own "must not make a
   // repairable state unrepairable" fix. The revoked row here has the HIGHER rowid (inserted
   // second) specifically to prove the fix doesn't just fall back to highest-rowid regardless.
+  // Why the run's coordinator_handle is cleared to NULL below (round 16 correction, an
+  // independent review found the original seed - a handle unrelated to either duplicate - had
+  // silently become a round-16 repro instead of a round-14 one): round 16 added a tier that
+  // INVERTS this preference specifically when the run has a live, non-NULL coordinator_handle
+  // that matches neither duplicate (every duplicate is then known-stale, so prefer 'revoked' -
+  // see that tier's own comment). This test exists to isolate round 14's still-real fallback
+  // tier - genuinely no live-binding information at all - not round 16's; a separate dedicated
+  // test below covers round 16's inverted case.
   it('prefers a non-revoked legacy coordinator principal over a revoked one when deduping', () => {
     tempDir = mkdtempSync(join(tmpdir(), 'orca-db-version-skew-dup-coordinator-revoked-'))
     const dbPath = join(tempDir, 'orchestration.db')
@@ -446,6 +454,7 @@ describe('OrchestrationDb version-skew migration', () => {
     seed.close()
     const raw = new Database(dbPath)
     raw.exec('DROP INDEX idx_legacy_principal_coordinator')
+    raw.prepare('UPDATE runs SET coordinator_handle = NULL WHERE id = ?').run(run.id)
     const insertPrincipal = raw.prepare(
       `INSERT INTO legacy_compatibility_principals (
          id, run_id, dispatch_id, role, host_scope, terminal_handle, pane_key,
@@ -621,6 +630,145 @@ describe('OrchestrationDb version-skew migration', () => {
       .all() as { id: string; status: string }[]
     expect(remaining).toHaveLength(1)
     expect(remaining[0]).toMatchObject({ id: 'legacy_p_worker_live_settled', status: 'settled' })
+  })
+
+  // Why (round 16, fix for a real P2 an independent review found in round 15's own fix): round
+  // 15's authoritative-match tier is a no-op in the MOST common post-takeover shape - a run's
+  // live coordinator_handle after a genuine handoff belongs to the NEW coordinator, which never
+  // appears as a legacy principal's terminal_handle at all (confirmed empirically: the new
+  // coordinator never gets a legacy_compatibility_principals row of its own). When the run HAS a
+  // live coordinator_handle but it matches NEITHER duplicate, every duplicate is definitively
+  // stale - in that case, prefer 'revoked' over 'committed' (the OPPOSITE of round 14's default),
+  // because a surviving 'committed' row would let a stale legacy identity still authenticate via
+  // commitLegacyCompatibilityPrincipal's existing-row match and exert live legacy operations
+  // against a run it no longer has authority over.
+  it('prefers a revoked legacy coordinator principal over a committed one when the run coordinator_handle matches neither', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'orca-db-version-skew-dup-coordinator-known-stale-'))
+    const dbPath = join(tempDir, 'orchestration.db')
+    const seed = new OrchestrationDb(dbPath)
+    const run = seed.createRun({
+      objective: 'dup coordinator known-stale repro',
+      coordinatorHandle: 'term_coord_modern',
+      coordinatorPaneKey: 'tab_coord:77777777-7777-4777-9777-777777777777'
+    })
+    seed.close()
+    const raw = new Database(dbPath)
+    raw.exec('DROP INDEX idx_legacy_principal_coordinator')
+    const insertPrincipal = raw.prepare(
+      `INSERT INTO legacy_compatibility_principals (
+         id, run_id, dispatch_id, role, host_scope, terminal_handle, pane_key,
+         launch_token_hash, process_incarnation, status
+       ) VALUES (?, ?, NULL, 'coordinator', '{}', ?, ?, ?, NULL, ?)`
+    )
+    // Inserted FIRST (lower rowid) and committed - would win both round 14's status preference
+    // AND a plain highest-rowid tie-break, so this genuinely isolates the round-16 inversion.
+    insertPrincipal.run(
+      'legacy_p_known_stale_committed',
+      run.id,
+      'term_coord_old_a',
+      'tab_a:leaf',
+      'hash_a',
+      'committed'
+    )
+    insertPrincipal.run(
+      'legacy_p_known_stale_revoked',
+      run.id,
+      'term_coord_old_b',
+      'tab_b:leaf',
+      'hash_b',
+      'revoked'
+    )
+    raw.pragma(`user_version = ${SCHEMA_VERSION}`)
+    raw.close()
+
+    db = new OrchestrationDb(dbPath)
+
+    const rawAfter = (db as unknown as { db: Database.Database }).db
+    const remaining = rawAfter
+      .prepare("SELECT id, status FROM legacy_compatibility_principals WHERE role = 'coordinator'")
+      .all() as { id: string; status: string }[]
+    expect(remaining).toHaveLength(1)
+    expect(remaining[0]).toMatchObject({ id: 'legacy_p_known_stale_revoked', status: 'revoked' })
+  })
+
+  // Why (round 16): mirrors the coordinator case above for the worker/dispatch tier - 'settled' is
+  // the worker analogue of 'revoked' (workers never reach 'revoked' in practice - see the
+  // defensive-symmetry note above), since requireCommittedLegacyPrincipal and
+  // legacy-lifecycle-operation.ts both already deny live legacy actions to a 'settled' principal.
+  it('prefers a settled legacy worker principal over a committed one when the dispatch assignee_handle matches neither', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'orca-db-version-skew-dup-worker-known-stale-'))
+    const dbPath = join(tempDir, 'orchestration.db')
+    const seed = new OrchestrationDb(dbPath)
+    const run = seed.createRun({
+      objective: 'dup worker known-stale repro',
+      coordinatorHandle: 'term_coord',
+      coordinatorPaneKey: 'tab_coord:88888888-8888-4888-9888-888888888888'
+    })
+    const task = seed.createTask({ spec: 'legacy worker known-stale repro', runId: run.id })
+    const dispatch = seed.createDispatchContext(task.id, 'term_worker_modern', 'tab_worker:leaf')
+    seed.close()
+    const raw = new Database(dbPath)
+    raw.exec('DROP INDEX idx_legacy_principal_dispatch')
+    raw.exec(`
+      DROP TABLE legacy_compatibility_principals;
+      CREATE TABLE legacy_compatibility_principals (
+        id                  TEXT PRIMARY KEY,
+        run_id              TEXT NOT NULL,
+        dispatch_id         TEXT,
+        role                TEXT NOT NULL CHECK(role IN ('worker', 'coordinator')),
+        host_scope          TEXT NOT NULL,
+        terminal_handle     TEXT NOT NULL,
+        pane_key            TEXT NOT NULL,
+        launch_token_hash   TEXT NOT NULL,
+        process_incarnation TEXT,
+        status              TEXT NOT NULL CHECK(status IN ('committed', 'settled', 'revoked')),
+        CHECK(
+          (role = 'worker' AND dispatch_id IS NOT NULL) OR
+          (role = 'coordinator' AND dispatch_id IS NULL)
+        )
+      );
+    `)
+    const insertPrincipal = raw.prepare(
+      `INSERT INTO legacy_compatibility_principals (
+         id, run_id, dispatch_id, role, host_scope, terminal_handle, pane_key,
+         launch_token_hash, process_incarnation, status
+       ) VALUES (?, ?, ?, 'worker', '{}', ?, ?, ?, NULL, ?)`
+    )
+    // Inserted FIRST (lower rowid) and settled - a plain highest-rowid tie-break would pick the
+    // OTHER (committed) row instead, so this genuinely isolates the round-16 inversion. (Round
+    // 14's own status-preference tier is a no-op either way here - neither row is 'revoked'.)
+    insertPrincipal.run(
+      'legacy_p_worker_known_stale_settled',
+      run.id,
+      dispatch.id,
+      'term_worker_old_b',
+      'tab_b:leaf',
+      'hash_b',
+      'settled'
+    )
+    insertPrincipal.run(
+      'legacy_p_worker_known_stale_committed',
+      run.id,
+      dispatch.id,
+      'term_worker_old_a',
+      'tab_a:leaf',
+      'hash_a',
+      'committed'
+    )
+    raw.pragma(`user_version = ${SCHEMA_VERSION}`)
+    raw.close()
+
+    db = new OrchestrationDb(dbPath)
+
+    const rawAfter = (db as unknown as { db: Database.Database }).db
+    const remaining = rawAfter
+      .prepare("SELECT id, status FROM legacy_compatibility_principals WHERE role = 'worker'")
+      .all() as { id: string; status: string }[]
+    expect(remaining).toHaveLength(1)
+    expect(remaining[0]).toMatchObject({
+      id: 'legacy_p_worker_known_stale_settled',
+      status: 'settled'
+    })
   })
 
   // Why (round 12): the v29 tasks CHECK-constraint probe is a distinct fact from the
