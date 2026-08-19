@@ -22,17 +22,23 @@ const POST_V6_COLUMNS = [
   ['legacy_adoptions', 'source_run_id'],
   ['legacy_compatibility_principals', 'id'],
   ['legacy_operation_receipts', 'principal_id'],
-  ['legacy_mail_receipts', 'principal_id'],
+  ['legacy_mail_receipts', 'principal_id']
+] as const
+
+const VERSIONED_POST_V6_COLUMNS = [
   // Why: migrate-task-terminal-states.ts's INSERT-SELECT explicitly names these three columns -
   // without probing for them here, a DB missing only this later v13-v28 addition would still be
   // judged "post-v6, skip re-migrating" and then crash the whole OrchestrationDb constructor
   // (not just createTask()) the first time that later migration runs against it.
-  ['tasks', 'created_by_pane_key'],
-  ['tasks', 'created_by_process_incarnation'],
-  ['tasks', 'created_by_run_generation']
-] as const
-
-const VERSIONED_POST_V6_COLUMNS = [
+  // Why versioned, not unversioned (fix for a real regression review found): these three land at
+  // v24 (migrate-v13-v28.ts's `if (current < 24)` block), same as the pre-existing v27 entry
+  // below - putting them in the unversioned POST_V6_COLUMNS list instead made a perfectly healthy
+  // v7-v23 database (one that predates v24 and has never needed these columns) look "incomplete"
+  // and rewound its migration start version all the way back to 6, re-running every migration
+  // from v7 - including several live-data backfills - unnecessarily.
+  { version: 24, table: 'tasks', column: 'created_by_pane_key' },
+  { version: 24, table: 'tasks', column: 'created_by_process_incarnation' },
+  { version: 24, table: 'tasks', column: 'created_by_run_generation' },
   { version: 27, table: 'federated_dispatches', column: 'to_home_acknowledged_sequence' }
 ] as const
 

@@ -105,6 +105,36 @@ describe('orchestration RPC methods', () => {
       )
     })
 
+    // Why (fix for a real false positive review found): mockCurrentWorkerStart never stubs
+    // getOrchestrationDispatchAuthority, so it returns null - exactly the "authority record
+    // absent, requireWorkerAuthority falls back to getTerminalPaneKey/
+    // getTerminalProcessIncarnation" case that made the original beforeWrite hook (comparing
+    // straight against a fresh getOrchestrationDispatchAuthority() read, no fallback) mismatch
+    // and hard-fail even though nothing had changed. The test above never catches this because
+    // its sendTerminalAgentPrompt mock never actually CALLS beforeWrite - this one does, mirroring
+    // the real runtime's contract, to prove the hook itself is correct, not just present.
+    it('does not false-positive the beforeWrite identity check when the authority record is absent (fallback path)', async () => {
+      setup()
+      mockCurrentWorkerStart()
+      vi.spyOn(runtime, 'getOrchestrationDispatchAuthority').mockReturnValue(null)
+      vi.spyOn(runtime, 'sendTerminalAgentPrompt').mockImplementation(
+        async (handle, _prompt, options) => {
+          await options?.beforeWrite?.('pty_worker')
+          return { handle, accepted: true, bytesWritten: 1 }
+        }
+      )
+      const task = db.createTask({ spec: 'implement worker start' })
+
+      const result = (await call('orchestration.workerStart', {
+        task: task.id,
+        from: 'term_coord',
+        agent: 'codex'
+      })) as { state: string; lastError?: string }
+
+      expect(result.state).toBe('ready')
+      expect(result.lastError).toBeUndefined()
+    })
+
     it('applies and reports opaque per-invocation model preferences', async () => {
       setup()
       mockCurrentWorkerStart()

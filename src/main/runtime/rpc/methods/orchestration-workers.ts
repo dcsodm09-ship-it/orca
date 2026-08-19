@@ -242,10 +242,23 @@ export const ORCHESTRATION_WORKER_START_METHODS: RpcMethod[] = [
         const startedTerminalHandle: string = terminalHandle
         await runtime.sendTerminalAgentPrompt(startedTerminalHandle, preamble, {
           beforeWrite: () => {
+            // Why (fix for a real false-positive found by review): terminalAuthority came from
+            // requireWorkerAuthority, which FALLS BACK to getTerminalPaneKey/
+            // getTerminalProcessIncarnation whenever getOrchestrationDispatchAuthority returns
+            // null or an incomplete record (disconnected pty, WSL-without-distro, etc). Comparing
+            // straight against a fresh getOrchestrationDispatchAuthority() read here - with no
+            // fallback - made the two sides read from different sources and mismatch even when
+            // nothing had actually changed, hard-failing every such dispatch. Mirror the exact
+            // same fallback chain so this only fires on a genuine identity change.
             const current = runtime.getOrchestrationDispatchAuthority(startedTerminalHandle)
+            const currentPaneKey =
+              current?.paneKey ?? runtime.getTerminalPaneKey(startedTerminalHandle)
+            const currentProcessIncarnation =
+              current?.processIncarnation ??
+              runtime.getTerminalProcessIncarnation(startedTerminalHandle)
             if (
-              current?.paneKey !== terminalAuthority.paneKey ||
-              current?.processIncarnation !== terminalAuthority.processIncarnation
+              currentPaneKey !== terminalAuthority.paneKey ||
+              currentProcessIncarnation !== terminalAuthority.processIncarnation
             ) {
               throw new OrchestrationError(
                 'worker_identity_changed',

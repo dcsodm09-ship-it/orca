@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import Database from '../../sqlite/sync-database'
+import { SCHEMA_VERSION } from './db/contract-constants'
 import { LEGACY_CONTRACT_VERSION, LEGACY_RUN_ID, OrchestrationDb } from './db'
 import { resolveOrchestrationMigrationStartVersion } from './orchestration-schema-version-skew'
 
@@ -186,6 +187,30 @@ describe('OrchestrationDb version-skew migration', () => {
 
     expect(resolveOrchestrationMigrationStartVersion(raw, 20, 19)).toBe(20)
     expect(raw.pragma('user_version', { simple: true })).toBe(20)
+
+    raw.close()
+  })
+
+  // Why (#14548 round 7 P2, fix for a real regression a review found): the three tasks.created_by_*
+  // columns land at v24 (migrate-v13-v28.ts's `if (current < 24)` block) - putting them in the
+  // UNVERSIONED POST_V6_COLUMNS list instead of VERSIONED_POST_V6_COLUMNS made a perfectly
+  // healthy pre-v24 database (v7-v23, which never needed these columns) look "incomplete" and
+  // rewound it all the way back to migration start version 6, unnecessarily re-running every
+  // migration since v7 including several live-data backfills.
+  it('does not rewind a healthy pre-v24 database missing only the v24 created_by_* columns', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'orca-db-version-skew-pre-v24-'))
+    const dbPath = join(tempDir, 'orchestration.db')
+    // Seed a fully-current, fully-migrated database, then strip it back down to what a real
+    // pre-v24 database actually looked like - present through v23, missing only the v24 columns.
+    const seed = new OrchestrationDb(dbPath)
+    seed.close()
+    const raw = new Database(dbPath)
+    raw.exec('ALTER TABLE tasks DROP COLUMN created_by_pane_key')
+    raw.exec('ALTER TABLE tasks DROP COLUMN created_by_process_incarnation')
+    raw.exec('ALTER TABLE tasks DROP COLUMN created_by_run_generation')
+    raw.pragma('user_version = 23')
+
+    expect(resolveOrchestrationMigrationStartVersion(raw, 23, SCHEMA_VERSION)).toBe(23)
 
     raw.close()
   })

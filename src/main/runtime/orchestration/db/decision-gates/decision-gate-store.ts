@@ -1,4 +1,9 @@
-import type { DecisionGateRow, DispatchContextRow, GateStatus } from '../../types'
+import {
+  isTerminalTaskStatus,
+  type DecisionGateRow,
+  type DispatchContextRow,
+  type GateStatus
+} from '../../types'
 import { OrchestrationError } from '../../orchestration-error'
 import { LEGACY_RUN_ID } from '../contract-constants'
 import { generateId } from '../generated-id'
@@ -17,6 +22,20 @@ export function createGate(
 ): DecisionGateRow {
   this.db.exec('SAVEPOINT create_gate')
   try {
+    // Why (#14548 round 7, review-found pre-existing gap): the UPDATE below unconditionally
+    // forces the task to 'blocked' with no status predicate, and `gate.requester` (the only
+    // ownership fence in this function) is optional - orchestration.gateCreate's RPC handler
+    // calls this with none, so an already-terminal task (cancelled/superseded, or even
+    // completed/failed) could be silently reopened into 'blocked' by a late/stray gate-create
+    // call, with none of cancelTask's own fencing ever having run for this transition.
+    const existingTask = this.getTask(gate.taskId)
+    if (existingTask && isTerminalTaskStatus(existingTask.status)) {
+      throw new OrchestrationError(
+        'task_not_startable',
+        `Task ${gate.taskId} cannot open a decision gate: it is already ${existingTask.status}.`,
+        { taskId: gate.taskId }
+      )
+    }
     const active = this.db
       .prepare(
         `SELECT * FROM dispatch_contexts

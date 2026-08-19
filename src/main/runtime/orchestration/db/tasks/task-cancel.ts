@@ -49,6 +49,46 @@ function cascadeCancelPendingDependents(
   }
 }
 
+// Why (#14548 round 7): a task that is itself serving as another task's `replacement_task_id`
+// can settle two ways the one-hop replacement-chain logic elsewhere doesn't automatically react
+// to on its own:
+//  - it completes AFTER already being recorded as the replacement, but before anything re-checked
+//    the original's dependents from THIS side of the link (e.g. it had already completed before
+//    cancelTask ever recorded the link — promoteReadyTasks only fires from the completing side,
+//    and only if the link existed yet when it ran).
+//  - it settles WITHOUT completing (failed/cancelled/superseded) — the substitution didn't pan
+//    out, so the original's still-pending dependents must be cascaded now, the same as if the
+//    original had been bare-cancelled with no replacement at all.
+// Exported so both cancelTask (below) and updateTaskStatus (task-status-transition.ts) can call
+// it after their own terminal transition commits.
+export function reconcileReplacementOutcome(db: OrchestrationDb, settledTaskId: string): void {
+  const originals = db.db
+    .prepare('SELECT id FROM tasks WHERE replacement_task_id = ?')
+    .all(settledTaskId) as { id: string }[]
+  if (originals.length === 0) {
+    return
+  }
+  const replacement = db.getTask(settledTaskId)
+  if (!replacement) {
+    return
+  }
+  if (replacement.status === 'completed') {
+    db.promoteReadyTasks(settledTaskId)
+    return
+  }
+  if (!isTerminalTaskStatus(replacement.status)) {
+    return
+  }
+  for (const { id: originalId } of originals) {
+    cascadeCancelPendingDependents(
+      db,
+      originalId,
+      'cancelled',
+      `Replacement ${settledTaskId} for ${originalId} did not complete (${replacement.status})`
+    )
+  }
+}
+
 // Why: first-class terminal transition for deliberately stopped/replaced work (#14548) — atomically
 // fences any active context-only Dispatch instead of asking callers to compose worker-stop + task-update.
 // Idempotent: a Task already terminal (by cancel or otherwise) is left untouched, mirroring the
@@ -131,6 +171,16 @@ export function cancelTask(
         : `Dependency ${id} was ${status}`,
       options.replacementTaskId
     )
+    // Why (#14548 round 7, GAP 1): if the replacement just linked here already completed BEFORE
+    // this call ever recorded the link (its own promoteReadyTasks ran with no link to find yet),
+    // re-check now that the link exists.
+    if (options.replacementTaskId) {
+      reconcileReplacementOutcome(this, options.replacementTaskId)
+    }
+    // Why (#14548 round 7, GAP 2): `id` may itself be serving as some OTHER task's replacement -
+    // if this cancel/supersede means `id` will never complete either, that original's still-
+    // pending dependents need cascading now, same as if there had been no replacement at all.
+    reconcileReplacementOutcome(this, id)
     const task = this.getTask(id)
     this.db.exec(`RELEASE ${CANCEL_TASK_SAVEPOINT}`)
     return task

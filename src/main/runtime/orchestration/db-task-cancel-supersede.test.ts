@@ -230,6 +230,53 @@ describe('Task cancel/supersede (#14548 Phase 1)', () => {
     expect(db.getTask(dependent.id)?.status).toBe('ready')
   })
 
+  it('promotes a pending dependent when the replacement already completed BEFORE the supersede was recorded (#14548 round 7 GAP 1)', () => {
+    const { db } = createDatabase()
+    const original = db.createTask({ spec: 'old approach' })
+    const dependent = db.createTask({ spec: 'waits on original', deps: [original.id] })
+    const replacement = db.createTask({ spec: 'new approach' })
+
+    // Why: the replacement finishes before anything ever links it to `original` - its own
+    // promoteReadyTasks(replacement.id) call found no superseded predecessor yet, so this can't
+    // rely on that call alone; cancelTask must re-check once the link actually exists.
+    db.updateTaskStatus(replacement.id, 'completed')
+    expect(db.getTask(dependent.id)?.status).toBe('pending')
+
+    db.cancelTask(original.id, 'superseded', { replacementTaskId: replacement.id })
+
+    expect(db.getTask(dependent.id)?.status).toBe('ready')
+  })
+
+  it('cascades a pending dependent once the replacement itself fails instead of completing (#14548 round 7 GAP 2)', () => {
+    const { db } = createDatabase()
+    const original = db.createTask({ spec: 'old approach' })
+    const dependent = db.createTask({ spec: 'waits on original', deps: [original.id] })
+    const replacement = db.createTask({ spec: 'new approach' })
+    db.cancelTask(original.id, 'superseded', { replacementTaskId: replacement.id })
+    expect(db.getTask(dependent.id)?.status).toBe('pending')
+
+    // Why: the substitution didn't pan out - the dependent must not be left pending forever
+    // just because SOME replacement id was once recorded.
+    db.updateTaskStatus(replacement.id, 'failed')
+
+    expect(db.getTask(dependent.id)).toMatchObject({
+      status: 'cancelled',
+      terminal_reason: expect.stringContaining(replacement.id)
+    })
+  })
+
+  it('cascades a pending dependent once the replacement itself gets cancelled (#14548 round 7 GAP 2)', () => {
+    const { db } = createDatabase()
+    const original = db.createTask({ spec: 'old approach' })
+    const dependent = db.createTask({ spec: 'waits on original', deps: [original.id] })
+    const replacement = db.createTask({ spec: 'new approach' })
+    db.cancelTask(original.id, 'superseded', { replacementTaskId: replacement.id })
+
+    db.cancelTask(replacement.id, 'cancelled', { reason: 'abandoned' })
+
+    expect(db.getTask(dependent.id)?.status).toBe('cancelled')
+  })
+
   it('does not promote a supersede-with-replacement dependent while the replacement is still unfinished', () => {
     const { db } = createDatabase()
     const original = db.createTask({ spec: 'old approach' })

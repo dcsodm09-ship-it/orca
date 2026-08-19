@@ -1,6 +1,7 @@
 import { OrchestrationError } from '../../orchestration-error'
 import type { TaskRow, TaskStatus } from '../../types'
 import { settleActiveDispatchesForTask } from '../dispatch-context/dispatch-completion'
+import { reconcileReplacementOutcome } from './task-cancel'
 import type { OrchestrationDb } from '../orchestration-db'
 
 export function updateTaskStatus(
@@ -119,6 +120,11 @@ export function updateTaskStatus(
     }
     if (terminalStatus) {
       settleActiveDispatchesForTask(this, id, status, result)
+      // Why (#14548 round 7): `id` may itself be serving as some OTHER task's replacement - if
+      // it just settled here (completed OR failed), react on that original's behalf. Complements
+      // (does not replace) the promoteReadyTasks(id) call below, which promotes id's OWN direct
+      // dependents - this instead promotes/cascades the dependents of whatever `id` REPLACED.
+      reconcileReplacementOutcome(this, id)
     }
     if (status === 'completed') {
       this.promoteReadyTasks(id)

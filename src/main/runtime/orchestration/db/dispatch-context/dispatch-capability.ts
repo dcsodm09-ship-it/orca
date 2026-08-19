@@ -34,12 +34,16 @@ export function mintDispatchCapability(
   // dispatch can legitimately claim this pane in the window between that read and this rebind, since
   // the rebind never re-validated it — mirrors the NOT EXISTS guard DISPATCH_CONTEXT_CLAIM_SQL
   // already applies at create time.
-  // Why (dispatch-authority race): the earlier `getDispatchContextById` read above is a separate
-  // statement from this UPDATE, so a concurrent writer on another connection (a second Orca window
-  // or host sharing this DB file) can flip `status` between the two — e.g. a stale-dispatch sweep
-  // failing this exact context. Re-check status IN the same UPDATE, not just at the read above;
-  // must allow the same two statuses as the initial guard ('pending' covers the composed-worker
-  // startup path via prepareStartingWorkerAuthority, 'dispatched' covers the plain --inject path).
+  // Why (dispatch-authority race): the earlier `getDispatchContextById` read above is a separate,
+  // un-transacted statement from this UPDATE (unlike prepareStartingWorkerAuthority's own inline
+  // mint, which wraps its read+write in BEGIN IMMEDIATE), so a concurrent writer on a genuinely
+  // separate connection - a second Orca instance sharing this DB file via ORCA_BYPASS_SINGLE_
+  // INSTANCE_LOCK/dev mode, or a network-mounted userData dir; app.requestSingleInstanceLock()
+  // rules this out for a normal packaged install - could flip `status` between the two, e.g.
+  // failDispatch() marking this exact context 'failed'. Re-check status IN the same UPDATE, not
+  // just at the read above; must allow the same two statuses as the initial guard ('pending' is
+  // reachable via this function too - not every 'pending' dispatch takes the composed-worker
+  // path's own separate mint - 'dispatched' covers the plain --inject path).
   const result = this.db
     .prepare(
       `UPDATE dispatch_contexts
@@ -76,7 +80,7 @@ export function mintDispatchCapability(
     // Why: disambiguate the three 0-row causes, status first — a concurrent mint already claimed
     // this row's capability, a concurrent dispatch claimed this row's target pane out from under
     // it, or (dispatch-authority race) the row left 'pending'/'dispatched' entirely between the
-    // read above and this UPDATE (e.g. a concurrent stale-dispatch sweep failed it).
+    // read above and this UPDATE (e.g. a concurrent failDispatch() call on this exact context).
     const current = this.getDispatchContextById(params.dispatchId)
     if (!current || (current.status !== 'pending' && current.status !== 'dispatched')) {
       throw new OrchestrationError(

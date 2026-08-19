@@ -352,6 +352,29 @@ describe('Task/Dispatch lifecycle guards', () => {
     }
   )
 
+  // Why (#14548 round 7, review-found pre-existing gap): createGate's only ownership fence is
+  // gate.requester, which is optional - orchestration.gateCreate's RPC handler never supplies
+  // one, and there's no active-dispatch to trip the worker guard once cancelTask has already
+  // settled it. Without this, a cancelled/superseded task could be silently reopened to
+  // 'blocked' by a late gate-create call, bypassing every fence cancelTask itself applies.
+  it.each(['cancelled', 'superseded'] as const)(
+    'refuses to open a decision gate on an already-%s task',
+    (status) => {
+      const database = createDatabase()
+      const task = database.createTask({ spec: 'terminated work' })
+      database.cancelTask(task.id, status, { reason: 'stopped' })
+
+      expect(() => database.createGate({ taskId: task.id, question: 'Proceed?' })).toThrowError(
+        expect.objectContaining({
+          code: 'task_not_startable',
+          data: { taskId: task.id }
+        })
+      )
+      expect(database.listGates({ taskId: task.id })).toHaveLength(0)
+      expect(database.getTask(task.id)?.status).toBe(status)
+    }
+  )
+
   it('rejects gate creation while a supervised worker remains active', () => {
     const database = createDatabase()
     const task = database.createTask({ spec: 'worker gate guard' })
