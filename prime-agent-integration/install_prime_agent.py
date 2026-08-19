@@ -5981,16 +5981,66 @@ def _install_locked_within_release_dir(
     )
     verify_unchanged_private_ssd_asset_digest(node, node_sha256, node_identity)
     launch_guard = bin_dir / "prime-agent-launch-guard.py"
-    atomic_create_private_file(
-        launch_guard,
-        managed_launch_guard_script(node, entrypoint, node_sha256, entrypoint_sha256),
-        0o700,
+    # Round 32, 2026-08-19 (independent Claude opus/max round-31 review,
+    # P1): the launch guard and command wrapper are the two files this
+    # installer ITSELF generates and that get exec'd on every managed
+    # `prime-agent` invocation thereafter (BIN_LINK -> command wrapper ->
+    # launch guard -> node/entrypoint), yet -- unlike node/npm-cli (pinned
+    # from a digest-verified tarball, streamed to disk) and the entrypoint
+    # (pinned to the tarball's own per-file digest, see
+    # `entrypoint_sha256` above) -- neither was ever included in
+    # `release_relative_pinned_digests` below. Both were already read back
+    # once, at creation time, by atomic_create_private_file()'s own
+    # write-then-reopen-then-compare mechanism -- but that only proves the
+    # bytes landed on disk correctly; it does not make them the trusted
+    # release baseline. That step happens later, when write_pending_
+    # install()'s tree_digest() walk reaches these paths -- and, absent a
+    # pin, tree_digest() just RECORDS whatever it finds there THEN, with
+    # zero comparison against anything. A same-UID racer who overwrites
+    # either file in the real, externally observable window between this
+    # atomic_create_private_file() call and tree_digest() later reaching
+    # this same path (bin/ sorts after lib/, so this window is the
+    # remainder of this function plus most of tree_digest()'s own walk --
+    # reproduced end-to-end, ~1.5s warm-cache on a real ~26,911-entry
+    # release tree, using the same busy-poll-for-appearance technique round
+    # 29 used against its own analogous window) has the tampered bytes
+    # silently adopted as the permanent `release_tree_sha256` baseline:
+    # finalize_pending_install()/verify() recompute the tree digest and it
+    # matches the (already-tampered) receipt, and neither file's content
+    # was covered by verify()'s own pre-exec digest check (round 29's
+    # node_sha256/npm_cli_sha256/entrypoint_sha256 loop) either --
+    # permanent RCE on every future managed invocation, verify() reports OK
+    # forever.
+    #
+    # The fix follows the SAME zero-window pattern round 29/30 established
+    # for node/npm-cli/the entrypoint, but from an even stronger starting
+    # position: this installer is the ORIGIN of the guard's and wrapper's
+    # bytes, not merely an early observer of bytes some external tarball
+    # produced, so their digest can be computed directly from the exact
+    # `bytes` object about to be written -- no separate read, no
+    # regenerating the script a second time (which would itself risk a
+    # false-positive mismatch if `managed_launch_guard_script()`/
+    # `managed_entrypoint_script()` were ever non-deterministic across
+    # calls) -- before any untrusted window exists at all. `launch_guard_
+    # raw`/`command_wrapper_raw` below are that exact object: hashed once,
+    # then written via atomic_create_private_file() unchanged, then folded
+    # into `release_relative_pinned_digests` so tree_digest()'s existing
+    # same-read compare-then-fold mechanism (round 29/30) automatically
+    # covers them with no new mechanism needed. Their digests are also
+    # recorded in the receipt (`launch_guard_sha256`/`command_wrapper_
+    # sha256`) and re-checked by verify()'s pre-exec loop on every future
+    # invocation, exactly mirroring node/npm-cli/the entrypoint -- defense
+    # in depth in case a future bug ever reopened the tree_digest()-level
+    # protection.
+    launch_guard_raw = managed_launch_guard_script(
+        node, entrypoint, node_sha256, entrypoint_sha256
     )
-    atomic_create_private_file(
-        bin_dir / "prime-agent",
-        managed_entrypoint_script(node, entrypoint, launch_guard),
-        0o700,
-    )
+    launch_guard_sha256 = sha256_bytes(launch_guard_raw)
+    atomic_create_private_file(launch_guard, launch_guard_raw, 0o700)
+    command_wrapper = bin_dir / "prime-agent"
+    command_wrapper_raw = managed_entrypoint_script(node, entrypoint, launch_guard)
+    command_wrapper_sha256 = sha256_bytes(command_wrapper_raw)
+    atomic_create_private_file(command_wrapper, command_wrapper_raw, 0o700)
     telemetry_settings = initialize_prime_state()
     probe_agent_dir = initialize_probe_home()
     ensure_private_dir(TOOL_ROOT / "receipts")
@@ -6004,7 +6054,7 @@ def _install_locked_within_release_dir(
         "state_dir": os.fspath(STATE_DIR),
         "state_link": os.fspath(STATE_LINK),
         "bin_link": os.fspath(BIN_LINK),
-        "bin_target": os.fspath(bin_dir / "prime-agent"),
+        "bin_target": os.fspath(command_wrapper),
         "launch_guard": os.fspath(launch_guard),
         "lifecycle_lock": os.fspath(lifecycle_lock_path()),
         "node_target": os.fspath(node),
@@ -6035,6 +6085,19 @@ def _install_locked_within_release_dir(
         "node_sha256": node_sha256,
         "npm_cli_sha256": npm_cli_sha256,
         "entrypoint_sha256": entrypoint_sha256,
+        # Round 32, 2026-08-19 (independent Claude opus/max round-31
+        # review, P1): the launch guard's and command wrapper's own
+        # content digests, computed directly from the exact bytes this
+        # install wrote for each (see the `launch_guard_raw`/
+        # `command_wrapper_raw` capture above) -- the same treatment as
+        # node_sha256/npm_cli_sha256/entrypoint_sha256 just above, extended
+        # to the two files this installer itself generates. Folded into
+        # `release_relative_pinned_digests` (below) so tree_digest() closes
+        # the install-time window the same way it already does for those
+        # three, and read back by verify()'s pre-exec digest loop on every
+        # future invocation for defense in depth.
+        "launch_guard_sha256": launch_guard_sha256,
+        "command_wrapper_sha256": command_wrapper_sha256,
         "probe_home": os.fspath(PROBE_HOME),
         "session_dir": os.fspath(managed_session_dir()),
         "asset_sha256": ASSETS,
@@ -6133,8 +6196,59 @@ def _install_locked_within_release_dir(
     # this round's fix made those already-slow calls fail closed on a
     # pinned-content mismatch instead of leaving that residual UNCLOSED, at
     # the cost of a small, separately-measured increment to a cost that was
-    # already there. The one genuinely irreducible residual after this fix
-    # is the same class this file already accepts elsewhere (see e.g.
+    # already there.
+    #
+    # Round 32, 2026-08-19 (independent Claude opus/max round-31 review,
+    # P1): the paragraph above, as written through round 30, characterized
+    # the only remaining residual as the microsecond-scale lstat/open gap
+    # (see below) without ever stating WHICH paths that claim actually
+    # covered -- an over-claim by omission, because `release_relative_
+    # pinned_digests` at that point covered only node, npm-cli, and the
+    # four locally patched packages' own tarball-declared members (which
+    # includes the entrypoint, dist/bundle/cli.js). It did NOT cover the
+    # launch guard (bin/prime-agent-launch-guard.py) or the command
+    # wrapper (bin/prime-agent) -- the two files THIS INSTALLER ITSELF
+    # generates, and that get exec'd on every future managed `prime-agent`
+    # invocation (BIN_LINK -> command wrapper -> launch guard ->
+    # node/entrypoint) -- so a same-UID racer who tampered either one in
+    # the window between its own atomic_create_private_file() call and
+    # tree_digest() later reaching that same path had the tampered bytes
+    # silently adopted as the permanent baseline: permanent RCE on every
+    # future invocation, verify() reporting OK forever. Both are now
+    # included in `release_relative_pinned_digests` above (see the comment
+    # at their creation site, just before `launch_guard_raw`/`command_
+    # wrapper_raw`), closing that gap the same zero-window way.
+    #
+    # What is actually true as of this fix: EVERY RELEASE_DIR-relative path
+    # this installer or its generated scripts ever exec -- node, npm-cli,
+    # the entrypoint (dist/bundle/cli.js), the launch guard, and the
+    # command wrapper -- is now in `release_relative_pinned_digests`, so
+    # tree_digest()'s same-read compare-then-fold mechanism covers all five
+    # with zero window, and verify()'s pre-exec digest loop independently
+    # re-checks all five on every future invocation as defense in depth.
+    #
+    # The genuinely narrower residual that remains, accepted and
+    # deliberately not fixed this round: files under RELEASE_DIR that are
+    # recorded in tree_digest()'s overall release_tree_sha256 (so tampering
+    # them still shows up as detected "release tree drifted" DRIFT) but are
+    # NOT individually pinned and NOT ever exec'd post-install --
+    # package.json, package-lock.json, LICENSE, upstream-package-lock.json,
+    # and the toolchain's own non-node/npm-cli files (npm's other library
+    # sources, docs, etc.). A same-UID racer who tampers one of these in
+    # the same install-time window has that tampered content silently
+    # adopted as part of the recorded tree_digest() baseline, exactly as
+    # the pinned paths' pre-round-29 behavior was -- but, unlike the five
+    # pinned/exec'd paths above, nothing in this installer or its generated
+    # scripts ever reads or executes any of these files' content again
+    # after install, so the practical consequence of winning that race is
+    # inert recorded drift (a receipt field that silently reflects
+    # attacker-chosen bytes nothing acts on), not code execution. Closing
+    # this residual too is straightforward given the mechanism now built
+    # (add each path's already-known-correct digest -- e.g. LICENSE_SHA256,
+    # the generated lock's own hash -- to the same map) but is intentionally
+    # out of THIS round's required scope; the one genuinely irreducible
+    # residual for every path that IS pinned (including the five exec'd
+    # ones) is the same class this file already accepts elsewhere (see e.g.
     # create_fresh_private_dir()'s own docstring): the microsecond-scale,
     # in-process gap inside a single sha256_file_verified() call between
     # its own lstat() and O_NOFOLLOW open() -- not something an external
@@ -6151,6 +6265,17 @@ def _install_locked_within_release_dir(
     release_relative_pinned_digests: dict[str, str] = {
         os.fspath(node.relative_to(RELEASE_DIR)): node_sha256,
         os.fspath(npm_cli.relative_to(RELEASE_DIR)): npm_cli_sha256,
+        # Round 32, 2026-08-19 (independent Claude opus/max round-31
+        # review, P1): the launch guard and command wrapper -- the two
+        # remaining files actually exec'd on every future managed
+        # invocation -- pinned to the exact bytes this install itself
+        # generated and wrote for each (see `launch_guard_raw`/
+        # `command_wrapper_raw` above). This closes the round-31 finding:
+        # every RELEASE_DIR-relative path that is ever exec'd by the
+        # managed command (node, npm-cli, the entrypoint, the launch
+        # guard, the command wrapper) now has a pinned entry here.
+        os.fspath(launch_guard.relative_to(RELEASE_DIR)): launch_guard_sha256,
+        os.fspath(command_wrapper.relative_to(RELEASE_DIR)): command_wrapper_sha256,
     }
     for locally_patched_name, pinned_digests in patched_content_digests.items():
         package_relative = os.fspath(
@@ -6540,6 +6665,8 @@ def verify(expected_lock_identity: tuple[int, int] | None = None) -> dict[str, A
     entrypoint = resolve_ssd(
         release / "lib/node_modules/prime-agent/dist/bundle/cli.js"
     )
+    launch_guard = resolve_ssd(Path(receipt["launch_guard"]))
+    command_wrapper = resolve_ssd(Path(receipt["bin_target"]))
     # Round 29, 2026-08-19 (independent Claude opus/max round-29 review,
     # P1-2): receipt['node_sha256']/['npm_cli_sha256']/['entrypoint_sha256']
     # -- each an independently, tarball-derived SHA-256 digest captured
@@ -6559,10 +6686,28 @@ def verify(expected_lock_identity: tuple[int, int] | None = None) -> dict[str, A
     # on every subsequent verify() call, immediately before any of the
     # three is executed below (exact_tool_version() execs `node` and, via
     # it, `npm_cli`; run_version_probe() execs `node` and `entrypoint`).
+    #
+    # Round 32, 2026-08-19 (independent Claude opus/max round-31 review,
+    # P1): extended to the launch guard and command wrapper -- the two
+    # files this installer itself GENERATES rather than merely observes
+    # from a downloaded tarball (see the `launch_guard_sha256`/
+    # `command_wrapper_sha256` receipt fields' own comment, and the
+    # `release_relative_pinned_digests` construction in
+    # _install_locked_within_release_dir(), for the install-time half of
+    # this fix). Neither is actually exec'd by THIS function -- the launch
+    # guard and command wrapper are exec'd only via BIN_LINK's own
+    # end-user invocation path (command wrapper -> launch guard ->
+    # node/entrypoint), not by verify() itself -- so this check is
+    # deliberately defense in depth, exactly mirroring how this same loop
+    # already treats node/npm_cli/the entrypoint: independent of whatever
+    # tree_digest() recorded, and independent of whether anything in this
+    # process tree is about to exec these two files right now.
     for label, path, field in (
         ("Node.js runtime", node, "node_sha256"),
         ("npm CLI", npm_cli, "npm_cli_sha256"),
         ("Prime Agent entrypoint", entrypoint, "entrypoint_sha256"),
+        ("Prime Agent launch guard", launch_guard, "launch_guard_sha256"),
+        ("Prime Agent command wrapper", command_wrapper, "command_wrapper_sha256"),
     ):
         expected = receipt.get(field)
         if not isinstance(expected, str) or not expected:

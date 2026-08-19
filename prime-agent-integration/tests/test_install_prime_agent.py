@@ -9744,6 +9744,343 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 (tool_root / "receipts" / f"v{installer.VERSION}.json").exists()
             )
 
+    def _round32_tamper_generated_exec_target_harness(
+        self, *, target_relative: str, error_regex: str
+    ) -> None:
+        """Shared harness for the two round-32 regression tests just below.
+
+        Regression for independent Claude opus/max round-31 review, 2026-08-19,
+        P1: "round 30's pinned-digest mechanism ... covers only the 4
+        locally-patched packages' files plus node/npm-cli, and OMITS the two
+        files the installer itself generates and that actually get executed
+        on every managed prime-agent invocation: the launch guard
+        (bin/prime-agent-launch-guard.py) and the command wrapper
+        (bin/prime-agent). Both get read-back verified at creation time via
+        atomic_create_private_file()'s own mechanism, but ... their content
+        only becomes the permanent, trusted release baseline later, when
+        tree_digest() reaches them during write_pending_install(), with zero
+        comparison performed ... A same-UID racer overwriting either file in
+        the window between creation and tree_digest() reaching it ... gets
+        the tampered bytes adopted as the permanent
+        receipt['release_tree_sha256'] ... permanent RCE on every future
+        managed invocation, verify() reports OK forever."
+
+        Reuses round 29/30's own real-`install()`-plus-wrapped-function
+        regression idiom (see
+        test_install_locked_detects_late_tamper_after_digest_sweep_before_baseline_lock
+        just above), but targets `atomic_create_private_file()` itself --
+        the single choke point BOTH the launch guard and the command
+        wrapper are published through -- rather than the per-package digest
+        sweep round 29/30's own tests target: this wraps the REAL
+        `atomic_create_private_file()` (not a stub) so every file this
+        install genuinely publishes is genuinely published, then, as a side
+        effect of the call that publishes `target_relative` specifically,
+        overwrites that file's on-disk bytes IN PLACE (same inode, same
+        mode -- an in-place same-UID content swap, not a replace) --
+        exactly modeling a same-UID racer who wins the window between that
+        publication and write_pending_install()'s later tree_digest() call
+        reaching the same path.
+
+        Verified to FAIL against pre-fix HEAD (commit 035ef5dad5) in an
+        isolated scratch copy for BOTH target files: pre-fix,
+        `release_relative_pinned_digests` (built in
+        _install_locked_within_release_dir(), just before
+        write_pending_install()) contained only node's, npm-cli's, and the
+        four locally patched packages' own tarball-declared members --
+        never `bin/prime-agent-launch-guard.py` or `bin/prime-agent` -- so
+        tree_digest()'s pinned-digest comparison had no entry to compare
+        either path against and simply recorded the already-tampered bytes
+        as the permanent baseline; `installer.install()` completed
+        successfully with a clean receipt in both cases pre-fix, instead of
+        raising.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            user_home = root / "user"
+            user_home.mkdir(mode=0o700)
+
+            local_assets = {
+                "prime-agent": installer.MAIN_PATCHED_ASSET,
+                **installer.WORKSPACE_ASSETS,
+            }
+            generated = {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {
+                        "name": "orca-managed-prime-agent",
+                        "version": installer.VERSION,
+                        "dependencies": {
+                            "prime-agent": f"file:assets/{installer.MAIN_PATCHED_ASSET}"
+                        },
+                    },
+                    **{
+                        f"node_modules/local-{index}": {
+                            "name": name,
+                            "version": installer.VERSION,
+                            "resolved": f"file:assets/{asset_name}",
+                            "integrity": "sha512-dGVzdA==",
+                        }
+                        for index, (name, asset_name) in enumerate(local_assets.items())
+                    },
+                },
+            }
+            with mock.patch.object(installer, "RELEASE_DIR", release):
+                expected_lock_sha256 = installer.sha256_bytes(
+                    installer.normalized_production_lock(generated)
+                )
+            generated_lock_raw = installer.canonical_json(generated)
+
+            GENUINE_CLI_CONTENT = b"// genuine, tarball-pinned cli.js\n"
+            ATTACKER_CONTENT = (
+                b"#!/bin/sh\n"
+                b"# ATTACKER-controlled content, planted AFTER "
+                b"atomic_create_private_file() published the genuine bytes and "
+                b"BEFORE write_pending_install()'s tree_digest() call locked in "
+                b"the release baseline.\n"
+                b"exec /bin/sh -c 'echo pwned'\n"
+            )
+
+            def fake_run_npm(
+                npm_path, node_path, args, cwd, cache, install_home, install_tmp,
+                timeout=300, child_umask=None, release_dir_fd=None,
+            ):
+                cwd = Path(cwd)
+                if args and args[0] == "install":
+                    lock_path = cwd / "package-lock.json"
+                    lock_path.write_bytes(generated_lock_raw)
+                    os.chmod(lock_path, 0o600)
+                elif args and args[0] == "ci":
+                    bundle = cwd / "node_modules/prime-agent/dist/bundle"
+                    bundle.mkdir(parents=True, mode=0o700)
+                    for ancestor in (
+                        cwd / "node_modules",
+                        cwd / "node_modules/prime-agent",
+                        cwd / "node_modules/prime-agent/dist",
+                        bundle,
+                    ):
+                        os.chmod(ancestor, 0o700)
+                    cli = bundle / "cli.js"
+                    cli.write_bytes(GENUINE_CLI_CONTENT)
+                    os.chmod(cli, 0o600)
+
+            def fake_make_patched_asset(
+                original_asset,
+                original_sha256,
+                upstream_lock,
+                assets_dir,
+                *,
+                expected_name,
+                managed_name,
+                output_name,
+            ):
+                patched = assets_dir / output_name
+                installer.atomic_create_private_file(patched, b"stub-asset", 0o600)
+                published_stat = patched.lstat()
+                content_digests = (
+                    {
+                        Path("dist/bundle/cli.js"): installer.sha256_bytes(
+                            GENUINE_CLI_CONTENT
+                        ),
+                    }
+                    if managed_name == "prime-agent"
+                    else {}
+                )
+                return (
+                    patched,
+                    installer.sha256_bytes(b"stub-asset"),
+                    {"name": managed_name, "version": installer.VERSION},
+                    (published_stat.st_dev, published_stat.st_ino),
+                    content_digests,
+                )
+
+            def fake_safe_download(url, destination, expected_sha256, *, max_bytes=None):
+                if destination.name == "upstream-package-lock.json":
+                    payload = installer.canonical_json(
+                        {"lockfileVersion": 3, "packages": {}}
+                    )
+                else:
+                    payload = b"stub-download"
+                installer.atomic_create_private_file(destination, payload, 0o600)
+
+            fake_evidence = {
+                "volume_uuid": "TEST-UUID",
+                "node_version": installer.NODE_VERSION,
+                "npm_version": installer.NPM_VERSION,
+                "orca_support": {"test": "support"},
+            }
+
+            real_atomic_create_private_file = installer.atomic_create_private_file
+            tamper_fired = {"done": False}
+            target_path = release / target_relative
+
+            def tamper_after_publish(path, raw, mode=0o600):
+                real_atomic_create_private_file(path, raw, mode)
+                if path == target_path and not tamper_fired["done"]:
+                    # In-place same-UID content swap -- same inode, same
+                    # mode -- exactly modeling a same-UID racer overwriting
+                    # the just-published file rather than replacing it, so
+                    # this cannot be mistaken for a structural
+                    # (identity/symlink) tamper the existing checks would
+                    # already catch a different way.
+                    with open(path, "r+b") as handle:
+                        handle.seek(0)
+                        handle.write(ATTACKER_CONTENT)
+                        handle.truncate()
+                    tamper_fired["done"] = True
+
+            with contextlib.ExitStack() as stack:
+                enter = stack.enter_context
+                enter(mock.patch.object(installer, "SSD_ROOT", root))
+                enter(mock.patch.object(installer, "TOOL_ROOT", tool_root))
+                enter(mock.patch.object(installer, "RELEASE_DIR", release))
+                enter(mock.patch.object(installer, "STATE_DIR", tool_root / "state"))
+                enter(
+                    mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home")
+                )
+                enter(mock.patch.object(installer, "USER_HOME", user_home))
+                enter(mock.patch.object(installer, "STATE_LINK", user_home / ".prime"))
+                enter(
+                    mock.patch.object(
+                        installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "RECEIPT_PATH",
+                        tool_root / "receipts" / f"v{installer.VERSION}.json",
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "PENDING_PATH", tool_root / "pending-install.json"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_SHA256", expected_lock_sha256
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_PACKAGE_COUNT", len(local_assets)
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "volume_uuid", return_value="TEST-UUID")
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "verify_orca_support",
+                        return_value={"test": "support"},
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "prime_agent_command_candidates", return_value=[]
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "preflight", return_value=fake_evidence)
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "extract_node_toolchain",
+                        side_effect=self.fake_extract_node_toolchain,
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "exact_tool_version", return_value="stub"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "make_patched_asset",
+                        side_effect=fake_make_patched_asset,
+                    )
+                )
+                enter(mock.patch.object(installer, "run_npm", side_effect=fake_run_npm))
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "atomic_create_private_file",
+                        side_effect=tamper_after_publish,
+                    )
+                )
+
+                with self.assertRaisesRegex(installer.PrimeInstallError, error_regex):
+                    installer.install()
+
+            self.assertTrue(tamper_fired["done"])
+            self.assertFalse((tool_root / "pending-install.json").exists())
+            self.assertFalse(
+                (tool_root / "receipts" / f"v{installer.VERSION}.json").exists()
+            )
+
+    def test_install_locked_detects_launch_guard_tamper_before_baseline_lock(
+        self,
+    ) -> None:
+        # Regression for independent Claude opus/max round-31 review,
+        # 2026-08-19, P1 (round 32 fix): a same-UID racer who overwrites the
+        # generated launch guard (bin/prime-agent-launch-guard.py) in the
+        # window between atomic_create_private_file() publishing it and
+        # write_pending_install()'s tree_digest() call later reaching that
+        # same path -- see _round32_tamper_generated_exec_target_harness()'s
+        # own docstring for the full finding and reproduction methodology.
+        #
+        # Verified to FAIL against pre-fix HEAD (commit 035ef5dad5): the
+        # launch guard was not in release_relative_pinned_digests, so this
+        # exact tamper was silently baked into release_tree_sha256 and
+        # installer.install() completed successfully instead of raising.
+        self._round32_tamper_generated_exec_target_harness(
+            target_relative="bin/prime-agent-launch-guard.py",
+            error_regex=(
+                r"release tree content does not match its digest-verified "
+                r"pre-npm-ci pinned baseline: "
+                r"bin/prime-agent-launch-guard\.py$"
+            ),
+        )
+
+    def test_install_locked_detects_command_wrapper_tamper_before_baseline_lock(
+        self,
+    ) -> None:
+        # Regression for independent Claude opus/max round-31 review,
+        # 2026-08-19, P1 (round 32 fix): the same finding as the launch
+        # guard test just above, applied to the generated command wrapper
+        # (bin/prime-agent) instead -- see
+        # _round32_tamper_generated_exec_target_harness()'s own docstring
+        # for the full finding and reproduction methodology. Isolated from
+        # the launch guard specifically: only the wrapper is tampered here
+        # (the guard stays genuine), and the expected error's `$` anchor
+        # confirms tree_digest() reports the wrapper's own shorter relative
+        # path ("bin/prime-agent"), not the guard's longer one that shares
+        # its exact lexical prefix ("bin/prime-agent-launch-guard.py") and
+        # sorts immediately after it in tree_digest()'s own walk order.
+        #
+        # Verified to FAIL against pre-fix HEAD (commit 035ef5dad5): the
+        # command wrapper was not in release_relative_pinned_digests, so
+        # this exact tamper was silently baked into release_tree_sha256 and
+        # installer.install() completed successfully instead of raising.
+        self._round32_tamper_generated_exec_target_harness(
+            target_relative="bin/prime-agent",
+            error_regex=(
+                r"release tree content does not match its digest-verified "
+                r"pre-npm-ci pinned baseline: "
+                r"bin/prime-agent$"
+            ),
+        )
+
     def test_install_locked_detects_npm_cli_content_swap_during_npm_ci_window(
         self,
     ) -> None:
