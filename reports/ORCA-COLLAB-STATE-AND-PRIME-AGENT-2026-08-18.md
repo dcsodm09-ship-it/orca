@@ -622,6 +622,46 @@ _install_locked()` 路径的端到端测试）。96/96 测试通过，round 14/1
 mock 出来的，从没真正跑过一次带着真实 npm 默认权限的文件。**已派发 round 18
 修复。**
 
+> **状态更正**：round 17 的双 GO 是针对 `fd6a683a4a` 这个安全修复基线的，
+> 依然有效、不作废。但 round 18-20 是在这个基线之上、被"第一次真实执行"
+> 挖出的新一批问题（mock 测试永远测不到的那类），**这几轮还没有重新拿到
+> 双路复核干净**，所以整个候选现在仍然不能算"可以真正安装"。见下面 round
+> 18-19 明细。
+
+### Round 18-19：装机前最后冲刺——第一次真实跑通，又被 Codex 挡下一次
+
+Round 18 加了 `tighten_generated_private_file_mode()`（lstat→拒绝非常规
+文件/符号链接→O_NOFOLLOW open→fstat 身份重检→fchmod 到 0600），在真实
+`npm install --package-lock-only` 返回后、任何读取之前调用。**用这个修复，
+`sandbox_e2e.py` 真实（非 mock）生命周期回放第一次跑通了：安装→真实
+npm install/ci→verify→wrapper `--version`→wrapper `update`（正确拦截，
+exit 64）→enable→verify→uninstall→verify→recover，exit 0、`ok:true`，
+没碰真实用户状态**。98/98 测试。已提交 `c451cf91bb`。
+
+Round 19 派发装机前最后一轮双复核：
+
+- **Claude opus/max：GO，0 P0 0 P1**——现场证明修复真的是 TOCTOU 安全的
+  （`fchmod` 绑定同一个文件描述符，不是"窗口缩小"是"没有窗口"）；独立跑了
+  一遍真实生命周期回放确认成功；系统性检查了这条修复能不能覆盖到其它
+  npm 生成文件（`npm ci` 不会撤销这次收紧、`cli.js` 已经有对应的 chmod）；
+  1 个低危 P2（这台机器 umask 是 022 不受影响）+ 4 个纯信息性 P3。opus/max
+  原话："没有发现任何应该阻止真实安装的东西"。
+- **Codex sol/max：自动化/happy-path 层面 PASS，但候选级别的真实安装建议是
+  NO-GO——挑出一个真实、确定性复现的 P1，和 opus/max 测的是不同的攻击面**。
+  `tighten_generated_private_file_mode()` 只校验了路径最后一段——`lstat`
+  会跟随中间路径里的符号链接，`O_NOFOLLOW` 也只保护最后一段，**没有保护
+  祖先目录**。真实确定性复现：把 `managed/release`（祖先目录）换成指向
+  一个装着无关文件的兄弟目录的符号链接，再对
+  `managed/release/package-lock.json` 调用这个函数——**函数成功返回，
+  把那个无关文件 chmod 成了 0600**。真实调用路径里，同 UID 攻击者有整个
+  外部 `npm install --package-lock-only` 子进程运行期间的窗口来把 release
+  目录的路径名换成符号链接。这正是本文件在其它地方（round 6/8/10/14/16）
+  已经用"绑定祖先目录描述符链"这个模式解决过的同一类问题，这次的新函数
+  没有套用这个已有模式。
+
+**两路必须都干净才算数——现在不行。已派发 round 20 修复**（复用文件里已有
+的祖先目录描述符链模式，而不是发明新写法）。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
