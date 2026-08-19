@@ -907,6 +907,85 @@ install/enable/verify/disable/recover，真实 npm ci 输出零假阳性（真�
 `real_user_state_changed:false`。已提交 `c1ca06e61a`。**已派发 round
 27 双复核。**
 
+### Round 27：Codex 第三次被同一基础设施问题挡住；Claude opus/max 挑出 1 个新 P1——钉住的摘要只护住了 0.013% 的可执行字节
+
+**Codex 这一路**：通过真正的 Orca orchestration（`run_d5978b7f6cfe` /
+`task_75bb8d4122b5` / `ctx_17737d299c09`，`gpt-5.6-sol` + `max`）派发，
+在 `agent_readiness` 阶段又被同一个共享 `hooks.json` 信任提示挡住——
+和 round 23、round 25 完全同样的表现，这是**第三次**确认这不是偶发，
+而是一个持续存在、还没被那个并发工作解决的共享状态问题。仍然没有去
+碰共享的 hook 信任状态，`task-update --status failed` 附带清楚原因，
+worker 已正常释放。
+
+**Claude opus/max：NO_GO，0 P0、1 P1、2 P2、4 P3**——先独立确认了
+round 25 那两个 P1 真的关闭了（自己动手把 `4ecd34b2bd` 和
+`c1ca06e61a` 各自抽成隔离 scratch 副本、用参数对齐的假件真跑
+`install()`：pre-fix 两个场景都真的装完、攻击者字节真的被发布/写进
+receipt；post-fix 两个场景都真的报错拒绝，P1-A 的比对基线经字节级
+确认来自流式读取 tarball 时的哈希、从未落过磁盘）。107/107 测试两个
+解释器各跑一次全过、真实 `sandbox_e2e.py` 跑了两次都是 `exit 0`/
+`ok:true`。round 24 的 fd 锚定机制做了 AST 级 diff 确认字节未变。
+
+**但挖出一个新 P1，而且是本轮里说服力最强的一次**：钉住的入口文件
+摘要机制本身是对的，但**只覆盖了 `dist/bundle/cli.js` 这一个
+1813 字节的文件**——真实 `prime-agent@0.7.2` 的 `cli.js` 只是一个
+极薄的 ESM 转发壳，第 3 行静态 `import` 一个 chunk、运行时再动态
+`import` 真正的 CLI 主体，`dist/bundle/` 目录下这两类文件加起来
+**39 个文件、13,804,347 字节**，`cli.js` 只占其中 0.013%。这些
+被无条件执行的兄弟文件从头到尾没有任何东西盖住：
+`assert_materialized_node_modules_matches_lock()` 只查目录是否在
+已声明集合里、从不下钻到目录内部；launch guard 只钉了 `NODE`/`CLI`
+两条路径的摘要，`subprocess.run` 之后 Node 自己加载的一切都不再被
+校验；`receipt["release_tree_sha256"]` 是篡改**之后**才记录的，
+之后每次 `verify()` 只会永远报"没变"。用真实跑通的实测复现：npm ci
+运行期间只改 `chunk-BAWSWWEU.js`/`cli-main-CNDD2PLM.js`（`cli.js`
+本身保持真实字节），install 照样 `COMPLETED`，launch guard 和
+receipt 全部显示"干净"——等于对托管路径的每一次调用留下永久 RCE。
+opus/max 特别指出这**不是**"没做完"，而是安装器自己手上本来就有
+全部四个本地补丁包（`prime-agent`/`pi-ai`/`pi-tui`/
+`pi-agent-core`，合计 1739 个文件）逐文件的钉住摘要
+（`content_digests`），round 26 只用了其中一个文件的一条，其余
+1738 条被直接丢弃——补齐不需要新机制、新假设，就是把已经算好的
+东西真的用上。**残留文档的措辞被判定为"过度断言"而不只是"不完整"**：
+代码注释说 `cli.js` 是"这个安装器唯一真正执行内容的文件"，实测证明
+是错的（它只是转发壳，真正执行的是那 13.8MB）；未覆盖清单里写的是
+"其余三个本地补丁资产的非入口文件"，恰好漏掉了 `prime-agent` 自己
+1380 个非 `cli.js` 文件——而这正是真正执行代码的地方。opus/max 特别
+点出这和 round 26 自己在 round 24 那句"最早可信时点"过度断言道歉的
+问题是**同一种失败模式，往下又重演了一层**。
+
+另有 2 个 P2：(1) `assert_materialized_node_modules_matches_lock()`
+只检查条目是不是目录，非目录条目（比如攻击者种一个
+`node_modules/<name>.js` 文件而不是目录）直接被跳过、永远进不了
+"已物化"集合——用钉住的真实 Node 二进制现场验证，130/180 个真实
+声明的包因为没有 `"exports"` 字段，会被 CJS 的 `LOAD_AS_FILE` 先于
+`LOAD_AS_DIRECTORY` 命中，这类同名 `.js` 文件确实能劫持 `require`；
+(2) 二级嵌套 `node_modules/` 从不遍历，真实安装会产生 9 个嵌套目录、
+lock 声明 12 条嵌套记录，同款攻击换到"包内部子依赖目录"这一层就能
+绕过本轮新加的检查——文档里虽然提到了"嵌套层级不确定"这个说明，但
+写成了"是否会被 hoist 不确定"这种口吻，没有讲清楚"往深一层种任何东西
+现在都不受检查"这个更直接的后果。4 个 P3（`node_modules/.bin` 整个
+子树未纳入检查且文档未提；已声明集合用 lock 的 `name` 字段做键、和
+实际按目录名比对存在真实但目前不可达的 npm 别名场景不一致；已声明但
+未用到的 8 个可选原生模块目录名可以被种东西冒充；一处入口文件搬移前
+的 `os.chmod` 仍会跟随符号链接，17 行前的 `is_symlink()` 检查隔了一个
+可利用窗口，后续 `O_NOFOLLOW` 读取会兜底失败）。
+
+也如实指出了本轮两条新回归测试的一个真实但较轻的证据问题：直接对
+`4ecd34b2bd` 跑这两条新测试，实际触发的是函数签名从 4 元组变 5 元组
+导致的 `ValueError`（参数数量不对），而不是真正复现漏洞本身；opus/max
+自己用参数对齐的假件独立复现了两个场景在 pre-fix 代码上确实是真实
+可利用的，所以"pre-fix 会被攻破"这个结论仍然成立，只是测试本身没能
+自证这一点——建议下一轮给这两条测试补一个参数对齐的 pre-fix 变体。
+
+**已派发 round 28**：直接用 opus/max 给出的现成修法——保留全部四个
+本地补丁包的 `content_digests` 表（不要只留 `cli.js` 那一条），
+npm ci 之后对这四个包实际落盘的每一个文件都做校验（内容不对、缺失、
+多出来的文件全部拒绝），同时处理两个 P2（拒绝非目录条目、把嵌套
+`node_modules/` 也纳入遍历），并按本轮反馈把残留文档改成准确描述
+"registry 依赖包内部文件级别的内容"才是真正剩下的、依赖 npm 自身
+完整性校验兜底的那一部分。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
