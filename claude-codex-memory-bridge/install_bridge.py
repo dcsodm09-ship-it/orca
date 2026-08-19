@@ -767,9 +767,15 @@ def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
     # 2026-08-17, round 8, R8-P1-C for the ENOENT-tolerant half, R8-P2-B
     # for the EACCES-must-not-be-silent half) -- EXCEPT specifically inside
     # RUNTIME_BASE, where an unlistable directory, an unsearchable directory
-    # (_is_regular_file()'s own raise), and an unreadable or oversized file
-    # (_read_for_detection()'s own raises) all instead degrade to "nothing
-    # found there", same as ENOENT (self-check Workflow, 2026-08-18, round 2
+    # (_is_regular_file()'s own raise), an unreadable file, and (since round
+    # 13) an oversized-and-unreadable file all instead degrade to "nothing
+    # found there", same as ENOENT (a readable-but-merely-oversized file is
+    # scanned instead -- see _find_untracked_owned_configs()'s own
+    # _CandidateTooLargeForDetection handling below, and
+    # _stream_scan_oversized_for_bridge_marker()'s comment, for why that one
+    # case gets a bounded look at its content rather than blanket tolerance;
+    # independent Claude opus5/max review, 2026-08-19, round 13, R13-P2-A
+    # corrected this paragraph to distinguish the two) (self-check Workflow, 2026-08-18, round 2
     # pressure-test: RUNTIME_BASE's backups/releases directories are never
     # pruned -- this file's own design, documented at their creation sites
     # -- and accumulate for the tool's entire lifetime, so an ordinary,
@@ -911,8 +917,25 @@ def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
             # EACCES/identity-changed are.
             try:
                 marker_found = _stream_scan_oversized_for_bridge_marker(resolved)
-            except Exception as scan_exc:
-                raise InstallError(f"{scan_exc} (at {candidate_str})") from scan_exc
+            except Exception:
+                # The scan itself failing (EACCES, EIO, the file vanishing or
+                # being replaced mid-scan) IS genuine absence of evidence --
+                # exactly the class this whole block otherwise tolerates
+                # under RUNTIME_BASE, not the "we have positive evidence but
+                # can't verify it" case the marker-hit branch below is for
+                # (independent Claude opus5/max review, 2026-08-19, round 13,
+                # R13-P2-A: a candidate that is BOTH oversized AND unreadable
+                # -- e.g. a root-owned quarantine copy left by `sudo cp` under
+                # RUNTIME_BASE/backups/, which is never pruned -- used to be
+                # tolerated pre-round-13 via _read_for_detection()'s own
+                # blanket except-Exception tolerance; the streaming scan's
+                # own read failure was escalating unconditionally instead of
+                # falling into that same tolerance, regressing the exact
+                # invariant this function's own docstring and the comment
+                # above _find_untracked_owned_configs()'s loop both still
+                # promise): move on to the next candidate, same as every
+                # other absence-of-evidence outcome in this loop.
+                continue
             if marker_found:
                 raise InstallError(
                     f"cannot rule out an owned hook handler: oversized content under RUNTIME_BASE "

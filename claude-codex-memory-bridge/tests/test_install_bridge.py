@@ -1302,6 +1302,33 @@ class InstallEndToEndTests(unittest.TestCase):
         staged_dir.rename(account_dir)
         installer.uninstall()
 
+    def test_uninstall_tolerates_a_file_that_is_both_oversized_and_unreadable_inside_its_own_runtime_tree(self) -> None:
+        # Round-14 fix (2026-08-19, independent Claude opus5/max review,
+        # round 13, R13-P2-A): the two existing tolerance tests each cover
+        # one half of this shape (a 33-byte unreadable file; a readable
+        # MAX+1-byte file) but never their conjunction. A candidate that is
+        # BOTH oversized AND unreadable under RUNTIME_BASE -- e.g. a
+        # root-owned quarantine copy left by `sudo cp` in the never-pruned
+        # backups/ tree -- routed into _stream_scan_oversized_for_bridge_
+        # marker()'s own os.open()/os.read() calls, which then failed with
+        # EACCES; that failure was escalating unconditionally instead of
+        # being tolerated as the genuine absence-of-evidence it is,
+        # regressing the exact invariant round 12 (and this file's own
+        # long-standing comment) already established -- and hard-blocked
+        # uninstall()/install()/recover_pending_install(), leaving a pending
+        # journal when hit through install().
+        installer.install()
+        stray_dir = self.runtime_base / "backups/misc-staging/oversized-and-unreadable"
+        stray_dir.mkdir(parents=True)
+        stray_config = stray_dir / "hooks.json"
+        stray_config.write_bytes(b"\x00" * (installer.MAX_MANAGED_FILE_BYTES + 1))
+        os.chmod(stray_config, 0o000)
+        self.addCleanup(lambda: stray_config.exists() and os.chmod(stray_config, 0o600))
+
+        result = installer.uninstall()
+        self.assertTrue(result["ok"])
+        self.assertFalse(installer.PENDING_PATH.exists())
+
     def test_uninstall_still_fails_closed_on_an_oversized_file_outside_runtime_base_even_with_a_marker(self) -> None:
         # Sibling control for the fix above: the round-13 streaming-scan
         # fallback is deliberately scoped to RUNTIME_BASE only.  Outside it,
