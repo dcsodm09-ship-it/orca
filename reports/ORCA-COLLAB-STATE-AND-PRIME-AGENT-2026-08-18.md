@@ -986,6 +986,62 @@ npm ci 之后对这四个包实际落盘的每一个文件都做校验（内容�
 "registry 依赖包内部文件级别的内容"才是真正剩下的、依赖 npm 自身
 完整性校验兜底的那一部分。
 
+### Round 28：把四个本地补丁包已算好的摘要表真正全部用上 + 补两个 P2（已验证关闭，未独立复核）
+
+**P1 修复**：新增 `assert_locally_patched_package_matches_pinned_digests()`，
+npm ci 返回后对四个本地补丁包（`prime-agent` + 三个
+`@earendil-works/pi-*` workspace 资产）各调用一次。
+`_install_locked_within_release_dir()` 现在把 `make_patched_asset()`
+的四份 `content_digests` 表全部留着（之前三份被当成
+`_workspace_content_digests` 直接丢弃、只用了 `prime-agent` 里
+`cli.js` 那一条）放进新的 `patched_content_digests` 字典，对约 1739
+个文件逐一按 npm ci **之前**、来自已验证 tarball 的摘要重新校验——
+内容不对、钉住的文件缺失、多出未声明的文件、任何符号链接/非常规
+文件，全部拒绝。原来那段 `cli.js` 专用的捕获/比对逻辑保留（它还顺带
+捕获了 launch guard 需要的 `(st_dev, st_ino)` 身份），但现在被明确
+标注为"redundant-but-harmless"，不再是第二套互相独立的机制。
+
+**P2-1 修复**：`_materialized_node_modules_directory_names()` 现在
+拒绝任何应该是包名的位置出现非目录条目，只留一个通过真实 npm ci
+实测确认的合法例外
+`KNOWN_NON_DIRECTORY_NODE_MODULES_ENTRIES = frozenset({".package-lock.json"})`
+（不是假设出来的，是真跑了一次真实安装、逐条核对之后才写死的）。
+
+**P2-2 修复**：新增 `declared_nested_node_modules_packages()`（按 lock
+里各行自己的嵌套 `node_modules/` 容器路径分组，支持任意深度，不是
+只处理一层）和一个迭代式、深度有界的
+`_walk_nested_node_modules_containers()`（遍历 npm ci 真实产生的每个
+嵌套容器）。`assert_materialized_node_modules_matches_lock()` 现在多
+一个 `declared_nested` 参数，两层都查。写这两个修复之前先真跑了一次
+真实、非 mock 的 `install()`：确认 `.package-lock.json` 是唯一的
+顶层非目录条目、`.bin` 永远是目录、`@scope/` 目录内部零非目录条目、
+真实产生 9 个嵌套 `node_modules/` 目录，对应 lock 里 12 条嵌套声明
+（3 个目录各 hoist 了两个包），逐一核对完全吻合。
+
+同时把这几个函数的文档字符串改成精确描述覆盖范围（现在覆盖：四个
+本地补丁包的全部文件内容、任意深度的未声明包、任意层级的非目录
+"冒充包名"条目；仍然是接受的、写清楚的残留：约 196 个第三方
+registry 依赖包自己文件级别的内容篡改，仍然只靠 npm ci 自身的
+registry 完整性/SRI 校验兜底），避免 round 25、27 都点名过的过度
+断言模式再犯。
+
+3 条新回归测试（`prime-agent` 自己 `dist/bundle/` 里一个非入口
+兄弟文件被篡改、`cli.js` 保持真实——对应 P1 复现；顶层种一个非目录
+条目——对应 P2-1；在**第三方**包的嵌套 `node_modules/` 里种一个
+未声明的包，特意选第三方包而不是本地补丁包以便和 P1 机制区分开——
+对应 P2-2），三条都确认对 round-27 基线 `c1ca06e61a` 可复现（旧代码
+`PrimeInstallError` 不会抛出、装完了），对修复后的代码通过；round 26
+的一条既有测试因为新的、覆盖更广的检查现在会先一步抓到同一个场景，
+更新了预期报错文案（功能上仍然正确，注释里说明了演变过程，并确认
+round 24/25 那套机制仍然被另一条测试独立覆盖）。110/110 测试（两个
+解释器各跑两次）全过，`py_compile` 干净。round 24 的 fd 锚定、
+round 25/26 的入口文件钉住/未声明兄弟包检测回归测试逐条抽查仍然
+通过。真实（非 mock）`sandbox_e2e.py` 生命周期回放跑了两次，均
+`exit 0`/`ok:true`，完整走完
+install/enable/verify/update-blocked/uninstall/recover——新的全树
+摘要校验对着四个包真实 npm ci 的输出零假阳性。已提交 `ea8004f820`。
+**已派发 round 29 双复核。**
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
