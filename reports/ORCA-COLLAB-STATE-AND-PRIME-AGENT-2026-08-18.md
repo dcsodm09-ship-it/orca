@@ -740,6 +740,121 @@ attach 住一个 RELEASE_DIR 的文件描述符、给工具链二进制加解压
 执行前重新校验、把身份校验传播到 recovery 路径——一次性把这整类问题
 解决，而不是继续一个个路径打补丁。
 
+### Round 24：架构性修复——fd 锚定 RELEASE_DIR + 工具链摘要钉住（已验证关闭，未独立复核）
+
+照 opus/max 的架构性方向做，不再逐路径打补丁：
+
+- **Part 1（fd 锚定）**：`_install_locked()` 创建 RELEASE_DIR 后立刻
+  `os.open(RELEASE_DIR, O_RDONLY|O_DIRECTORY|O_NOFOLLOW)` 拿到
+  `release_dir_fd`，拆出 `_install_locked_within_release_dir()` 用
+  `try/finally` 保证这个 fd 全程存活、退出时一定关闭。新增
+  `assert_release_dir_fd_identity()`：比对这个存活 fd 的 `fstat()` 和
+  当前字面路径的 `fstat()`——比"记一次身份值再比对"更强，因为内核只要
+  fd 还开着就保证原 inode 不会被回收，无论字面路径上发生了什么重命名。
+  `run_npm()` 新增可选 `release_dir_fd`，两次 npm 调用前后都做这个校验；
+  `tighten_generated_private_file_mode()` 新增可选 `parent_dir_fd`，直接
+  用这个已有描述符而不是重新从 SSD_ROOT 走一遍祖先链；npm ci 之后挪
+  `node_modules`、建 `bin/` 都改走 dir_fd 绑定操作，不再走字面路径。
+- **Part 2（工具链摘要钉住）**：`extract_node_toolchain()` 从已验证摘要
+  的 tarball 流式读取 node/npm-cli.js 字节的同时捕获 SHA-256（零窗口捕获，
+  不是解压完再补读一次），在两次 `exact_tool_version()` 调用和两次
+  `run_npm()` 调用前都重新校验这个摘要；生成的 launch guard 里也钉进
+  `NODE_SHA256`/`CLI_SHA256`，`validate_exec_target()` 从只查结构属性
+  升级为每次真实调用前都重新校验内容摘要。
+- **Part 3（入口文件内容绑定）**：`cli.js` 的摘要在 `npm ci` 返回后立刻
+  捕获，`node_modules` 搬移后、写入 launch guard 前各重新校验一次。
+
+**本轮修复过程中，真实（非 mock）`sandbox_e2e.py` 生命周期回放自己就抓出
+一个真 bug**：Part 3 第一版在"给入口文件调紧权限之前"就捕获了摘要，但真实
+`npm ci` 落盘的 `cli.js` 权限是 `0o644`（来自官方 tarball 自带的权限位），
+导致真实回放在"unsafe private file"这一步直接失败——按 round 18 同款
+问题的同一种修法处理：把"chmod 到 0o700"这一步挪到摘要捕获**之前**。
+
+2 条新回归测试（两次 npm 调用之间换 node 二进制、npm ci 之后换
+cli.js 内容）+ 1 条这次真实权限 bug 的回归测试，全部确认对 round-23
+基线 `4d73ffd192` 可复现（旧代码换了照样装完，检测不到）、对修复后
+的代码通过。105/105 测试在 `/usr/bin/python3`（3.9）和 Homebrew
+python3（3.14）下均通过，`py_compile` 干净；round 14/16/20/22 的 P1
+回归测试逐条重跑仍然通过。真实生命周期回放（真下载、真的对约 200 个
+真实 registry 包跑 npm ci）：`ok:true`、
+`enable_verify_disable_recover: "passed"`、`real_user_state_changed: false`。
+未处理的（本轮范围之外）：round 23 遗留的 recovery 路径 P2 积压
+（`resume_incomplete_quarantine()`/`quarantine_partial_release()`
+缺身份断言、`ensure_private_dir()` 同 UID 静默接纳已存在目录、
+`atomic_write()` 在 recovery 路径缺父目录校验）。已提交
+`4ecd34b2bd`。**已派发 round 25 双复核。**
+
+### Round 25：Claude opus/max 再挑出 2 个新 P1——fd 锚定架构本身验证正确，但绑在了"事后现读"的基线上
+
+**Claude opus/max：NO_GO，0 P0、2 P1**——这次的验证结果本身是一次
+实质性进展：round 24 的 fd 锚定架构**被独立确认完全正确**（14 项独立
+检查全部通过，包括一次"同 UID 把 RELEASE_DIR 换名成另一个真实、合法
+目录"的复现，正确被拒绝），round 23 那两个 P1（工具链二进制在两次 npm
+调用之间被换、`cli.js` 内容在 npm ci 后被原地覆盖）**确认真的关闭了**。
+但往下再挖一层，同一个"信任字面路径/信任事后现读的状态"的模式又出现了：
+
+- **P1-A（入口文件信任基线取自未受信任的窗口内）**：round 24 自己的
+  文档字符串宣称"npm ci 返回后立刻捕获"是"这个值能被确定为可信的最早
+  时点"——opus/max 实测证明这句话是错的。同 UID 攻击者如果是在
+  `npm ci` **自己运行期间**（不是运行结束之后）覆盖
+  `node_modules/prime-agent/dist/bundle/cli.js`，这份被篡改的字节会被
+  当成基线采信：写进 launch guard 的 `CLI_SHA256`、写进
+  `receipt["entrypoint_sha256"]`，此后每次 `verify()` 都信任它。这个
+  缺口是**可以直接修的**：`safe_extract_main_asset()` 交给
+  `make_patched_asset()` 的 `content_digests`（来自已验证摘要的原始
+  tarball，本身就含 `dist/bundle/cli.js` 的摘要）此前被
+  `make_patched_asset()` 直接丢弃了——opus/max 验证过这个丢弃掉的摘要
+  本来就是有效基线（真实 npm ci 落盘的 `cli.js` 和 tarball 里的原始
+  成员逐字节相同）。
+- **P1-B（`run_npm()` 的"前后各查一次"对"npm 运行期间换、跑完前换
+  回"无感）**：复现方式——npm ci 一开始就把 RELEASE_DIR 整个改名挪开，
+  让 npm 的真实输出落进一个诱饵目录，npm 快返回前再把原目录（换上一份
+  攻击者准备好的、内含恶意模块的 `node_modules`）改名换回来。6 次
+  `assert_release_dir_fd_identity()` 全部通过、0 次报错，安装完整
+  成功、被替换的树被正式发布。用一个"cli.js 用真实字节、只额外加一个
+  恶意兄弟模块"的变体独立证明这条和 P1-A 不是同一个洞——单独修好
+  cli.js 的内容摘要并不会连带堵上这条。真实回放里实测观察到 `cli.js`
+  在 npm ci 仍在跑的过程中就已经落盘在磁盘上——一次约 9 分 15 秒真实
+  安装里，大约 3 分钟是理论可利用窗口。
+
+确认已关闭：round 24 fd 锚定架构本身（part a，14/14 独立检查通过）、
+round 23 两个 P1 都真的关闭了。真实生命周期回放依然是 exit 0/
+`ok:true`/9m15s；105/105 单测通过。dir_fd 迁移评估为"大部分完成、不是
+全部"——仍有几处字面路径操作在 RELEASE_DIR fd 已经在作用域内时没有
+改走 fd（assets/downloads 目录建立、`installed_package`、
+`pre_move_entrypoint`、`bin_dir`、`entrypoint`、两次写入 `bin/` 的
+`atomic_create_private_file()`），逐条判断为低影响（旁边有别的检查兜
+底）但明确标注为"大型部分迁移常见的那种残留"。另有 1 个 P2
+（`os.chmod(pre_move_entrypoint, 0o700)` 仍是字面路径、跟随符号链接，
+只靠 17 行前的一次 `is_symlink()` 检查兜底，同 UID、无权限边界穿越，
+但破坏了这份代码在别处一直坚持的 O_NOFOLLOW 纪律）+ 3 个 P3（一处
+过时注释、一处 `os.open("lib", dir_fd=...)` 在 rmdir+mkdir 之后的
+TOCTOU、`validate_exec_target()` 对 110MB node 二进制做整体摘要校验
+每次启动约 80ms 开销可忽略）。
+
+opus/max 自己的收尾评价："round 23 我建议了 fd 锚定方向，round 24
+把它实现对了——part (a) 确实是稳固的，round 23 那两个 P1 也真的关闭
+了。但这个建议瞄准的是问题的另外一半：fd 锚定 RELEASE_DIR 本身，保护
+不了**通过它可达的内容**；round 24 唯一试图覆盖内容的地方（cli.js）
+把基线钉在了从未受信任窗口现读出来的值上，而不是钉在手里本来就有的、
+tarball 摘要那个值上。round 21/22/23 的模式又往下一层重演了一次。"
+
+Codex 这一路的 round 25 并行复核**再次被同一个 hooks.json 基础设施
+问题挡住**（`task_38e943141432`，与 round 23 完全同样的表现），**没有
+再重试、也没有去动共享的 hook 信任状态**——记录为不满足双复核要求，
+只按 opus/max 单路结果继续。
+
+**已派发 round 26**：R25-P1-A 直接用 `make_patched_asset()` 已经算好
+但被丢弃的、来自已验证 tarball 的 `content_digests` 摘要做 `cli.js` 的
+信任基线（不再从磁盘现读）；R25-P1-B 明确认定是"同 UID 攻击者拥有外部
+子进程整段运行时间的任意文件系统操作能力"这一类更难的问题，本身逼近
+"不上操作系统级沙箱/强制访问控制就无法完全消除"的边界——要求这一轮
+在可行范围内做最有防御力的缓解（优先方向：npm ci 跑完后独立按
+package-lock.json 自带的 SRI 完整性哈希重新核验落盘的第三方包树，
+复刻一遍 npm 自己本该做的完整性校验，但作为安装器自己独立拥有的一道
+关卡），并如实、精确地在代码注释/文档字符串里写清楚具体覆盖到哪里、
+还剩什么没覆盖——不允许再出现 round 24 那种"最早可信时点"式的过度断言。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
