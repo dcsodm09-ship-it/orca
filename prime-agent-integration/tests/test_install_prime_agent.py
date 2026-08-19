@@ -6624,6 +6624,12 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             before_stat = lock_path.lstat()
             before_identity = (before_stat.st_dev, before_stat.st_ino)
 
+            # RELEASE_DIR's own identity, captured exactly as
+            # _install_locked() now captures it: immediately after
+            # creation, strictly before any external subprocess runs.
+            release_stat = release.lstat()
+            release_identity = (release_stat.st_dev, release_stat.st_ino)
+
             # Sanity: this is really the bug -- the exact, unmodified
             # security gate _install_locked() hands this file to
             # (verify_unchanged_private_ssd_file(), via
@@ -6650,7 +6656,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             # the real production /Volumes/Extreme SSD path.
             with mock.patch.object(installer, "SSD_ROOT", root):
                 returned_identity = installer.tighten_generated_private_file_mode(
-                    lock_path
+                    lock_path, expected_parent_identity=release_identity
                 )
 
             after_stat = lock_path.lstat()
@@ -6698,6 +6704,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             link_path = root / "release-package-lock.json"
             link_path.symlink_to(victim)
 
+            # link_path's parent IS root/SSD_ROOT itself in this fixture,
+            # so root's own identity is the "expected parent" here.
+            root_stat = root.lstat()
+            root_identity = (root_stat.st_dev, root_stat.st_ino)
+
             # Bound to the SAME dir_fd-chained ancestor walk
             # _install_locked() itself relies on (via
             # open_verified_generated_file_parent()), rooted at SSD_ROOT --
@@ -6708,7 +6719,9 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     installer.PrimeInstallError, "unsafe generated file"
                 ):
-                    installer.tighten_generated_private_file_mode(link_path)
+                    installer.tighten_generated_private_file_mode(
+                        link_path, expected_parent_identity=root_identity
+                    )
 
             # The symlink target must be completely untouched -- neither
             # its mode nor its content.
@@ -6765,13 +6778,28 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 lock_path.resolve(strict=True), victim.resolve(strict=True)
             )
 
+            # This fixture never creates a genuine, non-symlinked release
+            # directory at all -- "managed/release" is a symlink from the
+            # start, simulating the moment right after an attacker's swap.
+            # Any placeholder identity works here: the pre-existing
+            # symlink refusal inside the dir_fd-chained walk itself must
+            # raise while resolving the "release" component, strictly
+            # BEFORE the walk ever returns a descriptor for the new
+            # post-walk identity comparison to run against -- captured
+            # from an unrelated real directory purely so this call has a
+            # well-typed value to pass.
+            placeholder_stat = managed.lstat()
+            placeholder_identity = (placeholder_stat.st_dev, placeholder_stat.st_ino)
+
             with mock.patch.object(installer, "SSD_ROOT", root):
                 with self.assertRaisesRegex(
                     installer.PrimeInstallError,
                     "cannot inspect link parent|link parent is missing|"
                     "unsafe link parent",
                 ):
-                    installer.tighten_generated_private_file_mode(lock_path)
+                    installer.tighten_generated_private_file_mode(
+                        lock_path, expected_parent_identity=placeholder_identity
+                    )
 
             # The unrelated file in "outside" must be completely untouched
             # -- neither its mode nor its content -- through the ancestor
@@ -6787,6 +6815,431 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 (victim_after.st_dev, victim_after.st_ino), victim_before_identity
             )
             self.assertEqual(victim.read_bytes(), b"unrelated-lock-do-not-touch")
+
+    def test_tighten_generated_private_file_mode_refuses_ancestor_rename_swap(
+        self,
+    ) -> None:
+        # Regression for independent Codex sol/max round-21 review,
+        # 2026-08-19, P1: round 20's fix (open_verified_generated_file_parent()'s
+        # dir_fd-chained, O_NOFOLLOW-protected ancestor walk) refuses a
+        # SYMLINKED ancestor outright, but every per-component check it
+        # performs (real directory, not a symlink, owned by this UID, safe
+        # mode) genuinely passes on a same-UID RENAME-swap that replaces
+        # RELEASE_DIR with a DIFFERENT, legitimately-owned,
+        # correctly-permissioned REAL directory under the same name -- the
+        # walk validates properties-in-the-moment, not identity continuity
+        # with the RELEASE_DIR this installer itself created before npm
+        # ever ran. Reproduces Codex's exact, live-escalation repro: rename
+        # the real release directory aside, rename a prepared sibling real
+        # directory (containing an unrelated mode-0644 package-lock.json)
+        # into the release directory's name, and confirm
+        # tighten_generated_private_file_mode() now refuses instead of
+        # returning successfully and chmod'ing the unrelated victim file.
+        #
+        # Verified to FAIL against pre-fix (round-21 HEAD, commit
+        # f291e95d97) code in an isolated scratch copy: pre-fix,
+        # tighten_generated_private_file_mode() took no
+        # expected_parent_identity parameter at all and validated only the
+        # replacement directory's current type/owner/mode, so this exact
+        # scenario returned successfully, returned the VICTIM's inode, and
+        # chmod'ed the unrelated file to 0o600.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "release"
+            release.mkdir(mode=0o700)
+            lock_path = release / "package-lock.json"
+            lock_path.write_bytes(b"real-generated-lock-do-not-touch")
+            os.chmod(lock_path, 0o644)
+
+            # Capture RELEASE_DIR's identity exactly like _install_locked()
+            # does, immediately after creating it and strictly before any
+            # external subprocess (npm) runs.
+            release_stat = release.lstat()
+            release_identity = (release_stat.st_dev, release_stat.st_ino)
+
+            # The same-UID racer's swap: RELEASE_DIR itself ("release") is
+            # renamed aside -- taking the real generated lock with it --
+            # and a DIFFERENT, prepared, legitimately-owned,
+            # correctly-permissioned REAL directory ("decoy") -- not a
+            # symlink -- is renamed into its place, containing its own,
+            # completely unrelated, mode-0644 package-lock.json.
+            aside = root / "release-real-aside"
+            os.rename(release, aside)
+            decoy = root / "decoy"
+            decoy.mkdir(mode=0o700)
+            (decoy / "package-lock.json").write_bytes(b"unrelated-lock-do-not-touch")
+            os.chmod(decoy / "package-lock.json", 0o644)
+            victim_before = (decoy / "package-lock.json").lstat()
+            victim_before_identity = (victim_before.st_dev, victim_before.st_ino)
+            os.rename(decoy, release)
+            # decoy's directory entry now lives at `release` (the rename
+            # moved the whole directory, contents included) -- reference
+            # the unrelated file through ITS NEW location for every
+            # post-rename check below, not through the old `decoy` path,
+            # which no longer names anything on disk.
+            victim = release / "package-lock.json"
+
+            # Sanity: the swap is real -- "release" now really is a
+            # different directory (different inode) than the one
+            # release_identity was captured from, and every per-component
+            # property check the existing walk performs on it (real
+            # directory, not a symlink, owned by this UID, mode 0o700)
+            # genuinely passes -- if any of these ever stopped being true,
+            # the rest of this test would not be exercising round 21's
+            # reported gap.
+            swapped_stat = release.lstat()
+            self.assertNotEqual(
+                (swapped_stat.st_dev, swapped_stat.st_ino), release_identity
+            )
+            self.assertFalse(release.is_symlink())
+            self.assertEqual(swapped_stat.st_uid, os.getuid())
+            self.assertEqual(stat.S_IMODE(swapped_stat.st_mode), 0o700)
+
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "ancestor directory identity changed",
+                ):
+                    installer.tighten_generated_private_file_mode(
+                        release / "package-lock.json",
+                        expected_parent_identity=release_identity,
+                    )
+
+            # The unrelated file in the decoy (now occupying "release")
+            # must be completely untouched -- neither its mode nor its
+            # content.
+            victim_after = victim.lstat()
+            self.assertEqual(
+                stat.S_IMODE(victim_after.st_mode),
+                0o644,
+                "an unrelated file reached only through a same-UID "
+                "rename-swap of RELEASE_DIR itself must never be chmod'ed",
+            )
+            self.assertEqual(
+                (victim_after.st_dev, victim_after.st_ino), victim_before_identity
+            )
+            self.assertEqual(victim.read_bytes(), b"unrelated-lock-do-not-touch")
+
+    def test_assert_release_dir_identity_detects_rename_swap(self) -> None:
+        # Direct unit coverage for assert_release_dir_identity() in
+        # isolation, complementing the full _install_locked() integration
+        # regression below
+        # (test_install_locked_detects_release_dir_rename_swap_before_post_ci_use):
+        # confirms the checkpoint itself both accepts a still-genuine
+        # RELEASE_DIR and refuses a same-UID rename-swap that replaced it
+        # with a different, legitimately-owned, correctly-permissioned
+        # real directory.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "release"
+            release.mkdir(mode=0o700)
+            release_stat = release.lstat()
+            release_identity = (release_stat.st_dev, release_stat.st_ino)
+
+            with mock.patch.object(installer, "RELEASE_DIR", release):
+                # The identity has not drifted -- must return quietly.
+                installer.assert_release_dir_identity(release_identity)
+
+                aside = root / "release-real-aside"
+                os.rename(release, aside)
+                decoy = root / "decoy"
+                decoy.mkdir(mode=0o700)
+                os.rename(decoy, release)
+
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "release directory identity changed",
+                ):
+                    installer.assert_release_dir_identity(release_identity)
+
+    def test_install_locked_detects_release_dir_rename_swap_before_post_ci_use(
+        self,
+    ) -> None:
+        # Regression for independent Codex sol/max round-21 review,
+        # 2026-08-19, P1 residual: round 21's reported gap
+        # (tighten_generated_private_file_mode(), fixed above) was one of
+        # TWO points in _install_locked() that trust RELEASE_DIR's identity
+        # across a long external `npm` subprocess window without pinning
+        # it to the identity captured before that subprocess ever ran.
+        # This is the SECOND: everything after `npm ci` (materializing
+        # node_modules, moving it to lib/node_modules, chmod'ing the
+        # entrypoint, and writing the launch guard + command wrapper
+        # scripts) resolved RELEASE_DIR purely by lexical path, with no
+        # identity check at all, immediately after the SECOND long
+        # external subprocess window (`npm ci`) closed. A same-UID racer
+        # who renames RELEASE_DIR aside -- taking its real, freshly
+        # `npm ci`'d contents with it -- and renames a different,
+        # legitimately-owned, correctly-permissioned real directory into
+        # its place at any point during that subprocess's run would
+        # otherwise have every one of those steps silently operate on the
+        # decoy instead. assert_release_dir_identity(), called immediately
+        # after `npm ci` returns and before any of those steps run, must
+        # refuse instead.
+        #
+        # Verified to FAIL against pre-fix (round-21 HEAD, commit
+        # f291e95d97) code in an isolated scratch copy: pre-fix, nothing
+        # re-checked RELEASE_DIR's own identity between the two npm
+        # invocations and the node_modules move, so this swap was silently
+        # used -- the fake `npm ci` below installs the swap as a side
+        # effect of the SAME call _install_locked() uses to materialize
+        # node_modules, so pre-fix, execution reached the node_modules
+        # move/chmod/launch-guard-write block operating on the decoy.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            user_home = root / "user"
+            user_home.mkdir(mode=0o700)
+
+            local_assets = {
+                "prime-agent": installer.MAIN_PATCHED_ASSET,
+                **installer.WORKSPACE_ASSETS,
+            }
+            generated = {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {
+                        "name": "orca-managed-prime-agent",
+                        "version": installer.VERSION,
+                        "dependencies": {
+                            "prime-agent": f"file:assets/{installer.MAIN_PATCHED_ASSET}"
+                        },
+                    },
+                    **{
+                        f"node_modules/local-{index}": {
+                            "name": name,
+                            "version": installer.VERSION,
+                            "resolved": f"file:assets/{asset_name}",
+                            "integrity": "sha512-dGVzdA==",
+                        }
+                        for index, (name, asset_name) in enumerate(local_assets.items())
+                    },
+                },
+            }
+            with mock.patch.object(installer, "RELEASE_DIR", release):
+                expected_lock_sha256 = installer.sha256_bytes(
+                    installer.normalized_production_lock(generated)
+                )
+            generated_lock_raw = installer.canonical_json(generated)
+
+            decoy_marker = {}
+
+            def fake_run_npm(
+                npm_path, node_path, args, cwd, cache, install_home, install_tmp,
+                timeout=300, child_umask=None,
+            ):
+                cwd = Path(cwd)
+                if args and args[0] == "install":
+                    lock_path = cwd / "package-lock.json"
+                    lock_path.write_bytes(generated_lock_raw)
+                    os.chmod(lock_path, 0o600)
+                elif args and args[0] == "ci":
+                    bundle = cwd / "node_modules/prime-agent/dist/bundle"
+                    bundle.mkdir(parents=True, mode=0o700)
+                    for ancestor in (
+                        cwd / "node_modules",
+                        cwd / "node_modules/prime-agent",
+                        cwd / "node_modules/prime-agent/dist",
+                        bundle,
+                    ):
+                        os.chmod(ancestor, 0o700)
+                    cli = bundle / "cli.js"
+                    cli.write_text("// fake cli\n", encoding="utf-8")
+                    os.chmod(cli, 0o600)
+                    # The same-UID racer's swap, won at the very end of
+                    # this subprocess's long run: RELEASE_DIR itself is
+                    # renamed aside (taking the just-materialized,
+                    # legitimate node_modules with it), and a different,
+                    # legitimately-owned, correctly-permissioned real
+                    # directory is renamed into its place. The decoy is
+                    # deliberately built STRUCTURALLY WELL-FORMED -- its
+                    # own real node_modules/prime-agent/dist/bundle/cli.js,
+                    # distinguishable only by content -- so that, without
+                    # the fix, every downstream step (the
+                    # installed_package.is_dir() check, the node_modules
+                    # move, the entrypoint chmod, and the launch-guard /
+                    # command-wrapper publication) would silently accept
+                    # and use it instead of merely failing on an
+                    # incidentally-missing directory; this is the same
+                    # standard of proof as Codex's original chmod repro,
+                    # applied to this second window.
+                    aside = cwd.parent / "release-real-aside"
+                    os.rename(cwd, aside)
+                    decoy = cwd.parent / "decoy-release"
+                    decoy_bundle = decoy / "node_modules/prime-agent/dist/bundle"
+                    decoy_bundle.mkdir(parents=True, mode=0o700)
+                    for ancestor in (
+                        decoy,
+                        decoy / "node_modules",
+                        decoy / "node_modules/prime-agent",
+                        decoy / "node_modules/prime-agent/dist",
+                        decoy_bundle,
+                    ):
+                        os.chmod(ancestor, 0o700)
+                    decoy_cli = decoy_bundle / "cli.js"
+                    decoy_cli.write_text("// DECOY cli -- do not trust\n", encoding="utf-8")
+                    os.chmod(decoy_cli, 0o600)
+                    marker_stat = decoy_cli.lstat()
+                    decoy_marker["identity"] = (
+                        marker_stat.st_dev, marker_stat.st_ino
+                    )
+                    os.rename(decoy, cwd)
+                    # decoy's directory entry now lives at `cwd` (== the
+                    # real RELEASE_DIR path) -- reference the decoy cli.js
+                    # through ITS NEW location for the post-install
+                    # assertions below, not through the old `decoy` path,
+                    # which no longer names anything on disk.
+                    decoy_marker["path"] = (
+                        cwd / "node_modules/prime-agent/dist/bundle/cli.js"
+                    )
+
+            def fake_make_patched_asset(
+                original_asset,
+                original_sha256,
+                upstream_lock,
+                assets_dir,
+                *,
+                expected_name,
+                managed_name,
+                output_name,
+            ):
+                patched = assets_dir / output_name
+                installer.atomic_create_private_file(patched, b"stub-asset", 0o600)
+                published_stat = patched.lstat()
+                return (
+                    patched,
+                    installer.sha256_bytes(b"stub-asset"),
+                    {"name": managed_name, "version": installer.VERSION},
+                    (published_stat.st_dev, published_stat.st_ino),
+                )
+
+            def fake_safe_download(url, destination, expected_sha256, *, max_bytes=None):
+                if destination.name == "upstream-package-lock.json":
+                    payload = installer.canonical_json(
+                        {"lockfileVersion": 3, "packages": {}}
+                    )
+                else:
+                    payload = b"stub-download"
+                installer.atomic_create_private_file(destination, payload, 0o600)
+
+            fake_evidence = {
+                "volume_uuid": "TEST-UUID",
+                "node_version": installer.NODE_VERSION,
+                "npm_version": installer.NPM_VERSION,
+                "orca_support": {"test": "support"},
+            }
+            fake_node = release / "toolchain/bin/node"
+            fake_npm_cli = release / "toolchain/lib/node_modules/npm/bin/npm-cli.js"
+
+            with contextlib.ExitStack() as stack:
+                enter = stack.enter_context
+                enter(mock.patch.object(installer, "SSD_ROOT", root))
+                enter(mock.patch.object(installer, "TOOL_ROOT", tool_root))
+                enter(mock.patch.object(installer, "RELEASE_DIR", release))
+                enter(mock.patch.object(installer, "STATE_DIR", tool_root / "state"))
+                enter(
+                    mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home")
+                )
+                enter(mock.patch.object(installer, "USER_HOME", user_home))
+                enter(mock.patch.object(installer, "STATE_LINK", user_home / ".prime"))
+                enter(
+                    mock.patch.object(
+                        installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "RECEIPT_PATH",
+                        tool_root / "receipts" / f"v{installer.VERSION}.json",
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "PENDING_PATH", tool_root / "pending-install.json"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_SHA256", expected_lock_sha256
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_PACKAGE_COUNT", len(local_assets)
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "volume_uuid", return_value="TEST-UUID")
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "verify_orca_support",
+                        return_value={"test": "support"},
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "prime_agent_command_candidates", return_value=[]
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "preflight", return_value=fake_evidence)
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "extract_node_toolchain",
+                        return_value=(fake_node, fake_npm_cli),
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "exact_tool_version", return_value="stub"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "make_patched_asset",
+                        side_effect=fake_make_patched_asset,
+                    )
+                )
+                enter(mock.patch.object(installer, "run_npm", side_effect=fake_run_npm))
+
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "release directory identity changed",
+                ):
+                    installer.install()
+
+            # The decoy's own cli.js -- the file the post-`npm ci` steps
+            # would have moved into lib/node_modules and chmod'ed to 0o700
+            # had the swap gone undetected -- must be completely untouched:
+            # still at 0o600 (never chmod'ed to 0o700), never moved out of
+            # node_modules/ into lib/node_modules/, and still holding its
+            # own decoy content, not silently accepted as if it were the
+            # real npm-ci output.
+            marker = decoy_marker["path"]
+            marker_stat = marker.lstat()
+            self.assertEqual(stat.S_IMODE(marker_stat.st_mode), 0o600)
+            self.assertEqual(
+                (marker_stat.st_dev, marker_stat.st_ino),
+                decoy_marker["identity"],
+            )
+            self.assertEqual(marker.read_text(encoding="utf-8"), "// DECOY cli -- do not trust\n")
+            self.assertFalse((release / "lib/node_modules").exists())
+            self.assertFalse((release / "bin/prime-agent").exists())
+            self.assertFalse((tool_root / "pending-install.json").exists())
+            self.assertFalse(
+                (tool_root / "receipts" / f"v{installer.VERSION}.json").exists()
+            )
 
 
 if __name__ == "__main__":

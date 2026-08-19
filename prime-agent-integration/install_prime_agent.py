@@ -463,7 +463,9 @@ def read_private_ssd_file(path: Path, *, max_bytes: int = 4 * 1024 * 1024) -> by
     return read_private_file(resolve_ssd(path), max_bytes=max_bytes)
 
 
-def open_verified_generated_file_parent(path: Path) -> int:
+def open_verified_generated_file_parent(
+    path: Path, *, expected_identity: tuple[int, int] | None = None
+) -> int:
     """Return an open, verified directory descriptor for `path`'s immediate
     parent, resolved via the SAME dir_fd-chained, openat()-style ancestor
     walk open_verified_ancestor_chain() already uses for the managed
@@ -492,16 +494,47 @@ def open_verified_generated_file_parent(path: Path) -> int:
     2026-08-19, P1; round-19's Claude opus/max review tested only leaf-path
     symlink substitution and lstat-to-open inode swaps at the leaf, not
     this ancestor-directory-level gap).
+
+    `expected_identity`, when given, is forwarded unchanged to
+    open_verified_ancestor_chain(), which compares it against the returned
+    descriptor's own (st_dev, st_ino) before returning it -- closing the
+    NEXT gap round 19's symlink-only fix left open: a same-UID rename-swap
+    that replaces `path`'s parent with a different, real, legitimately-
+    owned, correctly-permissioned directory (not a symlink) passes every
+    per-component check this walk performs, since those checks validate
+    properties in the moment, not identity continuity with whatever this
+    installer itself created before npm ever ran (independent Codex
+    sol/max round-21 review, 2026-08-19, P1; see
+    open_verified_ancestor_chain()'s own docstring for the full
+    reasoning).
     """
-    return open_verified_ancestor_chain(path, create_missing=False, root=SSD_ROOT)
+    return open_verified_ancestor_chain(
+        path, create_missing=False, root=SSD_ROOT, expected_identity=expected_identity
+    )
 
 
-def tighten_generated_private_file_mode(path: Path, mode: int = 0o600) -> tuple[int, int]:
+def tighten_generated_private_file_mode(
+    path: Path, mode: int = 0o600, *, expected_parent_identity: tuple[int, int]
+) -> tuple[int, int]:
     """Tighten an existing file's permission bits to `mode` in place, right
     after an external process this installer does not control (`npm`) has
     just generated it at whatever mode that process's own ambient umask
     happened to produce, and return the (st_dev, st_ino) identity it was
     tightened at.
+
+    `expected_parent_identity` is required, not optional with a
+    None-means-skip default: this is the ONE call site that mutates a
+    file's mode through an ancestor directory resolved fresh, by name,
+    strictly AFTER a long external `npm` subprocess this installer does not
+    control has already run -- a caller that forgot to pass it would
+    silently regress to round 21's gap (a same-UID rename-swap of
+    RELEASE_DIR itself, using a different, real, legitimately-owned,
+    correctly-permissioned directory, passing every per-component check
+    open_verified_ancestor_chain() performs). Callers must pass the
+    (st_dev, st_ino) identity captured for `path`'s intended parent BEFORE
+    that subprocess ran -- for _install_locked(), that is RELEASE_DIR's own
+    identity, captured immediately after ensure_private_dir(RELEASE_DIR)
+    creates it and before either `npm` invocation that follows.
 
     Every OTHER private SSD state file this installer itself writes is
     published already at the intended private mode by atomic_write()/
@@ -550,8 +583,29 @@ def tighten_generated_private_file_mode(path: Path, mode: int = 0o600) -> tuple[
     (this path itself swapped for a symlink) was already refused by the
     O_NOFOLLOW-open-then-fstat-identity-check discipline read_private_file()
     established; only the ancestor-directory case was missed.
+
+    round 19's fix still only refused a SYMLINKED ancestor, though: every
+    per-component check open_verified_directory_component() performs
+    (real directory, not a symlink, owned by this UID, safe mode)
+    validates properties in the moment, not identity continuity with
+    whatever RELEASE_DIR actually was before npm ran -- so a same-UID
+    rename-swap that replaces RELEASE_DIR with a DIFFERENT, real,
+    legitimately-owned, correctly-permissioned directory (not a symlink)
+    passed every one of those checks and reached the fchmod below on
+    whatever unrelated file happened to sit at the expected name inside
+    it. `expected_parent_identity`, forwarded to
+    open_verified_generated_file_parent() and compared there against the
+    resolved parent's own (st_dev, st_ino) before its descriptor is ever
+    returned, closes that gap: the replacement directory can only pass
+    that comparison by actually BEING the one RELEASE_DIR identity was
+    captured from (independent Codex sol/max round-21 review, 2026-08-19,
+    P1; round 21's own Claude opus/max review tested only symlink swaps
+    and swaps at other points in the walk, not a same-UID rename-swap to
+    another real, well-formed directory).
     """
-    parent_descriptor = open_verified_generated_file_parent(path)
+    parent_descriptor = open_verified_generated_file_parent(
+        path, expected_identity=expected_parent_identity
+    )
     try:
         name = path.name
         try:
@@ -586,6 +640,59 @@ def tighten_generated_private_file_mode(path: Path, mode: int = 0o600) -> tuple[
             os.close(parent_descriptor)
         except OSError:
             pass
+
+
+def assert_release_dir_identity(expected_identity: tuple[int, int]) -> None:
+    """Re-assert that RELEASE_DIR still resolves, right now, to the same
+    (st_dev, st_ino) identity _install_locked() captured immediately after
+    creating it, strictly before either external `npm` subprocess it does
+    not control has ever run.
+
+    tighten_generated_private_file_mode() (via
+    open_verified_generated_file_parent()) already re-asserts this SAME
+    captured identity immediately after `npm install --package-lock-only`
+    -- the first of the two long subprocess windows -- but nothing
+    previously re-asserted it after the SECOND: `npm ci`, which actually
+    materializes node_modules, is immediately followed by
+    _install_locked() moving node_modules to lib/node_modules, chmod'ing
+    the entrypoint, and writing the launch guard and command wrapper
+    scripts -- all of it resolving RELEASE_DIR by plain lexical path, with
+    no identity check at all, right after that window closes. A same-UID
+    racer who renames RELEASE_DIR aside (taking npm's real, just-installed
+    output with it) and renames a different, legitimately-owned,
+    correctly-permissioned real directory into its place at any point
+    during `npm ci`'s run would otherwise have every one of those steps --
+    including the two atomic_create_private_file() calls that publish the
+    launch guard and the command wrapper npm's *own* future symlinked
+    invocation permanently trusts -- silently operate on that replacement
+    instead (independent Codex sol/max round-21 review, 2026-08-19, P1
+    residual: round 21's own report was specific to
+    tighten_generated_private_file_mode(), but the SAME root cause --
+    trusting RELEASE_DIR's identity across an external subprocess window
+    without pinning it -- reaches this second, unreviewed call site too).
+
+    Deliberately the SAME plain path.lstat()-based idiom
+    assert_lifecycle_lock_path_identity() already established for
+    re-asserting a captured identity hasn't drifted (as opposed to the
+    heavier dir_fd-chained walk open_verified_ancestor_chain() uses to
+    resolve a descriptor it is about to MUTATE through): comparing the
+    terminal (st_dev, st_ino) is sufficient here regardless of which
+    ancestor was swapped, or whether the swap used a symlink or a rename,
+    because the resulting directory can only share the original's inode by
+    actually being it.
+    """
+    try:
+        current = RELEASE_DIR.lstat()
+    except OSError as exc:
+        raise PrimeInstallError(
+            "managed Prime Agent release directory became unavailable during install"
+        ) from exc
+    if (current.st_dev, current.st_ino) != expected_identity:
+        raise PrimeInstallError(
+            "managed Prime Agent release directory identity changed during "
+            "install; a same-UID actor may have replaced it with a "
+            "different directory"
+        )
 
 
 def verify_unchanged_private_ssd_file(
@@ -3498,7 +3605,11 @@ def open_verified_directory_component(
 
 
 def open_verified_ancestor_chain(
-    link: Path, *, create_missing: bool, root: Path | None = None
+    link: Path,
+    *,
+    create_missing: bool,
+    root: Path | None = None,
+    expected_identity: tuple[int, int] | None = None,
 ) -> int:
     """Walk from `root` (USER_HOME by default) to link's parent entirely via
     dir_fd-chained, openat()-style lookups (see
@@ -3522,6 +3633,39 @@ def open_verified_ancestor_chain(
     racer who swaps RELEASE_DIR (or any ancestor above it, e.g. TOOL_ROOT
     or "releases") for a symlink cannot redirect this walk either
     (independent Codex sol/max round-19 review, 2026-08-19, P1).
+
+    `expected_identity`, when given, is compared -- via os.fstat(), on the
+    already-open, already-verified descriptor this walk is about to return,
+    strictly BEFORE returning it -- against the (st_dev, st_ino) the caller
+    captured for that SAME final directory at some earlier, trusted point
+    (for open_verified_generated_file_parent()/
+    tighten_generated_private_file_mode(), that is RELEASE_DIR's own
+    identity, captured by _install_locked() immediately after it creates
+    RELEASE_DIR and strictly before the external `npm` subprocess this walk
+    exists to defend against ever runs). Every per-component check this walk
+    already performs (open_verified_directory_component(): real directory,
+    not a symlink, owned by this UID, safe mode) validates properties
+    IN THE MOMENT -- it cannot by itself distinguish the original directory
+    from a same-UID actor's rename-swap replacement, because a replacement
+    built from a different, legitimately-owned, correctly-permissioned REAL
+    directory (not a symlink) genuinely satisfies every one of those checks.
+    Comparing the terminal descriptor's inode against an identity captured
+    before the untrusted window closes that gap regardless of which
+    ancestor was swapped, or whether the swap used a symlink or a rename,
+    because the resulting directory can only share the original's
+    (st_dev, st_ino) by actually BEING it (independent Codex sol/max
+    round-21 review, 2026-08-19, P1: round 20's fix refused a SYMLINKED
+    RELEASE_DIR, but a same-UID rename-swap that replaced it with a
+    different, real, 0700, self-owned directory -- reproduced by renaming
+    the real release directory aside and renaming a prepared sibling real
+    directory, containing an unrelated mode-0644 package-lock.json, into
+    the release name -- passed every existing per-component check and let
+    tighten_generated_private_file_mode() chmod the unrelated file).
+    Defaults to None (no check) so every OTHER caller of this shared walk
+    (ensure_local_link_parent(), verify_link_parent_descriptor(),
+    remove_exact_symlink()'s BIN_LINK-parent resolution -- none of which
+    hold an identity captured across an external subprocess window; each
+    re-walks fresh immediately before use) is unaffected.
     """
     require_link_dir_fd_support()
     lexical_root = (USER_HOME if root is None else root).absolute()
@@ -3546,6 +3690,13 @@ def open_verified_ancestor_chain(
             )
             os.close(current_descriptor)
             current_descriptor = next_descriptor
+        if expected_identity is not None:
+            resolved = os.fstat(current_descriptor)
+            if (resolved.st_dev, resolved.st_ino) != expected_identity:
+                raise PrimeInstallError(
+                    "managed ancestor directory identity changed since "
+                    f"capture: {display_path}"
+                )
         return current_descriptor
     except BaseException:
         try:
@@ -4160,6 +4311,35 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     ensure_private_dir(TOOL_ROOT)
     ensure_private_dir(TOOL_ROOT / "releases")
     ensure_private_dir(RELEASE_DIR)
+    # Capture RELEASE_DIR's own (st_dev, st_ino) identity right now --
+    # immediately after this installer itself creates it, and strictly
+    # before either external `npm` subprocess below (which this installer
+    # does not control the runtime of) ever runs. This is the ONLY point
+    # in the entire install where RELEASE_DIR's identity can be captured
+    # with the same "before an external subprocess touches anything"
+    # guarantee already established for the managed lifecycle lock
+    # (assert_lifecycle_lock_path_identity(), lock_identity) and for each
+    # locally patched asset (patched_asset_identities below). Threaded
+    # through to tighten_generated_private_file_mode() (immediately after
+    # `npm install --package-lock-only`) and re-asserted again immediately
+    # after `npm ci` (assert_release_dir_identity()), so a same-UID racer
+    # who renames RELEASE_DIR aside and renames a different, legitimately-
+    # owned, correctly-permissioned real directory into its place -- at
+    # any point during either npm subprocess's run -- is refused instead
+    # of silently trusted, even though every per-component property check
+    # open_verified_ancestor_chain() performs (real directory, not a
+    # symlink, owned by this UID, safe mode) genuinely passes on the
+    # replacement (independent Codex sol/max round-21 review, 2026-08-19,
+    # P1: round 20's fix refused only a SYMLINKED RELEASE_DIR; a same-UID
+    # rename-swap to another real, well-formed directory validates
+    # properties-in-the-moment, not identity continuity, so it passed
+    # every existing check).
+    #
+    # Deliberately NOT named `lock_identity` or `package_lock_identity`
+    # for the same shadowing reason `manifest_identity` below is not
+    # either -- see the comment at package_lock_identity's own capture.
+    release_dir_stat = RELEASE_DIR.lstat()
+    release_dir_identity = (release_dir_stat.st_dev, release_dir_stat.st_ino)
     assets_dir = ensure_private_dir(RELEASE_DIR / "assets")
     cache = ensure_private_dir(TOOL_ROOT / "npm-cache")
     install_home = ensure_private_dir(TOOL_ROOT / "install-home")
@@ -4317,7 +4497,9 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     # by both a Claude opus/max review and a separate Codex QA pass). Keep
     # this name distinct from the `lock_identity` parameter for the same
     # reason `manifest_identity` above is not named `lock_identity` either.
-    package_lock_identity = tighten_generated_private_file_mode(lock_path)
+    package_lock_identity = tighten_generated_private_file_mode(
+        lock_path, expected_parent_identity=release_dir_identity
+    )
     generated_lock_raw = lock_path.read_bytes()
     generated_lock = strict_json(generated_lock_raw)
     if not isinstance(generated_lock, dict):
@@ -4342,6 +4524,18 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
         install_home,
         install_tmp,
     )
+    # `npm ci` is the SECOND long external subprocess window this install
+    # exposes RELEASE_DIR to -- and everything from here through the end of
+    # this function (materializing/verifying node_modules, moving it to
+    # lib/node_modules, chmod'ing the entrypoint, writing the launch guard
+    # and command wrapper) resolves RELEASE_DIR by plain lexical path, with
+    # no identity check at all, immediately after that window closes.
+    # Re-assert RELEASE_DIR's identity right now, before any of that trusts
+    # it again -- closing the SAME same-UID rename-swap gap
+    # tighten_generated_private_file_mode() above closes for the FIRST
+    # window, applied to the second (independent Codex sol/max round-21
+    # review, 2026-08-19, P1 residual; see assert_release_dir_identity()).
+    assert_release_dir_identity(release_dir_identity)
     installed_package = RELEASE_DIR / "node_modules/prime-agent"
     if installed_package.is_symlink() or not installed_package.is_dir():
         raise PrimeInstallError("npm did not materialize a private Prime Agent package")
