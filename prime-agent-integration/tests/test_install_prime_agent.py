@@ -8165,6 +8165,21 @@ class PrimeAgentInstallerTests(unittest.TestCase):
         # for this exact fixture (no comparison against any pinned
         # baseline existed), so this test's assertRaisesRegex block would
         # itself fail with "PrimeInstallError not raised".
+        #
+        # Round 27, 2026-08-19: this same swap is now caught by
+        # assert_locally_patched_package_matches_pinned_digests() (the P1
+        # fix's complete, per-file sweep of all four locally patched
+        # packages, which now runs BEFORE the round-24/25 entrypoint-
+        # specific capture/compare this test originally targeted) rather
+        # than by the entrypoint-specific comparison itself -- the error
+        # message below reflects that broader check firing first. The
+        # round-24/25 mechanism this test used to isolate is still
+        # independently exercised, unchanged, by
+        # test_install_locked_detects_entrypoint_content_swap_after_npm_ci
+        # above (which wraps the real capture_private_ssd_asset_digest()
+        # rather than pre-materializing tampered content, so it fails
+        # closed on the round-24/25 comparison specifically even now that
+        # the round-27 sweep also runs).
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             tool_root = root / "tool"
@@ -8367,7 +8382,8 @@ class PrimeAgentInstallerTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(
                     installer.PrimeInstallError,
-                    "entrypoint content does not match the digest-verified original tarball",
+                    r"prime-agent materialized file content does not match the "
+                    r"digest-verified original tarball: dist/bundle/cli\.js",
                 ):
                     installer.install()
 
@@ -8630,6 +8646,790 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     installer.PrimeInstallError,
                     r"npm materialized undeclared node_modules package\(s\)",
+                ):
+                    installer.install()
+
+            self.assertFalse((release / "lib/node_modules").exists())
+            self.assertFalse((release / "bin/prime-agent-launch-guard.py").exists())
+            self.assertFalse((release / "bin/prime-agent").exists())
+            self.assertFalse((tool_root / "pending-install.json").exists())
+            self.assertFalse(
+                (tool_root / "receipts" / f"v{installer.VERSION}.json").exists()
+            )
+
+    def test_install_locked_detects_tampered_non_entrypoint_sibling_file(
+        self,
+    ) -> None:
+        # Regression for independent Claude opus/max round-27 review,
+        # 2026-08-19, P1: "The pinned entrypoint digest mechanism ... covers
+        # only dist/bundle/cli.js -- a 1,813-byte ESM forwarding stub that
+        # is 0.013% of the 39-file/13,804,347-byte dist/bundle/ directory it
+        # ships alongside. cli.js statically imports one chunk ... and
+        # dynamically imports the real CLI main module at runtime -- both
+        # execute unconditionally on every invocation, and neither is
+        # covered by anything ... Reproduced live: tampering with the
+        # sibling chunk files during npm ci's window while leaving cli.js
+        # itself genuine still completes install with a clean launch guard
+        # and receipt -- permanent RCE on every future managed invocation."
+        #
+        # This test's fake_make_patched_asset returns a content_digests map
+        # for "prime-agent" that pins BOTH dist/bundle/cli.js AND a second,
+        # non-entrypoint file (dist/bundle/chunk-real.js) that cli.js
+        # imports -- exactly like the real, digest-verified original
+        # tarball would. fake_run_npm's "ci" branch materializes cli.js
+        # with the GENUINE, correctly-pinned content, but materializes
+        # chunk-real.js with DIFFERENT, attacker-controlled bytes --
+        # isolating the P1 repro: a same-UID racer who leaves the
+        # entrypoint alone and only tampers with what it imports.
+        #
+        # Verified to FAIL against pre-fix HEAD (commit c1ca06e61a) in an
+        # isolated scratch copy: pre-fix, content_digests for the three
+        # entries other than dist/bundle/cli.js were computed by
+        # make_patched_asset() but never threaded anywhere, and
+        # assert_materialized_node_modules_matches_lock() only ever checked
+        # directory PRESENCE -- so this exact fixture (genuine cli.js,
+        # tampered sibling chunk) completed install() successfully with the
+        # attacker's chunk-real.js content published unmodified into
+        # lib/node_modules, no comparison against any pinned baseline for
+        # that file ever performed.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            user_home = root / "user"
+            user_home.mkdir(mode=0o700)
+
+            local_assets = {
+                "prime-agent": installer.MAIN_PATCHED_ASSET,
+                **installer.WORKSPACE_ASSETS,
+            }
+            generated = {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {
+                        "name": "orca-managed-prime-agent",
+                        "version": installer.VERSION,
+                        "dependencies": {
+                            "prime-agent": f"file:assets/{installer.MAIN_PATCHED_ASSET}"
+                        },
+                    },
+                    **{
+                        f"node_modules/local-{index}": {
+                            "name": name,
+                            "version": installer.VERSION,
+                            "resolved": f"file:assets/{asset_name}",
+                            "integrity": "sha512-dGVzdA==",
+                        }
+                        for index, (name, asset_name) in enumerate(local_assets.items())
+                    },
+                },
+            }
+            with mock.patch.object(installer, "RELEASE_DIR", release):
+                expected_lock_sha256 = installer.sha256_bytes(
+                    installer.normalized_production_lock(generated)
+                )
+            generated_lock_raw = installer.canonical_json(generated)
+
+            GENUINE_CLI_CONTENT = b"// genuine, tarball-pinned cli.js\n"
+            GENUINE_CHUNK_CONTENT = b"// genuine, tarball-pinned chunk-real.js\n"
+            ATTACKER_CHUNK_CONTENT = (
+                b"// ATTACKER chunk-real.js, tampered during npm ci's own runtime\n"
+            )
+
+            def fake_run_npm(
+                npm_path, node_path, args, cwd, cache, install_home, install_tmp,
+                timeout=300, child_umask=None, release_dir_fd=None,
+            ):
+                cwd = Path(cwd)
+                if args and args[0] == "install":
+                    lock_path = cwd / "package-lock.json"
+                    lock_path.write_bytes(generated_lock_raw)
+                    os.chmod(lock_path, 0o600)
+                elif args and args[0] == "ci":
+                    bundle = cwd / "node_modules/prime-agent/dist/bundle"
+                    bundle.mkdir(parents=True, mode=0o700)
+                    for ancestor in (
+                        cwd / "node_modules",
+                        cwd / "node_modules/prime-agent",
+                        cwd / "node_modules/prime-agent/dist",
+                        bundle,
+                    ):
+                        os.chmod(ancestor, 0o700)
+                    # The entrypoint itself is genuine -- the repro is
+                    # specifically that leaving cli.js untouched and only
+                    # tampering with what it imports must still be caught.
+                    cli = bundle / "cli.js"
+                    cli.write_bytes(GENUINE_CLI_CONTENT)
+                    os.chmod(cli, 0o600)
+                    # The same-UID racer's plant: a sibling chunk cli.js
+                    # imports, tampered in place during npm ci's own window.
+                    chunk = bundle / "chunk-real.js"
+                    chunk.write_bytes(ATTACKER_CHUNK_CONTENT)
+                    os.chmod(chunk, 0o600)
+
+            def fake_make_patched_asset(
+                original_asset,
+                original_sha256,
+                upstream_lock,
+                assets_dir,
+                *,
+                expected_name,
+                managed_name,
+                output_name,
+            ):
+                patched = assets_dir / output_name
+                installer.atomic_create_private_file(patched, b"stub-asset", 0o600)
+                published_stat = patched.lstat()
+                # The pinned, tarball-derived baseline for BOTH of
+                # prime-agent's dist/bundle/ files -- exactly as
+                # safe_extract_main_asset() would have captured them from
+                # the real, digest-verified tarball strictly before `npm
+                # ci` ever ran. Deliberately includes chunk-real.js's
+                # GENUINE content, never the attacker's.
+                content_digests = (
+                    {
+                        Path("dist/bundle/cli.js"): installer.sha256_bytes(
+                            GENUINE_CLI_CONTENT
+                        ),
+                        Path("dist/bundle/chunk-real.js"): installer.sha256_bytes(
+                            GENUINE_CHUNK_CONTENT
+                        ),
+                    }
+                    if managed_name == "prime-agent"
+                    else {}
+                )
+                return (
+                    patched,
+                    installer.sha256_bytes(b"stub-asset"),
+                    {"name": managed_name, "version": installer.VERSION},
+                    (published_stat.st_dev, published_stat.st_ino),
+                    content_digests,
+                )
+
+            def fake_safe_download(url, destination, expected_sha256, *, max_bytes=None):
+                if destination.name == "upstream-package-lock.json":
+                    payload = installer.canonical_json(
+                        {"lockfileVersion": 3, "packages": {}}
+                    )
+                else:
+                    payload = b"stub-download"
+                installer.atomic_create_private_file(destination, payload, 0o600)
+
+            fake_evidence = {
+                "volume_uuid": "TEST-UUID",
+                "node_version": installer.NODE_VERSION,
+                "npm_version": installer.NPM_VERSION,
+                "orca_support": {"test": "support"},
+            }
+
+            with contextlib.ExitStack() as stack:
+                enter = stack.enter_context
+                enter(mock.patch.object(installer, "SSD_ROOT", root))
+                enter(mock.patch.object(installer, "TOOL_ROOT", tool_root))
+                enter(mock.patch.object(installer, "RELEASE_DIR", release))
+                enter(mock.patch.object(installer, "STATE_DIR", tool_root / "state"))
+                enter(
+                    mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home")
+                )
+                enter(mock.patch.object(installer, "USER_HOME", user_home))
+                enter(mock.patch.object(installer, "STATE_LINK", user_home / ".prime"))
+                enter(
+                    mock.patch.object(
+                        installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "RECEIPT_PATH",
+                        tool_root / "receipts" / f"v{installer.VERSION}.json",
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "PENDING_PATH", tool_root / "pending-install.json"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_SHA256", expected_lock_sha256
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_PACKAGE_COUNT", len(local_assets)
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "volume_uuid", return_value="TEST-UUID")
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "verify_orca_support",
+                        return_value={"test": "support"},
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "prime_agent_command_candidates", return_value=[]
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "preflight", return_value=fake_evidence)
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "extract_node_toolchain",
+                        side_effect=self.fake_extract_node_toolchain,
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "exact_tool_version", return_value="stub"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "make_patched_asset",
+                        side_effect=fake_make_patched_asset,
+                    )
+                )
+                enter(mock.patch.object(installer, "run_npm", side_effect=fake_run_npm))
+
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    r"prime-agent materialized file content does not match the "
+                    r"digest-verified original tarball: dist/bundle/chunk-real\.js",
+                ):
+                    installer.install()
+
+            self.assertFalse((release / "lib/node_modules").exists())
+            self.assertFalse((release / "bin/prime-agent-launch-guard.py").exists())
+            self.assertFalse((release / "bin/prime-agent").exists())
+            self.assertFalse((tool_root / "pending-install.json").exists())
+            self.assertFalse(
+                (tool_root / "receipts" / f"v{installer.VERSION}.json").exists()
+            )
+
+    def test_install_locked_detects_planted_non_directory_top_level_entry(
+        self,
+    ) -> None:
+        # Regression for independent Claude opus/max round-27 review,
+        # 2026-08-19, P2-1: "assert_materialized_node_modules_matches_lock()
+        # skips non-directory top-level entries entirely (`if not
+        # entry.is_dir(): continue` ...) -- a planted top-level FILE (e.g.
+        # node_modules/some-package.js) is an undeclared entry planted
+        # during npm ci and is never added to the 'materialized' set, so
+        # it's silently invisible to the check that's supposed to catch
+        # exactly this. ... Node's CJS LOAD_AS_FILE(DIR/X) resolution
+        # precedes LOAD_AS_DIRECTORY(DIR/X), so a same-named .js file
+        # shadows a directory package for any package lacking an 'exports'
+        # field."
+        #
+        # fake_run_npm's "ci" branch materializes the legitimate prime-agent
+        # tree (genuine cli.js, matching fake_make_patched_asset's pinned
+        # baseline) PLUS one extra, non-directory top-level entry --
+        # "evil-shadow.js" -- planted directly under node_modules/,
+        # simulating a same-UID racer's file-based shadow plant.
+        #
+        # Verified to FAIL against pre-fix HEAD (commit c1ca06e61a) in an
+        # isolated scratch copy: pre-fix,
+        # assert_materialized_node_modules_matches_lock()'s top-level walk
+        # unconditionally skipped any non-directory entry
+        # (`if not entry.is_dir(): continue`), so this planted file was
+        # never added to the "materialized" set and never appeared in the
+        # unexpected-entries diff -- install() completed successfully with
+        # the planted file published unmodified into lib/node_modules.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            user_home = root / "user"
+            user_home.mkdir(mode=0o700)
+
+            local_assets = {
+                "prime-agent": installer.MAIN_PATCHED_ASSET,
+                **installer.WORKSPACE_ASSETS,
+            }
+            generated = {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {
+                        "name": "orca-managed-prime-agent",
+                        "version": installer.VERSION,
+                        "dependencies": {
+                            "prime-agent": f"file:assets/{installer.MAIN_PATCHED_ASSET}"
+                        },
+                    },
+                    **{
+                        f"node_modules/local-{index}": {
+                            "name": name,
+                            "version": installer.VERSION,
+                            "resolved": f"file:assets/{asset_name}",
+                            "integrity": "sha512-dGVzdA==",
+                        }
+                        for index, (name, asset_name) in enumerate(local_assets.items())
+                    },
+                },
+            }
+            with mock.patch.object(installer, "RELEASE_DIR", release):
+                expected_lock_sha256 = installer.sha256_bytes(
+                    installer.normalized_production_lock(generated)
+                )
+            generated_lock_raw = installer.canonical_json(generated)
+
+            GENUINE_CLI_CONTENT = b"// genuine, tarball-pinned cli.js\n"
+
+            def fake_run_npm(
+                npm_path, node_path, args, cwd, cache, install_home, install_tmp,
+                timeout=300, child_umask=None, release_dir_fd=None,
+            ):
+                cwd = Path(cwd)
+                if args and args[0] == "install":
+                    lock_path = cwd / "package-lock.json"
+                    lock_path.write_bytes(generated_lock_raw)
+                    os.chmod(lock_path, 0o600)
+                elif args and args[0] == "ci":
+                    bundle = cwd / "node_modules/prime-agent/dist/bundle"
+                    bundle.mkdir(parents=True, mode=0o700)
+                    for ancestor in (
+                        cwd / "node_modules",
+                        cwd / "node_modules/prime-agent",
+                        cwd / "node_modules/prime-agent/dist",
+                        bundle,
+                    ):
+                        os.chmod(ancestor, 0o700)
+                    cli = bundle / "cli.js"
+                    cli.write_bytes(GENUINE_CLI_CONTENT)
+                    os.chmod(cli, 0o600)
+                    # The same-UID racer's plant: a non-directory entry
+                    # directly at the top level of node_modules/, never
+                    # part of the verified lock's declared closure and
+                    # never one of KNOWN_NON_DIRECTORY_NODE_MODULES_ENTRIES.
+                    shadow = cwd / "node_modules/evil-shadow.js"
+                    shadow.write_text(
+                        "// attacker-controlled shadow file\n", encoding="utf-8"
+                    )
+                    os.chmod(shadow, 0o600)
+
+            def fake_make_patched_asset(
+                original_asset,
+                original_sha256,
+                upstream_lock,
+                assets_dir,
+                *,
+                expected_name,
+                managed_name,
+                output_name,
+            ):
+                patched = assets_dir / output_name
+                installer.atomic_create_private_file(patched, b"stub-asset", 0o600)
+                published_stat = patched.lstat()
+                content_digests = (
+                    {Path("dist/bundle/cli.js"): installer.sha256_bytes(GENUINE_CLI_CONTENT)}
+                    if managed_name == "prime-agent"
+                    else {}
+                )
+                return (
+                    patched,
+                    installer.sha256_bytes(b"stub-asset"),
+                    {"name": managed_name, "version": installer.VERSION},
+                    (published_stat.st_dev, published_stat.st_ino),
+                    content_digests,
+                )
+
+            def fake_safe_download(url, destination, expected_sha256, *, max_bytes=None):
+                if destination.name == "upstream-package-lock.json":
+                    payload = installer.canonical_json(
+                        {"lockfileVersion": 3, "packages": {}}
+                    )
+                else:
+                    payload = b"stub-download"
+                installer.atomic_create_private_file(destination, payload, 0o600)
+
+            fake_evidence = {
+                "volume_uuid": "TEST-UUID",
+                "node_version": installer.NODE_VERSION,
+                "npm_version": installer.NPM_VERSION,
+                "orca_support": {"test": "support"},
+            }
+
+            with contextlib.ExitStack() as stack:
+                enter = stack.enter_context
+                enter(mock.patch.object(installer, "SSD_ROOT", root))
+                enter(mock.patch.object(installer, "TOOL_ROOT", tool_root))
+                enter(mock.patch.object(installer, "RELEASE_DIR", release))
+                enter(mock.patch.object(installer, "STATE_DIR", tool_root / "state"))
+                enter(
+                    mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home")
+                )
+                enter(mock.patch.object(installer, "USER_HOME", user_home))
+                enter(mock.patch.object(installer, "STATE_LINK", user_home / ".prime"))
+                enter(
+                    mock.patch.object(
+                        installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "RECEIPT_PATH",
+                        tool_root / "receipts" / f"v{installer.VERSION}.json",
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "PENDING_PATH", tool_root / "pending-install.json"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_SHA256", expected_lock_sha256
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_PACKAGE_COUNT", len(local_assets)
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "volume_uuid", return_value="TEST-UUID")
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "verify_orca_support",
+                        return_value={"test": "support"},
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "prime_agent_command_candidates", return_value=[]
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "preflight", return_value=fake_evidence)
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "extract_node_toolchain",
+                        side_effect=self.fake_extract_node_toolchain,
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "exact_tool_version", return_value="stub"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "make_patched_asset",
+                        side_effect=fake_make_patched_asset,
+                    )
+                )
+                enter(mock.patch.object(installer, "run_npm", side_effect=fake_run_npm))
+
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    r"unexpected non-directory entry where a declared package "
+                    r"name was expected: evil-shadow\.js",
+                ):
+                    installer.install()
+
+            self.assertFalse((release / "lib/node_modules").exists())
+            self.assertFalse((release / "bin/prime-agent-launch-guard.py").exists())
+            self.assertFalse((release / "bin/prime-agent").exists())
+            self.assertFalse((tool_root / "pending-install.json").exists())
+            self.assertFalse(
+                (tool_root / "receipts" / f"v{installer.VERSION}.json").exists()
+            )
+
+    def test_install_locked_detects_undeclared_package_in_nested_node_modules(
+        self,
+    ) -> None:
+        # Regression for independent Claude opus/max round-27 review,
+        # 2026-08-19, P2-2: "Nested node_modules/ (a package's own
+        # sub-dependencies) is never walked -- 9 real nested node_modules/
+        # directories materialize in a real install, and the lock declares
+        # 12 nested rows, but
+        # assert_materialized_node_modules_matches_lock() only checks depth
+        # 1. The same attack ... one directory deeper completely bypasses
+        # the round-26 check." (Empirically confirmed via a real darwin-
+        # arm64 `npm ci` replay of this installer's own pinned lock, round
+        # 27, 2026-08-19: exactly 9 materialized nested node_modules/
+        # containers against 12 declared nested rows, and the materialized
+        # contents of every one matched its declared rows exactly.)
+        #
+        # This test plants the undeclared package inside a REGISTRY
+        # (non-locally-patched) declared package's own nested node_modules/
+        # -- "some-registry-dep" -- deliberately NOT inside one of the four
+        # locally patched packages, so this isolates P2-2 cleanly: a plant
+        # inside prime-agent's own tree would also be caught by this same
+        # round's P1 fix (assert_locally_patched_package_matches_pinned_
+        # digests()' fully recursive walk), which would make it impossible
+        # to tell which mechanism actually caught it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            user_home = root / "user"
+            user_home.mkdir(mode=0o700)
+
+            local_assets = {
+                "prime-agent": installer.MAIN_PATCHED_ASSET,
+                **installer.WORKSPACE_ASSETS,
+            }
+            registry_dep_row = {
+                "name": "some-registry-dep",
+                "version": "1.0.0",
+                "resolved": (
+                    "https://registry.npmjs.org/some-registry-dep/-/"
+                    "some-registry-dep-1.0.0.tgz"
+                ),
+                "integrity": "sha512-dGVzdA==",
+            }
+            nested_subdep_row = {
+                "name": "its-legit-subdep",
+                "version": "2.0.0",
+                "resolved": (
+                    "https://registry.npmjs.org/its-legit-subdep/-/"
+                    "its-legit-subdep-2.0.0.tgz"
+                ),
+                "integrity": "sha512-dGVzdA==",
+            }
+            generated = {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {
+                        "name": "orca-managed-prime-agent",
+                        "version": installer.VERSION,
+                        "dependencies": {
+                            "prime-agent": f"file:assets/{installer.MAIN_PATCHED_ASSET}"
+                        },
+                    },
+                    **{
+                        f"node_modules/local-{index}": {
+                            "name": name,
+                            "version": installer.VERSION,
+                            "resolved": f"file:assets/{asset_name}",
+                            "integrity": "sha512-dGVzdA==",
+                        }
+                        for index, (name, asset_name) in enumerate(local_assets.items())
+                    },
+                    "node_modules/some-registry-dep": registry_dep_row,
+                    "node_modules/some-registry-dep/node_modules/its-legit-subdep": (
+                        nested_subdep_row
+                    ),
+                },
+            }
+            with mock.patch.object(installer, "RELEASE_DIR", release):
+                expected_lock_sha256 = installer.sha256_bytes(
+                    installer.normalized_production_lock(generated)
+                )
+            generated_lock_raw = installer.canonical_json(generated)
+
+            GENUINE_CLI_CONTENT = b"// genuine, tarball-pinned cli.js\n"
+
+            def fake_run_npm(
+                npm_path, node_path, args, cwd, cache, install_home, install_tmp,
+                timeout=300, child_umask=None, release_dir_fd=None,
+            ):
+                cwd = Path(cwd)
+                if args and args[0] == "install":
+                    lock_path = cwd / "package-lock.json"
+                    lock_path.write_bytes(generated_lock_raw)
+                    os.chmod(lock_path, 0o600)
+                elif args and args[0] == "ci":
+                    bundle = cwd / "node_modules/prime-agent/dist/bundle"
+                    bundle.mkdir(parents=True, mode=0o700)
+                    for ancestor in (
+                        cwd / "node_modules",
+                        cwd / "node_modules/prime-agent",
+                        cwd / "node_modules/prime-agent/dist",
+                        bundle,
+                    ):
+                        os.chmod(ancestor, 0o700)
+                    cli = bundle / "cli.js"
+                    cli.write_bytes(GENUINE_CLI_CONTENT)
+                    os.chmod(cli, 0o600)
+                    # The declared registry dependency and its ONE declared
+                    # nested sub-dependency -- both legitimate, matching the
+                    # lock exactly.
+                    legit_nested = (
+                        cwd
+                        / "node_modules/some-registry-dep/node_modules"
+                        / "its-legit-subdep"
+                    )
+                    legit_nested.mkdir(parents=True, mode=0o700)
+                    os.chmod(cwd / "node_modules/some-registry-dep", 0o700)
+                    os.chmod(
+                        cwd / "node_modules/some-registry-dep/node_modules", 0o700
+                    )
+                    # The same-UID racer's plant: an ENTIRELY UNDECLARED
+                    # package sitting one directory deeper than the
+                    # round-25/26 check ever looked -- inside a legitimately
+                    # declared package's own nested node_modules/, planted
+                    # during npm ci's own multi-minute runtime, without
+                    # touching RELEASE_DIR's own directory entry or any
+                    # top-level node_modules/ entry at all.
+                    evil_nested = (
+                        cwd
+                        / "node_modules/some-registry-dep/node_modules"
+                        / "evil-nested-package"
+                    )
+                    evil_nested.mkdir(parents=True, mode=0o700)
+                    (evil_nested / "index.js").write_text(
+                        "// attacker-controlled nested module\n", encoding="utf-8"
+                    )
+                    os.chmod(evil_nested / "index.js", 0o600)
+
+            def fake_make_patched_asset(
+                original_asset,
+                original_sha256,
+                upstream_lock,
+                assets_dir,
+                *,
+                expected_name,
+                managed_name,
+                output_name,
+            ):
+                patched = assets_dir / output_name
+                installer.atomic_create_private_file(patched, b"stub-asset", 0o600)
+                published_stat = patched.lstat()
+                content_digests = (
+                    {Path("dist/bundle/cli.js"): installer.sha256_bytes(GENUINE_CLI_CONTENT)}
+                    if managed_name == "prime-agent"
+                    else {}
+                )
+                return (
+                    patched,
+                    installer.sha256_bytes(b"stub-asset"),
+                    {"name": managed_name, "version": installer.VERSION},
+                    (published_stat.st_dev, published_stat.st_ino),
+                    content_digests,
+                )
+
+            def fake_safe_download(url, destination, expected_sha256, *, max_bytes=None):
+                if destination.name == "upstream-package-lock.json":
+                    payload = installer.canonical_json(
+                        {"lockfileVersion": 3, "packages": {}}
+                    )
+                else:
+                    payload = b"stub-download"
+                installer.atomic_create_private_file(destination, payload, 0o600)
+
+            fake_evidence = {
+                "volume_uuid": "TEST-UUID",
+                "node_version": installer.NODE_VERSION,
+                "npm_version": installer.NPM_VERSION,
+                "orca_support": {"test": "support"},
+            }
+
+            with contextlib.ExitStack() as stack:
+                enter = stack.enter_context
+                enter(mock.patch.object(installer, "SSD_ROOT", root))
+                enter(mock.patch.object(installer, "TOOL_ROOT", tool_root))
+                enter(mock.patch.object(installer, "RELEASE_DIR", release))
+                enter(mock.patch.object(installer, "STATE_DIR", tool_root / "state"))
+                enter(
+                    mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home")
+                )
+                enter(mock.patch.object(installer, "USER_HOME", user_home))
+                enter(mock.patch.object(installer, "STATE_LINK", user_home / ".prime"))
+                enter(
+                    mock.patch.object(
+                        installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "RECEIPT_PATH",
+                        tool_root / "receipts" / f"v{installer.VERSION}.json",
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "PENDING_PATH", tool_root / "pending-install.json"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_SHA256", expected_lock_sha256
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "GENERATED_LOCK_PACKAGE_COUNT",
+                        len(local_assets) + 2,
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "volume_uuid", return_value="TEST-UUID")
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "verify_orca_support",
+                        return_value={"test": "support"},
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "prime_agent_command_candidates", return_value=[]
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "preflight", return_value=fake_evidence)
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "extract_node_toolchain",
+                        side_effect=self.fake_extract_node_toolchain,
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "exact_tool_version", return_value="stub"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "make_patched_asset",
+                        side_effect=fake_make_patched_asset,
+                    )
+                )
+                enter(mock.patch.object(installer, "run_npm", side_effect=fake_run_npm))
+
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    r"npm materialized undeclared nested node_modules package\(s\) "
+                    r"not present in the verified lock inside "
+                    r"node_modules/some-registry-dep/node_modules: "
+                    r"\['evil-nested-package'\]",
                 ):
                     installer.install()
 

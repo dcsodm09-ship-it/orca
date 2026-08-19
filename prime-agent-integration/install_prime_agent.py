@@ -2330,8 +2330,17 @@ def make_patched_asset(
     # untamperable baseline -- fixed before npm ever ran, and therefore
     # never influenced by a same-UID swap that happens during OR after
     # npm's own subprocess window (round 25, 2026-08-19, P1-A; see
-    # _install_locked_within_release_dir()'s entrypoint-digest capture,
-    # which is the only current consumer of this return value).
+    # _install_locked_within_release_dir()'s entrypoint-digest capture).
+    # Round 27, 2026-08-19, P1: that entrypoint-digest capture was, until
+    # this round, the ONLY consumer of this return value -- pinning just
+    # ONE entry (dist/bundle/cli.js) out of the complete per-file map this
+    # function already builds for every one of the four locally patched
+    # packages. _install_locked_within_release_dir() now also threads the
+    # COMPLETE map returned here, for every one of those four calls, into
+    # assert_locally_patched_package_matches_pinned_digests() -- which
+    # verifies every file `npm ci` materializes for that package, not only
+    # its entrypoint -- so this map has two independent consumers today,
+    # not one.
     return patched, sha256_bytes(patched_raw), manifest, published_identity, content_digests
 
 
@@ -2612,8 +2621,197 @@ def declared_top_level_node_modules_packages(packages: dict[str, Any]) -> frozen
     return frozenset(declared)
 
 
+def declared_nested_node_modules_packages(
+    packages: dict[str, Any]
+) -> dict[str, frozenset[str]]:
+    """Every node_modules/ CONTAINER this closure declares at any nesting
+    depth BEYOND the top level -- e.g. "node_modules/proxy-agent/node_modules"
+    or "node_modules/@aws-sdk/credential-provider-sso/node_modules" -- mapped
+    to the SET of bare package directory names (scoped packages spelled
+    "@scope/name") that container declares directly beneath it, derived from
+    the SAME validated generated package-lock.json "packages" map
+    declared_top_level_node_modules_packages() already reads.
+
+    A row's container is everything up to and including its OWN LAST
+    "node_modules/" segment (`lock_path.rfind("node_modules/")`), so this
+    groups correctly at ANY depth the lock format allows -- not only the one
+    level of nesting this closure's pinned lock happens to have today (12
+    declared nested rows across 9 distinct nested containers, empirically
+    confirmed via a real darwin-arm64 `npm ci` replay of this exact pinned
+    lock, round 27, 2026-08-19) -- without any change to this function if a
+    future lock refresh introduces a doubly-nested row.
+
+    Used, together with declared_top_level_node_modules_packages(), as the
+    complete "what npm ci is SUPPOSED to have materialized" baseline for
+    assert_materialized_node_modules_matches_lock() (round 27, 2026-08-19,
+    P2-2 fix; see that function's own docstring for why the round-25/26
+    version of this check, scoped to the top level only, missed this
+    entirely).
+    """
+    grouped: dict[str, set[str]] = {}
+    for lock_path, row in packages.items():
+        if not isinstance(lock_path, str) or not lock_path.startswith("node_modules/"):
+            continue
+        if not isinstance(row, dict):
+            continue
+        last = lock_path.rfind("node_modules/")
+        if last == 0:
+            continue  # Top-level row -- declared_top_level_node_modules_packages()'s concern, not this function's.
+        container = lock_path[:last] + "node_modules"
+        name = package_name_from_lock_path(lock_path, row)
+        if name:
+            grouped.setdefault(container, set()).add(name)
+    return {container: frozenset(names) for container, names in grouped.items()}
+
+
+# Round 27, 2026-08-19 (independent Claude opus/max round-27 review, P2-1):
+# the ONE non-directory entry a real `npm ci` -- run against this exact
+# pinned lock's closure, on a real darwin-arm64 install -- writes directly at
+# the top level of node_modules/: npm's own hidden installation bookkeeping
+# marker, never a package. Verified empirically (not assumed): a real
+# replay's node_modules/ top level, the inside of every "@scope/" directory
+# it materializes, and every nested node_modules/ container it materializes,
+# together contain exactly one non-directory entry in the whole tree, and it
+# is this file. Any OTHER non-directory entry found anywhere a declared
+# package name is expected is therefore refused outright rather than
+# silently ignored, the way this file's own round-25 version of this check
+# used to (`if not entry.is_dir(): continue`).
+KNOWN_NON_DIRECTORY_NODE_MODULES_ENTRIES: frozenset[str] = frozenset({".package-lock.json"})
+
+# Depth sanity bound for _walk_nested_node_modules_containers()'s iterative
+# descent through materialized node_modules/ containers -- not a real
+# security boundary (a same-UID attacker with write access for npm ci's
+# entire runtime already has far cheaper ways to waste this installer's
+# time), but cheap insurance against a pathologically deep, symlink-free
+# directory chain turning a should-be-instant structural check into an
+# unbounded one. Real npm output for this closure nests at most one level
+# deep (empirically confirmed, round 27, 2026-08-19); 64 is generous
+# headroom for any plausible future lock refresh while still being a hard
+# stop well short of anything that would make this check slow.
+MAX_NODE_MODULES_NESTING_DEPTH = 64
+
+
+def _materialized_node_modules_directory_names(directory: Path, label: str) -> frozenset[str]:
+    """The set of package directory NAMES (bare, e.g. "lru-cache", or
+    "@scope/name" for a scoped package) directly materialized one level
+    inside a node_modules/ directory (`directory`) -- the top-level
+    RELEASE_DIR/node_modules itself, or a package's own nested node_modules/
+    -- computed identically either way, so
+    assert_materialized_node_modules_matches_lock()'s top-level and nested
+    checks can never independently drift in what counts as a legitimate
+    entry.
+
+    Fails closed -- rather than silently skipping, as this file's own
+    round-25 version of this logic did for the top level -- on:
+      * a symlink anywhere a package name, ".bin", or the npm bookkeeping
+        marker is expected;
+      * a non-directory entry where a declared package name is expected,
+        UNLESS its name is in KNOWN_NON_DIRECTORY_NODE_MODULES_ENTRIES
+        (round 27, 2026-08-19, P2-1: the round-25 version's
+        `if not entry.is_dir(): continue` silently dropped a planted
+        top-level FILE from the "materialized" set entirely, so it could
+        never appear in the unexpected-entries diff -- a same-named ".js"
+        file placed beside a real package directory, e.g.
+        node_modules/some-package.js, went completely uncaught, and Node's
+        own CJS LOAD_AS_FILE(DIR/X) resolution precedes
+        LOAD_AS_DIRECTORY(DIR/X), so such a file actually shadows the real
+        package for any package lacking an "exports" field -- true for the
+        majority of this closure's declared packages, confirmed against the
+        pinned Node build actually used here);
+      * a non-directory entry, or a further symlink, inside an "@scope"
+        directory.
+    """
+    names: set[str] = set()
+    try:
+        entries = sorted(directory.iterdir(), key=lambda item: item.name)
+    except OSError as exc:
+        raise PrimeInstallError(f"cannot inspect materialized {label}") from exc
+    for entry in entries:
+        name = entry.name
+        if entry.is_symlink():
+            raise PrimeInstallError(f"materialized {label} entry is a symlink: {name}")
+        if not entry.is_dir():
+            if name in KNOWN_NON_DIRECTORY_NODE_MODULES_ENTRIES:
+                continue
+            raise PrimeInstallError(
+                f"materialized {label} contains an unexpected non-directory entry "
+                f"where a declared package name was expected: {name}"
+            )
+        if name == ".bin":
+            continue
+        if name.startswith("@"):
+            try:
+                scoped_entries = sorted(entry.iterdir(), key=lambda item: item.name)
+            except OSError as exc:
+                raise PrimeInstallError(f"cannot inspect materialized {label}") from exc
+            for scoped_entry in scoped_entries:
+                scoped_name = scoped_entry.name
+                if scoped_entry.is_symlink():
+                    raise PrimeInstallError(
+                        f"materialized {label} entry is a symlink: {name}/{scoped_name}"
+                    )
+                if not scoped_entry.is_dir():
+                    raise PrimeInstallError(
+                        f"materialized {label} contains an unexpected non-directory "
+                        f"entry inside a scope where a declared package name was "
+                        f"expected: {name}/{scoped_name}"
+                    )
+                names.add(f"{name}/{scoped_name}")
+            continue
+        names.add(name)
+    return frozenset(names)
+
+
+def _walk_nested_node_modules_containers(
+    node_modules_root: Path,
+) -> list[tuple[str, frozenset[str]]]:
+    """Discover every node_modules/ CONTAINER reachable by descending
+    through materialized package directories starting at `node_modules_root`
+    -- the top level itself, plus every package's own nested node_modules/
+    at any depth -- and return one (container_path, materialized_names) pair
+    per container found, INCLUDING the top level as the first entry.
+    `container_path` uses the SAME lock-relative string convention
+    declared_nested_node_modules_packages() derives from package-lock.json
+    (e.g. "node_modules" for the top level,
+    "node_modules/proxy-agent/node_modules" for a container nested one level
+    inside proxy-agent's own package directory), so a caller can compare
+    each entry directly against that function's return value with no
+    further translation.
+
+    Iterative (an explicit work queue, not recursion) and depth-bounded via
+    MAX_NODE_MODULES_NESTING_DEPTH, so a pathologically deep, symlink-free
+    directory chain fails closed with a clear error instead of an unbounded
+    walk or a Python RecursionError (round 27, 2026-08-19, P2-2 fix;
+    see that constant's own comment).
+    """
+    results: list[tuple[str, frozenset[str]]] = []
+    queue: list[tuple[Path, str, int]] = [(node_modules_root, "node_modules", 0)]
+    while queue:
+        directory, container_path, depth = queue.pop()
+        if depth > MAX_NODE_MODULES_NESTING_DEPTH:
+            raise PrimeInstallError(
+                "materialized node_modules/ nests deeper than this installer "
+                f"will inspect: {container_path}"
+            )
+        names = _materialized_node_modules_directory_names(directory, container_path)
+        results.append((container_path, names))
+        for name in names:
+            package_dir = directory / name
+            nested = package_dir / "node_modules"
+            if nested.is_symlink():
+                raise PrimeInstallError(
+                    f"materialized node_modules entry is a symlink: "
+                    f"{container_path}/{name}/node_modules"
+                )
+            if nested.is_dir():
+                queue.append((nested, f"{container_path}/{name}/node_modules", depth + 1))
+    return results
+
+
 def assert_materialized_node_modules_matches_lock(
-    release_dir: Path, declared_top_level: frozenset[str]
+    release_dir: Path,
+    declared_top_level: frozenset[str],
+    declared_nested: dict[str, frozenset[str]],
 ) -> None:
     """Round 25, 2026-08-19 (independent Claude opus/max round-25 review,
     P1-B): `npm ci`'s own runtime is an external subprocess window this
@@ -2637,14 +2835,23 @@ def assert_materialized_node_modules_matches_lock(
     duplicating -- and re-trusting -- the same network fetch npm's own
     `--ci` integrity checking already performs. That fuller approach was
     judged out of scope for this round; what this function does instead:
-    compare the SET of top-level (and top-level-scoped) directory NAMES
-    actually materialized under node_modules/ against `declared_top_level`
-    -- the set declared_top_level_node_modules_packages() derived from the
-    SAME lock file content this entire install is already pinned to -- and
-    fail closed if npm materialized anything not in that declared set.
-    This directly catches the "planted sibling module" repro above,
-    because a new package directory necessarily has a name absent from the
-    verified lock.
+    compare the SET of directory NAMES actually materialized under
+    node_modules/ -- at the top level (including top-level-scoped
+    directories) AND inside every nested node_modules/ container reachable
+    by descending through those directories, at any depth
+    (_walk_nested_node_modules_containers()) -- against `declared_top_level`
+    and `declared_nested`, the sets declared_top_level_node_modules_packages()
+    and declared_nested_node_modules_packages() derived from the SAME lock
+    file content this entire install is already pinned to, and fail closed
+    if npm materialized anything, at any level, not in the corresponding
+    declared set. This directly catches the "planted sibling module" repro
+    above, because a new package directory necessarily has a name absent
+    from the verified lock -- and, as of round 27 (2026-08-19, P2-1/P2-2),
+    catches the SAME attack one directory deeper (inside a package's own
+    node_modules/) or disguised as a non-directory entry at a position a
+    package name is expected, both of which the round-25/26 version of this
+    check missed entirely (see _materialized_node_modules_directory_names()
+    and _walk_nested_node_modules_containers() for exactly how).
 
     Deliberately NOT checked, and an ACCEPTED RESIDUAL of the same-UID
     threat model (documented here rather than silently left uncovered, per
@@ -2654,59 +2861,176 @@ def assert_materialized_node_modules_matches_lock(
     docstring for the same class of residual applied to future invocations):
     a same-UID attacker who instead overwrites the CONTENT of a package
     directory that IS already declared in the lock (rather than adding a
-    new one) is NOT caught by this check. For the one file whose content
-    this installer actually executes -- node_modules/prime-agent/dist/
-    bundle/cli.js -- that residual is separately closed by the
-    pinned-tarball-digest comparison in
-    _install_locked_within_release_dir() (round 25, P1-A). It is NOT
-    closed for any other file in any other package, including the three
-    other locally patched workspace assets' own non-entrypoint files, or
-    any of this closure's registry dependencies' files beyond what
-    `npm ci`'s own registry-integrity checking already covers for a
-    genuine, unmodified registry download. Nested peer-dependency
-    node_modules (a package's own node_modules/ subdirectory) are also not
-    walked by this check, for the same reason
-    declared_top_level_node_modules_packages() excludes them from the
-    declared set: real npm's own hoisting behavior for this closure is not
-    something this installer's review/test environment can assert one way
-    or the other, and asserting the wrong thing would produce a false
-    positive on every real install rather than a real protection. Be
-    precise about this scope in any future review: this closes the
-    "undeclared sibling package" half of the round-25 P1-B repro, not the
-    full same-UID-filesystem-access-for-the-duration-of-npm-ci threat
-    model.
+    new one) is NOT caught by this structural, directory-presence-only
+    check. As of round 27 (2026-08-19, P1 fix), that residual is CLOSED for
+    all four locally patched packages (prime-agent and the three
+    `@earendil-works/pi-*` workspace assets) -- every file of every one of
+    those four packages is verified, immediately after this check runs, by
+    assert_locally_patched_package_matches_pinned_digests() against the
+    original, pre-npm-ci, tarball-derived digest map make_patched_asset()
+    already computed for each. It is NOT closed, and remains an accepted
+    residual, for the content of any of this closure's ~196 third-party
+    REGISTRY dependency packages' own files -- this installer still relies
+    on `npm ci`'s own registry-integrity/SRI checking for those, not an
+    independent check of its own. Be precise about this scope in any future
+    review, matching the lesson of both round 25 and round 27's own
+    findings: an inaccurate "covered" claim here is itself the kind of bug
+    that lets real gaps go undetected.
     """
     node_modules_root = release_dir / "node_modules"
     if node_modules_root.is_symlink() or not node_modules_root.is_dir():
         raise PrimeInstallError("npm did not materialize a private node_modules directory")
-    materialized: set[str] = set()
-    for entry in sorted(node_modules_root.iterdir(), key=lambda item: item.name):
-        name = entry.name
-        if entry.is_symlink():
-            raise PrimeInstallError(
-                f"materialized node_modules entry is a symlink: node_modules/{name}"
-            )
-        if not entry.is_dir():
-            continue
-        if name == ".bin":
-            continue
-        if name.startswith("@"):
-            for scoped_entry in sorted(entry.iterdir(), key=lambda item: item.name):
-                scoped_name = scoped_entry.name
-                if scoped_entry.is_symlink():
-                    raise PrimeInstallError(
-                        "materialized node_modules entry is a symlink: "
-                        f"node_modules/{name}/{scoped_name}"
-                    )
-                if scoped_entry.is_dir():
-                    materialized.add(f"node_modules/{name}/{scoped_name}")
-            continue
-        materialized.add(f"node_modules/{name}")
-    unexpected = sorted(materialized - declared_top_level)
-    if unexpected:
+    containers = _walk_nested_node_modules_containers(node_modules_root)
+    _, top_names = containers[0]
+    materialized_top_level = {f"node_modules/{name}" for name in top_names}
+    unexpected_top = sorted(materialized_top_level - declared_top_level)
+    if unexpected_top:
         raise PrimeInstallError(
             "npm materialized undeclared node_modules package(s) not present "
-            f"in the verified lock: {unexpected}"
+            f"in the verified lock: {unexpected_top}"
+        )
+    for container_path, names in containers[1:]:
+        declared_names = declared_nested.get(container_path, frozenset())
+        unexpected_nested = sorted(names - declared_names)
+        if unexpected_nested:
+            raise PrimeInstallError(
+                "npm materialized undeclared nested node_modules package(s) not "
+                f"present in the verified lock inside {container_path}: {unexpected_nested}"
+            )
+
+
+def assert_locally_patched_package_matches_pinned_digests(
+    package_dir: Path, pinned_digests: dict[Path, str], package_label: str
+) -> None:
+    """Round 27, 2026-08-19 (independent Claude opus/max round-27 review,
+    P1): verify EVERY file `npm ci` materialized under one of the four
+    locally patched packages' own installed directory -- not merely its
+    entrypoint -- against `pinned_digests`, the SAME per-file digest map
+    make_patched_asset() (via safe_extract_main_asset()) already captured
+    directly from the digest-verified ORIGINAL tarball's bytes as they were
+    streamed to disk, strictly BEFORE `npm ci` (or anything else) ever ran.
+
+    Round 25/26 only ever pinned ONE entry out of this map --
+    dist/bundle/cli.js, prime-agent's own ESM forwarding stub -- even though
+    the installer already computed a complete, per-file digest for every one
+    of this closure's 1,739 files across all four locally patched packages
+    (prime-agent, @earendil-works/pi-ai, @earendil-works/pi-tui,
+    @earendil-works/pi-agent-core). cli.js is 0.013% of prime-agent's own
+    dist/bundle/ directory (39 files, 13,804,347 bytes) and both statically
+    and dynamically imports the REST of that directory's content
+    unconditionally on every invocation -- none of which round 25/26
+    covered: assert_materialized_node_modules_matches_lock() only ever
+    checked directory PRESENCE, never a declared package's own contents, and
+    receipt['release_tree_sha256'] is recorded AFTER this point in the
+    install, so it cannot detect tampering that already happened before it
+    runs. Reproduced: tampering with a sibling chunk file next to a genuine,
+    correctly-pinned cli.js, during npm ci's own window, previously
+    completed install with a clean launch guard and a clean receipt --
+    permanent RCE on every future managed invocation.
+
+    Fails closed on:
+      * content mismatch for any pinned file (a same-UID swap of ANY file
+        in ANY of the four locally patched packages, not only the
+        entrypoint);
+      * a pinned file missing from disk after `npm ci` (npm silently
+        dropped, or never wrote, something the original, digest-verified
+        tarball declared);
+      * an extra, undeclared file present anywhere in the package's own
+        directory tree that is not in `pinned_digests` -- caught even if it
+        sits deeper than this package's own top level, since the walk below
+        is fully recursive (this is also what makes an undeclared nested
+        node_modules/ planted INSIDE one of these four packages redundant-
+        but-harmlessly caught here too, ahead of
+        assert_materialized_node_modules_matches_lock()'s own nested check,
+        since any file under such a plant is necessarily not in the pinned
+        map);
+      * a symlink, or any other non-regular-file entry, anywhere in the
+        tree (the original tarball this digest map was built from contains
+        no symlinks at all -- safe_extract_main_asset() itself refuses any
+        tar member that is a symlink, hardlink, device, or fifo -- so a
+        symlink materialized here can only be something `npm ci` or a
+        same-UID racer added, never something this map ever pinned).
+
+    Called once per locally patched package, immediately after `npm ci`
+    returns and after assert_materialized_node_modules_matches_lock()'s own
+    structural check, for all four packages -- including the three
+    `@earendil-works/pi-*` workspace assets this file's own prior
+    documentation incorrectly implied were out of scope. What remains an
+    accepted, documented residual after this round: third-party REGISTRY
+    dependency packages' own file content (this installer still relies on
+    npm's own registry-integrity/SRI checking for those, not an independent
+    check of its own) -- see
+    assert_materialized_node_modules_matches_lock()'s own docstring for the
+    complete, precise statement of scope.
+
+    The existing entrypoint-specific digest capture and re-verification in
+    _install_locked_within_release_dir() (round 24/25's
+    capture_private_ssd_asset_digest()/verify_unchanged_private_ssd_asset_digest()
+    calls on dist/bundle/cli.js) is intentionally left in place rather than
+    removed now that this function subsumes its content check: it also
+    captures the (st_dev, st_ino) IDENTITY this installer needs to re-verify
+    cli.js specifically through the node_modules move and into the launch
+    guard's permanent baked-in trust anchor, which is a distinct concern
+    this function does not address. Its own content-digest comparison is
+    therefore now redundant with this function's broader sweep -- but
+    harmlessly so, not a second, divergent mechanism checking the same thing
+    two different ways: both compare the same on-disk bytes against entries
+    of the exact same pinned `main_content_digests` map.
+
+    `pinned_digests` may legitimately be empty -- ONLY as a test double's
+    stand-in for a locally patched package a specific test does not
+    exercise; a REAL make_patched_asset() call always returns at least one
+    entry (package.json, at minimum, per safe_extract_main_asset()'s own
+    manifest/digest self-consistency invariant), so an empty map can never
+    happen for a genuine install. An empty map means "nothing pinned for
+    this package by this caller" and is treated as nothing to verify, rather
+    than requiring `package_dir` to exist -- there is no real content this
+    call could compare against either way.
+    """
+    if not pinned_digests:
+        return
+    if package_dir.is_symlink() or not package_dir.is_dir():
+        raise PrimeInstallError(f"{package_label} package directory is missing after npm ci")
+    observed: set[Path] = set()
+    stack: list[Path] = [package_dir]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = sorted(os.scandir(current), key=lambda item: item.name)
+        except OSError as exc:
+            raise PrimeInstallError(
+                f"cannot inspect {package_label} package tree after npm ci"
+            ) from exc
+        for entry in entries:
+            entry_path = Path(entry.path)
+            relative = entry_path.relative_to(package_dir)
+            if entry.is_symlink():
+                raise PrimeInstallError(
+                    f"{package_label} materialized an unexpected symlink: {relative}"
+                )
+            if entry.is_dir(follow_symlinks=False):
+                stack.append(entry_path)
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                raise PrimeInstallError(
+                    f"{package_label} materialized an unexpected non-regular file: {relative}"
+                )
+            expected_digest = pinned_digests.get(relative)
+            if expected_digest is None:
+                raise PrimeInstallError(
+                    f"{package_label} materialized an undeclared file not present "
+                    f"in the pinned pre-npm-ci digest map: {relative}"
+                )
+            observed.add(relative)
+            if sha256_file(entry_path) != expected_digest:
+                raise PrimeInstallError(
+                    f"{package_label} materialized file content does not match the "
+                    f"digest-verified original tarball: {relative}"
+                )
+    missing = sorted(os.fspath(path) for path in (set(pinned_digests) - observed))
+    if missing:
+        raise PrimeInstallError(
+            f"{package_label} is missing pinned file(s) after npm ci: {missing}"
         )
 
 
@@ -4947,6 +5271,22 @@ def _install_locked_within_release_dir(
     # their own (round 16, 2026-08-18, P1; see
     # verify_unchanged_private_ssd_asset_digest()).
     patched_asset_identities: dict[str, tuple[int, int]] = {}
+    # Round 27, 2026-08-19 (independent Claude opus/max round-27 review,
+    # P1): EVERY make_patched_asset() call's own tarball-derived, per-file
+    # digest map is kept here now, keyed by managed_name -- not just the
+    # main "prime-agent" asset's. Round 25/26 discarded the three workspace
+    # assets' own maps entirely (bound to `_` below) on the theory that only
+    # prime-agent's extracted tree contains the entrypoint this installer
+    # executes; that theory was correct about the entrypoint but wrong about
+    # scope -- dist/bundle/cli.js statically and dynamically imports the
+    # REST of prime-agent's own dist/bundle/ directory unconditionally, and
+    # none of that, nor any file of the three workspace assets, was ever
+    # content-verified after npm ci. Every entry here is threaded to
+    # assert_locally_patched_package_matches_pinned_digests() further below,
+    # once npm ci returns, so every file of all four locally patched
+    # packages -- not only prime-agent's entrypoint -- is verified against
+    # its own pre-npm-ci, tarball-derived baseline.
+    patched_content_digests: dict[str, dict[Path, str]] = {}
     workspace_order = (
         "@earendil-works/pi-ai",
         "@earendil-works/pi-tui",
@@ -4955,7 +5295,7 @@ def _install_locked_within_release_dir(
     for managed_name in workspace_order:
         declaration = WORKSPACE_PACKAGES[managed_name]
         official_asset_name = str(declaration["official_asset"])
-        patched, digest, manifest, identity, _workspace_content_digests = make_patched_asset(
+        patched, digest, manifest, identity, workspace_content_digests = make_patched_asset(
             assets_dir / official_asset_name,
             ASSETS[official_asset_name],
             upstream_lock,
@@ -4967,6 +5307,7 @@ def _install_locked_within_release_dir(
         patched_assets[patched.name] = digest
         patched_manifests[managed_name] = manifest
         patched_asset_identities[patched.name] = identity
+        patched_content_digests[managed_name] = workspace_content_digests
     main_asset_name = f"prime-agent-{VERSION}.tgz"
     (
         patched_asset,
@@ -4974,12 +5315,10 @@ def _install_locked_within_release_dir(
         patched_manifest,
         patched_asset_identity,
         # The main "prime-agent" asset's own tarball-derived, per-file
-        # digest map -- the ONLY one of the four make_patched_asset() calls
-        # this function needs the content_digests return value from, since
-        # it is the only one whose extracted tree contains the entrypoint
-        # this installer later executes (dist/bundle/cli.js). Threaded
-        # through to the entrypoint-digest capture further below (round 25,
-        # 2026-08-19, P1-A).
+        # digest map. Kept under its own name (rather than only reachable
+        # via patched_content_digests["prime-agent"], set immediately below)
+        # because the entrypoint-digest capture further below (round 25,
+        # 2026-08-19, P1-A) reads specifically from this one map.
         main_content_digests,
     ) = make_patched_asset(
         assets_dir / main_asset_name,
@@ -4993,6 +5332,7 @@ def _install_locked_within_release_dir(
     patched_assets[patched_asset.name] = patched_sha
     patched_manifests["prime-agent"] = patched_manifest
     patched_asset_identities[patched_asset.name] = patched_asset_identity
+    patched_content_digests["prime-agent"] = main_content_digests
     root_manifest = {
         "name": "orca-managed-prime-agent",
         "version": VERSION,
@@ -5092,6 +5432,14 @@ def _install_locked_within_release_dir(
     declared_top_level_packages = declared_top_level_node_modules_packages(
         generated_lock["packages"]
     )
+    # The same closure's NESTED node_modules/ declarations (a package's own
+    # sub-dependencies) -- round 27, 2026-08-19, P2-2 fix; see
+    # declared_nested_node_modules_packages()'s own docstring. Captured here,
+    # alongside the top-level set above, from the same pinned lock content
+    # and before the same `npm ci` runs.
+    declared_nested_packages = declared_nested_node_modules_packages(
+        generated_lock["packages"]
+    )
     # Re-verify both package.json and the just-validated package-lock.json
     # are still exactly what was read/validated above, immediately before
     # `npm ci` independently re-reads both from RELEASE_DIR on its own
@@ -5148,10 +5496,43 @@ def _install_locked_within_release_dir(
     # assert_release_dir_fd_identity() calls in this function would ever
     # raise for it. See assert_materialized_node_modules_matches_lock()'s
     # own docstring for exactly what this check does and does not cover.
-    assert_materialized_node_modules_matches_lock(RELEASE_DIR, declared_top_level_packages)
+    assert_materialized_node_modules_matches_lock(
+        RELEASE_DIR, declared_top_level_packages, declared_nested_packages
+    )
+    # Round 27, 2026-08-19 (independent Claude opus/max round-27 review,
+    # P1): the check above is purely STRUCTURAL -- directory presence and
+    # naming, at any nesting depth -- and says nothing about the CONTENT of
+    # a package directory that IS declared. Verify every file of every one
+    # of the four locally patched packages against its own pre-npm-ci,
+    # tarball-derived digest map now, before ANY of their content is
+    # trusted for publication -- see
+    # assert_locally_patched_package_matches_pinned_digests()'s own
+    # docstring for exactly what this closes and what remains an accepted
+    # residual afterward.
+    for locally_patched_name, pinned_digests in patched_content_digests.items():
+        assert_locally_patched_package_matches_pinned_digests(
+            RELEASE_DIR / "node_modules" / locally_patched_name,
+            pinned_digests,
+            locally_patched_name,
+        )
     installed_package = RELEASE_DIR / "node_modules/prime-agent"
     if installed_package.is_symlink() or not installed_package.is_dir():
         raise PrimeInstallError("npm did not materialize a private Prime Agent package")
+    # Round 27, 2026-08-19: the loop just above already verified
+    # dist/bundle/cli.js's content against this SAME `main_content_digests`
+    # pinned baseline, as part of prime-agent's complete file tree -- so the
+    # content comparison below (pinned_entrypoint_sha256 vs.
+    # observed_entrypoint_sha256) is now redundant with that broader sweep.
+    # It is kept, unchanged, because it is NOT solely a content check: it
+    # also captures `entrypoint_identity`, the (st_dev, st_ino) pair every
+    # verify_unchanged_private_ssd_asset_digest() call below and after the
+    # node_modules move needs to re-assert continuity through, and which
+    # gets baked into the launch guard as a permanent future trust anchor --
+    # a concern assert_locally_patched_package_matches_pinned_digests() does
+    # not address. Both comparisons check the same on-disk bytes against
+    # entries of the exact same pinned map, so this is a harmless, not a
+    # divergent, duplicate.
+    #
     # Round 24, 2026-08-19 (independent Codex sol/max round-23 review,
     # P1-2): capture the entrypoint's content digest right NOW -- strictly
     # before any further installer-side step (moving node_modules,
