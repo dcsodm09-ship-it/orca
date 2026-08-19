@@ -68,6 +68,14 @@ const VERSIONED_POST_V6_COLUMNS = [
   // (migrate-task-terminal-states.ts, called from migrate.ts's `if (current < 29)`);
   // worker_dispatches.terminated_by at v30 and dispatch_contexts.stale_escalated_at at v31 (both
   // inline in migrate.ts).
+  // Why the v11/v22/v28 entries can never independently PROVE a false rewind in production
+  // (round 12 accuracy note, not a functional issue - flagged by review, kept anyway):
+  // createTables() runs its full current-schema CREATE ... IF NOT EXISTS pass before migrate()
+  // ever does, so mutation_receipts/mutation_caller_identities/idx_dispatch_assignee_handle are
+  // always healed before the resolver looks. Keep them anyway - they're still correct, still
+  // cheap, and document real facts about when each artifact was introduced; do not read their
+  // presence here as "this is the only thing standing between a healthy old database and a
+  // false rewind" for these three specifically.
   { version: 11, table: 'mutation_receipts', column: 'state' },
   { version: 26, table: 'mutation_receipt_ledger', column: 'singleton' },
   { version: 28, table: 'mutation_caller_identities', column: 'transport' },
@@ -99,6 +107,13 @@ const POST_V6_INDEXES = [
 // Why the rest (round 11, same follow-up-audit fix as the columns above): idx_dispatch_
 // assignee_handle at v22, idx_dispatch_active_assignee_handle at v25, idx_mutation_receipts_
 // completed_updated alongside v26's mutation_receipt_ledger - all in migrate-v13-v28.ts.
+// Why the 2 legacy-principal entries (round 12, fix for a real gap an independent review found
+// on its own dedicated full re-audit): idx_legacy_principal_coordinator/idx_legacy_principal_
+// dispatch are the ONLY enforcement of "at most one coordinator/worker principal per run" -
+// legacy_compatibility_principals's own table-level UNIQUE(role, run_id, dispatch_id) does not
+// cover the coordinator case, since SQLite treats every NULL dispatch_id as distinct. Missing
+// them wouldn't misjudge completeness in a way that crashes, but would silently let
+// getLegacyCompatibilityPrincipal's .get() pick an arbitrary one of several duplicates.
 const VERSIONED_POST_V6_INDEXES = [
   { version: 8, index: 'idx_deliveries_one_outstanding' },
   { version: 8, index: 'idx_deliveries_run_created' },
@@ -106,6 +121,8 @@ const VERSIONED_POST_V6_INDEXES = [
   { version: 15, index: 'idx_federation_relay_pending' },
   { version: 16, index: 'idx_remote_questions_dispatch_status' },
   { version: 19, index: 'idx_messages_delivery_contract' },
+  { version: 19, index: 'idx_legacy_principal_coordinator' },
+  { version: 19, index: 'idx_legacy_principal_dispatch' },
   { version: 22, index: 'idx_dispatch_assignee_handle' },
   { version: 25, index: 'idx_dispatch_active_assignee_handle' },
   { version: 26, index: 'idx_mutation_receipts_completed_updated' }
@@ -118,6 +135,12 @@ function hasOrchestrationColumn(db: Database.Database, table: string, column: st
 
 function hasOrchestrationIndex(db: Database.Database, index: string): boolean {
   return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(index)
+}
+
+function hasOrchestrationTrigger(db: Database.Database, trigger: string): boolean {
+  return !!db
+    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?")
+    .get(trigger)
 }
 
 // Why gated at v9 (round 10, fix for a real bug 2 independent reviews confirmed): the messages
@@ -170,6 +193,37 @@ function hasConsistentLegacyAdoption(db: Database.Database): boolean {
   return true
 }
 
+// Why gated at v29, mirroring messagesAllowQuestions' v9 pattern (round 12, fix for a real gap
+// an independent review found): tasks only gains 'cancelled'/'superseded' as CHECK-allowed
+// statuses at v29 (migrate-task-terminal-states.ts's own rebuild, gated by migrate.ts's
+// `if (current < 29)`), in the SAME rebuild that adds terminal_reason/replacement_task_id -
+// those two columns are already probed above, but the CHECK constraint widening is a distinct
+// fact this probe covers (migrateTaskTerminalStates's own idempotency guard,
+// tasksStatusCheckAllowsCancelled, treats the CHECK as authoritative - the resolver should too).
+function tasksAllowCancelledOrSuperseded(db: Database.Database): boolean {
+  const row = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'")
+    .get() as { sql: string } | undefined
+  return !!row && row.sql.includes("'cancelled'")
+}
+
+// Why gated at v26 (round 12, fix for a real gap an independent review found): the v26 migration
+// (migrateMutationReceiptCapacity) does 3 things in one exec() - creates mutation_receipt_ledger
+// (already column-probed above), creates 2 triggers that keep receipt_count exact, and seeds the
+// ledger's one row. Missing the triggers or the seed row wouldn't misjudge completeness in a way
+// that crashes immediately, but ensureMutationReceiptCapacity's receiptCount() would eventually
+// throw "Mutation receipt ledger metadata is missing" (seed row) or the count would silently
+// drift and either never enforce the 10k cap or get permanently stuck reporting the ledger full
+// (triggers) - both unrecoverable by restart, since a "complete" verdict here means migrate()
+// never gets another chance to re-run this block.
+function hasConsistentMutationReceiptLedger(db: Database.Database): boolean {
+  return (
+    hasOrchestrationTrigger(db, 'mutation_receipts_count_insert') &&
+    hasOrchestrationTrigger(db, 'mutation_receipts_count_delete') &&
+    !!db.prepare('SELECT 1 FROM mutation_receipt_ledger WHERE singleton = 1').get()
+  )
+}
+
 function hasCompletePostV6Schema(db: Database.Database, storedVersion: number): boolean {
   return (
     POST_V6_COLUMNS.every(([table, column]) => hasOrchestrationColumn(db, table, column)) &&
@@ -182,7 +236,9 @@ function hasCompletePostV6Schema(db: Database.Database, storedVersion: number): 
       ({ version, index }) => storedVersion < version || hasOrchestrationIndex(db, index)
     ) &&
     (storedVersion < 9 || messagesAllowQuestions(db)) &&
-    (storedVersion < 19 || hasConsistentLegacyAdoption(db))
+    (storedVersion < 19 || hasConsistentLegacyAdoption(db)) &&
+    (storedVersion < 26 || hasConsistentMutationReceiptLedger(db)) &&
+    (storedVersion < 29 || tasksAllowCancelledOrSuperseded(db))
   )
 }
 

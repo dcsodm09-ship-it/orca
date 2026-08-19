@@ -332,6 +332,107 @@ describe('OrchestrationDb version-skew migration', () => {
     raw.close()
   })
 
+  // Why (round 12): the v26 mutation-receipt-ledger consistency probe checks 2 triggers + a seed
+  // row, none of which the generic column/index/table matrix below can exercise (dropping only
+  // the ledger's `singleton` column, as that matrix does for the "v26 boundary" case, leaves the
+  // triggers and seed row untouched - it never proves THIS probe does anything). Test each half
+  // independently: missing triggers alone, and a missing seed row alone, both while claiming the
+  // current schema version, must both be caught.
+  it.each(['triggers', 'seed row'] as const)(
+    'rewinds a database claiming the current version whose v26 mutation-receipt ledger is missing its %s',
+    (missing) => {
+      tempDir = mkdtempSync(
+        join(tmpdir(), `orca-db-version-skew-v26-${missing.replace(' ', '-')}-`)
+      )
+      const dbPath = join(tempDir, 'orchestration.db')
+      const seed = new OrchestrationDb(dbPath)
+      seed.close()
+      const raw = new Database(dbPath)
+      if (missing === 'triggers') {
+        raw.exec('DROP TRIGGER mutation_receipts_count_insert')
+        raw.exec('DROP TRIGGER mutation_receipts_count_delete')
+      } else {
+        raw.exec('DELETE FROM mutation_receipt_ledger WHERE singleton = 1')
+      }
+      raw.pragma(`user_version = ${SCHEMA_VERSION}`)
+
+      expect(resolveOrchestrationMigrationStartVersion(raw, SCHEMA_VERSION, SCHEMA_VERSION)).toBe(6)
+
+      raw.close()
+    }
+  )
+
+  it('does not rewind a healthy v25 database missing only the v26 mutation-receipt ledger entirely', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'orca-db-version-skew-pre-v26-ledger-'))
+    const dbPath = join(tempDir, 'orchestration.db')
+    const seed = new OrchestrationDb(dbPath)
+    seed.close()
+    const raw = new Database(dbPath)
+    raw.exec('DROP TRIGGER mutation_receipts_count_insert')
+    raw.exec('DROP TRIGGER mutation_receipts_count_delete')
+    raw.exec('DROP INDEX idx_mutation_receipts_completed_updated')
+    raw.exec('DROP TABLE mutation_receipt_ledger')
+    raw.pragma('user_version = 25')
+
+    expect(resolveOrchestrationMigrationStartVersion(raw, 25, SCHEMA_VERSION)).toBe(25)
+
+    raw.close()
+  })
+
+  // Why (round 12): the v29 tasks CHECK-constraint probe is a distinct fact from the
+  // terminal_reason/replacement_task_id columns the generic matrix already covers (both are
+  // added in the SAME rebuild, but the resolver needs to check the CHECK independently - see
+  // tasksAllowCancelledOrSuperseded's own docstring).
+  it('rewinds a database claiming the current version whose tasks CHECK constraint predates v29', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'orca-db-version-skew-v29-check-'))
+    const dbPath = join(tempDir, 'orchestration.db')
+    const seed = new OrchestrationDb(dbPath)
+    seed.close()
+    const raw = new Database(dbPath)
+    raw.exec(`
+      CREATE TABLE tasks_pre_v29 (
+        id            TEXT PRIMARY KEY,
+        run_id        TEXT NOT NULL,
+        parent_id     TEXT,
+        created_by_terminal_handle TEXT,
+        created_by_pane_key TEXT,
+        created_by_process_incarnation TEXT,
+        created_by_run_generation INTEGER,
+        task_title    TEXT,
+        display_name  TEXT,
+        spec          TEXT NOT NULL,
+        status        TEXT NOT NULL DEFAULT 'pending'
+          CHECK(status IN ('pending', 'ready', 'dispatched', 'completed', 'failed', 'blocked')),
+        deps          TEXT NOT NULL DEFAULT '[]',
+        result        TEXT,
+        created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at  TEXT,
+        terminal_reason      TEXT,
+        replacement_task_id  TEXT
+      );
+      INSERT INTO tasks_pre_v29 (
+        id, run_id, parent_id, created_by_terminal_handle, created_by_pane_key,
+        created_by_process_incarnation, created_by_run_generation,
+        task_title, display_name, spec, status, deps, result, created_at, completed_at
+      )
+      SELECT
+        id, run_id, parent_id, created_by_terminal_handle, created_by_pane_key,
+        created_by_process_incarnation, created_by_run_generation,
+        task_title, display_name, spec, status, deps, result, created_at, completed_at
+      FROM tasks;
+      DROP TABLE tasks;
+      ALTER TABLE tasks_pre_v29 RENAME TO tasks;
+      CREATE INDEX idx_tasks_status ON tasks(status);
+      CREATE INDEX idx_tasks_parent ON tasks(parent_id);
+      CREATE INDEX idx_tasks_run_status ON tasks(run_id, status);
+    `)
+    raw.pragma(`user_version = ${SCHEMA_VERSION}`)
+
+    expect(resolveOrchestrationMigrationStartVersion(raw, SCHEMA_VERSION, SCHEMA_VERSION)).toBe(6)
+
+    raw.close()
+  })
+
   // Why (round 11, fix for a real bug a genuinely-independent review found beyond what round
   // 9/10's own sweeps covered): round 9's sweep only grepped 3 migration files and stopped at
   // v27; it never checked migrate.ts itself (which has its own inline v29-v31 blocks, not
@@ -402,7 +503,9 @@ describe('OrchestrationDb version-skew migration', () => {
         'idx_messages_undelivered_direct_run',
         'idx_messages_unread_current_inbox',
         'idx_messages_unread_current_inbox_type',
-        'idx_messages_unread_current_run_type'
+        'idx_messages_unread_current_run_type',
+        'idx_legacy_principal_coordinator',
+        'idx_legacy_principal_dispatch'
       ]
     },
     { version: 22, indexes: ['idx_dispatch_assignee_handle'] },
@@ -433,32 +536,45 @@ describe('OrchestrationDb version-skew migration', () => {
     { version: 31, columns: [['dispatch_contexts', 'stale_escalated_at']] }
   ]
 
-  it.each(VERSION_BOUNDARY_DROPS)(
-    'does not rewind a healthy database exactly one version below the v$version boundary',
-    ({ version, columns, indexes, tables }) => {
-      tempDir = mkdtempSync(join(tmpdir(), `orca-db-version-skew-pre-v${version}-`))
-      const dbPath = join(tempDir, 'orchestration.db')
-      const seed = new OrchestrationDb(dbPath)
-      seed.close()
-      const raw = new Database(dbPath)
-      // Why indexes/triggers before columns: anything whose definition references a column
-      // blocks that column's DROP COLUMN until it's gone too - messages.delivery_contract is
-      // also read by a trigger, not just indexes.
-      for (const index of indexes ?? []) {
-        raw.exec(`DROP INDEX ${index}`)
-      }
-      for (const trigger of raw
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'")
-        .all() as { name: string }[]) {
+  function seedAndStripBoundaryArtifacts(
+    label: string,
+    { columns, indexes, tables }: (typeof VERSION_BOUNDARY_DROPS)[number]
+  ): Database.Database {
+    tempDir = mkdtempSync(join(tmpdir(), `orca-db-version-skew-${label}-`))
+    const dbPath = join(tempDir, 'orchestration.db')
+    const seed = new OrchestrationDb(dbPath)
+    seed.close()
+    const raw = new Database(dbPath)
+    // Why indexes/triggers before columns: anything whose definition references a column
+    // blocks that column's DROP COLUMN until it's gone too - messages.delivery_contract is
+    // also read by a trigger, not just indexes. Only drop a trigger whose own SQL references one
+    // of THIS iteration's columns - a v26 test case (say) must not incidentally strip the v26
+    // mutation-receipt-count triggers meant for a DIFFERENT test case's probe.
+    for (const index of indexes ?? []) {
+      raw.exec(`DROP INDEX ${index}`)
+    }
+    const droppedColumnNames = new Set((columns ?? []).map(([, column]) => column))
+    for (const trigger of raw
+      .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'")
+      .all() as { name: string; sql: string }[]) {
+      if ([...droppedColumnNames].some((column) => trigger.sql.includes(column))) {
         raw.exec(`DROP TRIGGER ${trigger.name}`)
       }
-      for (const [table, column] of columns ?? []) {
-        raw.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`)
-      }
-      for (const table of tables ?? []) {
-        raw.exec(`DROP TABLE ${table}`)
-      }
-      const storedVersion = version - 1
+    }
+    for (const [table, column] of columns ?? []) {
+      raw.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`)
+    }
+    for (const table of tables ?? []) {
+      raw.exec(`DROP TABLE ${table}`)
+    }
+    return raw
+  }
+
+  it.each(VERSION_BOUNDARY_DROPS)(
+    'does not rewind a healthy database exactly one version below the v$version boundary',
+    (entry) => {
+      const raw = seedAndStripBoundaryArtifacts(`pre-v${entry.version}`, entry)
+      const storedVersion = entry.version - 1
       raw.pragma(`user_version = ${storedVersion}`)
 
       expect(() =>
@@ -467,6 +583,27 @@ describe('OrchestrationDb version-skew migration', () => {
       expect(resolveOrchestrationMigrationStartVersion(raw, storedVersion, SCHEMA_VERSION)).toBe(
         storedVersion
       )
+
+      raw.close()
+    }
+  )
+
+  // Why (round 12, fix for a real methodology bug an independent review found): the matrix above
+  // only tests the false-POSITIVE direction (a healthy old database must not be wrongly rewound)
+  // - it can never fail if a VERSIONED_POST_V6_COLUMNS/INDEXES entry is deleted entirely, since
+  // removing an entry can only make the completeness check MORE permissive, and every assertion
+  // above is "must not rewind". Proven empirically: with round 11's whole source fix reverted,
+  // all 23 cases above still passed. This mirror tests the actual regression class round 11 fixed
+  // - a database FALSELY CLAIMING the current schema version while genuinely missing one of
+  // these artifacts (exactly what a stale user_version pragma or a corrupted/hand-edited database
+  // looks like) must be detected and rewound to 6, not trusted at face value.
+  it.each(VERSION_BOUNDARY_DROPS)(
+    'rewinds a database claiming the current version but missing its v$version artifact',
+    (entry) => {
+      const raw = seedAndStripBoundaryArtifacts(`claims-current-missing-v${entry.version}`, entry)
+      raw.pragma(`user_version = ${SCHEMA_VERSION}`)
+
+      expect(resolveOrchestrationMigrationStartVersion(raw, SCHEMA_VERSION, SCHEMA_VERSION)).toBe(6)
 
       raw.close()
     }
