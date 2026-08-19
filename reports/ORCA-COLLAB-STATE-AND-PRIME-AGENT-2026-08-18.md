@@ -600,6 +600,28 @@ _install_locked()` 路径的端到端测试）。96/96 测试通过，round 14/1
 该看的方向是"`npm ci` 跑完之后才建立的信任基线"和 `st_ctime_ns` 那个两行小
 修复，不是插入机制、命令分类或下载资产校验（这些都已经确认关闭）。
 
+## 0c. 双 GO 之后：重新核对上游证据 + 第一次真实（非 mock）执行挖出的新问题
+
+用户明确要求"重新核对上游证据，然后安装"。现场用 `gh api` 核实：上游
+（`PrimeIntellect-ai/prime-agent`）已经发了 v0.7.3（2026-08-17），**没有追新
+版本**——17 轮安全复核全部是针对 v0.7.2 那份具体上游 JS 代码做的，换版本等于
+让这些工作部分作废。v0.7.2 自己的 4 个 release 包哈希现场核实和当初钉的完全
+一致（GitHub release 资产不可变）。真正过期的只有产物闭包哈希
+`GENERATED_LOCK_SHA256`——现场跑了一次真实的隔离 npm 依赖解析，200 行没变，
+196 行注册表包里只有 6 个 `@smithy/*`（AWS SDK v3）发生补丁级升级，同一天
+（2026-08-15）通过 npm 官方 GitHub Actions OIDC 可信发布机制发布、维护者
+不变、包本身 2.5 年以上历史——6 个全部核实过（不是抽样），没有可疑信号。
+已重新钉哈希并提交（commit `1f5c1a53fc`）。
+
+**重新钉完之后，真实（非 mock）跑了一次 `sandbox_e2e.py` 生命周期回放——哈希
+检查这次真的过了，但立刻碰到一个新的、17 轮安全复核期间因为一直是 mock 测试
+而从没被发现过的真实 bug**：真实 `npm install --package-lock-only` 生成的
+`package-lock.json` 是按进程默认 umask 出来的（644），但代码要求这个文件
+必须零 group/other 权限位——`package.json` 那边有显式代码强制发布成 0600，
+`package-lock.json` 是 npm 自己生成的、没有对应的收紧步骤。96 个单测全是
+mock 出来的，从没真正跑过一次带着真实 npm 默认权限的文件。**已派发 round 18
+修复。**
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
