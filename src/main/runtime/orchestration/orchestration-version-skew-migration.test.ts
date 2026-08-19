@@ -421,8 +421,10 @@ describe('OrchestrationDb version-skew migration', () => {
       .prepare("SELECT id FROM legacy_compatibility_principals WHERE role = 'coordinator'")
       .all() as { id: string }[]
     expect(remaining).toHaveLength(1)
-    // Why the surviving row: the dedup keeps the highest rowid (most recently inserted) per
-    // group - legacy_p_2 was inserted after legacy_p_1.
+    // Why the surviving row: neither duplicate's terminal_handle matches the run's live
+    // coordinator_handle ('term_coord'), so the round-15 authoritative-match step is a no-op here
+    // and this falls through to the highest-rowid tie-break - legacy_p_2 was inserted after
+    // legacy_p_1.
     expect(remaining[0]?.id).toBe('legacy_p_2')
   })
 
@@ -478,6 +480,147 @@ describe('OrchestrationDb version-skew migration', () => {
       .all() as { id: string; status: string }[]
     expect(remaining).toHaveLength(1)
     expect(remaining[0]).toMatchObject({ id: 'legacy_p_committed', status: 'committed' })
+  })
+
+  // Why (round 15, fix for a real design gap an independent review found in round 14's own fix):
+  // 'revoked' is not a corruption marker - it is the coordinator's genuine terminal state after a
+  // legitimate takeover, so preferring "non-revoked" by status alone has no guaranteed
+  // correlation with which duplicate the run still actually recognizes. The one signal that IS
+  // authoritative is which duplicate's terminal_handle matches the run's live coordinator_handle.
+  // This seeds the OPPOSITE shape from round 14's own test: the REVOKED row here is the one whose
+  // terminal_handle matches the run's live coordinator_handle, and it is also the LOWER-rowid row
+  // (inserted first) - so both the round-14 status-preference heuristic AND a plain rowid
+  // tie-break would each independently pick the wrong (committed, non-matching) row. Only
+  // consulting the live binding gets this right.
+  it('prefers a duplicate whose terminal_handle matches the run coordinator_handle, even if revoked', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'orca-db-version-skew-dup-coordinator-live-binding-'))
+    const dbPath = join(tempDir, 'orchestration.db')
+    const seed = new OrchestrationDb(dbPath)
+    const run = seed.createRun({
+      objective: 'dup coordinator live-binding repro',
+      coordinatorHandle: 'term_coord_live',
+      coordinatorPaneKey: 'tab_coord:33333333-3333-4333-9333-333333333333'
+    })
+    seed.close()
+    const raw = new Database(dbPath)
+    raw.exec('DROP INDEX idx_legacy_principal_coordinator')
+    const insertPrincipal = raw.prepare(
+      `INSERT INTO legacy_compatibility_principals (
+         id, run_id, dispatch_id, role, host_scope, terminal_handle, pane_key,
+         launch_token_hash, process_incarnation, status
+       ) VALUES (?, ?, NULL, 'coordinator', '{}', ?, ?, ?, NULL, ?)`
+    )
+    // Inserted FIRST (lower rowid) and revoked - but its terminal_handle matches the run's live
+    // coordinator_handle, so it is the one that should survive.
+    insertPrincipal.run(
+      'legacy_p_live_revoked',
+      run.id,
+      'term_coord_live',
+      'tab_live:leaf',
+      'hash_live',
+      'revoked'
+    )
+    // Inserted SECOND (higher rowid) and committed - but stale: no longer the run's coordinator.
+    insertPrincipal.run(
+      'legacy_p_stale_committed',
+      run.id,
+      'term_coord_stale',
+      'tab_stale:leaf',
+      'hash_stale',
+      'committed'
+    )
+    raw.pragma(`user_version = ${SCHEMA_VERSION}`)
+    raw.close()
+
+    db = new OrchestrationDb(dbPath)
+
+    const rawAfter = (db as unknown as { db: Database.Database }).db
+    const remaining = rawAfter
+      .prepare("SELECT id, status FROM legacy_compatibility_principals WHERE role = 'coordinator'")
+      .all() as { id: string; status: string }[]
+    expect(remaining).toHaveLength(1)
+    expect(remaining[0]).toMatchObject({ id: 'legacy_p_live_revoked', status: 'revoked' })
+  })
+
+  // Why (round 15): mirrors the coordinator case above for the worker/dispatch tier - the
+  // authoritative signal there is the dispatch's live assignee_handle, not principal status.
+  it('prefers a duplicate legacy worker principal whose terminal_handle matches the dispatch assignee_handle', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'orca-db-version-skew-dup-worker-live-binding-'))
+    const dbPath = join(tempDir, 'orchestration.db')
+    const seed = new OrchestrationDb(dbPath)
+    const run = seed.createRun({
+      objective: 'dup worker live-binding repro',
+      coordinatorHandle: 'term_coord',
+      coordinatorPaneKey: 'tab_coord:66666666-6666-4666-9666-666666666666'
+    })
+    const task = seed.createTask({ spec: 'legacy worker dup repro', runId: run.id })
+    const dispatch = seed.createDispatchContext(task.id, 'term_worker_live', 'tab_worker:leaf')
+    seed.close()
+    const raw = new Database(dbPath)
+    raw.exec('DROP INDEX idx_legacy_principal_dispatch')
+    // Unlike the coordinator case (NULL dispatch_id makes every row distinct under the table's
+    // own UNIQUE(role, run_id, dispatch_id)), two worker rows for the SAME dispatch_id collide
+    // with that base constraint too, and SQLite refuses to drop a UNIQUE constraint's
+    // auto-generated index directly - rebuild the (still-empty at this point) table without it,
+    // simulating a database whose table predates that constraint.
+    raw.exec(`
+      DROP TABLE legacy_compatibility_principals;
+      CREATE TABLE legacy_compatibility_principals (
+        id                  TEXT PRIMARY KEY,
+        run_id              TEXT NOT NULL,
+        dispatch_id         TEXT,
+        role                TEXT NOT NULL CHECK(role IN ('worker', 'coordinator')),
+        host_scope          TEXT NOT NULL,
+        terminal_handle     TEXT NOT NULL,
+        pane_key            TEXT NOT NULL,
+        launch_token_hash   TEXT NOT NULL,
+        process_incarnation TEXT,
+        status              TEXT NOT NULL CHECK(status IN ('committed', 'settled', 'revoked')),
+        CHECK(
+          (role = 'worker' AND dispatch_id IS NOT NULL) OR
+          (role = 'coordinator' AND dispatch_id IS NULL)
+        )
+      );
+    `)
+    const insertPrincipal = raw.prepare(
+      `INSERT INTO legacy_compatibility_principals (
+         id, run_id, dispatch_id, role, host_scope, terminal_handle, pane_key,
+         launch_token_hash, process_incarnation, status
+       ) VALUES (?, ?, ?, 'worker', '{}', ?, ?, ?, NULL, ?)`
+    )
+    // Inserted FIRST (lower rowid) and settled - its terminal_handle matches the dispatch's live
+    // assignee_handle, so it is the one that should survive. A plain highest-rowid tie-break
+    // would pick the OTHER row instead, so this genuinely isolates the authoritative-match step.
+    insertPrincipal.run(
+      'legacy_p_worker_live_settled',
+      run.id,
+      dispatch.id,
+      'term_worker_live',
+      'tab_live:leaf',
+      'hash_live',
+      'settled'
+    )
+    // Inserted SECOND (higher rowid) and committed - but stale: no longer the dispatch's assignee.
+    insertPrincipal.run(
+      'legacy_p_worker_stale_committed',
+      run.id,
+      dispatch.id,
+      'term_worker_stale',
+      'tab_stale:leaf',
+      'hash_stale',
+      'committed'
+    )
+    raw.pragma(`user_version = ${SCHEMA_VERSION}`)
+    raw.close()
+
+    db = new OrchestrationDb(dbPath)
+
+    const rawAfter = (db as unknown as { db: Database.Database }).db
+    const remaining = rawAfter
+      .prepare("SELECT id, status FROM legacy_compatibility_principals WHERE role = 'worker'")
+      .all() as { id: string; status: string }[]
+    expect(remaining).toHaveLength(1)
+    expect(remaining[0]).toMatchObject({ id: 'legacy_p_worker_live_settled', status: 'settled' })
   })
 
   // Why (round 12): the v29 tasks CHECK-constraint probe is a distinct fact from the

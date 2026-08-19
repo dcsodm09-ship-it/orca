@@ -122,8 +122,10 @@ const POST_V6_INDEXES = [
 // 2 entries here changed a database with pre-existing duplicate principals from "boots
 // degraded" to "rewinds to 6, then throws forever on this exact CREATE UNIQUE INDEX re-running
 // into its own leftover duplicates" - migrateLegacyContractStorage now deletes duplicates
-// (deterministic most-recent-wins) immediately before creating these indexes, so a completeness
-// check that correctly diagnoses this state doesn't also make it unrepairable.
+// (round 15: prefer whichever duplicate's terminal_handle still matches the run's/dispatch's
+// live binding, falling back to a deterministic highest-rowid tie-break only when nothing
+// matches) immediately before creating these indexes, so a completeness check that correctly
+// diagnoses this state doesn't also make it unrepairable.
 const VERSIONED_POST_V6_INDEXES = [
   { version: 8, index: 'idx_deliveries_one_outstanding' },
   { version: 8, index: 'idx_deliveries_run_created' },
