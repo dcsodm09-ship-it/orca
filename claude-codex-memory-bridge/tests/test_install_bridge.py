@@ -347,6 +347,32 @@ class InstallBridgeTests(unittest.TestCase):
         ).encode()
         self.assertFalse(installer._contains_owned_handler(poison))
 
+    def test_stream_scan_oversized_finds_a_marker_split_exactly_across_a_chunk_boundary(self) -> None:
+        # Round-13 fix (2026-08-19): _stream_scan_oversized_for_bridge_marker()
+        # reads in 1 MiB chunks with a small overlap window so a marker that
+        # happens to straddle two chunks isn't missed -- this constructs that
+        # exact shape rather than trusting the sliding-window logic by
+        # inspection. Also confirms the no-marker and marker-not-split cases.
+        marker = f"--bridge-id {installer.BRIDGE_ID}".encode()
+        chunk_size = 1_048_576
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            split_path = root / "split.bin"
+            # Position the marker so it starts a few bytes before the chunk
+            # boundary and ends a few bytes after it.
+            straddle_offset = chunk_size - 5
+            split_path.write_bytes(b"a" * straddle_offset + marker + b"b" * 2000)
+            self.assertTrue(installer._stream_scan_oversized_for_bridge_marker(split_path))
+
+            clean_path = root / "clean.bin"
+            clean_path.write_bytes(b"a" * (chunk_size * 2))
+            self.assertFalse(installer._stream_scan_oversized_for_bridge_marker(clean_path))
+
+            whole_path = root / "whole.bin"
+            whole_path.write_bytes(b"a" * 100 + marker + b"b" * (chunk_size * 2))
+            self.assertTrue(installer._stream_scan_oversized_for_bridge_marker(whole_path))
+
 
 class InstallEndToEndTests(unittest.TestCase):
     # plan()/install()/verify()/uninstall() were entirely uncovered by the
@@ -1233,6 +1259,70 @@ class InstallEndToEndTests(unittest.TestCase):
         relocated_config.write_bytes(installer.canonical_json(payload))
         staged_dir.rename(account_dir)
         installer.uninstall()
+
+    def test_uninstall_catches_an_oversized_valid_relocated_handler_inside_its_own_runtime_tree(self) -> None:
+        # Round-13 fix (2026-08-19, independent Claude opus5/max AND Codex
+        # sol/gpt-5.6-terra round-12 reviews -- both found this, disagreeing
+        # only on severity label, P2 vs P1; per the standing rule any
+        # reproducible P1 from either path blocks regardless of the other
+        # reviewer's grade): round 12's raised structural-detection bound
+        # (MAX_MANAGED_FILE_BYTES for RUNTIME_BASE candidates) only helps up
+        # to that same cap -- a relocated handler padded past
+        # MAX_MANAGED_FILE_BYTES itself makes _read_for_detection() refuse
+        # ("too large"), and that refusal used to be blanket-tolerated under
+        # RUNTIME_BASE as absence-of-evidence, silently abandoning a live,
+        # valid, plain-UTF-8 owned handler exactly the way R11-P1-B did.
+        # _read_for_detection()'s "too large" raise is now a distinct
+        # exception type routed to a bounded streaming marker scan instead
+        # (_stream_scan_oversized_for_bridge_marker()), so a genuine handler
+        # of ANY size still gets caught.
+        installer.install()
+        account_dir = self.account_config.parent.parent
+        staged_dir = self.runtime_base / "backups/misc-staging/oversized-account"
+        staged_dir.parent.mkdir(parents=True, exist_ok=True)
+        account_dir.rename(staged_dir)
+        self.addCleanup(lambda: staged_dir.exists() and staged_dir.rename(account_dir))
+        relocated_config = staged_dir / "home/hooks.json"
+        payload = json.loads(relocated_config.read_bytes())
+        payload["_operator_notes"] = "x" * (installer.MAX_MANAGED_FILE_BYTES + 16_384)
+        padded = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode()
+        self.assertGreater(len(padded), installer.MAX_MANAGED_FILE_BYTES)
+        relocated_config.write_bytes(padded)
+
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.uninstall()
+        self.assertIn("cannot rule out", str(ctx.exception))
+        self.assertIn(os.fspath(relocated_config), str(ctx.exception))
+        self.assertTrue((self.runtime_base / "latest-receipt.json").exists())
+        self.assertFalse(installer.PENDING_PATH.exists())
+        self.assertEqual(relocated_config.read_bytes(), padded)
+
+        del payload["_operator_notes"]
+        relocated_config.write_bytes(installer.canonical_json(payload))
+        staged_dir.rename(account_dir)
+        installer.uninstall()
+
+    def test_uninstall_still_fails_closed_on_an_oversized_file_outside_runtime_base_even_with_a_marker(self) -> None:
+        # Sibling control for the fix above: the round-13 streaming-scan
+        # fallback is deliberately scoped to RUNTIME_BASE only.  Outside it,
+        # an oversized file must stay exactly as fail-closed as any other
+        # inspection failure there, regardless of whether it happens to
+        # contain the bridge marker -- this scan has no special reason to
+        # trust a genuinely oversized third-party hooks.json the way it
+        # trusts RUNTIME_BASE's own never-writes-hooks.json invariant.
+        installer.install()
+        stray_dir = self.local_homes / "codex-accounts/oversized-tool-cache"
+        stray_dir.mkdir()
+        stray_config = stray_dir / "hooks.json"
+        marker = f"--bridge-id {installer.BRIDGE_ID}".encode()
+        stray_config.write_bytes(b"not json " * 500_000 + marker + b" more junk")
+        self.assertGreater(stray_config.stat().st_size, installer.MAX_MANAGED_FILE_BYTES)
+
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.uninstall()
+        self.assertIn("too large", str(ctx.exception))
+        self.assertTrue((self.runtime_base / "latest-receipt.json").exists())
+        self.assertFalse(installer.PENDING_PATH.exists())
 
     def test_uninstall_tolerates_an_oversized_file_inside_its_own_runtime_tree(self) -> None:
         # Round-11 self-check (2026-08-18, final-check pressure test,

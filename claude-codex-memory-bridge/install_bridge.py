@@ -60,6 +60,25 @@ class InstallError(Exception):
     pass
 
 
+class _CandidateTooLargeForDetection(InstallError):
+    # Raised only by _read_for_detection() when a candidate is a readable,
+    # regular file whose sole problem is exceeding MAX_MANAGED_FILE_BYTES --
+    # deliberately a distinct subclass of InstallError (not just a specially
+    # worded InstallError) so _find_untracked_owned_configs() can route this
+    # one case to a bounded streaming marker scan instead of the blanket
+    # absence-of-evidence tolerance every other _read_for_detection() failure
+    # (EACCES, identity-changed-mid-read) still gets under RUNTIME_BASE (round
+    # 13, closing R12-P1-A / P2-R12-A: independent Claude opus5/max and Codex
+    # sol/gpt-5.6-terra round-12 reviews both found -- agreeing on the fix,
+    # disagreeing only on severity label, P2 vs P1 -- that a genuine live
+    # relocated handler merely padded past MAX_MANAGED_FILE_BYTES under
+    # RUNTIME_BASE was silently abandoned because this exact raise used to be
+    # blanket-tolerated there as if the file's oversized-ness meant nothing
+    # could be known about it). Every existing caller that catches
+    # InstallError (or Exception) broadly continues to work unchanged.
+    pass
+
+
 def sha256_bytes(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
@@ -229,7 +248,7 @@ def _read_for_detection(path: Path) -> bytes | None:
         if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
             return None
         if before.st_size > MAX_MANAGED_FILE_BYTES:
-            raise InstallError(f"cannot safely inspect {path}: too large")
+            raise _CandidateTooLargeForDetection(f"cannot safely inspect {path}: too large")
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         opened = os.fstat(descriptor)
         if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
@@ -656,6 +675,58 @@ def _contains_owned_handler(raw: bytes, *, structural_max_bytes: int = _STRUCTUR
     return False
 
 
+def _stream_scan_oversized_for_bridge_marker(path: Path) -> bool:
+    # Bounded, constant-memory alternative to _raw_bytes_contain_bridge_marker()
+    # for a regular, readable file that only failed _read_for_detection()'s
+    # check for exceeding MAX_MANAGED_FILE_BYTES -- reading the whole thing
+    # into one `bytes` object the way _read_for_detection() does is exactly
+    # what that size cap exists to prevent. Reads in fixed-size chunks
+    # directly from an O_NOFOLLOW file descriptor (same open-time symlink
+    # protection as _read_for_detection()), keeping only a small overlap
+    # window between chunks (one byte short of the marker's widest encoded
+    # form) so a marker split across a chunk boundary is still found -- never
+    # holds more than one chunk plus that overlap in memory at once,
+    # regardless of total file size (round 13, closing R12-P1-A / P2-R12-A:
+    # independent Claude opus5/max and Codex sol/gpt-5.6-terra round-12
+    # reviews both found, and both suggested this exact fix shape -- a
+    # genuine live relocated handler merely padded past MAX_MANAGED_FILE_BYTES
+    # under RUNTIME_BASE was silently abandoned because _read_for_detection()'s
+    # size-cap raise used to be blanket-tolerated there as if an oversized
+    # file's content was simply unknowable, rather than cheaply scannable).
+    # Only ever called on a candidate _find_untracked_owned_configs() has
+    # already confirmed is a regular file under RUNTIME_BASE too large for
+    # _read_for_detection(); does not re-derive that condition itself.
+    marker_variants = [
+        f"--bridge-id {BRIDGE_ID}".encode(encoding)
+        for encoding in ("utf-8", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
+    ]
+    overlap_len = max(len(variant) for variant in marker_variants) - 1
+    chunk_size = 1_048_576  # 1 MiB
+    descriptor = -1
+    try:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+            return False
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise InstallError(f"file identity changed while inspecting {path}")
+        tail = b""
+        while True:
+            chunk = os.read(descriptor, chunk_size)
+            if not chunk:
+                return False
+            window = tail + chunk
+            if any(variant in window for variant in marker_variants):
+                return True
+            tail = window[-overlap_len:] if overlap_len else b""
+    except OSError as exc:
+        raise InstallError(f"cannot read {path}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
     # Broader-than-discovery safety scan for uninstall()'s /
     # recover_pending_install()'s untracked-owned-handler check (see their
@@ -812,12 +883,42 @@ def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
         # _read_for_detection(), not validate_owned_file(): this is
         # detecting whether a live handler exists, not deciding whether to
         # trust the file enough to rewrite it -- see that function's own
-        # comment and R9-P1-B. None means "not a file we can identify"; any
-        # other failure (cannot open/read, oversized, identity changed
-        # mid-read) is absence-of-evidence, same tolerance/re-raise policy
-        # as _is_regular_file() above.
+        # comment and R9-P1-B. None means "not a file we can identify"; a
+        # candidate too large for _read_for_detection() to load whole is
+        # handled separately below (it is readable, so it is not genuine
+        # absence-of-evidence); every other failure (cannot open/read,
+        # identity changed mid-read) is absence-of-evidence, same
+        # tolerance/re-raise policy as _is_regular_file() above.
         try:
             candidate_raw = _read_for_detection(resolved)
+        except _CandidateTooLargeForDetection as exc:
+            if not _is_under_runtime_root(resolved):
+                # Outside RUNTIME_BASE this stays exactly as fail-closed as
+                # any other inspection failure there -- a genuinely large
+                # third-party hooks.json is a real, if rare, possibility, and
+                # this scan has no special reason to trust it the way it
+                # trusts RUNTIME_BASE's own never-writes-hooks.json invariant.
+                raise InstallError(f"{exc} (at {candidate_str})") from exc
+            # Round 13 (closing R12-P1-A / P2-R12-A): unlike every other
+            # _read_for_detection() failure, "too large" does not mean "no
+            # information" -- the file is perfectly readable, just bigger
+            # than MAX_MANAGED_FILE_BYTES, so a bounded streaming scan can
+            # still cheaply establish whether the marker is present without
+            # ever loading the whole file, closing the exact gap both
+            # independent round-12 reviewers found: a genuine live relocated
+            # handler merely padded past the size cap was silently abandoned
+            # because this raise used to be blanket-tolerated the same way
+            # EACCES/identity-changed are.
+            try:
+                marker_found = _stream_scan_oversized_for_bridge_marker(resolved)
+            except Exception as scan_exc:
+                raise InstallError(f"{scan_exc} (at {candidate_str})") from scan_exc
+            if marker_found:
+                raise InstallError(
+                    f"cannot rule out an owned hook handler: oversized content under RUNTIME_BASE "
+                    f"matches the bridge marker (at {candidate_str})"
+                ) from exc
+            continue
         except Exception as exc:
             if _is_under_runtime_root(resolved):
                 continue
