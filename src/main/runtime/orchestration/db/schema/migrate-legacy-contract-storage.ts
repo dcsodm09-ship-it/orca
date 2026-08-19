@@ -53,6 +53,35 @@ export function migrateLegacyContractStorage(this: OrchestrationDb): void {
       UNIQUE(role, run_id, dispatch_id)
     );
 
+    -- Why (round 13, fix for a real regression an independent review found): a database with
+    -- duplicate coordinator/worker principals (only reachable via external corruption/repair
+    -- tooling, never via normal writes - commitLegacyCompatibilityPrincipal's own SELECT-then-
+    -- INSERT is serialized under BEGIN IMMEDIATE) used to boot in a silently-degraded state
+    -- (getLegacyCompatibilityPrincipal's .get() picks one of several arbitrarily). Once this
+    -- migration's own idempotent re-run started being trusted as a completeness signal (the
+    -- schema-version-skew probe added in round 12), that database instead hit this exact
+    -- CREATE UNIQUE INDEX on its own leftover duplicates and threw, permanently: a completeness
+    -- check that diagnoses a repairable state correctly must not also make it unrepairable.
+    -- Keep the most recently written row per (run_id, role='coordinator') and per
+    -- (dispatch_id, role='worker') group; this is deliberately a "most recent wins" tie-break,
+    -- not a judgment about which principal was semantically more valid - there is no timestamp
+    -- column on this table to do better, and any single deterministic winner is strictly an
+    -- improvement over refusing to boot at all.
+    DELETE FROM legacy_compatibility_principals
+      WHERE role = 'coordinator'
+        AND rowid NOT IN (
+          SELECT MAX(rowid) FROM legacy_compatibility_principals
+          WHERE role = 'coordinator'
+          GROUP BY run_id
+        );
+    DELETE FROM legacy_compatibility_principals
+      WHERE role = 'worker'
+        AND rowid NOT IN (
+          SELECT MAX(rowid) FROM legacy_compatibility_principals
+          WHERE role = 'worker'
+          GROUP BY dispatch_id
+        );
+
     CREATE UNIQUE INDEX IF NOT EXISTS idx_legacy_principal_coordinator
       ON legacy_compatibility_principals(run_id)
       WHERE role = 'coordinator';

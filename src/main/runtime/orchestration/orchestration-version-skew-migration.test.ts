@@ -379,6 +379,53 @@ describe('OrchestrationDb version-skew migration', () => {
     raw.close()
   })
 
+  // Why (round 13, fix for a real regression an independent review found and reproduced): the
+  // v19 legacy-principal unique indexes round 12 added to the completeness check changed the
+  // failure mode of an ALREADY-corrupted database (duplicate coordinator principals for one run,
+  // only reachable via external corruption/repair tooling, never via normal writes) from
+  // "boots in a silently-degraded state" to "throws permanently on every future boot" - because
+  // once the resolver correctly diagnoses the database as incomplete and rewinds to 6,
+  // migrateLegacyContractStorage's own CREATE UNIQUE INDEX hits the duplicates it exists to
+  // prevent. A completeness check that correctly diagnoses a repairable state must not also make
+  // it unrepairable - opening a real OrchestrationDb (not just calling the resolver in
+  // isolation) must both NOT throw and actually repair the duplicate down to one row.
+  it('repairs (does not crash on) a database with duplicate legacy coordinator principals', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'orca-db-version-skew-dup-coordinator-'))
+    const dbPath = join(tempDir, 'orchestration.db')
+    const seed = new OrchestrationDb(dbPath)
+    const run = seed.createRun({
+      objective: 'dup coordinator repro',
+      coordinatorHandle: 'term_coord',
+      coordinatorPaneKey: 'tab_coord:11111111-1111-4111-8111-111111111111'
+    })
+    seed.close()
+    const raw = new Database(dbPath)
+    raw.exec('DROP INDEX idx_legacy_principal_coordinator')
+    const insertPrincipal = raw.prepare(
+      `INSERT INTO legacy_compatibility_principals (
+         id, run_id, dispatch_id, role, host_scope, terminal_handle, pane_key,
+         launch_token_hash, process_incarnation, status
+       ) VALUES (?, ?, NULL, 'coordinator', '{}', ?, ?, ?, NULL, 'committed')`
+    )
+    insertPrincipal.run('legacy_p_1', run.id, 'term_coord_a', 'tab_a:leaf_a', 'hash_a')
+    insertPrincipal.run('legacy_p_2', run.id, 'term_coord_b', 'tab_b:leaf_b', 'hash_b')
+    raw.pragma(`user_version = ${SCHEMA_VERSION}`)
+    raw.close()
+
+    expect(() => {
+      db = new OrchestrationDb(dbPath)
+    }).not.toThrow()
+
+    const rawAfter = (db as unknown as { db: Database.Database }).db
+    const remaining = rawAfter
+      .prepare("SELECT id FROM legacy_compatibility_principals WHERE role = 'coordinator'")
+      .all() as { id: string }[]
+    expect(remaining).toHaveLength(1)
+    // Why the surviving row: the dedup keeps the highest rowid (most recently inserted) per
+    // group - legacy_p_2 was inserted after legacy_p_1.
+    expect(remaining[0]?.id).toBe('legacy_p_2')
+  })
+
   // Why (round 12): the v29 tasks CHECK-constraint probe is a distinct fact from the
   // terminal_reason/replacement_task_id columns the generic matrix already covers (both are
   // added in the SAME rebuild, but the resolver needs to check the CHECK independently - see
@@ -597,6 +644,22 @@ describe('OrchestrationDb version-skew migration', () => {
   // - a database FALSELY CLAIMING the current schema version while genuinely missing one of
   // these artifacts (exactly what a stale user_version pragma or a corrupted/hand-edited database
   // looks like) must be detected and rewound to 6, not trusted at face value.
+  // Why honesty, not more coverage, is the fix here for now (round 13, from an independent
+  // review's mutation-sweep finding, deliberately NOT fully resolved this round): each case
+  // above groups every artifact a version introduces together and only asserts the WHOLE group
+  // is detected - it does not prove any SPECIFIC entry's own gate fires, because
+  // hasCompletePostV6Schema's `&&` chain short-circuits on the FIRST failing check, and several
+  // versions (v19 especially, with 6 columns + 3 indexes in one case) bundle artifacts that
+  // would mask each other if only one were actually gated. A mutation sweep (delete one
+  // completeness-check entry at a time, run the suite) found the bulk of individual entries -
+  // not just v19's - currently survive undetected this way, purely because a SIBLING entry in
+  // the same group happens to catch the same corrupted-database state first. Flattening this
+  // into one case per artifact (stripping exactly what SQLite forces alongside it, nothing more)
+  // would close that gap but is a substantially larger rewrite than this round's fix scope -
+  // deliberately deferred, not silently accepted. What IS still proven here: every group as a
+  // WHOLE is detected (a version's migration block genuinely not having run is caught), which is
+  // the realistic corruption shape; what is NOT proven is that every listed entry is individually
+  // load-bearing versus redundant with a sibling.
   it.each(VERSION_BOUNDARY_DROPS)(
     'rewinds a database claiming the current version but missing its v$version artifact',
     (entry) => {

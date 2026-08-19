@@ -68,14 +68,14 @@ const VERSIONED_POST_V6_COLUMNS = [
   // (migrate-task-terminal-states.ts, called from migrate.ts's `if (current < 29)`);
   // worker_dispatches.terminated_by at v30 and dispatch_contexts.stale_escalated_at at v31 (both
   // inline in migrate.ts).
-  // Why the v11/v22/v28 entries can never independently PROVE a false rewind in production
-  // (round 12 accuracy note, not a functional issue - flagged by review, kept anyway):
-  // createTables() runs its full current-schema CREATE ... IF NOT EXISTS pass before migrate()
-  // ever does, so mutation_receipts/mutation_caller_identities/idx_dispatch_assignee_handle are
-  // always healed before the resolver looks. Keep them anyway - they're still correct, still
-  // cheap, and document real facts about when each artifact was introduced; do not read their
-  // presence here as "this is the only thing standing between a healthy old database and a
-  // false rewind" for these three specifically.
+  // Why the v11/v28 entries below (and v22's index further down in VERSIONED_POST_V6_INDEXES)
+  // can never independently PROVE a false rewind in production (round 12 accuracy note, not a
+  // functional issue - flagged by review, kept anyway): createTables() runs its full current-
+  // schema CREATE ... IF NOT EXISTS pass before migrate() ever does, so mutation_receipts/
+  // mutation_caller_identities/idx_dispatch_assignee_handle are always healed before the
+  // resolver looks. Keep them anyway - they're still correct, still cheap, and document real
+  // facts about when each artifact was introduced; do not read their presence here as "this is
+  // the only thing standing between a healthy old database and a false rewind" for these three.
   { version: 11, table: 'mutation_receipts', column: 'state' },
   { version: 26, table: 'mutation_receipt_ledger', column: 'singleton' },
   { version: 28, table: 'mutation_caller_identities', column: 'transport' },
@@ -105,8 +105,10 @@ const POST_V6_INDEXES = [
 // against migrate-v2-v12.ts/migrate-v13-v28.ts/migrate-legacy-contract-storage.ts, mirroring
 // VERSIONED_POST_V6_COLUMNS's own fix.
 // Why the rest (round 11, same follow-up-audit fix as the columns above): idx_dispatch_
-// assignee_handle at v22, idx_dispatch_active_assignee_handle at v25, idx_mutation_receipts_
-// completed_updated alongside v26's mutation_receipt_ledger - all in migrate-v13-v28.ts.
+// assignee_handle at v22 (see the v11/v28 column note above - same "createTables heals it
+// first, never independently provable" caveat applies here too), idx_dispatch_active_assignee_
+// handle at v25, idx_mutation_receipts_completed_updated alongside v26's mutation_receipt_ledger
+// - all in migrate-v13-v28.ts.
 // Why the 2 legacy-principal entries (round 12, fix for a real gap an independent review found
 // on its own dedicated full re-audit): idx_legacy_principal_coordinator/idx_legacy_principal_
 // dispatch are the ONLY enforcement of "at most one coordinator/worker principal per run" -
@@ -114,6 +116,12 @@ const POST_V6_INDEXES = [
 // cover the coordinator case, since SQLite treats every NULL dispatch_id as distinct. Missing
 // them wouldn't misjudge completeness in a way that crashes, but would silently let
 // getLegacyCompatibilityPrincipal's .get() pick an arbitrary one of several duplicates.
+// Why round 13 also touched migrate-legacy-contract-storage.ts, not just this file: adding these
+// 2 entries here changed a database with pre-existing duplicate principals from "boots
+// degraded" to "rewinds to 6, then throws forever on this exact CREATE UNIQUE INDEX re-running
+// into its own leftover duplicates" - migrateLegacyContractStorage now deletes duplicates
+// (deterministic most-recent-wins) immediately before creating these indexes, so a completeness
+// check that correctly diagnoses this state doesn't also make it unrepairable.
 const VERSIONED_POST_V6_INDEXES = [
   { version: 8, index: 'idx_deliveries_one_outstanding' },
   { version: 8, index: 'idx_deliveries_run_created' },
@@ -141,6 +149,10 @@ function hasOrchestrationTrigger(db: Database.Database, trigger: string): boolea
   return !!db
     .prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?")
     .get(trigger)
+}
+
+function hasOrchestrationTable(db: Database.Database, table: string): boolean {
+  return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)
 }
 
 // Why gated at v9 (round 10, fix for a real bug 2 independent reviews confirmed): the messages
@@ -216,7 +228,18 @@ function tasksAllowCancelledOrSuperseded(db: Database.Database): boolean {
 // drift and either never enforce the 10k cap or get permanently stuck reporting the ledger full
 // (triggers) - both unrecoverable by restart, since a "complete" verdict here means migrate()
 // never gets another chance to re-run this block.
+// Why self-guarded, not relying on the sibling checks earlier in hasCompletePostV6Schema's &&
+// chain (round 13, fix for a real gap an independent review found): this function's own SELECT
+// would throw `no such table: mutation_receipt_ledger` on a database missing that table -
+// currently unreachable only because 2 EARLIER, UNRELATED checks in the chain already catch that
+// same database first (masking, not protecting). Repeating the exact mistake round 10 already
+// fixed once for hasConsistentLegacyAdoption's `legacy_adoptions` query - probe the table's own
+// existence before querying it, so this function is correct standing alone, not just by
+// accident of evaluation order.
 function hasConsistentMutationReceiptLedger(db: Database.Database): boolean {
+  if (!hasOrchestrationTable(db, 'mutation_receipt_ledger')) {
+    return false
+  }
   return (
     hasOrchestrationTrigger(db, 'mutation_receipts_count_insert') &&
     hasOrchestrationTrigger(db, 'mutation_receipts_count_delete') &&
