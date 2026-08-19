@@ -1253,6 +1253,90 @@ P1-2：npm ci 运行期间换 `npm-cli.js`；P2-1：子目录锚定的嵌套
 
 已提交 `035ef5dad5`。**已派发 round 31 双复核。**
 
+### Round 31：Codex 第五次被同一基础设施问题挡住（用户已决定自己交互式解决）；Claude opus/max 挑出 1 个新 P1——被钉住的是"内容"，没被钉住的恰好是"真正会被执行的两个文件"
+
+**Codex 这一路**（`run_402ad43b722a` / `task_ad5da837c4d9` /
+`ctx_79219b5a5dfb`）第五次遇到同一个 `codex-hooks-review-prompt`
+阻断——这次不再重复升级（round 29 已经完整记录+升级过一次），如实
+记录后按用户已经做出的决定（自己交互式回答一次）等待，不重试。
+
+**Claude opus/max：NO_GO，0 P0、1 P1、0 P2、2 P3（信息性）**——先
+逐项确认 round 30 那四处修复都是真的、都在各自覆盖范围内正确：
+`sha256_file()` 在安装器里已经**零个**存活的安全相关调用点（全部
+换成了 `sha256_file_verified()` 或走 `read_private_ssd_file()` 的
+O_NOFOLLOW+fstat）；`npm-cli.js` 修复对着真实场景复现有效，
+`verify()` 的三个字段检查在三条执行路径前**全部**生效、没有绕过口；
+嵌套 `node_modules` 检查在 2/3/4 层深度、作用域/非作用域包名下全部
+命中；4 条新回归测试逐条在隔离环境里确认对 `ea8004f820` 真的会
+复现失败、对修复后通过。round 30 那句"对每个被钉住的路径，验证的
+读和贡献基线的读是同一次操作，间隙为零"——**对被钉住的路径来说这句
+话是真的**，opus/max 自己拿一个被钉住的文件做对照复现，确认篡改
+确实会被同一次读取当场拦下。
+
+**但挖出一个新 P1，而且恰好是最要命的两个文件**：`release_relative_
+pinned_digests` 这张钉住表里，四个本地补丁包的全部文件、加上
+node/npm-cli 自己的摘要都在，**唯独没有安装器自己生成的 launch
+guard（`bin/prime-agent-launch-guard.py`）和 command wrapper
+（`bin/prime-agent`）**——这两个恰恰是每次托管调用真正会被执行的
+入口。它们在创建时确实做了"读回校验"（`atomic_create_private_file`
+自己的机制），但这只是"round 29 那个模式里的 T1 时刻"，它们的内容
+真正变成永久基线要等到之后 `tree_digest()` 扫到它们的时候——而
+因为它们不在钉住表里，`tree_digest()` 对它们做的是"直接记录"，
+**零比对**。同 UID 攻击者只要在这两个文件被创建之后、
+`tree_digest()` 真正扫到它们之前的窗口里覆盖内容，篡改后的字节就
+会被当成 `receipt['release_tree_sha256']` 的一部分永久采信——此后
+`finalize_pending_install()`/`verify()` 重新算出来的树摘要照样和
+receipt 吻合（因为 receipt 本来记的就是被篡改后的值），
+`verify()` 那三个字段检查也不覆盖这两个文件——等于每次
+`prime-agent` 调用都在跑攻击者的代码，`verify()` 永远报告"OK"。
+
+**真实复现**：把 round 30 自己那条回归测试原样复用，只换攻击目标，
+走的是真实的 `atomic_create_private_file`/`tree_digest`/
+`write_pending_install`/`finalize_pending_install`——对 guard、
+对 wrapper 分别测试，两次都是 `install() = SUCCESS`、磁盘上是攻击者
+字节、`receipt_tree_sha256` 和重新算出来的树摘要吻合；同一套代码对
+一个被钉住的对照文件（`chunk-real.js`）测试，正确地拒绝并报错，
+证明差别确实就出在"在不在钉住表里"这一件事上。在真实的、26911 个
+条目的安装树上做了交叉核实：`guard_is_pinned=false`、
+`wrapper_is_pinned=false`、`unpinned_bin=["bin/prime-agent",
+"bin/prime-agent-launch-guard.py"]`、钉住计数 1741、零孤立钉住项
+（钉住表本身没有对不上树的多余键）。实测窗口（热缓存）约 1.5 秒——
+round 29 那次真实复现用的正是"轮询等目标文件出现、一出现就覆盖"这
+同一招，在 1.5 秒的窗口里一样轻松命中。
+
+**对 round 30"间隙为零"这句话的专项判断**：对已经被钉住的路径而言
+是准确的，opus/max 自己独立复现确认；但残留说明本身**在精神上等于
+又一次过度断言**——round 30 的注释把唯一剩下的残留描述成"微秒级的
+进程内 lstat/open 间隙"，只字未提还有两个**不在钉住表里、而且正是
+真正会被执行**的文件，仍然背着一个从 1.5 秒到数十秒不等、比那个
+微秒级间隙大好几个数量级、也远比它更实际可利用的窗口。这正是
+round 25/27/29 都点名过的同一种失败模式——"对覆盖到的部分说得很
+精确"和"对没覆盖到的部分只字不提或轻描淡写"合在一起，读起来就是
+一句过度断言。修法很直接：launch guard 和 wrapper 的字节本来就是
+安装器自己用 `managed_launch_guard_script()`/
+`managed_entrypoint_script()` 生成的，在生成的那一刻就能算出精确
+摘要、直接塞进 `release_relative_pinned_digests`，理想情况下也应该
+和 node/npm-cli/entrypoint 一样进 receipt、被 `verify()` 的执行前
+检查覆盖。
+
+2 个信息性 P3：同一种"记录而非比对"的模式也覆盖到
+`package.json`/`package-lock.json`/`LICENSE`/
+`upstream-package-lock.json`/4706 个工具链文件（含 npm 自己真实的
+`lib/cli.js`）——但这些安装完之后不会被真正执行（npm 装完就不会
+再跑，node/cli.js 已经钉住+校验），窗口内被篡改顶多留下"记录了但
+没人用"的漂移，不是 RCE，值得纵深防御但不构成 P1；约 196 个第三方
+registry 依赖包内容级别的残留文档描述依然准确、本轮未变。
+
+真实测试：114/114（两个解释器各跑两次）全过，`py_compile` 干净；
+真实（非 mock）`sandbox_e2e.py` 跑两次均 `exit 0`/`ok:true`，
+26911 个条目两次一致（每次安装摘要不同属正常 npm 非确定性）。
+
+**已派发 round 32**：把 launch guard 和 wrapper 的生成字节钉进
+`release_relative_pinned_digests`，理想情况下也补进 receipt 并让
+`verify()` 的执行前检查覆盖它们，同时把残留说明改成如实包含这两个
+文件曾经存在过的窗口大小，不要再犯"只讲清楚覆盖到的部分"这种
+选择性精确。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max

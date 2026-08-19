@@ -307,8 +307,13 @@ opus/max 给出了具体、廉价的最小修法。**round 30（commit `035ef5da
 重新校验（`verify()` 三个哈希字段从死证据变成真正生效）、两个 P2 也修好（子目录
 锚定的嵌套 `node_modules/` 纳入检查、摘要读取改用单次 O_NOFOLLOW+fstat 身份确认）。
 114/114 测试（两解释器各跑两次）全过、真实 `sandbox_e2e.py` 跑两次均 `ok:true`。
-**round 31 双复核已派发**，尚未独立确认。完整逐轮细节见
-`reports/ORCA-COLLAB-STATE-AND-PRIME-AGENT-2026-08-18.md`。
+**round 31 双复核结果**：Codex 第五次被同一 hooks.json 问题挡住（用户已决定自己交互式
+解决，未重复升级）；Claude opus/max **NO_GO，1 个新 P1**——被钉住摘要表覆盖的是四个
+本地补丁包+node/npm-cli，唯独漏了安装器自己生成、真正会被每次调用执行的 launch guard
+和 command wrapper 这两个文件，同一种"记录而非比对"的窗口（实测约 1.5 秒）在这两个
+最要命的文件上原封不动，真实复现出永久 RCE、`verify()` 永远报告 OK。修法很直接（这两
+个文件的字节是安装器自己生成的，生成时就能算出精确摘要钉进去）。**round 32 已派发**。
+完整逐轮细节见 `reports/ORCA-COLLAB-STATE-AND-PRIME-AGENT-2026-08-18.md`。
 `fd6a683a4a` 这个双 GO 时点**已被 8 轮后续真实发现超越，不能再作为"可以安装"的
 依据**——按用户规则，需要在当前 HEAD 上重新拿到一次真正、当下有效的双路 GO。
 
