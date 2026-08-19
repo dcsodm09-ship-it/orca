@@ -391,7 +391,7 @@ describe('Last-status persistence', () => {
     }
   })
 
-  it('restores Codex child hierarchy and reaps unconfirmed children on the next root Stop', async () => {
+  it('restores Codex child hierarchy and keeps a hook-confirmed child alive across the next root Stop', async () => {
     mkdirSync(join(userDataPath, 'agent-hooks'), { recursive: true })
     const receivedAt = recentTs()
     writeFileSync(
@@ -467,8 +467,14 @@ describe('Last-status persistence', () => {
         buildBody({ hook_event_name: 'Stop', model: 'gpt-5.4' }),
         '/hook/codex'
       )
+      // Why: the child was confirmed live by the PreToolUse above and is still
+      // 'working' — the lead's own Stop must not discard it or report 'done'.
       expect(server.getStatusSnapshot()).toEqual([
-        expect.objectContaining({ state: 'done', model: 'gpt-5.4', subagents: undefined })
+        expect.objectContaining({
+          state: 'working',
+          model: 'gpt-5.4',
+          subagents: [expect.objectContaining({ model: 'gpt-5.4-mini' })]
+        })
       ])
     } finally {
       server.stop()

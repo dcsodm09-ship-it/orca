@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { _internals } from './server'
 import { buildBody } from './server.test-fixtures'
 
@@ -100,8 +103,12 @@ describe('Codex hook normalization', () => {
       buildBody({ hook_event_name: 'Stop', model: 'gpt-5.4' }),
       'production'
     )
-    expect(rootStop?.payload.state).toBe('done')
-    expect(rootStop?.payload.subagents).toBeUndefined()
+    // Why: child-session was confirmed by live SubagentStart/PreToolUse hooks and is still
+    // 'working' — the lead's own Stop must not discard it or falsely report the pane 'done'.
+    expect(rootStop?.payload.state).toBe('working')
+    expect(rootStop?.payload.subagents).toMatchObject([
+      { id: 'child-session', agentType: 'reviewer', state: 'working' }
+    ])
 
     const resumedChild = _internals.normalizeHookPayload(
       'codex',
@@ -228,5 +235,111 @@ describe('Codex hook normalization', () => {
     )
     expect(result?.payload.state).toBe('working')
     expect(result?.payload.prompt).toBe('')
+  })
+})
+
+describe('Codex Stop-time subagent roster cleanup', () => {
+  const dirs: string[] = []
+
+  afterEach(() => {
+    for (const dir of dirs) {
+      rmSync(dir, { recursive: true, force: true })
+    }
+    dirs.length = 0
+  })
+
+  function writeParentRolloutWithGhostChild(childId: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'codex-normalization-phantom-'))
+    dirs.push(dir)
+    const parentPath = join(dir, 'rollout-parent.jsonl')
+    writeFileSync(
+      parentPath,
+      `${JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'sub_agent_activity',
+          occurred_at_ms: 1234,
+          agent_thread_id: childId,
+          agent_path: '/root/ghost_review',
+          kind: 'started'
+        }
+      })}\n`
+    )
+    // Deliberately no matching rollout-child-<id>.jsonl is ever written, so the
+    // child's own rollout stays unreadable for the rest of this test.
+    return parentPath
+  }
+
+  it('retires a transcript-only child once its grace window elapses, even on a Stop with no transcript_path of its own', () => {
+    vi.useFakeTimers()
+    try {
+      const childId = '019fa65f-3144-7151-9c02-cff7a28f316f'
+      const parentPath = writeParentRolloutWithGhostChild(childId)
+
+      const discovered = _internals.normalizeHookPayload(
+        'codex',
+        buildBody({
+          hook_event_name: 'PostToolUse',
+          transcript_path: parentPath,
+          tool_name: 'collaborationspawn_agent'
+        }),
+        'production'
+      )
+      // Why: within the grace window an unreadable-so-far rollout must not be
+      // assumed dead — the child still gates the pane 'working'.
+      expect(discovered?.payload.state).toBe('working')
+      expect(discovered?.payload.subagents).toEqual([
+        expect.objectContaining({ id: childId, state: 'working' })
+      ])
+
+      // The grace window elapses with no further Codex activity of any kind.
+      vi.advanceTimersByTime(61_000)
+
+      // This Stop happens to carry no transcript_path, so
+      // reconcileCodexSubagentTranscript alone never runs again for this pane —
+      // retirement must come from the independent Stop-time grace check.
+      const stop = _internals.normalizeHookPayload(
+        'codex',
+        buildBody({ hook_event_name: 'Stop' }),
+        'production'
+      )
+      expect(stop?.payload.state).toBe('done')
+      expect(stop?.payload.subagents).toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps a still-within-grace transcript-only child alive across a Stop that carries no transcript_path', () => {
+    vi.useFakeTimers()
+    try {
+      const childId = '019fa65f-3144-7151-9c02-cff7a28f316f'
+      const parentPath = writeParentRolloutWithGhostChild(childId)
+
+      _internals.normalizeHookPayload(
+        'codex',
+        buildBody({
+          hook_event_name: 'PostToolUse',
+          transcript_path: parentPath,
+          tool_name: 'collaborationspawn_agent'
+        }),
+        'production'
+      )
+
+      // Well short of the 60s grace deadline.
+      vi.advanceTimersByTime(5_000)
+
+      const stop = _internals.normalizeHookPayload(
+        'codex',
+        buildBody({ hook_event_name: 'Stop' }),
+        'production'
+      )
+      expect(stop?.payload.state).toBe('working')
+      expect(stop?.payload.subagents).toEqual([
+        expect.objectContaining({ id: childId, state: 'working' })
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

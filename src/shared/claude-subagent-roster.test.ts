@@ -1,15 +1,17 @@
 import { describe, expect, it } from 'vitest'
 import { AGENT_STATUS_MAX_SUBAGENTS } from './agent-status-types'
 import { readClaudeBackgroundAgentTasks } from './claude-background-task-inventory'
+import { foldClaudeBackgroundTasksIntoRoster } from './claude-subagent-background-task-fold'
 import {
+  CLAUDE_WAITING_SUBAGENT_STALE_MS,
   claudeRosterHasRuntimeWorkingSubagent,
   claudeRosterHasWorkingSubagent,
   claudeRosterToSnapshots,
   claudeTeammateIdMatchesName,
-  foldClaudeBackgroundTasksIntoRoster,
   idleClaudeTeammateByName,
   reapUnconfirmedRestoredClaudeSubagents,
   stopClaudeSubagent,
+  upsertWaitingClaudeSubagent,
   upsertWorkingClaudeSubagent,
   type ClaudeSubagentRoster
 } from './claude-subagent-roster'
@@ -398,6 +400,113 @@ describe('claude-subagent-roster', () => {
     foldClaudeBackgroundTasksIntoRoster(roster, [task({ id: 'a9' })], 100)
     foldClaudeBackgroundTasksIntoRoster(roster, [task({ id: 'other', teammate: true })], 200)
     expect(roster.has('a9')).toBe(false)
+  })
+
+  it('eventually reaps a waiting teammate row whose SubagentStop never arrives', () => {
+    // Why: background_tasks carries no per-task wait signal, so a 'waiting' row can only
+    // ever be protected by this fold, never reconfirmed by it — an unbounded protection
+    // would let a leaked wait (its SubagentStop/TeammateIdle lost) pin the pane 'waiting'
+    // forever, since resolveClaudePaneState now forces 'waiting' whenever any roster row
+    // is 'waiting'.
+    const roster: ClaudeSubagentRoster = new Map()
+    upsertWaitingClaudeSubagent(
+      roster,
+      'aprobe1-6d3cb5b5',
+      { agentType: 'probe1', toolName: 'Bash', toolInput: 'ls' },
+      100
+    )
+    foldClaudeBackgroundTasksIntoRoster(
+      roster,
+      [task({ id: 'other', teammate: true })],
+      100 + CLAUDE_WAITING_SUBAGENT_STALE_MS
+    )
+    expect(roster.has('aprobe1-6d3cb5b5')).toBe(true)
+
+    foldClaudeBackgroundTasksIntoRoster(
+      roster,
+      [task({ id: 'other', teammate: true })],
+      100 + CLAUDE_WAITING_SUBAGENT_STALE_MS + 1
+    )
+    expect(roster.has('aprobe1-6d3cb5b5')).toBe(false)
+  })
+
+  it('is immune to many folds happening within the same short window', () => {
+    // Why: folds can run far more often than any real chance for this specific child to
+    // resolve (e.g. many unrelated lead Stops in quick succession) — counting folds instead
+    // of elapsed real time would evict a slow-but-genuinely-alive wait; wall-clock doesn't.
+    const roster: ClaudeSubagentRoster = new Map()
+    upsertWaitingClaudeSubagent(roster, 'aprobe1-6d3cb5b5', { agentType: 'probe1' }, 100)
+    for (let i = 0; i < 50; i++) {
+      foldClaudeBackgroundTasksIntoRoster(roster, [task({ id: 'other', teammate: true })], 100 + i)
+    }
+    expect(roster.has('aprobe1-6d3cb5b5')).toBe(true)
+  })
+
+  it('resets the waiting staleness window on a fresh live PermissionRequest', () => {
+    const roster: ClaudeSubagentRoster = new Map()
+    upsertWaitingClaudeSubagent(roster, 'aprobe1-6d3cb5b5', { agentType: 'probe1' }, 100)
+    foldClaudeBackgroundTasksIntoRoster(
+      roster,
+      [task({ id: 'other', teammate: true })],
+      100 + CLAUDE_WAITING_SUBAGENT_STALE_MS - 1
+    )
+    expect(roster.has('aprobe1-6d3cb5b5')).toBe(true)
+
+    // Why: a live re-confirmation (e.g. the same request still pending) proves the child is
+    // genuinely still there — it must reset the window, not merely delay the reap by the
+    // same fixed amount.
+    upsertWaitingClaudeSubagent(
+      roster,
+      'aprobe1-6d3cb5b5',
+      { agentType: 'probe1' },
+      100 + CLAUDE_WAITING_SUBAGENT_STALE_MS - 1
+    )
+    foldClaudeBackgroundTasksIntoRoster(
+      roster,
+      [task({ id: 'other', teammate: true })],
+      100 + (CLAUDE_WAITING_SUBAGENT_STALE_MS - 1) * 2
+    )
+    expect(roster.has('aprobe1-6d3cb5b5')).toBe(true)
+  })
+
+  it('reaps a waiting row even once confirmedTeammate is permanently set', () => {
+    // Why: confirmedTeammate is a permanent IDENTITY flag ("this id belongs to a known named
+    // teammate"), not a liveness signal. An earlier version of this bound checked it before
+    // the 'waiting' branch, so every teammate past its first TeammateIdle bypassed the bound
+    // entirely — the common case this bound exists for, not a rare one.
+    const roster: ClaudeSubagentRoster = new Map()
+    upsertWorkingClaudeSubagent(roster, 'aprobe1-6d3cb5b5', { agentType: 'probe1' }, 0)
+    idleClaudeTeammateByName(roster, 'probe1')
+    expect(roster.get('aprobe1-6d3cb5b5')?.confirmedTeammate).toBe(true)
+
+    upsertWaitingClaudeSubagent(
+      roster,
+      'aprobe1-6d3cb5b5',
+      { agentType: 'probe1', toolName: 'Bash', toolInput: 'ls' },
+      100
+    )
+    foldClaudeBackgroundTasksIntoRoster(
+      roster,
+      [task({ id: 'other', teammate: true })],
+      100 + CLAUDE_WAITING_SUBAGENT_STALE_MS + 1
+    )
+    expect(roster.has('aprobe1-6d3cb5b5')).toBe(false)
+  })
+
+  it("does not downgrade a listed-as-running task's row out of 'waiting'", () => {
+    // Why: background_tasks has no per-task wait signal — the listed-authoritative branch
+    // must not silently clear a still-pending approval just because the id also shows up
+    // as a running background task.
+    const roster: ClaudeSubagentRoster = new Map()
+    upsertWaitingClaudeSubagent(
+      roster,
+      'a1',
+      { agentType: 'general-purpose', toolName: 'Bash', toolInput: 'ls' },
+      100
+    )
+    foldClaudeBackgroundTasksIntoRoster(roster, [task({ id: 'a1', running: true })], 200)
+    expect(roster.get('a1')?.state).toBe('waiting')
+    expect(roster.get('a1')?.waitingToolName).toBe('Bash')
   })
 
   it('matches teammate ids by name only up to the hyphen-free suffix', () => {

@@ -1,25 +1,24 @@
-import { closeSync, openSync, readSync, readdirSync, statSync, type Stats } from 'node:fs'
-import { basename, dirname, extname, isAbsolute, join } from 'node:path'
+import { extname, isAbsolute } from 'node:path'
 
 import {
   finishCodexSubagent,
+  isHookConfirmedCodexSubagent,
   setCodexSubagentModel,
+  touchCodexSubagentConfirmedAt,
   upsertCodexSubagent,
   type CodexSubagentRoster
 } from './codex-subagent-roster'
+import {
+  readJsonlCursor,
+  record,
+  resolveChildTranscript,
+  SAFE_THREAD_ID,
+  type JsonlCursor,
+  type JsonRecord
+} from './codex-transcript-jsonl-cursor'
 
-const TRANSCRIPT_READ_MAX_BYTES = 1024 * 1024
-const TRANSCRIPT_LINE_MAX_BYTES = 256 * 1024
-const TRANSCRIPT_DIRECTORY_MAX_ENTRIES = 4096
 // Why: retire a child whose rollout stays unreadable this long, else a deleted/never-written file pins a phantom row forever.
 const CHILD_UNREADABLE_GRACE_MS = 60_000
-const SAFE_THREAD_ID = /^[A-Za-z0-9-]{1,64}$/
-
-type JsonlCursor = {
-  filePath?: string
-  offset: number
-  carry: string
-}
 
 type TrackedTranscriptSubagent = JsonlCursor & {
   description?: string
@@ -34,139 +33,6 @@ type TrackedTranscriptSubagent = JsonlCursor & {
 export type CodexSubagentTranscriptState = {
   parent: JsonlCursor
   subagents: Map<string, TrackedTranscriptSubagent>
-}
-
-type JsonRecord = Record<string, unknown>
-
-function record(value: unknown): JsonRecord | undefined {
-  return typeof value === 'object' && value !== null ? (value as JsonRecord) : undefined
-}
-
-/** Returns undefined when the file is unreadable, distinguishing a vanished rollout from one with no new lines. */
-function readJsonlCursor(cursor: JsonlCursor): JsonRecord[] | undefined {
-  if (!cursor.filePath) {
-    return undefined
-  }
-  let stats: Stats
-  try {
-    stats = statSync(cursor.filePath)
-  } catch {
-    return undefined
-  }
-  if (!stats.isFile()) {
-    return undefined
-  }
-  if (stats.size < cursor.offset) {
-    cursor.offset = 0
-    cursor.carry = ''
-  }
-  if (stats.size === cursor.offset) {
-    return []
-  }
-  const bytesToRead = Math.min(stats.size - cursor.offset, TRANSCRIPT_READ_MAX_BYTES)
-  const start = stats.size - cursor.offset > bytesToRead ? stats.size - bytesToRead : cursor.offset
-  const buffer = Buffer.allocUnsafe(bytesToRead)
-  let bytesRead = 0
-  let fd: number | undefined
-  try {
-    fd = openSync(cursor.filePath, 'r')
-    bytesRead = readSync(fd, buffer, 0, bytesToRead, start)
-  } catch {
-    return undefined
-  } finally {
-    if (fd !== undefined) {
-      closeSync(fd)
-    }
-  }
-  const skippedPrefix = start !== cursor.offset
-  const content = `${skippedPrefix ? '' : cursor.carry}${buffer.toString('utf8', 0, bytesRead)}`
-  const lines = content.split('\n')
-  cursor.offset = start + bytesRead
-  cursor.carry = lines.pop() ?? ''
-  if (skippedPrefix) {
-    lines.shift()
-  }
-  const records: JsonRecord[] = []
-  for (const line of lines) {
-    if (Buffer.byteLength(line, 'utf8') > TRANSCRIPT_LINE_MAX_BYTES) {
-      continue
-    }
-    try {
-      const parsed = record(JSON.parse(line) as unknown)
-      if (parsed) {
-        records.push(parsed)
-      }
-    } catch {
-      // A malformed rollout line must not block later lifecycle events.
-    }
-  }
-  return records
-}
-
-function readTranscriptDirectory(directory: string): string[] {
-  let entries: string[]
-  try {
-    entries = readdirSync(directory)
-  } catch {
-    return []
-  }
-  if (entries.length > TRANSCRIPT_DIRECTORY_MAX_ENTRIES) {
-    entries = entries.slice(-TRANSCRIPT_DIRECTORY_MAX_ENTRIES)
-  }
-  return entries
-}
-
-// Why: Codex files each rollout under its OWN local start date, so a session running past midnight spawns children into a sibling day directory.
-function childDayDirectory(parentPath: string, startedAt: number): string | undefined {
-  const dayDir = dirname(parentPath)
-  const monthDir = dirname(dayDir)
-  const yearDir = dirname(monthDir)
-  if (
-    !/^\d{2}$/.test(basename(dayDir)) ||
-    !/^\d{2}$/.test(basename(monthDir)) ||
-    !/^\d{4}$/.test(basename(yearDir)) ||
-    !Number.isFinite(startedAt)
-  ) {
-    return undefined
-  }
-  const startedOn = new Date(startedAt)
-  if (Number.isNaN(startedOn.getTime())) {
-    return undefined
-  }
-  const pad = (value: number): string => String(value).padStart(2, '0')
-  return join(
-    dirname(yearDir),
-    String(startedOn.getFullYear()).padStart(4, '0'),
-    pad(startedOn.getMonth() + 1),
-    pad(startedOn.getDate())
-  )
-}
-
-function resolveChildTranscript(
-  parentPath: string,
-  threadId: string,
-  startedAt: number,
-  entriesByDirectory: Map<string, string[]>
-): string | undefined {
-  if (!SAFE_THREAD_ID.test(threadId)) {
-    return undefined
-  }
-  const suffix = `-${threadId}.jsonl`
-  const parentDir = dirname(parentPath)
-  const childDir = childDayDirectory(parentPath, startedAt)
-  const directories = childDir && childDir !== parentDir ? [parentDir, childDir] : [parentDir]
-  for (const directory of directories) {
-    let entries = entriesByDirectory.get(directory)
-    if (!entries) {
-      entries = readTranscriptDirectory(directory)
-      entriesByDirectory.set(directory, entries)
-    }
-    const fileName = entries.find((entry) => entry.endsWith(suffix))
-    if (fileName) {
-      return join(directory, fileName)
-    }
-  }
-  return undefined
 }
 
 function readActivity(recordValue: JsonRecord):
@@ -287,7 +153,7 @@ export function reconcileCodexSubagentTranscript(
     upsertCodexSubagent(
       roster,
       activity.id,
-      { description: tracked.description, state: 'working' },
+      { description: tracked.description, state: 'working', source: 'transcript' },
       tracked.startedAt
     )
   }
@@ -310,18 +176,78 @@ export function reconcileCodexSubagentTranscript(
       if (now - tracked.unresolvedSince <= CHILD_UNREADABLE_GRACE_MS) {
         continue
       }
-    } else {
-      tracked.unresolvedSince = undefined
-      tracked.model = readChildModel(records) ?? tracked.model
-      // Why: re-applied every reconcile, not just on discovery — the parent's
-      // own activity upsert can rebuild this child's roster entry, which would
-      // otherwise drop a model found on an earlier poll.
-      setCodexSubagentModel(roster, id, tracked.model)
-      if (!childIsComplete(records)) {
-        continue
+      // Why: this id's OWN transcript stayed unreadable past the grace window, but it may since
+      // have been separately confirmed live by a hook (upgrading its roster row to
+      // source:'hook') — that confirmation must not be silently undone just because transcript
+      // polling itself found nothing. Same reasoning and guard as
+      // retireExpiredUnresolvedCodexSubagentTranscripts; this is the OTHER call site the same
+      // grace-expiry condition can reach (every reconcile, not just at Stop), so it needs the
+      // identical guard, independently.
+      if (!isHookConfirmedCodexSubagent(roster, id)) {
+        finishCodexSubagent(roster, id)
       }
+      state.subagents.delete(id)
+      continue
     }
+    tracked.unresolvedSince = undefined
+    tracked.model = readChildModel(records) ?? tracked.model
+    // Why: re-applied every reconcile, not just on discovery — the parent's
+    // own activity upsert can rebuild this child's roster entry, which would
+    // otherwise drop a model found on an earlier poll.
+    setCodexSubagentModel(roster, id, tracked.model)
+    // Why: only ACTUAL new content is treated as liveness evidence — not merely a successful,
+    // unchanged read (readJsonlCursor returns `[]`, not undefined, when the file is readable but
+    // hasn't grown since the last poll). A child whose rollout stops growing because the process
+    // crashed right after writing task_started would otherwise look "alive" forever under the
+    // 1s poll (every tick reads the same static file successfully), permanently defeating the
+    // staleness bound this same mechanism exists to enforce. Genuinely new lines are real,
+    // repeated proof of life for a child only ever reconfirmed via transcript reads.
+    if (records.length > 0) {
+      touchCodexSubagentConfirmedAt(roster, id)
+    }
+    if (!childIsComplete(records)) {
+      continue
+    }
+    // Why: unlike the grace-expiry path above, task_complete is direct evidence from the
+    // child's OWN rollout that it finished — this overrides hook-confirmed status (the hook's
+    // own Stop may simply not have arrived yet), so this delete stays unconditional.
     finishCodexSubagent(roster, id)
+    state.subagents.delete(id)
+  }
+}
+
+/**
+ * Force-check every currently-`unresolvedSince`-marked child against the grace deadline and
+ * retire the expired ones, without needing a fresh rollout read or a later reconcile call.
+ *
+ * `reconcileCodexSubagentTranscript`'s own grace check only re-evaluates when reconcile runs
+ * again — but Stop is normally the last hook event of a turn, so a child that first went
+ * unresolved at (or shortly before) that same Stop's reconcile would have its deadline set to
+ * "now" and never get a later call to re-check it against. Call this once at Stop, in addition
+ * to (not instead of) reconcileCodexSubagentTranscript, so the grace window still expires on
+ * its own. Only deletes the roster row when it is NOT hook-confirmed: an id can be tracked here
+ * (transcript-discovered) and later separately confirmed by a live hook, upgrading its roster row
+ * to 'source: hook' — deleting that row on this path would silently undo a real hook
+ * confirmation and could kill a genuinely still-running child. A hook-confirmed id is instead the
+ * Stop-time hook veto's responsibility (see hasHookConfirmedCodexSubagent and its own bounded
+ * fallback, retireStaleHookConfirmedCodexSubagents) — this function still stops TRACKING it here
+ * either way, since transcript-side polling has nothing further to add once a hook owns the id.
+ */
+export function retireExpiredUnresolvedCodexSubagentTranscripts(
+  state: CodexSubagentTranscriptState,
+  roster: CodexSubagentRoster,
+  now: number
+): void {
+  for (const [id, tracked] of state.subagents) {
+    if (tracked.unresolvedSince === undefined) {
+      continue
+    }
+    if (now - tracked.unresolvedSince <= CHILD_UNREADABLE_GRACE_MS) {
+      continue
+    }
+    if (!isHookConfirmedCodexSubagent(roster, id)) {
+      finishCodexSubagent(roster, id)
+    }
     state.subagents.delete(id)
   }
 }

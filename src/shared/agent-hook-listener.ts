@@ -27,23 +27,30 @@ import {
 import { normalizeOptionalField } from './agent-status-field-normalization'
 import { isAskUserQuestionTool } from './agent-question-answered-intent'
 import {
+  claudeRosterFindWaitingSubagent,
   claudeRosterHasRestoredSnapshotSubagent,
   claudeRosterHasRuntimeWorkingSubagent,
+  claudeRosterHasWaitingSubagent,
   claudeRosterHasWorkingSubagent,
   claudeRosterToSnapshots,
   claudeTeammateIdMatchesName,
-  foldClaudeBackgroundTasksIntoRoster,
   idleClaudeTeammateByName,
   reapUnconfirmedRestoredClaudeSubagents,
   stopClaudeSubagent,
+  upsertWaitingClaudeSubagent,
   upsertWorkingClaudeSubagent,
-  type ClaudeSubagentRoster
+  type ClaudeSubagentRoster,
+  type TrackedClaudeSubagent
 } from './claude-subagent-roster'
+import { foldClaudeBackgroundTasksIntoRoster } from './claude-subagent-background-task-fold'
 import { readClaudeBackgroundAgentTasks } from './claude-background-task-inventory'
 import {
   codexRosterEffectiveState,
   codexRosterToSnapshots,
   finishCodexSubagent,
+  hasHookConfirmedCodexSubagent,
+  reapUnconfirmedRestoredCodexSubagents,
+  retireStaleHookConfirmedCodexSubagents,
   seedCodexSubagentRoster,
   upsertCodexSubagent,
   type CodexSubagentRoster
@@ -52,6 +59,7 @@ import {
   createCodexSubagentTranscriptState,
   hasTrackedCodexTranscriptSubagents,
   reconcileCodexSubagentTranscript,
+  retireExpiredUnresolvedCodexSubagentTranscripts,
   type CodexSubagentTranscriptState
 } from './codex-subagent-transcript'
 import { ORCA_HOOK_PROTOCOL_VERSION } from './agent-hook-types'
@@ -157,6 +165,17 @@ export type ClaudeLeadTurnState = {
   waitingAgentId?: string
   /** Tool call that owns the wait; late completions from parallel sibling tools must not dismiss its card. */
   waitingToolUseId?: string
+  /** Who the CURRENT wait belongs to, set precisely at wait-start alongside waitingAgentId — a
+   *  child's own waiting-inducing event sets 'child' (with waitingAgentId), the LEAD's own (no
+   *  agent_id) sets 'lead' (waitingAgentId stays unset, since there's no child to point at).
+   *  Deliberately distinct from "waitingAgentId is absent": that alone is ambiguous between
+   *  "the lead itself is waiting" and "an unrelated event wiped a child's pointer" — both look
+   *  identical without this field, and conflating them let a typed answer to the LEAD's own
+   *  question silently resolve a genuinely-still-blocked CHILD's unrelated wait instead (a
+   *  reproducible P1). Only 'child' + a still-'waiting' pointer target may resolve an inferred
+   *  answer directly; 'lead' must never fall back to guessing a child, and undefined (any other
+   *  event overwrote the cache since) is the only case allowed to fall back to a roster scan. */
+  waitingOwner?: 'lead' | 'child'
   /** End time of the lead turn closed while background inventory kept the pane `working`. Repeated on the later all-clear `done`. */
   turnCompletedAt?: number
   /** Lead state a child-induced wait displaced, restored when the wait clears; can't invent 'working' since the done-gate only downgrades done→working, never back. */
@@ -672,6 +691,13 @@ export type ToolSnapshot = {
   toolInput?: string
   /** Full JSON of an AskUserQuestion tool input; set only on its own event and NOT inherited (resolveToolState) so no stale prompt lingers. */
   interactivePrompt?: string
+  /** The waiting child's own tool_use_id, when this snapshot was pinned from a roster row's
+   *  frozen wait state (a repoint, or the unrelated-event re-derivation) rather than the lead's
+   *  own live tool event. toolInput is NOT a usable per-child discriminator for AskUserQuestion
+   *  waits specifically (deriveToolInputPreview has no entry for that tool, so it's always
+   *  undefined) — this is the one field that actually distinguishes which child's card is
+   *  currently on screen when more than one is waiting on its own question. */
+  waitingToolUseId?: string
   hasToolUpdate?: boolean
   hasToolInputField?: boolean
   lastAssistantMessage?: string
@@ -2643,10 +2669,17 @@ function resolveClaudePaneState(
   paneKey: string,
   lead: Pick<ClaudeLeadTurnState, 'state' | 'interrupted'>
 ): AgentStatusState {
+  const roster = state.claudeSubagentRosterByPaneKey.get(paneKey)
+  // Why: mirrors codexRosterEffectiveState — any child still blocked on its own
+  // PermissionRequest/AskUserQuestion pins the pane 'waiting' regardless of the
+  // lead's own state, so a sibling's resolution can never mask another child's
+  // still-pending approval (#P1).
+  if (claudeRosterHasWaitingSubagent(roster)) {
+    return 'waiting'
+  }
   if (lead.state !== 'done') {
     return lead.state
   }
-  const roster = state.claudeSubagentRosterByPaneKey.get(paneKey)
   return claudeRosterHasWorkingSubagent(roster) ||
     (!lead.interrupted &&
       (state.claudeRunningNonAgentTaskPaneKeys.has(paneKey) ||
@@ -2764,7 +2797,18 @@ export function seedClaudeSubagentRosterFromSnapshots(
   }
   const roster = getOrCreateClaudeSubagentRoster(state, paneKey)
   for (const snapshot of snapshots) {
-    // Why: idle-teammate liveness can't be proven across a restart (its TeammateIdle confirmation is gone); only working seeds restore, and a live teammate re-earns its row via SubagentStart.
+    // Why: idle-teammate liveness can't be proven across a restart (its TeammateIdle confirmation
+    // is gone); only working seeds restore, and a live teammate re-earns its row via SubagentStart.
+    // A 'waiting' seed is deliberately NOT restored either, despite being a real Claude/Codex
+    // parity gap (Codex's seedCodexSubagentRoster does accept it) — a restored 'waiting' row was
+    // tried and reverted: resolveClaudePaneState's unconditional "any waiting child wins" rule
+    // forces the pane 'waiting' on the very next event, and the restoredUnconfirmed safety net at
+    // the bottom of normalizeClaudeEvent only covers 'working', so the row silently loses its
+    // unconfirmed marker and, with it, all eligibility for the dead-pane liveness sweep — a
+    // self-perpetuating fake 'waiting' with no recovery path in the general case (verified
+    // end-to-end against a real AgentHookServer + hook HTTP flow). Fixing this properly needs the
+    // unconfirmed-preservation gate extended to a restoredFromSnapshot-driven 'waiting' too, which
+    // is real design work, not a quick patch — not attempted this round.
     if (snapshot.state !== 'working') {
       continue
     }
@@ -2825,7 +2869,27 @@ export function reapRestoredClaudeSubagentsForDeadPane(
   return true
 }
 
-/** Drop a child-owned waiting state when the child stops/idles, restoring the displaced lead state. */
+/** Codex counterpart of reapRestoredClaudeSubagentsForDeadPane — same
+ *  contract: caller must have proven the pane is LOCAL-launched. */
+export function reapRestoredCodexSubagentsForDeadPane(
+  state: HookListenerState,
+  paneKey: string
+): boolean {
+  const roster = state.codexSubagentRosterByPaneKey.get(paneKey)
+  if (!roster || !reapUnconfirmedRestoredCodexSubagents(roster)) {
+    return false
+  }
+  if (roster.size === 0) {
+    state.codexSubagentRosterByPaneKey.delete(paneKey)
+  }
+  return true
+}
+
+/** Drop a child-owned waiting state when the child stops/idles, restoring the displaced lead
+ *  state — UNLESS a sibling child is still blocked on its own PermissionRequest/AskUserQuestion
+ *  (the caller already flipped this child's own roster row before calling in), in which case the
+ *  single-slot wait pointer repoints at that sibling instead of dropping to the pre-wait state,
+ *  or its still-pending approval card would silently disappear (#P1). */
 function clearClaudePendingWaitForAgent(
   state: HookListenerState,
   paneKey: string,
@@ -2833,6 +2897,25 @@ function clearClaudePendingWaitForAgent(
 ): void {
   const lead = state.claudeLeadStateByPaneKey.get(paneKey)
   if (lead?.state !== 'waiting' || !lead.waitingAgentId || !ownsWait(lead.waitingAgentId)) {
+    return
+  }
+  const stillWaiting = claudeRosterFindWaitingSubagent(
+    state.claudeSubagentRosterByPaneKey.get(paneKey)
+  )
+  if (stillWaiting) {
+    const [waitingId, tracked] = stillWaiting
+    state.claudeLeadStateByPaneKey.set(paneKey, {
+      ...lead,
+      waitingAgentId: waitingId,
+      waitingToolUseId: tracked.waitingToolUseId
+    })
+    const previousTool = state.lastToolByPaneKey.get(paneKey)
+    state.lastToolByPaneKey.set(paneKey, {
+      toolName: tracked.waitingToolName,
+      toolInput: tracked.waitingToolInput,
+      waitingToolUseId: tracked.waitingToolUseId,
+      lastAssistantMessage: previousTool?.lastAssistantMessage
+    })
     return
   }
   state.claudeLeadStateByPaneKey.set(paneKey, lead.stateBeforeWait ?? { state: 'working' })
@@ -2845,12 +2928,116 @@ function clearClaudePendingWaitForAgent(
   )
 }
 
+/** Which roster row (if any) a typed AskUserQuestion answer resolves. `waitingOwner` is the
+ *  primary signal: 'lead' means the LEAD's own question is what's pending — a typed answer never
+ *  resolves a CHILD's row in that case, full stop, however tempting a roster scan's guess might
+ *  look (this is the fix for a real P1: without this, answering the lead's own question could
+ *  silently resolve a genuinely-still-blocked child's unrelated wait instead). 'child' means
+ *  `pointedId` names exactly which one, set precisely at wait-start — used directly as long as
+ *  that row is still 'waiting' on an AskUserQuestion (the pointer can validly name a plain
+ *  PermissionRequest row too, which a typed answer can never resolve). Only when `waitingOwner`
+ *  is undefined (an unrelated event overwrote the whole record since, wiping which case this
+ *  was) does this fall back to a bare roster scan — the last-resort path, since normalizeClaudeEvent
+ *  can lose this information on any lead event unrelated to any child. A bare scan alone has no
+ *  way to tell "the one just answered" from "the first one inserted" when MULTIPLE children are
+ *  each waiting on their own AskUserQuestion, so among AskUserQuestion-only candidates it prefers
+ *  whichever one's own tool_use_id matches the pane's currently DISPLAYED snapshot's
+ *  `waitingToolUseId` (lastToolByPaneKey — kept pinned to whichever waiting child's card is
+ *  actually on screen even once the pointer itself is gone). Deliberately NOT toolInput: that
+ *  field has no entry for AskUserQuestion in deriveToolInputPreview, so it's always undefined for
+ *  every candidate here and can't discriminate anything — tool_use_id is the one field that
+ *  actually identifies a specific child's specific wait. Falls back to the first match only when
+ *  nothing displayed matches either (e.g. the display itself was never pinned from a roster row,
+ *  such as right after a fresh SessionStart). */
+function findAnsweredQuestionSubagent(
+  roster: ClaudeSubagentRoster | undefined,
+  waitingOwner: 'lead' | 'child' | undefined,
+  pointedId: string | undefined,
+  displayedTool: { toolName?: string; waitingToolUseId?: string } | undefined
+): [id: string, tracked: TrackedClaudeSubagent] | undefined {
+  if (waitingOwner === 'lead') {
+    return undefined
+  }
+  if (waitingOwner === 'child' && pointedId !== undefined) {
+    const pointed = roster?.get(pointedId)
+    return pointed?.state === 'waiting' && isAskUserQuestionTool(pointed.waitingToolName)
+      ? [pointedId, pointed]
+      : undefined
+  }
+  if (!roster) {
+    return undefined
+  }
+  let firstMatch: [string, TrackedClaudeSubagent] | undefined
+  for (const entry of roster) {
+    if (entry[1].state !== 'waiting' || !isAskUserQuestionTool(entry[1].waitingToolName)) {
+      continue
+    }
+    if (
+      displayedTool?.waitingToolUseId !== undefined &&
+      entry[1].waitingToolUseId === displayedTool.waitingToolUseId
+    ) {
+      return entry
+    }
+    firstMatch ??= entry
+  }
+  return firstMatch
+}
+
 /** Clear an AskUserQuestion wait after the answer is typed (answering emits no hook event; the caller infers it from the submit keystroke). Restores the stashed pre-wait lead state or 'working', drops the cached card, and returns the pane state to emit (gated up to 'working' while children run). */
 export function clearClaudeAnsweredQuestionWait(
   state: HookListenerState,
   paneKey: string
 ): Pick<ClaudeLeadTurnState, 'state' | 'interrupted' | 'turnCompletedAt'> {
   const lead = state.claudeLeadStateByPaneKey.get(paneKey)
+  const roster = state.claudeSubagentRosterByPaneKey.get(paneKey)
+  const answeredChild = findAnsweredQuestionSubagent(
+    roster,
+    lead?.waitingOwner,
+    lead?.waitingAgentId,
+    state.lastToolByPaneKey.get(paneKey)
+  )
+  if (roster && answeredChild) {
+    const [answeredId] = answeredChild
+    upsertWorkingClaudeSubagent(roster, answeredId, {}, Date.now())
+  }
+  // Why: checked unconditionally — not just when THIS call resolved a child — and BEFORE the
+  // lead-owned/no-op fallthrough below. A lead-owned question (waitingOwner:'lead') resolves
+  // the lead's own wait and touches no child row at all, but a genuinely-still-waiting sibling
+  // must keep owning the pane's single-slot wait pointer and tool snapshot regardless of what
+  // this specific answer resolved — otherwise a reader of lastToolByPaneKey sees an empty card
+  // for that sibling's real, still-pending request until some unrelated later event happens to
+  // re-derive it (#P2: this used to live inside the answeredChild-only branch, so answering the
+  // lead's own question wiped a still-blocked child's card instead of repinning it).
+  const stillWaiting = claudeRosterFindWaitingSubagent(roster)
+  if (stillWaiting) {
+    const [waitingId, tracked] = stillWaiting
+    // Why: build fresh rather than `...lead` — unlike clearClaudePendingWaitForAgent (which
+    // only reaches this repoint once lead.state is already provably 'waiting'), this function
+    // can get here with a stale cache from an unrelated event (e.g. {state:'done',
+    // interrupted:true} from a prior turn) — spreading it forward would carry that turn's
+    // interrupted/turnCompletedAt flags into a brand-new 'waiting' record they don't describe.
+    // stateBeforeWait is the one field still meaningful to preserve: it's what the pane
+    // restores to once every wait clears, independent of which wait is currently active.
+    state.claudeLeadStateByPaneKey.set(paneKey, {
+      state: 'waiting',
+      waitingAgentId: waitingId,
+      // Why: the repoint always names a CHILD's row (waitingId comes from the roster, never
+      // the lead), so this is unconditionally 'child' — omitting it left waitingOwner
+      // undefined, forcing a later answer for this same sibling through the less direct
+      // fallback-scan path in findAnsweredQuestionSubagent instead of the reliable pointer.
+      waitingOwner: 'child',
+      waitingToolUseId: tracked.waitingToolUseId,
+      ...(lead?.stateBeforeWait ? { stateBeforeWait: lead.stateBeforeWait } : {})
+    })
+    const previousTool = state.lastToolByPaneKey.get(paneKey)
+    state.lastToolByPaneKey.set(paneKey, {
+      toolName: tracked.waitingToolName,
+      toolInput: tracked.waitingToolInput,
+      waitingToolUseId: tracked.waitingToolUseId,
+      lastAssistantMessage: previousTool?.lastAssistantMessage
+    })
+    return { state: 'waiting' }
+  }
   const restored =
     lead?.state === 'waiting'
       ? (lead.stateBeforeWait ?? { state: 'working' as const })
@@ -3044,12 +3231,34 @@ function normalizeClaudeEvent(
       ? eventAgentId
       : undefined
   if (eventAgentId && (subagentOriginId || isWaitingInducing)) {
-    upsertWorkingClaudeSubagent(
-      getOrCreateClaudeSubagentRoster(state, paneKey),
-      eventAgentId,
-      { agentType: readString(hookPayload, 'agent_type') },
-      Date.now()
-    )
+    const targetRoster = getOrCreateClaudeSubagentRoster(state, paneKey)
+    if (isWaitingInducing) {
+      // Why: this child's OWN roster row must record ITS wait, not the generic
+      // 'working' every other child event uses — otherwise a second sibling's
+      // wait can silently erase this one's still-pending approval (#P1).
+      upsertWaitingClaudeSubagent(
+        targetRoster,
+        eventAgentId,
+        {
+          agentType: readString(hookPayload, 'agent_type'),
+          toolName: eventToolName,
+          toolInput: deriveToolInputPreview(eventToolName, hookPayload.tool_input),
+          // Why: only the AskUserQuestion path ever populates the lead-level
+          // waitingToolUseId (see below) — keep the frozen per-child copy in
+          // parity so a repoint can't newly engage the parallel-tool-use guard
+          // for a plain permission wait that never used it before.
+          toolUseId: isAskUserQuestionWait ? eventToolUseId : undefined
+        },
+        Date.now()
+      )
+    } else {
+      upsertWorkingClaudeSubagent(
+        targetRoster,
+        eventAgentId,
+        { agentType: readString(hookPayload, 'agent_type') },
+        Date.now()
+      )
+    }
   }
   if (subagentOriginId) {
     const lead = state.claudeLeadStateByPaneKey.get(paneKey)
@@ -3068,7 +3277,35 @@ function normalizeClaudeEvent(
         workingChildEvidence: true
       })
     }
-    // Why: approval granted — update the tool snapshot (drop the pending card) as the lead's own next tool event would.
+    // Why: approval granted for THIS child (already flipped 'working' above) — but a
+    // sibling may still be blocked on its own PermissionRequest/AskUserQuestion; repoint
+    // the single-slot wait pointer and tool-snapshot cache at it instead of dropping to
+    // the pre-wait state, or its still-pending approval card would silently disappear (#P1).
+    const stillWaiting = claudeRosterFindWaitingSubagent(
+      state.claudeSubagentRosterByPaneKey.get(paneKey)
+    )
+    if (stillWaiting) {
+      const [waitingId, tracked] = stillWaiting
+      const repointed: ClaudeLeadTurnState = {
+        ...lead,
+        waitingAgentId: waitingId,
+        waitingToolUseId: tracked.waitingToolUseId
+      }
+      state.claudeLeadStateByPaneKey.set(paneKey, repointed)
+      state.lastToolByPaneKey.set(paneKey, {
+        toolName: tracked.waitingToolName,
+        toolInput: tracked.waitingToolInput,
+        waitingToolUseId: tracked.waitingToolUseId,
+        lastAssistantMessage: state.lastToolByPaneKey.get(paneKey)?.lastAssistantMessage
+      })
+      return buildClaudeStatusPayload(state, eventName, promptText, paneKey, hookPayload, {
+        stateName: 'waiting',
+        updateToolSnapshot: false,
+        interrupted: repointed.interrupted,
+        turnCompletedAt: repointed.turnCompletedAt
+      })
+    }
+    // Why: update the tool snapshot (drop the pending card) as the lead's own next tool event would.
     // Restore the stashed lead state, not this child's 'working': the lead may already be done, and the done-gate never upgrades working back to done once the roster drains.
     const restored = lead.stateBeforeWait ?? { state: 'working' as const }
     state.claudeLeadStateByPaneKey.set(paneKey, restored)
@@ -3140,6 +3377,14 @@ function normalizeClaudeEvent(
     state: reportedStateName,
     ...(interrupted ? { interrupted } : {}),
     ...(isWaitingInducing && eventAgentId ? { waitingAgentId: eventAgentId } : {}),
+    // Why: 'child' vs 'lead' must be recorded explicitly, not inferred later from whether
+    // waitingAgentId happens to be set — an unrelated event that overwrites this whole record
+    // with no agent_id produces the exact same "waitingAgentId absent" shape as the lead's own
+    // wait, and conflating the two let a typed answer to the lead's own question silently
+    // resolve a different, still-genuinely-blocked child's wait instead (#P1). Omitted (not
+    // 'lead' or 'child') for any non-waiting-inducing event, which is the only case allowed to
+    // fall back to a roster scan in findAnsweredQuestionSubagent.
+    ...(isWaitingInducing ? { waitingOwner: eventAgentId ? 'child' : 'lead' } : {}),
     ...(isAskUserQuestionWait && waitingToolUseId !== undefined ? { waitingToolUseId } : {}),
     ...(stateBeforeWait ? { stateBeforeWait } : {}),
     ...(turnCompletedAt !== undefined ? { turnCompletedAt } : {})
@@ -3157,6 +3402,29 @@ function normalizeClaudeEvent(
   ) {
     // Why: a legacy or partial Stop confirms the lead boundary, not a child restored from disk; keep the child-only gate eligible for reconciliation.
     state.claudeUnconfirmedRestoredStatusPaneKeys.add(paneKey)
+  }
+
+  // Why: a roster child's own unresolved wait can force effectiveState 'waiting' even
+  // though THIS event is unrelated lead progress (e.g. a plain PreToolUse) — extracting
+  // this event's own tool fields into the snapshot would silently replace the still-
+  // blocked child's displayed tool/approval card with the lead's own activity (#P1).
+  const unrelatedWaitingChild = !isWaitingInducing
+    ? claudeRosterFindWaitingSubagent(effectiveRoster)
+    : undefined
+  if (effectiveState === 'waiting' && unrelatedWaitingChild) {
+    const [, tracked] = unrelatedWaitingChild
+    state.lastToolByPaneKey.set(paneKey, {
+      toolName: tracked.waitingToolName,
+      toolInput: tracked.waitingToolInput,
+      waitingToolUseId: tracked.waitingToolUseId,
+      lastAssistantMessage: state.lastToolByPaneKey.get(paneKey)?.lastAssistantMessage
+    })
+    return buildClaudeStatusPayload(state, eventName, promptText, paneKey, hookPayload, {
+      stateName: effectiveState,
+      updateToolSnapshot: false,
+      interrupted,
+      turnCompletedAt
+    })
   }
 
   return buildClaudeStatusPayload(state, eventName, promptText, paneKey, hookPayload, {
@@ -3636,11 +3904,17 @@ export function hasCodexTranscriptSubagents(state: HookListenerState, paneKey: s
 export function seedCodexStateFromSnapshot(
   state: HookListenerState,
   paneKey: string,
-  payload: Pick<ParsedAgentStatusPayload, 'model' | 'state' | 'subagents'>
+  payload: Pick<ParsedAgentStatusPayload, 'model' | 'state' | 'subagents'>,
+  options?: {
+    /** True only for the Orca-restart disk hydrate path — see
+     *  seedCodexSubagentRoster's matching option for why relay reseeding
+     *  must not pass this. */
+    restoredFromSnapshot?: boolean
+  }
 ): void {
   const snapshots = payload.subagents ?? []
   if (snapshots.length > 0 && !state.codexSubagentRosterByPaneKey.has(paneKey)) {
-    seedCodexSubagentRoster(getOrCreateCodexSubagentRoster(state, paneKey), snapshots)
+    seedCodexSubagentRoster(getOrCreateCodexSubagentRoster(state, paneKey), snapshots, options)
   }
   if (!state.codexLeadStateByPaneKey.has(paneKey)) {
     // Why: child hooks after restart omit the root model; seed it from durable status before they can overwrite the cache.
@@ -3802,7 +4076,8 @@ function normalizeCodexSubagentLifecycleEvent(
       {
         agentType: readString(hookPayload, 'agent_type'),
         model: readString(hookPayload, 'model'),
-        state: 'working'
+        state: 'working',
+        source: 'hook'
       },
       Date.now()
     )
@@ -3850,7 +4125,8 @@ function normalizeCodexEvent(
       {
         agentType: readString(hookPayload, 'agent_type'),
         model: readString(hookPayload, 'model'),
-        state: stateName === 'waiting' ? 'waiting' : 'working'
+        state: stateName === 'waiting' ? 'waiting' : 'working',
+        source: 'hook'
       },
       Date.now()
     )
@@ -3870,9 +4146,36 @@ function normalizeCodexEvent(
       transcriptPath
     )
   }
-  if (eventName === 'Stop' && !hasCodexTranscriptSubagents(state, paneKey)) {
-    // Why: Codex CLI 0.144 can omit child Stop hooks; later child activity safely recreates any agent still running.
-    state.codexSubagentRosterByPaneKey.delete(paneKey)
+  if (eventName === 'Stop') {
+    // Why: Stop is normally the last hook event of a turn, so a transcript-only child that went
+    // unresolved earlier (with no later reconcile call to re-check it, e.g. this Stop carried no
+    // transcript_path) would otherwise never get its grace deadline re-evaluated. Force the check
+    // here too, independent of reconcileCodexSubagentTranscript above and of the hook-confirmed
+    // exception below.
+    const transcriptState = state.codexSubagentTranscriptByPaneKey.get(paneKey)
+    const roster = state.codexSubagentRosterByPaneKey.get(paneKey)
+    if (transcriptState && roster) {
+      retireExpiredUnresolvedCodexSubagentTranscripts(transcriptState, roster, Date.now())
+    }
+    // Why: Codex CLI 0.144 can omit child Stop hooks; later child activity safely recreates any
+    // agent still running. Both provenances get an independent veto on the wipe: a still-tracked
+    // transcript row (mid-grace-window, possibly still genuinely active) must not be discarded
+    // just because no hook row exists, and a hook-confirmed row must survive this regardless of
+    // transcript state — deleting either would report the pane 'done' while that child is still
+    // genuinely working.
+    if (!hasCodexTranscriptSubagents(state, paneKey) && !hasHookConfirmedCodexSubagent(roster)) {
+      state.codexSubagentRosterByPaneKey.delete(paneKey)
+    } else if (roster) {
+      // Why: a hook row's exemption from the wipe above is otherwise unbounded — if its own
+      // SubagentStop hook is lost (the same CLI gap the wipe-veto exists to tolerate), nothing
+      // else ever retires it. This is that veto's bounded fallback: drop any hook row that has
+      // gone unconfirmed too long. Wall-clock, not a per-call counter — AgentHookServer's
+      // scheduleCodexSubagentPoll re-normalizes this same saved Stop body on a 1s timer while a
+      // transcript child is unresolved, which would hit this branch again each tick; a counter
+      // would misread that replay as many real Stops and evict a genuinely-active child in
+      // seconds, but elapsed wall-clock time is unaffected by how many times it replays.
+      retireStaleHookConfirmedCodexSubagents(roster, Date.now())
+    }
   }
   const previousLead = state.codexLeadStateByPaneKey.get(paneKey)
   state.codexLeadStateByPaneKey.set(paneKey, {

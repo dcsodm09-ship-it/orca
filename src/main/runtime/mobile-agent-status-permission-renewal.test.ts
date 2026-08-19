@@ -74,12 +74,37 @@ describe('mobile/paired projection for a pane pending a human answer', () => {
 
   // Why: the guard is bounded by freshness, or an agent killed while parked on a prompt
   // would hold the card open forever instead of decaying like any other abandoned row.
+  // This residual case is unrelated to SYNTHETIC_AGENT_TITLE_PROFILES having a Claude
+  // entry: orca-runtime.ts never reads that table, and the fixture's `idle`-class title
+  // is Claude's OWN trailing native repaint winning a race against Orca's one-shot
+  // synthetic push — that race is orthogonal to the structural gap the test below closes.
   it('still lets the title retire a `waiting` older than the stale boundary', () => {
     const hookAt = Date.now() - AGENT_STATUS_STALE_AFTER_MS - 1
     const out = renewFromPtyTitle()(claudeStatus('waiting', hookAt), parkedOnPromptPty(hookAt), {
       preserveQuestionUnderShellTitle: true
     })
     expect(out?.state).toBe('done')
+  })
+
+  // Why: before the `claude` entry in SYNTHETIC_AGENT_TITLE_PROFILES, Orca never
+  // injected a permission-labeled title for Claude, so pty.lastAgentStatus could
+  // never be 'permission' for a Claude pane and `titleConfirmsState` (orca-runtime.ts)
+  // was dead code for this agent — the guard above's 30-minute bound was the ONLY
+  // thing standing between a still-pending approval and a false `done`. Now that the
+  // synthetic push can classify the title as 'permission', title evidence itself
+  // confirms the wait and the state survives past the staleness boundary, matching
+  // how Codex (which already had a profile) has always behaved.
+  it('lets titleConfirmsState keep a stale Claude `waiting` alive once the synthetic permission title lands', () => {
+    const hookAt = Date.now() - AGENT_STATUS_STALE_AFTER_MS - 1
+    const permissionTitlePty = {
+      ...(parkedOnPromptPty(hookAt) as Record<string, unknown>),
+      lastAgentStatus: 'permission',
+      lastOscTitle: 'Claude - action required'
+    }
+    const out = renewFromPtyTitle()(claudeStatus('waiting', hookAt), permissionTitlePty, {
+      preserveQuestionUnderShellTitle: true
+    })
+    expect(out?.state).toBe('waiting')
   })
 
   // Why: proves the guard is scoped to pending-answer states rather than switching off

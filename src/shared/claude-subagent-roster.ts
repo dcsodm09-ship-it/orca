@@ -1,5 +1,8 @@
-import { AGENT_STATUS_MAX_SUBAGENTS, type AgentSubagentSnapshot } from './agent-status-types'
-import type { ClaudeBackgroundAgentTask } from './claude-background-task-inventory'
+import {
+  AGENT_STATUS_MAX_SUBAGENTS,
+  AGENT_STATUS_STALE_AFTER_MS,
+  type AgentSubagentSnapshot
+} from './agent-status-types'
 
 /** Mirrors the wire-normalization id cap in agent-status-types. Enforced at
  *  upsert so an over-long id can't gate the pane 'working' while being
@@ -23,8 +26,18 @@ export type TrackedClaudeSubagent = {
   description?: string
   startedAt: number
   /** 'idle' = teammate between mailbox turns: alive/resumable, row stays
-   *  visible but must not gate the pane 'working'. */
-  state: 'working' | 'idle'
+   *  visible but must not gate the pane 'working'. 'waiting' = this child's own
+   *  PermissionRequest/AskUserQuestion is unresolved — distinct from the pane-level
+   *  single-slot wait pointer so a second sibling's wait can never silently erase
+   *  a first sibling's still-pending one (#P1). */
+  state: 'working' | 'idle' | 'waiting'
+  /** Set only while state==='waiting': the blocked tool call captured once at
+   *  wait-start. Lets a sibling's later resolution repoint the pane's single-slot
+   *  wait pointer and tool-snapshot cache at this row without losing which tool
+   *  it is actually blocked on. Cleared whenever the row leaves 'waiting'. */
+  waitingToolName?: string
+  waitingToolInput?: string
+  waitingToolUseId?: string
   /** A TeammateIdle matched this id by name — proof it is a persistent
    *  in-process teammate, not a workflow lane that merely reuses the
    *  `a<name>-<hex>` id shape. Never cleared: identity can't change mid-life.
@@ -50,7 +63,29 @@ export type TrackedClaudeSubagent = {
    *  teammate-shaped. Never cleared: the listing mode of an id can't change
    *  mid-life. */
   listedAsSubagentTask?: true
+  /** Wall-clock time this row was last confirmed 'waiting' by a live hook event
+   *  (upsertWaitingClaudeSubagent). Set only while state==='waiting'; bounds how
+   *  long foldClaudeBackgroundTasksIntoRoster's teammate-shaped-id protection may
+   *  keep a 'waiting' row alive on its own (background_tasks carries no per-task
+   *  wait signal, so it can never itself reconfirm a pending wait) — without this,
+   *  a leaked wait (its SubagentStop/TeammateIdle never arrived) could pin the
+   *  pane 'waiting' forever, now that any 'waiting' row unconditionally forces
+   *  the pane state. Deliberately wall-clock, not a per-fold counter: folds can
+   *  run far more often than any real chance for this specific child to resolve
+   *  (e.g. many unrelated lead Stops in quick succession), so counting folds
+   *  risks evicting a slow-but-genuinely-alive wait — elapsed real time doesn't.
+   *  Cleared to undefined by any live touch that ends the wait (upsertWorkingClaudeSubagent,
+   *  stopClaudeSubagent, idleClaudeTeammateByName). */
+  waitingConfirmedAt?: number
 }
+
+/** How long a 'waiting' row may survive on foldClaudeBackgroundTasksIntoRoster's
+ *  teammate-shaped-id protection alone, with no live reconfirmation, before it's
+ *  treated as leaked and reaped — see TrackedClaudeSubagent.waitingConfirmedAt.
+ *  Reuses the same established convention as AGENT_STATUS_STALE_AFTER_MS (the
+ *  wire/mobile status projection's own "give up on a stale wait" bound) rather
+ *  than a fresh magic number. */
+export const CLAUDE_WAITING_SUBAGENT_STALE_MS = AGENT_STATUS_STALE_AFTER_MS
 
 /** Agent-team/named-agent lifecycle ids are `a<name>-<hex>` while one-shot
  *  ids are hyphen-free (`a<hex>`). Such ids are never listed as task ids in
@@ -74,6 +109,11 @@ export function upsertWorkingClaudeSubagent(
     existing.state = 'working'
     existing.agentType = fields.agentType ?? existing.agentType
     existing.description = fields.description ?? existing.description
+    // Why: no longer waiting — drop the frozen blocked-tool snapshot so a stale
+    // one can't be read back if this row is later re-marked waiting.
+    existing.waitingToolName = undefined
+    existing.waitingToolInput = undefined
+    existing.waitingToolUseId = undefined
     // Why: live activity proves the lifecycle stream owns this id again;
     // background_tasks omission must stop reaping it (teammate-shaped ids
     // never appear there). The fold re-tags its own recreations after this.
@@ -81,6 +121,7 @@ export function upsertWorkingClaudeSubagent(
     // Why: the live event proves the agent process behind the restored row is
     // still running it, so the liveness reap must stop treating it as a claim.
     existing.restoredFromSnapshot = undefined
+    existing.waitingConfirmedAt = undefined
     return
   }
   // Why: beyond the wire cap extra rows would be invisible anyway; idle
@@ -93,6 +134,55 @@ export function upsertWorkingClaudeSubagent(
     startedAt: now,
     agentType: fields.agentType,
     description: fields.description
+  })
+}
+
+/** Like upsertWorkingClaudeSubagent, but for a child whose OWN PermissionRequest/
+ *  AskUserQuestion event just fired: marks its row 'waiting' (not 'working') and
+ *  freezes the blocked tool's identity so a later sibling wait can't erase it —
+ *  see TrackedClaudeSubagent.state and claudeRosterFindWaitingSubagent. */
+export function upsertWaitingClaudeSubagent(
+  roster: ClaudeSubagentRoster,
+  id: string,
+  fields: {
+    agentType?: string
+    description?: string
+    toolName?: string
+    toolInput?: string
+    toolUseId?: string
+  },
+  now: number
+): void {
+  if (id.length === 0 || id.length > CLAUDE_SUBAGENT_ID_MAX_LENGTH) {
+    return
+  }
+  const existing = roster.get(id)
+  if (existing) {
+    existing.state = 'waiting'
+    existing.agentType = fields.agentType ?? existing.agentType
+    existing.description = fields.description ?? existing.description
+    existing.waitingToolName = fields.toolName
+    existing.waitingToolInput = fields.toolInput
+    existing.waitingToolUseId = fields.toolUseId
+    existing.backgroundTasksAuthoritative = undefined
+    existing.restoredFromSnapshot = undefined
+    // Why: a live PermissionRequest/AskUserQuestion is fresh proof this child is
+    // still genuinely waiting — resets the bounded fold-leak fallback above.
+    existing.waitingConfirmedAt = now
+    return
+  }
+  if (roster.size >= AGENT_STATUS_MAX_SUBAGENTS && !evictOldestIdleClaudeSubagent(roster)) {
+    return
+  }
+  roster.set(id, {
+    state: 'waiting',
+    startedAt: now,
+    agentType: fields.agentType,
+    description: fields.description,
+    waitingToolName: fields.toolName,
+    waitingToolInput: fields.toolInput,
+    waitingToolUseId: fields.toolUseId,
+    waitingConfirmedAt: now
   })
 }
 
@@ -128,123 +218,11 @@ export function stopClaudeSubagent(roster: ClaudeSubagentRoster, id: string): vo
   }
   tracked.backgroundTasksAuthoritative = undefined
   tracked.restoredFromSnapshot = undefined
+  tracked.waitingToolName = undefined
+  tracked.waitingToolInput = undefined
+  tracked.waitingToolUseId = undefined
+  tracked.waitingConfirmedAt = undefined
   tracked.state = 'idle'
-}
-
-/** Fold a lead Stop's `background_tasks` into the lifecycle-tracked roster.
- *
- *  The list is authoritative for subagent-typed entries only: a running
- *  one-shot/workflow lane is always listed under its lifecycle `agent_id`,
- *  foreground children cannot span a lead Stop, and finished tasks drop from
- *  the list. Teammate-typed entries prove nothing per-agent (unrelated ids,
- *  permanently "running") — but their PRESENCE proves the session has
- *  named-agent/teammate machinery, and their total absence from a complete
- *  inventory proves no teammate-shaped child can still be alive. So:
- *  - an empty list proves nothing is left alive → clear the roster;
- *  - an id-exact subagent-typed match that is running is trusted fully and
- *    tagged listedAsSubagentTask; one reported not running is removed;
- *  - an unmatched RUNNING subagent-typed entry is a one-shot this listener
- *    never saw start (Orca/relay restart mid-run) → recreate it;
- *  - an unlisted entry is finished or dead (its SubagentStop was lost) →
- *    remove it — UNLESS it is teammate-shaped, live-tracked, never
- *    subagent-listed, the list still shows teammate-typed tasks, AND it is
- *    working or TeammateIdle-confirmed: that is a named teammate whose id
- *    simply never appears, and removing it would drop the pane's done-gate
- *    (working) or its parked idle row (confirmed). */
-export function foldClaudeBackgroundTasksIntoRoster(
-  roster: ClaudeSubagentRoster,
-  tasks: ClaudeBackgroundAgentTask[],
-  now: number,
-  options?: { inventoryComplete?: boolean }
-): void {
-  if (tasks.length === 0) {
-    if (options?.inventoryComplete !== false) {
-      roster.clear()
-    }
-    return
-  }
-  const listedIds = new Set<string>()
-  const pendingRunningTasks = new Map<string, ClaudeBackgroundAgentTask>()
-  const hasTeammateTypedTask = tasks.some((task) => task.teammate)
-  for (const task of tasks) {
-    if (task.teammate) {
-      continue
-    }
-    listedIds.add(task.id)
-    const existing = roster.get(task.id)
-    if (existing) {
-      if (!task.running) {
-        roster.delete(task.id)
-        pendingRunningTasks.delete(task.id)
-        continue
-      }
-      // Why: a Stop can park the row before the lead inventory confirms the
-      // same workflow lane is still running; the authoritative task wins.
-      existing.state = 'working'
-      existing.agentType = task.agentType ?? existing.agentType
-      existing.description = task.description ?? existing.description
-      existing.listedAsSubagentTask = true
-      // Why: a live inventory listed the id as running — the restored claim is
-      // now confirmed by the current process, so liveness can't reap it.
-      existing.restoredFromSnapshot = undefined
-      continue
-    }
-    if (!task.running) {
-      pendingRunningTasks.delete(task.id)
-      continue
-    }
-    upsertWorkingClaudeSubagent(
-      roster,
-      task.id,
-      { agentType: task.agentType, description: task.description },
-      now
-    )
-    const created = roster.get(task.id)
-    if (created) {
-      created.backgroundTasksAuthoritative = true
-      created.listedAsSubagentTask = true
-    } else {
-      // Why: a full roster may still contain stale entries that this same
-      // inventory will reap. Retry after cleanup so a replacement stays live.
-      pendingRunningTasks.set(task.id, task)
-    }
-  }
-  if (options?.inventoryComplete !== false) {
-    for (const [id, tracked] of roster) {
-      if (listedIds.has(id)) {
-        continue
-      }
-      if (
-        hasTeammateTypedTask &&
-        !tracked.backgroundTasksAuthoritative &&
-        tracked.listedAsSubagentTask !== true &&
-        isClaudeTeammateLifecycleId(id) &&
-        // Why: an idle row that no TeammateIdle ever confirmed is a finished
-        // workflow lane wearing a teammate-shaped id — reap it here or the
-        // pre-#8825 idle pile rebuilds one lane per lead turn.
-        (tracked.state === 'working' || tracked.confirmedTeammate === true)
-      ) {
-        continue
-      }
-      roster.delete(id)
-    }
-  }
-  for (const task of pendingRunningTasks.values()) {
-    if (roster.size >= AGENT_STATUS_MAX_SUBAGENTS) {
-      break
-    }
-    upsertWorkingClaudeSubagent(
-      roster,
-      task.id,
-      { agentType: task.agentType, description: task.description },
-      now
-    )
-    const created = roster.get(task.id)
-    if (created) {
-      created.backgroundTasksAuthoritative = true
-      created.listedAsSubagentTask = true
-    }
-  }
 }
 
 /** Drop restored rows that no current-runtime child activity has confirmed. */
@@ -296,6 +274,12 @@ export function idleClaudeTeammateByName(roster: ClaudeSubagentRoster, name: str
       changed = changed || tracked.state !== 'idle' || tracked.confirmedTeammate !== true
       tracked.backgroundTasksAuthoritative = undefined
       tracked.restoredFromSnapshot = undefined
+      // Why: leaving 'waiting' (if it was) — matches every other exit path's
+      // contract that these fields are cleared once a row is no longer waiting.
+      tracked.waitingToolName = undefined
+      tracked.waitingToolInput = undefined
+      tracked.waitingToolUseId = undefined
+      tracked.waitingConfirmedAt = undefined
       tracked.state = 'idle'
       tracked.confirmedTeammate = true
     }
@@ -315,6 +299,32 @@ export function claudeRosterHasWorkingSubagent(roster: ClaudeSubagentRoster | un
     }
   }
   return false
+}
+
+/** Whether any child's own PermissionRequest/AskUserQuestion is unresolved — mirrors
+ *  claudeRosterHasWorkingSubagent. Any 'waiting' row must pin the pane 'waiting'
+ *  regardless of the lead's own state, exactly as Codex's codexRosterEffectiveState
+ *  scans its roster for any 'waiting' entry unconditionally (#P1: a second sibling's
+ *  wait/resolution must never mask a first sibling's still-pending one). */
+export function claudeRosterHasWaitingSubagent(roster: ClaudeSubagentRoster | undefined): boolean {
+  return claudeRosterFindWaitingSubagent(roster) !== undefined
+}
+
+/** First roster entry still blocked on its own PermissionRequest/AskUserQuestion, if
+ *  any — used to repoint the pane's single-slot wait pointer/tool-snapshot cache at a
+ *  still-pending sibling when another child's wait resolves. */
+export function claudeRosterFindWaitingSubagent(
+  roster: ClaudeSubagentRoster | undefined
+): [id: string, tracked: TrackedClaudeSubagent] | undefined {
+  if (!roster) {
+    return undefined
+  }
+  for (const entry of roster) {
+    if (entry[1].state === 'waiting') {
+      return entry
+    }
+  }
+  return undefined
 }
 
 /** A working child observed in this listener runtime, not merely restored from disk. */

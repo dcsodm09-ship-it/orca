@@ -5,6 +5,17 @@ import {
 } from './synthetic-agent-title'
 
 describe('synthetic agent titles', () => {
+  it('provides terminal-state titles for Claude hook completion', () => {
+    expect(getSyntheticAgentTerminalTitle('claude', 'done')).toBe('Claude ready')
+    expect(getSyntheticAgentTerminalTitle('claude', 'waiting')).toBe('Claude - action required')
+  })
+
+  it('does not synthesize Claude working titles over Claude native spinner titles', () => {
+    expect(shouldDriveSyntheticAgentTitleFromHook('claude', 'working')).toBe(false)
+    expect(shouldDriveSyntheticAgentTitleFromHook('claude', 'done')).toBe(true)
+    expect(shouldDriveSyntheticAgentTitleFromHook('claude', 'waiting')).toBe(true)
+  })
+
   it('provides terminal-state titles for Codex hook completion', () => {
     expect(getSyntheticAgentTerminalTitle('codex', 'done')).toBe('Codex ready')
     expect(getSyntheticAgentTerminalTitle('codex', 'waiting')).toBe('Codex - action required')

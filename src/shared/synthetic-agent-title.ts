@@ -10,6 +10,16 @@ export type SyntheticAgentTitleProfile = {
 }
 
 export const SYNTHETIC_AGENT_TITLE_PROFILES: Record<string, SyntheticAgentTitleProfile> = {
+  claude: {
+    workingLabel: 'Claude',
+    permissionLabel: 'Claude - action required',
+    idleLabel: 'Claude ready',
+    // Why: Claude's own OSC titles have no distinct glyph for a pending permission
+    // prompt (idle and permission both paint the same idle-class glyph), so only
+    // synthesize the terminal states native titles can't express — same rationale
+    // as Codex below.
+    synthesizeWorkingTitle: false
+  },
   codex: {
     workingLabel: 'Codex',
     permissionLabel: 'Codex - action required',

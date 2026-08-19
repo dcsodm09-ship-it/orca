@@ -122,6 +122,7 @@ import type {
 import { FOLDER_WORKSPACE_INSTANCE_SEPARATOR } from '../../shared/worktree/id'
 import { TUI_AGENT_CONFIG } from '../../shared/tui-agent-config'
 import type { TuiAgent } from '../../shared/tui-agent'
+import { createExistingWorktreeWorkerTerminal } from './rpc/methods/orchestration-worker-topology'
 import { RpcDispatcher } from './rpc/dispatcher'
 import type { RpcRequest } from './rpc/core'
 import { TERMINAL_METHODS } from './rpc/methods/terminal'
@@ -13927,6 +13928,46 @@ describe('OrcaRuntimeService', () => {
     expect(spawnCall?.launchAgent).toBe('cursor')
     expect(spawnCall?.env).toMatchObject({ CURSOR_PROFILE: 'captured' })
     expect(markCursorWorkspaceTrustedMock).toHaveBeenCalledWith(TEST_WORKTREE_PATH)
+  })
+
+  // Why: orchestration's existing-worktree worker spawn must not hit an
+  // unattended, unanswerable Codex/Cursor/Copilot trust prompt on the first
+  // worker started into a previously-untrusted worktree. createTerminal's
+  // internal resolveAgentTerminalCreateOptions marks trust for any
+  // startupAgent launch, which covers this orchestration path; this guards
+  // that invariant against a future regression.
+  it('marks Codex trust before spawning an orchestration worker into an existing worktree', async () => {
+    const spawn = vi.fn().mockResolvedValue({ id: 'pty-bg' })
+    const runtimeStore = {
+      ...store,
+      getSettings: () => ({
+        ...store.getSettings(),
+        disabledTuiAgents: [],
+        agentCmdOverrides: {},
+        agentDefaultArgs: {},
+        agentDefaultEnv: {}
+      })
+    }
+    const runtime = new OrcaRuntimeService(runtimeStore)
+    runtime.setPtyController({
+      spawn,
+      write: () => true,
+      kill: () => true,
+      getForegroundProcess: async () => null
+    })
+
+    await createExistingWorktreeWorkerTerminal({
+      runtime,
+      worktreeId: TEST_WORKTREE_ID,
+      agent: 'codex',
+      taskId: 'task-1',
+      effects: []
+    })
+
+    expect(markCodexProjectTrustedMock).toHaveBeenCalledWith(TEST_WORKTREE_PATH)
+    expect(markCodexProjectTrustedMock.mock.invocationCallOrder[0]).toBeLessThan(
+      spawn.mock.invocationCallOrder[0]!
+    )
   })
 
   it('resolves a startupAgent to the CLI binary on Windows, where `cursor` is the IDE', async () => {

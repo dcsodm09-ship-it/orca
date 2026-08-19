@@ -21,9 +21,15 @@ vi.mock('node:fs', async (importOriginal) => {
 import {
   createCodexSubagentTranscriptState,
   hasTrackedCodexTranscriptSubagents,
-  reconcileCodexSubagentTranscript
+  reconcileCodexSubagentTranscript,
+  retireExpiredUnresolvedCodexSubagentTranscripts
 } from './codex-subagent-transcript'
-import { codexRosterToSnapshots, type CodexSubagentRoster } from './codex-subagent-roster'
+import {
+  codexRosterToSnapshots,
+  retireStaleHookConfirmedCodexSubagents,
+  upsertCodexSubagent,
+  type CodexSubagentRoster
+} from './codex-subagent-roster'
 
 const CHILD_ID = '019fa65f-3144-7151-9c02-cff7a28f316f'
 
@@ -155,6 +161,109 @@ describe('Codex subagent transcript reconciliation', () => {
     }
   })
 
+  it('does not delete a row a live hook confirmed while its own rollout stayed unreadable', () => {
+    // Why: this id can be discovered via transcript polling first, then separately confirmed
+    // by a live hook (upgrading its roster row to source:'hook') before the transcript side's
+    // own grace window for THIS id expires. This grace-expiry delete is a second, independent
+    // call site from retireExpiredUnresolvedCodexSubagentTranscripts (reachable on every
+    // reconcile, not just at Stop) and needs the identical hook-confirmed guard.
+    vi.useFakeTimers()
+    try {
+      const dir = mkdtempSync(join(tmpdir(), 'codex-subagent-transcript-'))
+      dirs.push(dir)
+      const parentPath = join(dir, 'rollout-parent.jsonl')
+      writeFileSync(parentPath, jsonl([activity('started')]))
+      const state = createCodexSubagentTranscriptState()
+      const roster: CodexSubagentRoster = new Map()
+
+      reconcileCodexSubagentTranscript(state, roster, parentPath)
+      expect(roster.size).toBe(1)
+
+      // A live hook event (e.g. an agent_id-carrying PreToolUse) confirms the same id directly.
+      upsertCodexSubagent(roster, CHILD_ID, { state: 'working', source: 'hook' }, Date.now())
+      expect(roster.get(CHILD_ID)?.source).toBe('hook')
+
+      vi.advanceTimersByTime(61_000)
+      reconcileCodexSubagentTranscript(state, roster, parentPath)
+
+      expect(roster.has(CHILD_ID)).toBe(true)
+      expect(hasTrackedCodexTranscriptSubagents(state)).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps refreshing a hook-confirmed row via genuinely new transcript activity', () => {
+    // Why: a hook-confirmed child only ever reconfirmed by transcript polling (no further hook
+    // events touching it directly) must not go stale and be retired by
+    // retireStaleHookConfirmedCodexSubagents just because nothing but reconcile ever touches it
+    // — repeatedly observing genuinely NEW rollout content is direct evidence it's alive and
+    // must reset the staleness clock the same way a fresh hook touch does.
+    vi.useFakeTimers()
+    try {
+      const dir = mkdtempSync(join(tmpdir(), 'codex-subagent-transcript-'))
+      dirs.push(dir)
+      const parentPath = join(dir, 'rollout-parent.jsonl')
+      const childPath = join(dir, `rollout-child-${CHILD_ID}.jsonl`)
+      writeFileSync(parentPath, jsonl([activity('started')]))
+      const childRecords: unknown[] = [{ type: 'event_msg', payload: { type: 'task_started' } }]
+      writeFileSync(childPath, jsonl(childRecords))
+      const state = createCodexSubagentTranscriptState()
+      const roster: CodexSubagentRoster = new Map()
+
+      reconcileCodexSubagentTranscript(state, roster, parentPath)
+      upsertCodexSubagent(roster, CHILD_ID, { state: 'working', source: 'hook' }, Date.now())
+
+      // 4 ticks of 10 minutes each = 40 minutes total elapsed, well past the 30-minute stale
+      // bound overall — but each individual gap stays under it because each poll observes a
+      // genuinely new line appended since the last one, resetting lastConfirmedAt.
+      for (let i = 0; i < 4; i++) {
+        vi.advanceTimersByTime(10 * 60_000)
+        childRecords.push({ type: 'event_msg', payload: { type: 'agent_message' } })
+        writeFileSync(childPath, jsonl(childRecords))
+        reconcileCodexSubagentTranscript(state, roster, parentPath)
+        expect(retireStaleHookConfirmedCodexSubagents(roster, Date.now())).toEqual([])
+      }
+      expect(roster.has(CHILD_ID)).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not treat a static, unchanged rollout as ongoing proof of life', () => {
+    // Why: readJsonlCursor returns `[]` (not undefined) for a file that's readable but has not
+    // grown since the last poll — a child that crashed right after writing task_started leaves
+    // exactly this shape. Repeatedly reading that same static file successfully must NOT count
+    // as fresh liveness evidence, or the 1s poll (scheduleCodexSubagentPoll) would keep such a
+    // phantom alive forever by re-observing "still readable, still unchanged" every tick.
+    vi.useFakeTimers()
+    try {
+      const dir = mkdtempSync(join(tmpdir(), 'codex-subagent-transcript-'))
+      dirs.push(dir)
+      const parentPath = join(dir, 'rollout-parent.jsonl')
+      const childPath = join(dir, `rollout-child-${CHILD_ID}.jsonl`)
+      writeFileSync(parentPath, jsonl([activity('started')]))
+      writeFileSync(childPath, jsonl([{ type: 'event_msg', payload: { type: 'task_started' } }]))
+      const state = createCodexSubagentTranscriptState()
+      const roster: CodexSubagentRoster = new Map()
+
+      reconcileCodexSubagentTranscript(state, roster, parentPath)
+      upsertCodexSubagent(roster, CHILD_ID, { state: 'working', source: 'hook' }, Date.now())
+
+      // The child's rollout is never touched again — every subsequent read sees the same
+      // static, already-fully-read file (readJsonlCursor returns `[]`).
+      for (let i = 0; i < 3; i++) {
+        vi.advanceTimersByTime(10 * 60_000)
+        reconcileCodexSubagentTranscript(state, roster, parentPath)
+      }
+      vi.advanceTimersByTime(1)
+      expect(retireStaleHookConfirmedCodexSubagents(roster, Date.now())).toEqual([CHILD_ID])
+      expect(roster.has(CHILD_ID)).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('removes a child when Codex reports it interrupted', () => {
     const dir = mkdtempSync(join(tmpdir(), 'codex-subagent-transcript-'))
     dirs.push(dir)
@@ -169,6 +278,48 @@ describe('Codex subagent transcript reconciliation', () => {
 
     expect(hasTrackedCodexTranscriptSubagents(state)).toBe(false)
     expect(roster.size).toBe(0)
+  })
+
+  describe('retireExpiredUnresolvedCodexSubagentTranscripts', () => {
+    it('stops tracking but does not delete a row a live hook has since confirmed', () => {
+      // Why: an id can be transcript-discovered first, then separately confirmed by a live
+      // hook (upgrading its roster row to source:'hook') before its transcript-side grace
+      // window expires. Deleting the roster row here would silently undo that real
+      // confirmation and could report a genuinely still-running child 'done'.
+      const state = createCodexSubagentTranscriptState()
+      const roster: CodexSubagentRoster = new Map()
+      state.subagents.set(CHILD_ID, { offset: 0, carry: '', startedAt: 10, unresolvedSince: 0 })
+      upsertCodexSubagent(roster, CHILD_ID, { state: 'working', source: 'hook' }, 10)
+
+      retireExpiredUnresolvedCodexSubagentTranscripts(state, roster, 61_000)
+
+      expect(roster.has(CHILD_ID)).toBe(true)
+      expect(state.subagents.has(CHILD_ID)).toBe(false)
+    })
+
+    it('still deletes a transcript-only row past the grace window', () => {
+      const state = createCodexSubagentTranscriptState()
+      const roster: CodexSubagentRoster = new Map()
+      state.subagents.set(CHILD_ID, { offset: 0, carry: '', startedAt: 10, unresolvedSince: 0 })
+      upsertCodexSubagent(roster, CHILD_ID, { state: 'working', source: 'transcript' }, 10)
+
+      retireExpiredUnresolvedCodexSubagentTranscripts(state, roster, 61_000)
+
+      expect(roster.has(CHILD_ID)).toBe(false)
+      expect(state.subagents.has(CHILD_ID)).toBe(false)
+    })
+
+    it('leaves an unresolved row alone within the grace window', () => {
+      const state = createCodexSubagentTranscriptState()
+      const roster: CodexSubagentRoster = new Map()
+      state.subagents.set(CHILD_ID, { offset: 0, carry: '', startedAt: 10, unresolvedSince: 0 })
+      upsertCodexSubagent(roster, CHILD_ID, { state: 'working', source: 'transcript' }, 10)
+
+      retireExpiredUnresolvedCodexSubagentTranscripts(state, roster, 59_000)
+
+      expect(roster.has(CHILD_ID)).toBe(true)
+      expect(state.subagents.has(CHILD_ID)).toBe(true)
+    })
   })
 
   describe('child model identity', () => {

@@ -936,10 +936,10 @@ ipcMain.handle(
 )
 
 /** A PTY that dies while Orca is down never runs the teardown that clears pane
- *  state, so hydrate can rebuild a Claude subagent roster that no later hook can
- *  retire — pinning the pane 'working' and locking its agent out of hibernation
- *  for good. Once provider and hook hydration settle, targeted PTY liveness can
- *  retire only rows whose local owner is proven gone. */
+ *  state, so hydrate can rebuild a Claude or Codex subagent roster that no
+ *  later hook can retire — pinning the pane 'working' and locking its agent
+ *  out of hibernation for good. Once provider and hook hydration settle,
+ *  targeted PTY liveness can retire only rows whose local owner is proven gone. */
 async function reapRestoredSubagentsWithoutLiveAgent(): Promise<void> {
   const currentStore = store
   if (!currentStore) {
@@ -952,22 +952,35 @@ async function reapRestoredSubagentsWithoutLiveAgent(): Promise<void> {
   const persistedPtyIdByPaneKey = indexPersistedPaneKeyPtyIds(
     currentStore.getWorkspaceSession().terminalLayoutsByTabId ?? {}
   )
+  const isLocalExecutionHostForSweep = (worktreeId: string | undefined): boolean =>
+    isLocalExecutionHost(
+      resolveAgentWorkspaceExecutionHostId(worktreeId, {
+        getRepo: (repoId) => currentStore.getRepo(repoId),
+        getWorktreeMeta: (resolvedWorktreeId) => currentStore.getWorktreeMeta(resolvedWorktreeId),
+        getFolderWorkspace: (folderWorkspaceId) =>
+          currentStore.getFolderWorkspace(folderWorkspaceId),
+        getProjectGroups: () => currentStore.getProjectGroups()
+      })
+    )
   await sweepRestoredSubagentsWithoutLiveAgent({
     probeLiveLocalPty: (ptyId) => provider.probePtyLiveness(ptyId),
-    isLocalExecutionHost: (worktreeId) =>
-      isLocalExecutionHost(
-        resolveAgentWorkspaceExecutionHostId(worktreeId, {
-          getRepo: (repoId) => currentStore.getRepo(repoId),
-          getWorktreeMeta: (resolvedWorktreeId) => currentStore.getWorktreeMeta(resolvedWorktreeId),
-          getFolderWorkspace: (folderWorkspaceId) =>
-            currentStore.getFolderWorkspace(folderWorkspaceId),
-          getProjectGroups: () => currentStore.getProjectGroups()
-        })
-      ),
+    isLocalExecutionHost: isLocalExecutionHostForSweep,
     getBoundPtyIdForPaneKey: getPtyIdForPaneKey,
     getPersistedPtyIdForPaneKey: (paneKey) => persistedPtyIdByPaneKey.get(paneKey),
     reap: (isLocalHost, isLocalPaneAgentLive, isLocalPaneLivenessEvidenceCurrent) =>
       agentHookServer.reapRestoredClaudeSubagentsWithoutLiveAgent(
+        isLocalHost,
+        isLocalPaneAgentLive,
+        isLocalPaneLivenessEvidenceCurrent
+      )
+  })
+  await sweepRestoredSubagentsWithoutLiveAgent({
+    probeLiveLocalPty: (ptyId) => provider.probePtyLiveness(ptyId),
+    isLocalExecutionHost: isLocalExecutionHostForSweep,
+    getBoundPtyIdForPaneKey: getPtyIdForPaneKey,
+    getPersistedPtyIdForPaneKey: (paneKey) => persistedPtyIdByPaneKey.get(paneKey),
+    reap: (isLocalHost, isLocalPaneAgentLive, isLocalPaneLivenessEvidenceCurrent) =>
+      agentHookServer.reapRestoredCodexSubagentsWithoutLiveAgent(
         isLocalHost,
         isLocalPaneAgentLive,
         isLocalPaneLivenessEvidenceCurrent

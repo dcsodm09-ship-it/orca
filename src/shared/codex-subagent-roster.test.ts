@@ -1,12 +1,16 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   AGENT_MODEL_MAX_LENGTH,
   AGENT_STATUS_MAX_SUBAGENTS,
+  AGENT_STATUS_STALE_AFTER_MS,
   AGENT_TYPE_MAX_LENGTH
 } from './agent-status-types'
 import {
   codexRosterToSnapshots,
   finishCodexSubagent,
+  hasHookConfirmedCodexSubagent,
+  isHookConfirmedCodexSubagent,
+  retireStaleHookConfirmedCodexSubagents,
   setCodexSubagentModel,
   upsertCodexSubagent,
   type CodexSubagentRoster
@@ -110,6 +114,97 @@ describe('Codex subagent roster', () => {
       setCodexSubagentModel(roster, 'child-1', 'x'.repeat(AGENT_MODEL_MAX_LENGTH + 50))
 
       expect(roster.get('child-1')?.model).toHaveLength(AGENT_MODEL_MAX_LENGTH)
+    })
+  })
+
+  describe('retireStaleHookConfirmedCodexSubagents', () => {
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('eventually retires a hook-confirmed row whose own SubagentStop never arrives', () => {
+      // Why: a 'hook' row is otherwise exempt from the lead Stop's roster wipe entirely (see
+      // hasHookConfirmedCodexSubagent) — without a bounded fallback, a lost child SubagentStop
+      // (a known Codex CLI gap) would pin the row, and the pane, forever.
+      vi.useFakeTimers()
+      vi.setSystemTime(0)
+      const roster: CodexSubagentRoster = new Map()
+      upsertCodexSubagent(roster, 'child-1', { state: 'working', source: 'hook' }, 10)
+
+      expect(retireStaleHookConfirmedCodexSubagents(roster, AGENT_STATUS_STALE_AFTER_MS)).toEqual(
+        []
+      )
+      expect(roster.has('child-1')).toBe(true)
+
+      expect(
+        retireStaleHookConfirmedCodexSubagents(roster, AGENT_STATUS_STALE_AFTER_MS + 1)
+      ).toEqual(['child-1'])
+      expect(roster.has('child-1')).toBe(false)
+    })
+
+    it('is immune to the same Stop body being re-normalized many times within the same window', () => {
+      // Why: AgentHookServer's scheduleCodexSubagentPoll re-normalizes the same saved hook body
+      // on a 1s timer while a transcript child is unresolved, calling this function repeatedly
+      // for what is really one real Stop. A wall-clock bound must not evict a genuinely-alive
+      // child just because it was called many times in a short window — a per-call counter did.
+      vi.useFakeTimers()
+      vi.setSystemTime(0)
+      const roster: CodexSubagentRoster = new Map()
+      upsertCodexSubagent(roster, 'child-1', { state: 'working', source: 'hook' }, 10)
+
+      for (let i = 0; i < 20; i++) {
+        vi.advanceTimersByTime(1_000)
+        expect(retireStaleHookConfirmedCodexSubagents(roster, Date.now())).toEqual([])
+      }
+      expect(roster.has('child-1')).toBe(true)
+    })
+
+    it('resets the staleness window on a fresh hook touch', () => {
+      vi.useFakeTimers()
+      vi.setSystemTime(0)
+      const roster: CodexSubagentRoster = new Map()
+      upsertCodexSubagent(roster, 'child-1', { state: 'working', source: 'hook' }, 10)
+
+      vi.advanceTimersByTime(AGENT_STATUS_STALE_AFTER_MS - 1)
+      // Why: a fresh live confirmation proves the child is genuinely still there — it must
+      // reset the window, not merely delay retirement by the same fixed amount.
+      upsertCodexSubagent(roster, 'child-1', { state: 'working', source: 'hook' }, 20)
+      vi.advanceTimersByTime(AGENT_STATUS_STALE_AFTER_MS - 1)
+
+      expect(retireStaleHookConfirmedCodexSubagents(roster, Date.now())).toEqual([])
+      expect(roster.has('child-1')).toBe(true)
+    })
+
+    it('never touches a transcript-only row', () => {
+      const roster: CodexSubagentRoster = new Map()
+      upsertCodexSubagent(roster, 'child-1', { state: 'working', source: 'transcript' }, 10)
+
+      expect(
+        retireStaleHookConfirmedCodexSubagents(
+          roster,
+          Date.now() + AGENT_STATUS_STALE_AFTER_MS * 10
+        )
+      ).toEqual([])
+      expect(roster.has('child-1')).toBe(true)
+    })
+  })
+
+  describe('hasHookConfirmedCodexSubagent / isHookConfirmedCodexSubagent', () => {
+    it('distinguishes a hook-confirmed row from a transcript-only one', () => {
+      const roster: CodexSubagentRoster = new Map()
+      upsertCodexSubagent(roster, 'hook-child', { state: 'working', source: 'hook' }, 10)
+      upsertCodexSubagent(
+        roster,
+        'transcript-child',
+        { state: 'working', source: 'transcript' },
+        10
+      )
+
+      expect(hasHookConfirmedCodexSubagent(roster)).toBe(true)
+      expect(isHookConfirmedCodexSubagent(roster, 'hook-child')).toBe(true)
+      expect(isHookConfirmedCodexSubagent(roster, 'transcript-child')).toBe(false)
+      expect(isHookConfirmedCodexSubagent(roster, 'missing-child')).toBe(false)
+      expect(isHookConfirmedCodexSubagent(undefined, 'hook-child')).toBe(false)
     })
   })
 })

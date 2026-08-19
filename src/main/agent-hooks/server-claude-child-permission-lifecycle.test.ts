@@ -59,7 +59,7 @@ describe('Claude child permission lifecycle', () => {
       expect(server.getStatusSnapshot()[0]).toMatchObject({
         state: 'waiting',
         toolName: 'Bash',
-        subagents: [expect.objectContaining({ id: 'a-blocked', state: 'working' })]
+        subagents: [expect.objectContaining({ id: 'a-blocked', state: 'waiting' })]
       })
       await postClaudeHook({ hook_event_name: 'SubagentStop', agent_id: 'a-blocked' })
 
@@ -89,7 +89,7 @@ describe('Claude child permission lifecycle', () => {
       expect(server.getStatusSnapshot()[0]).toMatchObject({
         state: 'waiting',
         toolName: 'Bash',
-        subagents: [expect.objectContaining({ id: 'areviewer-6d3cb5b5', state: 'working' })]
+        subagents: [expect.objectContaining({ id: 'areviewer-6d3cb5b5', state: 'waiting' })]
       })
       await postClaudeHook({ hook_event_name: 'TeammateIdle', teammate_name: 'reviewer' })
 
@@ -125,7 +125,7 @@ describe('Claude child permission lifecycle', () => {
       expect(server.getStatusSnapshot()[0]).toMatchObject({
         state: 'waiting',
         toolName: 'Bash',
-        subagents: [expect.objectContaining({ id: 'areviewer-6d3cb5b5', state: 'working' })]
+        subagents: [expect.objectContaining({ id: 'areviewer-6d3cb5b5', state: 'waiting' })]
       })
     } finally {
       server.stop()
@@ -156,6 +156,69 @@ describe('Claude child permission lifecycle', () => {
       expect(status?.toolName).toBeUndefined()
       expect(status?.toolInput).toBeUndefined()
       expect(status?.subagents).toHaveLength(AGENT_STATUS_MAX_SUBAGENTS)
+    } finally {
+      server.stop()
+    }
+  })
+
+  it('keeps the first sibling waiting when a second sibling permission resolves first', async () => {
+    const { server, postClaudeHook } = await createServer()
+    try {
+      await postClaudeHook({ hook_event_name: 'UserPromptSubmit', prompt: 'guarded task' })
+      await postClaudeHook({
+        hook_event_name: 'PermissionRequest',
+        agent_id: 'a-child-a',
+        agent_type: 'general-purpose',
+        tool_name: 'Bash',
+        tool_input: { command: 'rm -rf a' },
+        tool_use_id: 'tu-a'
+      })
+      expect(server.getStatusSnapshot()[0]).toMatchObject({
+        state: 'waiting',
+        toolName: 'Bash',
+        toolInput: 'rm -rf a',
+        subagents: [expect.objectContaining({ id: 'a-child-a', state: 'waiting' })]
+      })
+
+      await postClaudeHook({
+        hook_event_name: 'PermissionRequest',
+        agent_id: 'a-child-b',
+        agent_type: 'general-purpose',
+        tool_name: 'Bash',
+        tool_input: { command: 'rm -rf b' },
+        tool_use_id: 'tu-b'
+      })
+      expect(server.getStatusSnapshot()[0]).toMatchObject({
+        state: 'waiting',
+        toolName: 'Bash',
+        toolInput: 'rm -rf b',
+        subagents: [
+          expect.objectContaining({ id: 'a-child-a', state: 'waiting' }),
+          expect.objectContaining({ id: 'a-child-b', state: 'waiting' })
+        ]
+      })
+
+      // Why: B's own approval resolves — A's still-unresolved PermissionRequest must
+      // stay visible instead of being silently overwritten by B's resolution (#P1).
+      await postClaudeHook({
+        hook_event_name: 'PostToolUse',
+        agent_id: 'a-child-b',
+        tool_name: 'Bash',
+        tool_use_id: 'tu-b',
+        tool_response: { output: 'done' }
+      })
+
+      const status = server.getStatusSnapshot()[0]
+      expect(status).toMatchObject({
+        paneKey: PANE,
+        state: 'waiting',
+        toolName: 'Bash',
+        toolInput: 'rm -rf a',
+        subagents: [
+          expect.objectContaining({ id: 'a-child-a', state: 'waiting' }),
+          expect.objectContaining({ id: 'a-child-b', state: 'working' })
+        ]
+      })
     } finally {
       server.stop()
     }

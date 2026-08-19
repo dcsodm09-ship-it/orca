@@ -29,6 +29,7 @@ import {
   parseFormEncodedBody,
   readRequestBody,
   reapRestoredClaudeSubagentsForDeadPane,
+  reapRestoredCodexSubagentsForDeadPane,
   reconcileRemoteCodexState,
   resolveCachedClaudeCompactOwnership,
   resolveHookSource,
@@ -50,9 +51,15 @@ import {
 import {
   claudeTeammateIdMatchesName,
   claudeRosterHasRestoredSnapshotSubagent,
+  claudeRosterHasWaitingSubagent,
   claudeRosterHasWorkingSubagent,
   claudeRosterToSnapshots
 } from '../../shared/claude-subagent-roster'
+import {
+  codexRosterHasRestoredSnapshotSubagent,
+  codexRosterHasWorkingSubagent,
+  codexRosterToSnapshots
+} from '../../shared/codex-subagent-roster'
 import {
   isAgentHookSource,
   restoreShedStatusFields,
@@ -2837,18 +2844,34 @@ export class AgentHookServer {
       ) {
         continue
       }
+      // Why: captured BEFORE the reap below, deliberately — a persisted 'waiting' pane whose
+      // roster held no 'waiting' row at all (a 'working' child instead, or none) got that
+      // 'waiting' from the LEAD's own independent state (e.g. its own AskUserQuestion), not
+      // from this child; reaping an unrelated dead child must never resolve that separate
+      // wait. Only a pane whose 'waiting' really was this child's doing (a 'waiting' row
+      // present here) is eligible to resolve once that row is gone.
+      const hadWaitingSubagentBeforeReap = claudeRosterHasWaitingSubagent(
+        this.state.claudeSubagentRosterByPaneKey.get(paneKey)
+      )
       if (!reapRestoredClaudeSubagentsForDeadPane(this.state, paneKey)) {
         continue
       }
       changedPanes += 1
       const roster = this.state.claudeSubagentRosterByPaneKey.get(paneKey)
       const subagents = claudeRosterToSnapshots(roster)
-      // Why: the pane's persisted 'working' was the child gate holding a finished
-      // lead open (subagent events never set lead state). With the last working row
-      // gone and no process left to report, 'done' is the only truthful state — and
-      // the one hibernation needs once this pane's agent is restored.
+      // Why: the pane's persisted 'working' was the child gate holding a finished lead open
+      // (subagent events never set lead state); a persisted 'waiting' caused by a child (see
+      // hadWaitingSubagentBeforeReap above) is the same situation — a persisted 'waiting' seed
+      // now restores too (seedClaudeSubagentRosterFromSnapshots accepts it, not just 'working'),
+      // so this reap can dead-pane-drop the sole reason a pane reads 'waiting' just as it
+      // already could for 'working'. With the last working/waiting row gone and no process
+      // left to report, 'done' is the only truthful state — and the one hibernation needs
+      // once this pane's agent is restored.
       const state =
-        enriched.payload.state === 'working' && !claudeRosterHasWorkingSubagent(roster)
+        (enriched.payload.state === 'working' && !claudeRosterHasWorkingSubagent(roster)) ||
+        (enriched.payload.state === 'waiting' &&
+          hadWaitingSubagentBeforeReap &&
+          !claudeRosterHasWaitingSubagent(roster))
           ? 'done'
           : enriched.payload.state
       const stateChanged = state !== enriched.payload.state
@@ -2857,6 +2880,87 @@ export class AgentHookServer {
         : enriched.receivedAt
       // Why: a reconciled `done` is process-probe-verified, not hydrated guesswork — carrying
       // restoredUnconfirmed onto it would make freshness gates suppress a legitimate completion.
+      const { restoredUnconfirmed, ...reconciledBase } = enriched
+      const reconciled: EnrichedAgentHookEventPayload = {
+        ...reconciledBase,
+        ...(state !== 'done' && restoredUnconfirmed ? { restoredUnconfirmed: true } : {}),
+        receivedAt: reconciledAt,
+        stateStartedAt: stateChanged ? reconciledAt : enriched.stateStartedAt,
+        payload: { ...enriched.payload, state, subagents }
+      }
+      this.state.lastStatusByPaneKey.set(paneKey, reconciled)
+    }
+    if (changedPanes > 0) {
+      this.scheduleStatusPersist()
+      this.notifyStatusChangeListeners()
+    }
+    return changedPanes
+  }
+
+  /** Codex counterpart of reapRestoredClaudeSubagentsWithoutLiveAgent — same
+   *  failure mode (a PTY that dies while Orca is down leaves a hydrated
+   *  roster row nothing can retire) and same liveness-probe contract; see
+   *  that method's comment. Only rows stamped restoredFromSnapshot by the
+   *  disk-hydrate path are candidates — relay-reseeded rows (reconcileRemoteCodexState)
+   *  always carry a non-null connectionId and so never pass the local-host gate below anyway. */
+  async reapRestoredCodexSubagentsWithoutLiveAgent(
+    isLocalExecutionHost: (worktreeId: string | undefined) => boolean,
+    isLocalPaneAgentLive: (paneKey: string) => Promise<boolean>,
+    isLocalPaneLivenessEvidenceCurrent: (paneKey: string) => boolean
+  ): Promise<number> {
+    const candidates: { paneKey: string; entry: EnrichedAgentHookEventPayload }[] = []
+    for (const [paneKey, entry] of this.state.lastStatusByPaneKey) {
+      const enriched = entry as EnrichedAgentHookEventPayload
+      if (
+        enriched.payload.agentType === 'codex' &&
+        enriched.connectionId === null &&
+        isLocalExecutionHost(enriched.worktreeId) &&
+        codexRosterHasRestoredSnapshotSubagent(
+          this.state.codexSubagentRosterByPaneKey.get(paneKey)
+        ) &&
+        !this.runtimeObservedStatusPaneKeys.has(paneKey)
+      ) {
+        candidates.push({ paneKey, entry: enriched })
+      }
+    }
+    const liveness = await Promise.all(
+      candidates.map(async (candidate) => {
+        try {
+          return await isLocalPaneAgentLive(candidate.paneKey)
+        } catch {
+          return true
+        }
+      })
+    )
+    let changedPanes = 0
+    for (const [index, candidate] of candidates.entries()) {
+      const { paneKey, entry: enriched } = candidate
+      if (
+        liveness[index] ||
+        !isLocalPaneLivenessEvidenceCurrent(paneKey) ||
+        this.state.lastStatusByPaneKey.get(paneKey) !== enriched ||
+        this.runtimeObservedStatusPaneKeys.has(paneKey) ||
+        !isLocalExecutionHost(enriched.worktreeId)
+      ) {
+        continue
+      }
+      if (!reapRestoredCodexSubagentsForDeadPane(this.state, paneKey)) {
+        continue
+      }
+      changedPanes += 1
+      const roster = this.state.codexSubagentRosterByPaneKey.get(paneKey)
+      const subagents = codexRosterToSnapshots(roster)
+      // Why: mirrors the Claude reap's completion inference — a persisted
+      // 'working' pane with no working roster row left is a finished lead a
+      // dead child was pinning open.
+      const state =
+        enriched.payload.state === 'working' && !codexRosterHasWorkingSubagent(roster)
+          ? 'done'
+          : enriched.payload.state
+      const stateChanged = state !== enriched.payload.state
+      const reconciledAt = stateChanged
+        ? Math.max(Date.now(), enriched.receivedAt + 1)
+        : enriched.receivedAt
       const { restoredUnconfirmed, ...reconciledBase } = enriched
       const reconciled: EnrichedAgentHookEventPayload = {
         ...reconciledBase,
@@ -3008,7 +3112,9 @@ export class AgentHookServer {
         }
         // Why: restore live child hierarchy immediately; provider-specific reconciliation reaps stale seeds.
         if (entry.payload.agentType === 'codex') {
-          seedCodexStateFromSnapshot(this.state, resolvedPaneKey, entry.payload)
+          seedCodexStateFromSnapshot(this.state, resolvedPaneKey, entry.payload, {
+            restoredFromSnapshot: true
+          })
         } else if (entry.payload.agentType === 'claude') {
           seedClaudeLeadTurnFromPersistedStatus(this.state, resolvedPaneKey, entry, {
             childOnlyBoundary: entry.claudeLeadBoundaryChildOnly === true
