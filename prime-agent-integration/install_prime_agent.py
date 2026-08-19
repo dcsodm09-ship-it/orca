@@ -146,6 +146,15 @@ RENAME_EXCL = 0x00000004
 # residual: the previous fallback only covered atomic_symlink()'s own
 # symlink-creation call and left the ancestor walk and all verification
 # unconditionally path-based).
+#
+# open_verified_ancestor_chain() (the shared walk underneath all of the
+# above) also takes an explicit `root`, so
+# open_verified_generated_file_parent() reuses the IDENTICAL algorithm
+# rooted at SSD_ROOT instead of USER_HOME to bind
+# tighten_generated_private_file_mode() to a verified ancestor chain for
+# RELEASE_DIR/package-lock.json, closing the analogous same-UID
+# ancestor-directory-swap gap for that generated file (independent Codex
+# sol/max round-19 review, 2026-08-19, P1).
 LINK_DIR_FD_SUPPORTED = (
     os.open in os.supports_dir_fd
     and os.mkdir in os.supports_dir_fd
@@ -454,6 +463,39 @@ def read_private_ssd_file(path: Path, *, max_bytes: int = 4 * 1024 * 1024) -> by
     return read_private_file(resolve_ssd(path), max_bytes=max_bytes)
 
 
+def open_verified_generated_file_parent(path: Path) -> int:
+    """Return an open, verified directory descriptor for `path`'s immediate
+    parent, resolved via the SAME dir_fd-chained, openat()-style ancestor
+    walk open_verified_ancestor_chain() already uses for the managed
+    command link (see ensure_local_link_parent() /
+    verify_link_parent_descriptor()), except rooted at SSD_ROOT instead of
+    USER_HOME: every component of `path`'s parent, all the way from
+    SSD_ROOT down (e.g. TOOL_ROOT, "releases", "v<VERSION>"), is opened
+    strictly relative to the previously opened and verified descriptor,
+    never re-resolved by path string, so a same-UID racer who swaps ANY
+    ancestor directory -- not only `path` itself -- at any point during or
+    after the walk cannot redirect the descriptor this returns.
+
+    Used by tighten_generated_private_file_mode() to close a gap
+    Path.lstat()-then-os.open(path, O_NOFOLLOW) cannot: Path.lstat()
+    follows every INTERMEDIATE symlink in a path, and O_NOFOLLOW on a
+    plain os.open() only refuses the FINAL component being a symlink --
+    neither protects an ancestor directory. A same-UID racer who swaps
+    RELEASE_DIR itself (or any ancestor above it) for a symlink to a
+    sibling directory, at any point during the long `npm install
+    --package-lock-only` subprocess window that runs before
+    tighten_generated_private_file_mode() is called, made the un-chained
+    implementation chmod an unrelated file inside that sibling directory to
+    0o600 -- reproduced deterministically by swapping RELEASE_DIR for a
+    symlink to a sibling directory containing an unrelated
+    package-lock.json (independent Codex sol/max round-19 review,
+    2026-08-19, P1; round-19's Claude opus/max review tested only leaf-path
+    symlink substitution and lstat-to-open inode swaps at the leaf, not
+    this ancestor-directory-level gap).
+    """
+    return open_verified_ancestor_chain(path, create_missing=False, root=SSD_ROOT)
+
+
 def tighten_generated_private_file_mode(path: Path, mode: int = 0o600) -> tuple[int, int]:
     """Tighten an existing file's permission bits to `mode` in place, right
     after an external process this installer does not control (`npm`) has
@@ -482,41 +524,68 @@ def tighten_generated_private_file_mode(path: Path, mode: int = 0o600) -> tuple[
     all 96 prior unit tests mocked lock-file generation in a way that
     bypassed real npm's actual default-umask output mode). package.json
     never hits this gap because atomic_create_private_file() publishes it
-    at 0o600 before npm ever touches it.
+    at 0o600 before npm ever touches it. _install_locked() also now spawns
+    that `npm install --package-lock-only` subprocess with an explicit
+    child umask of 0o077 (see run_npm()'s `child_umask` parameter), so a
+    real npm normally creates the file already private -- but that is
+    defense in depth only (npm has no obligation to honor, or could ignore
+    in some environment, an inherited umask), not a substitute for
+    tightening the mode explicitly right here.
 
-    Uses the same O_NOFOLLOW-open-then-fstat-identity-check discipline
-    read_private_file() itself uses before trusting a descriptor, rather
-    than a bare os.chmod(path, mode): a bare chmod-by-path follows a
-    symlink, so a same-UID actor who swapped this path for a symlink in the
-    instant between npm's write and this call would have this call silently
-    tighten (or fabricate a false sense of privacy for) some unrelated
-    target instead of failing closed on the substitution -- the same
+    Every step below -- the initial identity capture, the final
+    O_NOFOLLOW-protected open, and the fchmod -- is bound to a single
+    dir_fd obtained from open_verified_generated_file_parent()'s
+    SSD_ROOT-rooted ancestor walk, rather than to any lexical path: a bare
+    chmod-by-path (or a plain Path.lstat()-then-os.open(path, O_NOFOLLOW),
+    this function's own previous implementation) follows every
+    intermediate ancestor component by name, so a same-UID actor who
+    swapped RELEASE_DIR -- or any ancestor above it -- for a symlink at any
+    point during npm's long run would have made this call silently tighten
+    (or fabricate a false sense of privacy for) some unrelated file in an
+    attacker-chosen directory instead of failing closed on the
+    substitution (independent Codex sol/max round-19 review, 2026-08-19,
+    P1; see open_verified_generated_file_parent()). This is the same
     failure mode every other private-file operation in this file already
-    refuses to allow.
+    refuses to allow, just applied one level higher: the leaf-symlink case
+    (this path itself swapped for a symlink) was already refused by the
+    O_NOFOLLOW-open-then-fstat-identity-check discipline read_private_file()
+    established; only the ancestor-directory case was missed.
     """
+    parent_descriptor = open_verified_generated_file_parent(path)
     try:
-        before = path.lstat()
-    except OSError as exc:
-        raise PrimeInstallError(f"cannot inspect generated file before tightening: {path}") from exc
-    if (
-        not stat.S_ISREG(before.st_mode)
-        or stat.S_ISLNK(before.st_mode)
-        or before.st_uid != os.getuid()
-    ):
-        raise PrimeInstallError(f"unsafe generated file: {path}")
-    descriptor = -1
-    try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        opened = os.fstat(descriptor)
-        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
-            raise PrimeInstallError(f"generated file identity changed before tightening: {path}")
-        os.fchmod(descriptor, mode)
-    except OSError as exc:
-        raise PrimeInstallError(f"cannot tighten generated file mode: {path}") from exc
+        name = path.name
+        try:
+            before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except OSError as exc:
+            raise PrimeInstallError(f"cannot inspect generated file before tightening: {path}") from exc
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or before.st_uid != os.getuid()
+        ):
+            raise PrimeInstallError(f"unsafe generated file: {path}")
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_descriptor,
+            )
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise PrimeInstallError(f"generated file identity changed before tightening: {path}")
+            os.fchmod(descriptor, mode)
+        except OSError as exc:
+            raise PrimeInstallError(f"cannot tighten generated file mode: {path}") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        return (before.st_dev, before.st_ino)
     finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    return (before.st_dev, before.st_ino)
+        try:
+            os.close(parent_descriptor)
+        except OSError:
+            pass
 
 
 def verify_unchanged_private_ssd_file(
@@ -2178,9 +2247,32 @@ def run_npm(
     install_tmp: Path,
     *,
     timeout: int = 300,
+    child_umask: int | None = None,
 ) -> None:
+    """`child_umask`, when given, is applied to the CHILD process only, via
+    `preexec_fn` running after fork() and before exec() -- the parent
+    installer process's own umask is never touched. Only the `npm install
+    --package-lock-only` call site (_install_locked()) passes 0o077: that
+    is the one invocation that GENERATES a brand-new file
+    (package-lock.json) an external process controls the initial mode of,
+    so narrowing its ambient umask makes npm create it already-private from
+    the moment it exists, shrinking (but not eliminating -- npm has no
+    obligation to honor an inherited umask in every environment, and could
+    still be interrupted mid-write) the window it sits at a permissive
+    mode before tighten_generated_private_file_mode() explicitly fixes it.
+    This is deliberately NOT the default for every run_npm() call: `npm ci`
+    materializes an entire node_modules tree whose file/directory modes
+    this installer re-validates itself afterward (tree_digest(),
+    extract_node_toolchain()-style checks) under the existing, looser
+    0o022-tolerant gates -- scoping the tighter umask to only this one
+    call avoids any risk of an unrelated, unreviewed behavior change to
+    npm's other output across the rest of this file.
+    """
     environment = managed_npm_environment(
         node_path, cache, install_home, install_tmp
+    )
+    preexec_fn = (
+        (lambda: os.umask(child_umask)) if child_umask is not None else None
     )
     try:
         result = subprocess.run(
@@ -2193,6 +2285,7 @@ def run_npm(
             text=True,
             timeout=timeout,
             check=False,
+            preexec_fn=preexec_fn,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise PrimeInstallError("npm execution failed") from exc
@@ -3404,32 +3497,47 @@ def open_verified_directory_component(
     return descriptor
 
 
-def open_verified_ancestor_chain(link: Path, *, create_missing: bool) -> int:
-    """Walk from USER_HOME to link's parent entirely via dir_fd-chained,
-    openat()-style lookups (see open_verified_directory_component()) and
-    return an open, verified descriptor for the immediate parent. Used by
-    both ensure_local_link_parent() (create_missing=True, for link
-    creation) and verify_link_parent_descriptor() (create_missing=False,
-    for read-only verification), so creation and verification are bound to
-    the identical ancestor-resolution algorithm rather than verification
-    trusting a plain lexical path that could resolve through a since
-    -interposed symlink ancestor.
+def open_verified_ancestor_chain(
+    link: Path, *, create_missing: bool, root: Path | None = None
+) -> int:
+    """Walk from `root` (USER_HOME by default) to link's parent entirely via
+    dir_fd-chained, openat()-style lookups (see
+    open_verified_directory_component()) and return an open, verified
+    descriptor for the immediate parent. Used by both
+    ensure_local_link_parent() (create_missing=True, for link creation) and
+    verify_link_parent_descriptor() (create_missing=False, for read-only
+    verification), so creation and verification are bound to the identical
+    ancestor-resolution algorithm rather than verification trusting a plain
+    lexical path that could resolve through a since-interposed symlink
+    ancestor.
+
+    `root` defaults to None (meaning USER_HOME, read fresh from the module
+    global on every call -- not captured as a mutable default argument --
+    so tests that `mock.patch.object(installer, "USER_HOME", ...)` keep
+    working) but is also reused, with root=SSD_ROOT, by
+    open_verified_generated_file_parent() to bind
+    tighten_generated_private_file_mode() to the identical dir_fd-chained
+    ancestor walk instead of USER_HOME -- the SAME algorithm, just rooted
+    at a different pre-existing, non-swappable authority, so a same-UID
+    racer who swaps RELEASE_DIR (or any ancestor above it, e.g. TOOL_ROOT
+    or "releases") for a symlink cannot redirect this walk either
+    (independent Codex sol/max round-19 review, 2026-08-19, P1).
     """
     require_link_dir_fd_support()
-    lexical_home = USER_HOME.absolute()
+    lexical_root = (USER_HOME if root is None else root).absolute()
     try:
-        relative = link.parent.absolute().relative_to(lexical_home)
+        relative = link.parent.absolute().relative_to(lexical_root)
     except ValueError as exc:
-        raise PrimeInstallError(f"link path is outside the user home: {link}") from exc
+        raise PrimeInstallError(f"path is outside {lexical_root}: {link}") from exc
     try:
-        # The user home itself is pre-existing authority, opened by path
-        # exactly once as the root of the chain -- every component beneath
-        # it is then resolved only relative to an already-verified
-        # descriptor, never by path string again.
-        current_descriptor = os.open(lexical_home, os.O_RDONLY | os.O_DIRECTORY)
+        # The root itself is pre-existing authority, opened by path exactly
+        # once as the root of the chain -- every component beneath it is
+        # then resolved only relative to an already-verified descriptor,
+        # never by path string again.
+        current_descriptor = os.open(lexical_root, os.O_RDONLY | os.O_DIRECTORY)
     except OSError as exc:
-        raise PrimeInstallError(f"cannot open user home: {lexical_home}") from exc
-    display_path = lexical_home
+        raise PrimeInstallError(f"cannot open {lexical_root}") from exc
+    display_path = lexical_root
     try:
         for part in relative.parts:
             display_path = display_path / part
@@ -4167,6 +4275,17 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
         cache,
         install_home,
         install_tmp,
+        # This is the one run_npm() call that GENERATES a brand-new file
+        # (package-lock.json) whose initial mode this installer does not
+        # control -- narrow the child's umask so npm creates it already
+        # private, shrinking the window before
+        # tighten_generated_private_file_mode() below explicitly fixes it.
+        # Defense in depth only: that dir_fd-bound tightening step is what
+        # actually closes the gap (see its own docstring and
+        # open_verified_generated_file_parent()); this does not replace it
+        # and is deliberately not applied to the `npm ci` call further down
+        # (see run_npm()'s own docstring for why).
+        child_umask=0o077,
     )
     lock_path = RELEASE_DIR / "package-lock.json"
     # `npm install --package-lock-only` just generated this file itself, at

@@ -5823,7 +5823,8 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             generated_lock_raw = installer.canonical_json(generated)
 
             def fake_run_npm(
-                npm_path, node_path, args, cwd, cache, install_home, install_tmp, timeout=300
+                npm_path, node_path, args, cwd, cache, install_home, install_tmp,
+                timeout=300, child_umask=None,
             ):
                 cwd = Path(cwd)
                 if args and args[0] == "install":
@@ -6246,7 +6247,8 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             swapped_asset_name = installer.MAIN_PATCHED_ASSET
 
             def fake_run_npm(
-                npm_path, node_path, args, cwd, cache, install_home, install_tmp, timeout=300
+                npm_path, node_path, args, cwd, cache, install_home, install_tmp,
+                timeout=300, child_umask=None,
             ):
                 cwd = Path(cwd)
                 if args and args[0] == "install":
@@ -6640,10 +6642,16 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             # Step 3: the actual fix, called exactly the way
             # _install_locked() calls it -- immediately after npm
             # generates the file and before any security re-check reads
-            # it.
-            returned_identity = installer.tighten_generated_private_file_mode(
-                lock_path
-            )
+            # it. Bound to the SAME dir_fd-chained ancestor walk
+            # _install_locked() itself relies on (via
+            # open_verified_generated_file_parent()), rooted at SSD_ROOT --
+            # mock SSD_ROOT to this fixture's own root so that walk
+            # resolves "release"'s real on-disk ancestor chain instead of
+            # the real production /Volumes/Extreme SSD path.
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                returned_identity = installer.tighten_generated_private_file_mode(
+                    lock_path
+                )
 
             after_stat = lock_path.lstat()
             self.assertEqual(
@@ -6690,15 +6698,95 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             link_path = root / "release-package-lock.json"
             link_path.symlink_to(victim)
 
-            with self.assertRaisesRegex(
-                installer.PrimeInstallError, "unsafe generated file"
-            ):
-                installer.tighten_generated_private_file_mode(link_path)
+            # Bound to the SAME dir_fd-chained ancestor walk
+            # _install_locked() itself relies on (via
+            # open_verified_generated_file_parent()), rooted at SSD_ROOT --
+            # mock SSD_ROOT to this fixture's own root so the walk resolves
+            # this fixture's real on-disk ancestor chain instead of the
+            # real production /Volumes/Extreme SSD path.
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "unsafe generated file"
+                ):
+                    installer.tighten_generated_private_file_mode(link_path)
 
             # The symlink target must be completely untouched -- neither
             # its mode nor its content.
             self.assertEqual(stat.S_IMODE(victim.lstat().st_mode), 0o644)
             self.assertEqual(victim.read_bytes(), b"do-not-touch")
+
+    def test_tighten_generated_private_file_mode_refuses_ancestor_symlink_swap(
+        self,
+    ) -> None:
+        # Regression for independent Codex sol/max round-19 review,
+        # 2026-08-19, P1: round 18's fix (and round 19's Claude opus/max
+        # review, which tested only leaf-path symlink substitution and
+        # lstat-to-open inode swaps AT THE LEAF) only protected the LEAF
+        # path component -- Path.lstat() (used to capture "before") follows
+        # every INTERMEDIATE symlink in a path, and a plain os.open(path,
+        # O_NOFOLLOW) only refuses the FINAL component being a symlink.
+        # Neither protects an ancestor DIRECTORY. Reproduces Codex's exact,
+        # deterministic repro: RELEASE_DIR itself ("managed/release") is
+        # swapped for a symlink pointing at a sibling directory
+        # ("managed/outside") that holds its own, completely unrelated
+        # package-lock.json -- a same-UID racer has the entire `npm
+        # install --package-lock-only` subprocess's runtime window to make
+        # this swap before tighten_generated_private_file_mode() runs.
+        # Before the fix, this call silently chmod'ed the UNRELATED file in
+        # "outside" to 0o600; the fix must instead refuse the ancestor
+        # symlink outright (open_verified_generated_file_parent()'s
+        # dir_fd-chained, O_NOFOLLOW-protected walk refuses to open a
+        # symlinked ancestor component at all) and must never touch
+        # "outside" in any way.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            managed = root / "managed"
+            managed.mkdir(mode=0o700)
+            outside = managed / "outside"
+            outside.mkdir(mode=0o700)
+            victim = outside / "package-lock.json"
+            victim.write_bytes(b"unrelated-lock-do-not-touch")
+            os.chmod(victim, 0o644)
+            victim_before = victim.lstat()
+            victim_before_identity = (victim_before.st_dev, victim_before.st_ino)
+
+            # The same-UID racer's swap: RELEASE_DIR itself
+            # ("managed/release") no longer exists as a real directory --
+            # it is now a symlink to the sibling "outside" directory.
+            release_symlink = managed / "release"
+            release_symlink.symlink_to(outside, target_is_directory=True)
+
+            lock_path = release_symlink / "package-lock.json"
+            # Sanity: the lexical path really does resolve, through the
+            # ancestor symlink, to the unrelated victim file -- if this
+            # ever stopped being true the rest of this test would not be
+            # exercising the reported bug.
+            self.assertEqual(
+                lock_path.resolve(strict=True), victim.resolve(strict=True)
+            )
+
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "cannot inspect link parent|link parent is missing|"
+                    "unsafe link parent",
+                ):
+                    installer.tighten_generated_private_file_mode(lock_path)
+
+            # The unrelated file in "outside" must be completely untouched
+            # -- neither its mode nor its content -- through the ancestor
+            # symlink.
+            victim_after = victim.lstat()
+            self.assertEqual(
+                stat.S_IMODE(victim_after.st_mode),
+                0o644,
+                "an unrelated file reached only through a swapped ancestor "
+                "directory must never be chmod'ed",
+            )
+            self.assertEqual(
+                (victim_after.st_dev, victim_after.st_ino), victim_before_identity
+            )
+            self.assertEqual(victim.read_bytes(), b"unrelated-lock-do-not-touch")
 
 
 if __name__ == "__main__":

@@ -4,11 +4,16 @@ This is a source-level, fail-closed integration candidate. It installs a pinned
 Prime Agent runtime without rebuilding, rewriting, repackaging, or replacing
 `/Applications/Orca.app`.
 
-The installed Orca 1.4.182 source already contains Prime Agent command
-detection, launch, process identity, resume, and agent-directory routing. The
-missing local prerequisite is a trustworthy `prime-agent` command. This
-directory supplies that prerequisite, but the real user install has not been
-run.
+The installed Orca source already contains Prime Agent command detection,
+launch, process identity, resume, and agent-directory routing -- this
+candidate's evidence (including the real, non-mocked `tests/sandbox_e2e.py`
+lifecycle replay) was most recently gathered against installed Orca 1.4.184.
+That version number is not itself a live gate: `verify_orca_support()` never
+compares an Orca version string, it checks the actual support-file markers
+and hashes under `/Applications/Orca.app` at install/verify time, so it stays
+correct as Orca is updated. The missing local prerequisite is a trustworthy
+`prime-agent` command. This directory supplies that prerequisite, but the
+real user install has not been run.
 
 ## Pinned upstream evidence
 
@@ -250,13 +255,15 @@ temporary Extreme SSD directory:
 /usr/bin/python3 tests/sandbox_e2e.py
 ```
 
-The current unit suite has 96 tests, including deterministic runtime-command and
+The current unit suite has 99 tests, including deterministic runtime-command and
 resume/session guards, launch-lock, PATH, private npm probe, ancestor and
 durable-tree ordering, pending-journal and receipt publication races,
 leading-daemon-socket grammar, late-occupant, process-scan, unresolved-manifest,
 interrupted-forward/rollback recovery, symlinked-patched-asset-output,
 verified-link-ancestor-swap (both creation and dir_fd-bound removal),
-removed-path-reoccupation, and optimized-mode-assert-survival fault
+removed-path-reoccupation, generated-private-file ancestor-directory-swap
+(RELEASE_DIR itself swapped for a symlink to a sibling directory), and
+optimized-mode-assert-survival fault
 injections. The sandbox patches
 every managed target path and asserts in a `finally` gate that the real
 `~/.prime`, command, shared-tool root, release, state, probe-home, receipt,
