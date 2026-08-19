@@ -2123,7 +2123,7 @@ def make_patched_asset(
     expected_name: str,
     managed_name: str,
     output_name: str,
-) -> tuple[Path, str, dict[str, Any], tuple[int, int]]:
+) -> tuple[Path, str, dict[str, Any], tuple[int, int], dict[Path, str]]:
     safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", managed_name).strip("-")
     unpacked = RELEASE_DIR / f".unpacked-{safe_name}"
     # Must be freshly created, never a pre-existing directory: see
@@ -2314,7 +2314,25 @@ def make_patched_asset(
     published_stat = patched.lstat()
     published_identity = (published_stat.st_dev, published_stat.st_ino)
     shutil.rmtree(unpacked)
-    return patched, sha256_bytes(patched_raw), manifest, published_identity
+    # content_digests: the ORIGINAL tarball's own per-file digest map,
+    # captured by safe_extract_main_asset() directly from the digest-
+    # verified tarball's bytes as they were streamed to disk -- strictly
+    # BEFORE `npm ci` (or anything else) ever ran. Every entry describes
+    # exactly what safe_extract_main_asset() itself wrote to `package_dir`;
+    # every path this loop above archived into `patched_raw` was verified
+    # against this same digest immediately before its archive.addfile()
+    # call, except `manifest_relative` (package.json), whose entry was
+    # deliberately reassigned above to describe the bytes this function
+    # itself just published in its place. Returned so a caller that later
+    # compares some INDEPENDENTLY produced copy of one of these same
+    # relative paths (e.g. `npm ci`'s own materialized
+    # node_modules/prime-agent/dist/bundle/cli.js) can use THIS map as an
+    # untamperable baseline -- fixed before npm ever ran, and therefore
+    # never influenced by a same-UID swap that happens during OR after
+    # npm's own subprocess window (round 25, 2026-08-19, P1-A; see
+    # _install_locked_within_release_dir()'s entrypoint-digest capture,
+    # which is the only current consumer of this return value).
+    return patched, sha256_bytes(patched_raw), manifest, published_identity, content_digests
 
 
 def resolved_local_asset(resolved: str) -> Path:
@@ -2543,6 +2561,153 @@ def validate_generated_lock(
         "packages_checked": checked,
         "registry_packages_checked": registry_checked,
     }
+
+
+def declared_top_level_node_modules_packages(packages: dict[str, Any]) -> frozenset[str]:
+    """The set of DEPTH-1 node_modules-relative package directory paths
+    `packages` (a validated generated package-lock.json's own "packages"
+    map, as produced by `npm install --package-lock-only` and already
+    confirmed well-formed by validate_generated_lock()) declares -- e.g.
+    "node_modules/prime-agent" or "node_modules/@earendil-works/pi-ai" for
+    a direct top-level dependency, EXCLUDING any further-nested
+    peer-dependency entry (a lock_path containing more than one
+    "node_modules/" segment, e.g.
+    "node_modules/parent/node_modules/child"), which real npm's own
+    hoisting/`--omit=dev` behavior may or may not actually materialize at
+    the top level and this function does not attempt to reason about (see
+    assert_materialized_node_modules_matches_lock()'s docstring for what
+    that residual means in practice).
+
+    Each entry's NAME is resolved via package_name_from_lock_path() -- the
+    SAME resolution validate_generated_lock() already uses to establish
+    package identity elsewhere in this file -- rather than parsed
+    positionally out of `lock_path` alone: real npm always names a
+    top-level lock_path after the exact directory it materializes
+    ("node_modules/<name>"), so the two coincide for any real generated
+    lock, but going through the shared resolver keeps this function
+    consistent with the rest of this file's notion of "what package does
+    this lock row identify" in the one case they could diverge (a row
+    whose own declared "name" differs from its lock_path's trailing
+    segment).
+
+    Used as the authoritative "what npm ci is SUPPOSED to have installed
+    at the top level of node_modules/" baseline for
+    assert_materialized_node_modules_matches_lock() -- built entirely from
+    the SAME lock file content validate_generated_lock() already pinned
+    the whole install to (via GENERATED_LOCK_SHA256), captured before
+    `npm ci` ever runs, not from anything read after.
+    """
+    declared: set[str] = set()
+    for lock_path, row in packages.items():
+        if not isinstance(lock_path, str) or not lock_path.startswith("node_modules/"):
+            continue
+        if not isinstance(row, dict):
+            continue
+        suffix = lock_path[len("node_modules/"):]
+        if not suffix or "/node_modules/" in lock_path:
+            continue
+        name = package_name_from_lock_path(lock_path, row)
+        if name:
+            declared.add(f"node_modules/{name}")
+    return frozenset(declared)
+
+
+def assert_materialized_node_modules_matches_lock(
+    release_dir: Path, declared_top_level: frozenset[str]
+) -> None:
+    """Round 25, 2026-08-19 (independent Claude opus/max round-25 review,
+    P1-B): `npm ci`'s own runtime is an external subprocess window this
+    installer does not control -- measured in a real install at several
+    minutes -- and a same-UID local attacker with filesystem write access
+    for that entire duration can plant an ENTIRELY NEW, undeclared package
+    directory directly under RELEASE_DIR/node_modules/ (a "sibling
+    module") without ever touching RELEASE_DIR's own directory entry, so
+    none of assert_release_dir_identity()/assert_release_dir_fd_identity()'s
+    several call sites in _install_locked_within_release_dir() raise, and
+    the install would otherwise complete with the planted package
+    published as if it were part of the verified closure.
+
+    This is a deliberately NARROWER mitigation than a full, independent
+    re-verification of every installed file's content against
+    package-lock.json's own SRI "integrity" hashes: those hashes are
+    per-TARBALL, not per-file, and are not practically re-derivable from
+    an already-extracted directory tree without re-creating
+    registry-identical tar bytes (ordering, metadata, and compression all
+    matter to the hash), which this installer cannot do without
+    duplicating -- and re-trusting -- the same network fetch npm's own
+    `--ci` integrity checking already performs. That fuller approach was
+    judged out of scope for this round; what this function does instead:
+    compare the SET of top-level (and top-level-scoped) directory NAMES
+    actually materialized under node_modules/ against `declared_top_level`
+    -- the set declared_top_level_node_modules_packages() derived from the
+    SAME lock file content this entire install is already pinned to -- and
+    fail closed if npm materialized anything not in that declared set.
+    This directly catches the "planted sibling module" repro above,
+    because a new package directory necessarily has a name absent from the
+    verified lock.
+
+    Deliberately NOT checked, and an ACCEPTED RESIDUAL of the same-UID
+    threat model (documented here rather than silently left uncovered, per
+    this file's existing convention for accepted residuals -- see e.g.
+    run_npm()'s own docstring for the analogous exec-time TOCTOU on
+    NODE/CLI paths, or managed_launch_guard_script()'s validate_exec_target()
+    docstring for the same class of residual applied to future invocations):
+    a same-UID attacker who instead overwrites the CONTENT of a package
+    directory that IS already declared in the lock (rather than adding a
+    new one) is NOT caught by this check. For the one file whose content
+    this installer actually executes -- node_modules/prime-agent/dist/
+    bundle/cli.js -- that residual is separately closed by the
+    pinned-tarball-digest comparison in
+    _install_locked_within_release_dir() (round 25, P1-A). It is NOT
+    closed for any other file in any other package, including the three
+    other locally patched workspace assets' own non-entrypoint files, or
+    any of this closure's registry dependencies' files beyond what
+    `npm ci`'s own registry-integrity checking already covers for a
+    genuine, unmodified registry download. Nested peer-dependency
+    node_modules (a package's own node_modules/ subdirectory) are also not
+    walked by this check, for the same reason
+    declared_top_level_node_modules_packages() excludes them from the
+    declared set: real npm's own hoisting behavior for this closure is not
+    something this installer's review/test environment can assert one way
+    or the other, and asserting the wrong thing would produce a false
+    positive on every real install rather than a real protection. Be
+    precise about this scope in any future review: this closes the
+    "undeclared sibling package" half of the round-25 P1-B repro, not the
+    full same-UID-filesystem-access-for-the-duration-of-npm-ci threat
+    model.
+    """
+    node_modules_root = release_dir / "node_modules"
+    if node_modules_root.is_symlink() or not node_modules_root.is_dir():
+        raise PrimeInstallError("npm did not materialize a private node_modules directory")
+    materialized: set[str] = set()
+    for entry in sorted(node_modules_root.iterdir(), key=lambda item: item.name):
+        name = entry.name
+        if entry.is_symlink():
+            raise PrimeInstallError(
+                f"materialized node_modules entry is a symlink: node_modules/{name}"
+            )
+        if not entry.is_dir():
+            continue
+        if name == ".bin":
+            continue
+        if name.startswith("@"):
+            for scoped_entry in sorted(entry.iterdir(), key=lambda item: item.name):
+                scoped_name = scoped_entry.name
+                if scoped_entry.is_symlink():
+                    raise PrimeInstallError(
+                        "materialized node_modules entry is a symlink: "
+                        f"node_modules/{name}/{scoped_name}"
+                    )
+                if scoped_entry.is_dir():
+                    materialized.add(f"node_modules/{name}/{scoped_name}")
+            continue
+        materialized.add(f"node_modules/{name}")
+    unexpected = sorted(materialized - declared_top_level)
+    if unexpected:
+        raise PrimeInstallError(
+            "npm materialized undeclared node_modules package(s) not present "
+            f"in the verified lock: {unexpected}"
+        )
 
 
 def run_npm(
@@ -3061,9 +3226,21 @@ def managed_launch_guard_script(
     """`node_sha256`/`cli_sha256` are SHA-256 content digests -- for NODE,
     captured at extraction time by extract_node_toolchain() (before any
     `npm` subprocess this installer does not control ever ran); for CLI,
-    captured via capture_private_ssd_asset_digest() immediately after `npm
-    ci` returns and re-verified at every subsequent step before this call
-    (see _install_locked()) -- baked into the generated script as
+    PINNED to the original, digest-verified prime-agent tarball's own
+    per-file digest for dist/bundle/cli.js (via make_patched_asset()'s
+    content_digests return value), and only confirmed -- never merely
+    read and trusted -- against `npm ci`'s actual materialized output
+    immediately after it returns (see
+    _install_locked_within_release_dir()). Round 25, 2026-08-19
+    (independent Claude opus/max round-25 review, P1-A): an earlier
+    version of this docstring claimed the post-`npm ci` disk read itself
+    was "the earliest point [CLI's] final, trustworthy value can be
+    known" -- that was false, since a same-UID racer who overwrites CLI's
+    path DURING `npm ci`'s own runtime (not merely after it returns) had
+    their bytes read and trusted as this permanent baseline. Anchoring to
+    the pre-npm, tarball-derived digest instead means the baseline can
+    never be attacker-influenced regardless of when the swap happens --
+    baked into the generated script as
     NODE_SHA256/CLI_SHA256 and checked by validate_exec_target() before
     EVERY future real invocation of the managed command, not merely during
     this install. Round 22's launch guard validated NODE/CLI structurally
@@ -4778,7 +4955,7 @@ def _install_locked_within_release_dir(
     for managed_name in workspace_order:
         declaration = WORKSPACE_PACKAGES[managed_name]
         official_asset_name = str(declaration["official_asset"])
-        patched, digest, manifest, identity = make_patched_asset(
+        patched, digest, manifest, identity, _workspace_content_digests = make_patched_asset(
             assets_dir / official_asset_name,
             ASSETS[official_asset_name],
             upstream_lock,
@@ -4791,7 +4968,20 @@ def _install_locked_within_release_dir(
         patched_manifests[managed_name] = manifest
         patched_asset_identities[patched.name] = identity
     main_asset_name = f"prime-agent-{VERSION}.tgz"
-    patched_asset, patched_sha, patched_manifest, patched_asset_identity = make_patched_asset(
+    (
+        patched_asset,
+        patched_sha,
+        patched_manifest,
+        patched_asset_identity,
+        # The main "prime-agent" asset's own tarball-derived, per-file
+        # digest map -- the ONLY one of the four make_patched_asset() calls
+        # this function needs the content_digests return value from, since
+        # it is the only one whose extracted tree contains the entrypoint
+        # this installer later executes (dist/bundle/cli.js). Threaded
+        # through to the entrypoint-digest capture further below (round 25,
+        # 2026-08-19, P1-A).
+        main_content_digests,
+    ) = make_patched_asset(
         assets_dir / main_asset_name,
         ASSETS[main_asset_name],
         upstream_lock,
@@ -4890,6 +5080,18 @@ def _install_locked_within_release_dir(
     if not isinstance(generated_lock, dict):
         raise PrimeInstallError("generated lock is invalid")
     closure = validate_generated_lock(generated_lock_raw, generated_lock, patched_assets)
+    # The set of top-level node_modules/ package directory names this
+    # closure DECLARES -- derived from the SAME "packages" map
+    # validate_generated_lock() just pinned the whole install to (via
+    # GENERATED_LOCK_SHA256), captured now, before `npm ci` runs. Used by
+    # assert_materialized_node_modules_matches_lock() further below, after
+    # `npm ci` returns, to catch a same-UID racer planting an undeclared
+    # sibling package directly on disk during that subprocess's own
+    # runtime (round 25, 2026-08-19, P1-B; see that function's own
+    # docstring for exactly what this does and does not cover).
+    declared_top_level_packages = declared_top_level_node_modules_packages(
+        generated_lock["packages"]
+    )
     # Re-verify both package.json and the just-validated package-lock.json
     # are still exactly what was read/validated above, immediately before
     # `npm ci` independently re-reads both from RELEASE_DIR on its own
@@ -4936,13 +5138,23 @@ def _install_locked_within_release_dir(
     # and node is about to be baked into the launch guard as a permanent
     # future trust anchor below.
     verify_unchanged_private_ssd_asset_digest(node, node_sha256, node_identity)
+    # Round 25, 2026-08-19 (independent Claude opus/max round-25 review,
+    # P1-B): before trusting ANYTHING `npm ci` materialized under
+    # node_modules/, confirm npm did not ALSO materialize an undeclared
+    # top-level package directory -- a same-UID racer's "sibling module",
+    # planted directly on disk at any point during `npm ci`'s own
+    # multi-minute runtime without ever touching RELEASE_DIR's own
+    # directory entry, so none of the six assert_release_dir_identity()/
+    # assert_release_dir_fd_identity() calls in this function would ever
+    # raise for it. See assert_materialized_node_modules_matches_lock()'s
+    # own docstring for exactly what this check does and does not cover.
+    assert_materialized_node_modules_matches_lock(RELEASE_DIR, declared_top_level_packages)
     installed_package = RELEASE_DIR / "node_modules/prime-agent"
     if installed_package.is_symlink() or not installed_package.is_dir():
         raise PrimeInstallError("npm did not materialize a private Prime Agent package")
     # Round 24, 2026-08-19 (independent Codex sol/max round-23 review,
-    # P1-2): capture the entrypoint's content digest right NOW -- the
-    # earliest point its final, `npm ci`-produced content can be known --
-    # strictly before any further installer-side step (moving node_modules,
+    # P1-2): capture the entrypoint's content digest right NOW -- strictly
+    # before any further installer-side step (moving node_modules,
     # chmod'ing the entrypoint, generating the launch guard) gives a
     # same-UID racer more time to overwrite it in place. RELEASE_DIR's own
     # identity checks above prove the DIRECTORY was not swapped; they say
@@ -4952,9 +5164,32 @@ def _install_locked_within_release_dir(
     # whatever is on disk at its own, much later call time rather than
     # COMPARING against a value captured before this vulnerable window, so
     # it would silently treat a swap that happened before its first call as
-    # the legitimate baseline. See capture_private_ssd_asset_digest() and
-    # verify_unchanged_private_ssd_asset_digest() for how this is
-    # re-verified at each subsequent step below.
+    # the legitimate baseline. See verify_unchanged_private_ssd_asset_digest()
+    # for how this is re-verified at each subsequent step below.
+    #
+    # Round 25, 2026-08-19 (independent Claude opus/max round-25 review,
+    # P1-A): round 24's claim, directly above, that this is "the EARLIEST
+    # point its final, trustworthy value can be known" was wrong -- this
+    # read happens AFTER `npm ci` has already returned, so a same-UID
+    # racer who overwrites this exact path DURING `npm ci`'s own runtime
+    # (rather than after it returns) has THEIR bytes read here and would
+    # be adopted as the permanent trust baseline, with every check below
+    # merely re-confirming the racer's own value never changed again.
+    # `main_content_digests` (returned by the make_patched_asset() call
+    # above for the "prime-agent" asset) fixes this: it is
+    # safe_extract_main_asset()'s own per-file digest map, captured
+    # directly from the digest-verified ORIGINAL tarball's bytes as they
+    # were streamed to disk -- strictly BEFORE `npm ci` (or anything else
+    # in this function) ever ran, and never influenced by anything that
+    # happens afterward, in-window or not. Comparing the freshly observed
+    # on-disk digest below against THIS pinned value, rather than trusting
+    # the observed value outright, closes the window entirely for this one
+    # file: it does not matter WHEN a same-UID swap happened, only whether
+    # the final bytes match what the original, digest-verified tarball
+    # actually contained. (Empirically confirmed, by this round's own real,
+    # non-mocked tests/sandbox_e2e.py run: real `npm ci`'s materialized
+    # dist/bundle/cli.js is byte-identical to the raw tarball member, so
+    # this is a direct equality check, not a heuristic.)
     pre_move_entrypoint = installed_package / "dist/bundle/cli.js"
     if pre_move_entrypoint.is_symlink() or not pre_move_entrypoint.is_file():
         raise PrimeInstallError("Prime Agent entrypoint missing")
@@ -4974,9 +5209,37 @@ def _install_locked_within_release_dir(
     # to, just applied here instead of after the move -- right now, in
     # place, before any read of this file is attempted.
     os.chmod(pre_move_entrypoint, 0o700)
-    entrypoint_sha256, entrypoint_identity = capture_private_ssd_asset_digest(
+    observed_entrypoint_sha256, entrypoint_identity = capture_private_ssd_asset_digest(
         pre_move_entrypoint
     )
+    pinned_entrypoint_sha256 = main_content_digests.get(Path("dist/bundle/cli.js"))
+    if pinned_entrypoint_sha256 is None:
+        # Cannot happen given safe_extract_main_asset()'s own
+        # manifest/digest self-consistency check (every regular file it
+        # extracted has a content_digests entry) together with the
+        # pre_move_entrypoint.is_file() check just above, which already
+        # proves `npm ci` materialized this exact relative path from the
+        # patched tarball make_patched_asset() built from that same
+        # extraction -- defense-in-depth against this function's own logic
+        # drifting from that invariant, not a same-UID-attacker detection.
+        raise PrimeInstallError(
+            "Prime Agent entrypoint missing from the tarball-verified digest map"
+        )
+    if observed_entrypoint_sha256 != pinned_entrypoint_sha256:
+        raise PrimeInstallError(
+            "Prime Agent entrypoint content does not match the digest-verified "
+            "original tarball -- a same-UID actor may have swapped it during "
+            "or after npm ci"
+        )
+    # From here on, `entrypoint_sha256` is the PINNED, tarball-derived
+    # value -- never the value freshly read from disk above -- so every
+    # downstream re-verification, the launch guard's baked-in CLI_SHA256,
+    # and the receipt's entrypoint_sha256 field are all anchored to a
+    # baseline that was fixed before npm ever ran. The comparison above
+    # already confirmed the two are equal for THIS install; using the
+    # pinned one is what makes that comparison load-bearing for every
+    # future invocation rather than a one-time self-check.
+    entrypoint_sha256 = pinned_entrypoint_sha256
     global_root = RELEASE_DIR / "lib/node_modules"
     # Round 24, 2026-08-19: create "lib" and rename node_modules into it
     # via dir_fd-relative operations bound to release_dir_fd, rather than
@@ -5055,11 +5318,15 @@ def _install_locked_within_release_dir(
         "lifecycle_lock": os.fspath(lifecycle_lock_path()),
         "node_target": os.fspath(node),
         "npm_target": os.fspath(npm_cli),
-        # Provenance only, round 24 (2026-08-19): the content digests
-        # captured at extraction time (node/npm_cli) and immediately after
-        # `npm ci` returned (the entrypoint) -- see extract_node_toolchain()
-        # and capture_private_ssd_asset_digest(). The actual enforcement
-        # these values back happens DURING install, at each re-verification
+        # Provenance only, round 24 (2026-08-19), updated round 25
+        # (2026-08-19, P1-A): the content digests captured at extraction
+        # time (node/npm_cli) and, for the entrypoint, PINNED to the
+        # original digest-verified prime-agent tarball's own per-file
+        # digest for dist/bundle/cli.js -- confirmed (not merely read) to
+        # match `npm ci`'s actual materialized output -- see
+        # extract_node_toolchain() and make_patched_asset()'s
+        # content_digests return value. The actual enforcement these
+        # values back happens DURING install, at each re-verification
         # point above, and permanently at every future real invocation via
         # the digests baked into the launch guard
         # (managed_launch_guard_script()'s NODE_SHA256/CLI_SHA256) -- not
