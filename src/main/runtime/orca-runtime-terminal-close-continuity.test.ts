@@ -312,7 +312,7 @@ describe('terminal close and handle incarnation continuity', () => {
     harness.retirePersistedTab()
     harness.acknowledged.resolve()
     await expect(closing).resolves.toMatchObject({ handle, tabId: TAB_ID, ptyKilled: false })
-    expect(harness.kill).toHaveBeenCalledWith(PTY_ID)
+    expect(harness.kill).toHaveBeenCalledWith(PTY_ID, { terminatedBy: 'operator' })
     expect(harness.closeTerminal).not.toHaveBeenCalled()
     expect(harness.getSession().tabsByWorktree[WORKTREE_ID]).toEqual([])
   })
@@ -343,8 +343,8 @@ describe('terminal close and handle incarnation continuity', () => {
     harness.retirePersistedTab()
     harness.acknowledged.resolve()
     await expect(closing).resolves.toMatchObject({ ptyKilled: false })
-    expect(harness.kill).toHaveBeenCalledWith(PTY_ID)
-    expect(harness.kill).toHaveBeenCalledWith(SIBLING_PTY_ID)
+    expect(harness.kill).toHaveBeenCalledWith(PTY_ID, { terminatedBy: 'operator' })
+    expect(harness.kill).toHaveBeenCalledWith(SIBLING_PTY_ID, { terminatedBy: 'operator' })
   })
 
   it('uses verified teardown after retirement before falling back to kill', async () => {
@@ -360,7 +360,8 @@ describe('terminal close and handle incarnation continuity', () => {
     harness.acknowledged.resolve()
     await expect(closing).resolves.toMatchObject({ ptyKilled: true })
     expect(harness.stopAndWait).toHaveBeenCalledWith(PTY_ID, {
-      deadlineMs: expect.any(Number)
+      deadlineMs: expect.any(Number),
+      terminatedBy: 'operator'
     })
     expect(harness.kill).not.toHaveBeenCalled()
   })
@@ -403,7 +404,7 @@ describe('terminal close and handle incarnation continuity', () => {
       ptyStopVerdict: 'unverifiable',
       ptyStopReason: 'a follow-up stop was issued but its outcome could not be verified'
     })
-    expect(harness.kill).toHaveBeenCalledWith(PTY_ID)
+    expect(harness.kill).toHaveBeenCalledWith(PTY_ID, { terminatedBy: 'operator' })
   })
 
   it('leaves a confirmed kill receipt free of any stop verdict', async () => {
@@ -438,9 +439,10 @@ describe('terminal close and handle incarnation continuity', () => {
       ptyStopReason: 'provider_unavailable'
     })
     expect(harness.stopAndWait).toHaveBeenCalledWith(PTY_ID, {
-      deadlineMs: expect.any(Number)
+      deadlineMs: expect.any(Number),
+      terminatedBy: 'operator'
     })
-    expect(harness.kill).toHaveBeenCalledWith(PTY_ID)
+    expect(harness.kill).toHaveBeenCalledWith(PTY_ID, { terminatedBy: 'operator' })
   })
 
   it('finishes PTY teardown when the session store disappears after retirement', async () => {
@@ -462,7 +464,8 @@ describe('terminal close and handle incarnation continuity', () => {
     await expect(closing).resolves.toMatchObject({ handle, tabId: TAB_ID, ptyKilled: false })
     expect(harness.closeTerminal).toHaveBeenCalledWith(TAB_ID)
     expect(harness.stopAndWait).toHaveBeenCalledWith(RUNTIME_OWNED_PTY_ID, {
-      deadlineMs: expect.any(Number)
+      deadlineMs: expect.any(Number),
+      terminatedBy: 'operator'
     })
   })
 

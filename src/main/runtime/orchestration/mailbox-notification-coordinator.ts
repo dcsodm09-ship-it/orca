@@ -4,6 +4,7 @@ import type {
   OrchestrationMailboxOwner,
   RoutedOrchestrationMailbox
 } from './mailbox-owner'
+import type { OrchestrationMailboxDeliveryOrigin } from './mailbox-pointer-delivery-origin'
 import type {
   OrchestrationMailboxPointerDelivery,
   OrchestrationMessageWaiter
@@ -27,15 +28,19 @@ export class OrchestrationMailboxNotificationCoordinator<
 > {
   constructor(private readonly deps: NotificationCoordinatorDependencies<TWaiter>) {}
 
-  deliverForHandle(handle: string, reservedTypes?: ReadonlySet<string>): void {
-    this.deps.pointerDelivery.deliverForHandle(handle, reservedTypes)
+  deliverForHandle(
+    handle: string,
+    reservedTypes?: ReadonlySet<string>,
+    origin?: OrchestrationMailboxDeliveryOrigin
+  ): void {
+    this.deps.pointerDelivery.deliverForHandle(handle, reservedTypes, origin)
   }
 
   deliverForLeaf(leaf: OrchestrationMailboxLeaf): void {
     this.notifyForwarded(this.deps.mailboxOwner.routeForeignDirectMessages(leaf))
     const mailboxHandle = this.deps.mailboxOwner.resolve(leaf)
     if (mailboxHandle) {
-      this.deps.pointerDelivery.deliver(leaf, { mailboxHandle })
+      this.deps.pointerDelivery.deliver(leaf, { mailboxHandle, origin: 'idle-transition' })
     }
   }
 

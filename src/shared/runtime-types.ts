@@ -634,6 +634,9 @@ export type RuntimeTerminalSend = {
   accepted: boolean
   bytesWritten: number
   refusedReason?: 'no-agent' | 'permission'
+  // Why (#13805): true only when the write went through settlement verification
+  // (sendTerminalAgentPrompt's workingSequence check), not a fire-and-forget PTY write.
+  submissionVerified?: boolean
 }
 
 export type RuntimeTerminalAgentStatusState = 'working' | 'permission' | 'idle' | null

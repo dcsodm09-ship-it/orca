@@ -153,9 +153,22 @@ export const ORCHESTRATION_COMMAND_SPECS: CommandSpec[] = [
     path: ['orchestration', 'task-update'],
     summary: 'Update a task status',
     usage:
-      'orca orchestration task-update --id <task_id> --status <status> [--result <json>] [--run <run_id>] [--from <handle>] [--retry-request <id>] [--json]',
-    allowedFlags: [...GLOBAL_FLAGS, 'id', 'status', 'result', 'run', 'from', 'retry-request'],
-    notes: ['Valid --status values: pending, ready, dispatched, completed, failed, blocked.']
+      'orca orchestration task-update --id <task_id> --status <status> [--result <json>] [--reason <text>] [--replacement-task-id <task_id>] [--run <run_id>] [--from <handle>] [--retry-request <id>] [--json]',
+    allowedFlags: [
+      ...GLOBAL_FLAGS,
+      'id',
+      'status',
+      'result',
+      'reason',
+      'replacement-task-id',
+      'run',
+      'from',
+      'retry-request'
+    ],
+    notes: [
+      'Valid --status values: pending, ready, dispatched, completed, failed, blocked, cancelled, superseded.',
+      '--reason and --replacement-task-id apply only to --status cancelled|superseded.'
+    ]
   },
   ...ORCHESTRATION_WORKER_COMMAND_SPECS,
   {

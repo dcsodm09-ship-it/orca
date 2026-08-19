@@ -158,7 +158,10 @@ export function acknowledgeRunDelivery(
     if (messageIds.length > 0) {
       const placeholders = messageIds.map(() => '?').join(',')
       this.db
-        .prepare(`UPDATE messages SET read = 1 WHERE id IN (${placeholders})`)
+        .prepare(
+          `UPDATE messages SET read = 1, delivered_at = COALESCE(delivered_at, datetime('now'))
+           WHERE id IN (${placeholders})`
+        )
         .run(...messageIds)
     }
     this.db

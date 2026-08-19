@@ -1,6 +1,7 @@
 /** Turns a worker escalation into a dispatch failure, honoring the circuit breaker. */
 import type { OrchestrationDb } from './db'
 import type { MessageRow } from './types'
+import { isTerminalTaskStatus } from './types'
 
 /** Returns the task id when the escalation broke the circuit (task is now failed), else null. */
 export function applyEscalationToDispatch(
@@ -26,7 +27,7 @@ export function applyEscalationToDispatch(
   }
 
   const task = db.getTask(taskId)
-  if (!task || task.status === 'completed' || task.status === 'failed') {
+  if (!task || isTerminalTaskStatus(task.status)) {
     return null
   }
 

@@ -344,6 +344,32 @@ describe('Task/Dispatch invariant transactions', () => {
     }
   )
 
+  it('does not reopen a Task completed via its replacement Dispatch when the superseded terminal exits stale (#11499)', () => {
+    const { db } = createDatabase()
+    const task = db.createTask({ spec: 'supersede narrative work' })
+    const dispatchA = db.createDispatchContext(task.id, 'term_A')
+
+    // Supersede A: fence it before re-dispatch — the #14961 invariant now rejects a direct
+    // task-update to 'ready' while A is still active, so recovery goes through failDispatch first.
+    db.failDispatch(dispatchA.id, 'superseded by re-dispatch to term_B')
+    expect(db.getTask(task.id)?.status).toBe('ready')
+
+    const dispatchB = db.createDispatchContext(task.id, 'term_B')
+    db.updateTaskStatus(task.id, 'completed', 'done via B')
+    expect(db.getTask(task.id)).toMatchObject({ status: 'completed', result: 'done via B' })
+    expect(db.getDispatchContextById(dispatchB.id)?.status).toBe('completed')
+
+    // Terminal A is cleaned up late. The real exit handler (orca-runtime.ts's
+    // failActiveDispatchOnExit) resolves the active Dispatch by A's own terminal handle first —
+    // A was already fenced above, so it finds nothing to touch.
+    expect(db.getActiveDispatchForTerminal('term_A')).toBeUndefined()
+    db.failDispatch(dispatchA.id, 'Agent exited with code -1', { workerProcessExited: true })
+
+    expect(db.getTask(task.id)).toMatchObject({ status: 'completed', result: 'done via B' })
+    expect(db.getDispatchContextById(dispatchB.id)?.status).toBe('completed')
+    expect(db.getDispatchContextById(dispatchA.id)?.status).toBe('failed')
+  })
+
   it('keeps a federated late start authoritative after rejecting Task failure', () => {
     const { db } = createDatabase()
     const task = db.createTask({ spec: 'federated lifecycle' })
@@ -370,6 +396,70 @@ describe('Task/Dispatch invariant transactions', () => {
     expect(db.getTask(task.id)?.status).toBe('dispatched')
     expect(db.getDispatchContextById(started.dispatch.id)?.status).toBe('dispatched')
     expect(db.getWorkerDispatch(started.dispatch.id)?.state).toBe('ready')
+  })
+
+  // #15048: the exit failActiveDispatchOnExit observes when workerStop's own
+  // closeTerminal() kills the pty must not race settleWorkerStop — it must defer.
+  it('does not fail a Dispatch whose worker is already stopping under orchestration.workerStop (#15048)', () => {
+    const { db } = createDatabase()
+    const task = db.createTask({ spec: 'graceful stop race' })
+    const started = db.createStartingWorkerDispatch({ taskId: task.id, startOptions: {} })
+    db.prepareStartingWorkerAuthority({
+      dispatchId: started.dispatch.id,
+      handle: 'term_worker',
+      paneKey: 'tab_worker:eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+      processIncarnation: 'worker:1',
+      worktreeId: 'repo::worker',
+      effects: [],
+      setupState: 'not_applicable',
+      terminalOwnership: 'created'
+    })
+    db.markWorkerDispatchReady(started.dispatch.id)
+    const begun = db.beginWorkerStop(started.dispatch.id)
+    expect(begun.disposition).toBe('stopping')
+    expect(db.getWorkerDispatch(started.dispatch.id)?.state).toBe('stopping')
+
+    // The stop's own closeTerminal() kill fires the exit handler before settleWorkerStop runs.
+    const result = db.failDispatch(started.dispatch.id, 'Agent exited with code -1', {
+      workerProcessExited: true
+    })
+    expect(result?.status).toBe('dispatched')
+    expect(db.getWorkerDispatch(started.dispatch.id)?.state).toBe('stopping')
+
+    // settleWorkerStop must still see 'stopping' — no uncaught dispatch_inactive.
+    expect(() => db.settleWorkerStop(started.dispatch.id)).not.toThrow()
+    expect(db.getWorkerDispatch(started.dispatch.id)?.state).toBe('stopped')
+    expect(db.getDispatchContextById(started.dispatch.id)).toMatchObject({
+      status: 'failed',
+      last_failure: 'stopped'
+    })
+  })
+
+  it('records operator-initiated termination provenance on a Dispatch fail-on-exit (#15048)', () => {
+    const { db } = createDatabase()
+    const task = db.createTask({ spec: 'operator close' })
+    const started = db.createStartingWorkerDispatch({ taskId: task.id, startOptions: {} })
+    db.prepareStartingWorkerAuthority({
+      dispatchId: started.dispatch.id,
+      handle: 'term_worker',
+      paneKey: 'tab_worker:ffffffff-ffff-4fff-8fff-ffffffffffff',
+      processIncarnation: 'worker:1',
+      worktreeId: 'repo::worker',
+      effects: [],
+      setupState: 'not_applicable',
+      terminalOwnership: 'created'
+    })
+    db.markWorkerDispatchReady(started.dispatch.id)
+
+    db.failDispatch(started.dispatch.id, 'Terminal closed before the agent finished', {
+      workerProcessExited: true,
+      terminatedBy: 'operator'
+    })
+
+    expect(db.getWorkerDispatch(started.dispatch.id)).toMatchObject({
+      state: 'failed',
+      terminated_by: 'operator'
+    })
   })
 })
 

@@ -14,7 +14,10 @@ import { MESSAGE_TYPES } from '../../orchestration/types'
 import { buildDispatchPreamble } from '../../orchestration/preamble'
 import { formatMessageBanner } from '../../orchestration/formatter'
 import { isGroupAddress, resolveGroupAddress } from '../../orchestration/groups'
-import { reconcileLifecycleMessage } from '../../orchestration/lifecycle-reconciliation'
+import {
+  hasLifecycleAuthority,
+  reconcileLifecycleMessage
+} from '../../orchestration/lifecycle-reconciliation'
 import { waitForFederatedLifecycleSettlement } from '../../orchestration/federation-lifecycle-settlement'
 import { abbreviateOrchestrationTasks } from '../../../../shared/orchestration-task-summary'
 import {
@@ -36,6 +39,7 @@ import type { OrcaRuntimeService } from '../../orca-runtime'
 import type { RunRow } from '../../orchestration/types'
 import { encodeFederatedControlMessage } from '../../orchestration/federation-control-message'
 import { bindCoordinatorMutationPayload } from '../../orchestration/dispatch-message-binding'
+import { warnStaleDispatches } from '../../orchestration/coordinator-task-dispatch'
 import {
   ORCHESTRATION_FEDERATION_CONTROL_MAIL_PROTOCOL_VERSION,
   ORCHESTRATION_FEDERATION_LIFECYCLE_SETTLEMENT_PROTOCOL_VERSION
@@ -47,7 +51,9 @@ const TASK_STATUSES: TaskStatus[] = [
   'dispatched',
   'completed',
   'failed',
-  'blocked'
+  'blocked',
+  'cancelled',
+  'superseded'
 ]
 
 async function routeAllMailboxPages(
@@ -219,7 +225,20 @@ const TaskCreateParams = z.object({
 })
 
 const TaskListParams = z.object({
-  status: z.enum(['pending', 'ready', 'dispatched', 'completed', 'failed', 'blocked']).optional(),
+  // Why (#14548): kept in sync with TASK_STATUSES/TaskUpdateParams - a status cancelTask can
+  // now produce must be listable, or `task-list --status cancelled` Zod-rejects a real state.
+  status: z
+    .enum([
+      'pending',
+      'ready',
+      'dispatched',
+      'completed',
+      'failed',
+      'blocked',
+      'cancelled',
+      'superseded'
+    ])
+    .optional(),
   ready: OptionalBoolean,
   // Why: server-side truncation keeps --brief cheap over SSH/relay instead of shipping full specs the CLI throws away.
   brief: OptionalBoolean,
@@ -238,11 +257,24 @@ const TaskUpdateParams = z.object({
       return ''
     })
     .pipe(
-      z.enum(['pending', 'ready', 'dispatched', 'completed', 'failed', 'blocked'], {
-        message: 'Missing --status'
-      })
+      z.enum(
+        [
+          'pending',
+          'ready',
+          'dispatched',
+          'completed',
+          'failed',
+          'blocked',
+          'cancelled',
+          'superseded'
+        ],
+        { message: 'Missing --status' }
+      )
     ),
   result: OptionalString,
+  // Why (#14548): only meaningful for status=cancelled|superseded, routed to cancelTask below.
+  reason: OptionalString,
+  replacementTaskId: OptionalString,
   run: OptionalString,
   callerTerminalHandle: OptionalString
 })
@@ -685,7 +717,18 @@ export const ORCHESTRATION_METHODS: RpcMethod[] = [
           ? db.getDispatchContextById(routing.dispatchId)
           : undefined
         const messageType = (params.type ?? 'status') as MessageType
-        const msg = db.insertMessage({
+        // Why (#7429): only a worker_done that names neither id AND wasn't addressed to a
+        // specific dispatch: mailbox is a candidate for identity adoption below — one that
+        // already names a dispatch: recipient took an explicit path and must not be silently
+        // reattributed to a different (if sole) active Dispatch.
+        const workerDonePayload =
+          messageType === 'worker_done' ? parseRemoteWorkerPayload(params.payload) : undefined
+        const workerDoneIdentityOmitted =
+          workerDonePayload !== undefined &&
+          workerDonePayload.taskId === undefined &&
+          workerDonePayload.dispatchId === undefined &&
+          !to?.startsWith('dispatch:')
+        let msg = db.insertMessage({
           from,
           to,
           subject: params.subject,
@@ -767,6 +810,19 @@ export const ORCHESTRATION_METHODS: RpcMethod[] = [
           }
           if (!authority.valid) {
             const code = authority.code
+            // Why (#13364): a same-pane worker_done rejected only for a missing/invalid
+            // capability (not a wrong-pane/wrong-task sender) is a supervised worker that's
+            // otherwise still legitimate — leaving it at 'ready'/'starting' forever hides a
+            // recoverable report behind a state a retried, correctly-authenticated worker_done
+            // can heal (settleWorkerReport already resurrects stop_unknown on settlement).
+            if (
+              msg.type === 'worker_done' &&
+              code === 'dispatch_capability_invalid' &&
+              dispatch &&
+              hasLifecycleAuthority(dispatch, msg)
+            ) {
+              db.markWorkerReportRejectedUnknown(dispatch.id, authority.reason)
+            }
             const rejection =
               db.convertLifecycleMessageToRejection(msg.id, code, authority.reason) ?? msg
             runtime.notifyMessageArrived(rejection.to_handle, rejection.type)
@@ -779,6 +835,18 @@ export const ORCHESTRATION_METHODS: RpcMethod[] = [
               }
             })
           }
+        }
+        // Why (#7429): an authorized worker_done that named neither id falls back to the
+        // sender's sole active Dispatch — persist the adopted ids onto the row itself (not just
+        // in-memory) before reconciling, since a later replay (e.g. orchestration.check
+        // re-reading this row) re-parses the stored payload from scratch with no fallback.
+        if (
+          msg.type === 'worker_done' &&
+          workerDoneIdentityOmitted &&
+          dispatch?.status === 'dispatched' &&
+          hasLifecycleAuthority(dispatch, msg)
+        ) {
+          msg = db.adoptWorkerDoneDispatchIdentity(msg.id, dispatch.task_id, dispatch.id) ?? msg
         }
         // Why: reconcile releases the dispatch lock before waking recipients, else a woken coordinator re-dispatches while the lock is still held.
         if (msg.type === 'worker_done' || msg.type === 'heartbeat') {
@@ -926,6 +994,25 @@ export const ORCHESTRATION_METHODS: RpcMethod[] = [
       // Why: a live runtime handle is authoritative; pane metadata is only the restart fallback.
       const paneKey = runtime.getTerminalPaneKey(handle) ?? params.terminalPaneKey
       const boundRun = paneKey ? db.getCurrentRunForPane(paneKey) : undefined
+      // Why (#14829/#10673): sweep stale dispatches as a side effect of the documented
+      // worker-start/check supervision loop, since nothing else calls warnStaleDispatches
+      // outside the retired Coordinator loop. --peek stays inspect-only; a non-peek call
+      // only escalates dispatches on its own bound Run plus the shared legacy bucket.
+      // Why: scoped from `runtime.getTerminalPaneKey(handle)` directly, NOT the `paneKey`
+      // above — that one falls back to `params.terminalPaneKey`, unvalidated client input
+      // (round 2 of this exact bug: round 1 fixed `params.run` leaking into this same sweep
+      // before resolveRunScope's authorization runs below; this is the same hole via a
+      // different input). Neither `params.run` nor a client-suppliable pane key may scope a
+      // DB write that happens before that authorization.
+      if (params.peek !== true) {
+        const serverPaneKey = runtime.getTerminalPaneKey(handle)
+        const serverBoundRun = serverPaneKey ? db.getCurrentRunForPane(serverPaneKey) : undefined
+        warnStaleDispatches(
+          db,
+          () => {},
+          new Set([ORCHESTRATION_LEGACY_RUN_ID, ...(serverBoundRun ? [serverBoundRun.id] : [])])
+        )
+      }
       if (params.run || boundRun) {
         const run = resolveRunScope(runtime, {
           runId: params.run,
@@ -1575,7 +1662,16 @@ export const ORCHESTRATION_METHODS: RpcMethod[] = [
           `Task ${params.id} was not found in Run ${run.id}.`
         )
       }
-      const task = db.updateTaskStatus(params.id, params.status, params.result)
+      // Why (#14548): cancelled/superseded are terminal-but-not-completed statuses with their
+      // own fencing (active-dispatch guard, replacement-run validation, dependent cascade) -
+      // updateTaskStatus doesn't know any of that, so route through cancelTask instead.
+      const task =
+        params.status === 'cancelled' || params.status === 'superseded'
+          ? db.cancelTask(params.id, params.status, {
+              reason: params.reason,
+              replacementTaskId: params.replacementTaskId
+            })
+          : db.updateTaskStatus(params.id, params.status, params.result)
       if (!task) {
         throw new Error(`Task not found: ${params.id}`)
       }
@@ -1635,7 +1731,29 @@ export const ORCHESTRATION_METHODS: RpcMethod[] = [
       }
       const to = params.to
 
-      if (task.status !== 'ready') {
+      // Why: resolved before the reuse lookup below so a stale, uninjected context can only be
+      // reused onto the terminal's CURRENT pane, not blindly rebound to it later (#14809).
+      let dispatchAuthority = runtime.getOrchestrationDispatchAuthority(to)
+      let assigneePaneKey =
+        dispatchAuthority?.paneKey ?? runtime.getTerminalPaneKey(to) ?? undefined
+      let processIncarnation =
+        dispatchAuthority?.paneKey && dispatchAuthority.processIncarnation
+          ? dispatchAuthority.processIncarnation
+          : undefined
+
+      // Why (#14809): a prior --to-only dispatch already committed status='dispatched' and
+      // claimed the terminal's one active-dispatch slot without ever touching it; an --inject
+      // retry on that identical task+terminal reuses the context instead of re-creating one
+      // (which would either hit the ready-only guard below or the occupied-slot guard).
+      // findReusableUninjectedDispatchContext itself refuses the reuse if assigneePaneKey now
+      // collides with a different active Dispatch's pane (a reminted handle landing on an
+      // occupied pane) — reusableCtx stays undefined and createDispatchContext below takes over.
+      const reusableCtx =
+        params.inject && task.status === 'dispatched'
+          ? db.findReusableUninjectedDispatchContext(task.id, to, assigneePaneKey)
+          : undefined
+
+      if (task.status !== 'ready' && !reusableCtx) {
         throw new Error(`Task ${params.task} is ${task.status}; only ready tasks can be dispatched`)
       }
 
@@ -1649,15 +1767,32 @@ export const ORCHESTRATION_METHODS: RpcMethod[] = [
               'or dispatch without --inject and send the prompt manually.'
           )
         }
+        // Why: the await above can span a process replacement (e.g. the terminal's live
+        // pane/process changes mid-check) - the authority snapshotted before it may no longer
+        // describe what `to` actually resolves to now. Re-snapshot and require an exact match
+        // before minting a capability against it; otherwise the DB would bind lifecycle
+        // authority to a process the real injected write never reaches (or vice versa).
+        const currentAuthority = runtime.getOrchestrationDispatchAuthority(to)
+        if (
+          !currentAuthority?.paneKey ||
+          !currentAuthority.processIncarnation ||
+          currentAuthority.runtimeId !== dispatchAuthority?.runtimeId ||
+          currentAuthority.terminalHandle !== dispatchAuthority?.terminalHandle ||
+          currentAuthority.ptyId !== dispatchAuthority?.ptyId ||
+          currentAuthority.paneKey !== assigneePaneKey ||
+          currentAuthority.processIncarnation !== processIncarnation ||
+          currentAuthority.launchTokenHash !== dispatchAuthority?.launchTokenHash
+        ) {
+          throw new OrchestrationError(
+            'worker_identity_changed',
+            `Terminal ${to} changed process while dispatch injection was being validated; retry the dispatch.`
+          )
+        }
+        dispatchAuthority = currentAuthority
+        assigneePaneKey = currentAuthority.paneKey
+        processIncarnation = currentAuthority.processIncarnation
       }
 
-      const dispatchAuthority = runtime.getOrchestrationDispatchAuthority(to)
-      const assigneePaneKey =
-        dispatchAuthority?.paneKey ?? runtime.getTerminalPaneKey(to) ?? undefined
-      const processIncarnation =
-        dispatchAuthority?.paneKey && dispatchAuthority.processIncarnation
-          ? dispatchAuthority.processIncarnation
-          : undefined
       if (params.inject && (!assigneePaneKey || !processIncarnation)) {
         throw new OrchestrationError(
           'stable_pane_required',
@@ -1666,13 +1801,15 @@ export const ORCHESTRATION_METHODS: RpcMethod[] = [
       }
 
       revalidateLegacyCoordinator?.()
-      const ctx = db.createDispatchContext(
-        params.task,
-        to,
-        assigneePaneKey,
-        dispatchAuthority?.launchTokenHash ?? undefined,
-        processIncarnation
-      )
+      const ctx =
+        reusableCtx ??
+        db.createDispatchContext(
+          params.task,
+          to,
+          assigneePaneKey,
+          dispatchAuthority?.launchTokenHash ?? undefined,
+          processIncarnation
+        )
       const dispatchCapability = params.inject
         ? db.mintDispatchCapability({
             dispatchId: ctx.id,
@@ -1696,7 +1833,12 @@ export const ORCHESTRATION_METHODS: RpcMethod[] = [
       let injected = false
       if (params.inject) {
         try {
-          await runtime.sendTerminalAgentPrompt(to, preamble)
+          const submission = await runtime.sendTerminalAgentPrompt(to, preamble)
+          // Why (#10416): byte count only ever grows (padding, never truncation) so it can never
+          // catch a bad write; submissionVerified is the real settlement signal.
+          if (submission.submissionVerified !== true) {
+            throw new Error(`Injected write for dispatch ${ctx.id} was not verified as delivered.`)
+          }
           injected = true
         } catch (err) {
           db.failDispatch(ctx.id, err instanceof Error ? err.message : String(err))

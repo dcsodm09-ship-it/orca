@@ -24,6 +24,372 @@ describe('shared agent-hook-listener', () => {
     vi.unstubAllEnvs()
   })
 
+  it('resolves a Claude Stop to done even while the session sits in plan mode (known gap, follow-up pending)', () => {
+    // Why: `permission_mode` is the CLI's current session-wide permission setting, not a
+    // per-event "a plan is pending approval" flag — it stays 'plan' for the whole session
+    // when a user has plan mode as their default, including on ordinary turns that finished
+    // normally. Gating this Stop to 'waiting' (attempted for #10997) mapped every such turn to
+    // the runtime's 'permission' status, which made writeTerminalAgentPrompt's
+    // assertAgentPromptPermissionSafe throw agent_prompt_blocked on a genuinely idle worker and
+    // broke tui-idle/push-on-idle detection. No reliable field has been found in a real Stop
+    // payload to distinguish "paused for plan confirmation" from "finished while in plan mode",
+    // so this documents today's behavior rather than mis-fixing it.
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'UserPromptSubmit', prompt: 'plan it' })
+
+    const event = normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'Stop',
+      permission_mode: 'plan'
+    })
+
+    expect(event?.payload.state).toBe('done')
+    expect(event?.payload.interrupted).toBeUndefined()
+  })
+
+  it('lets an interrupt still win over plan mode on Claude Stop', () => {
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'UserPromptSubmit', prompt: 'plan it' })
+
+    const event = normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'Stop',
+      permission_mode: 'plan',
+      is_interrupt: true
+    })
+
+    expect(event?.payload.state).toBe('done')
+    expect(event?.payload.interrupted).toBe(true)
+  })
+
+  it('keeps Claude StopFailure resolving to done regardless of plan mode', () => {
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'UserPromptSubmit', prompt: 'plan it' })
+
+    const event = normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'StopFailure',
+      permission_mode: 'plan'
+    })
+
+    // Why: StopFailure has no plan-approval semantics, so plan mode must not gate it to waiting.
+    expect(event?.payload.state).toBe('done')
+  })
+
+  it('gates a bare Stop right after an unresolved PermissionRequest to waiting instead of done (#10997)', () => {
+    // Why: a real PermissionDenied hook (distinct from PermissionRequest) is the one reliable
+    // signal a Stop payload itself never carries; pendingPermissionRequest stands in for it so a
+    // Stop with no intervening decision can't be silently read as a legitimate finish.
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'UserPromptSubmit', prompt: 'do it' })
+    const waiting = normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'rm -rf /' }
+    })
+    expect(waiting?.payload.state).toBe('waiting')
+
+    const event = normalizeAndAccept(state, 'claude', { hook_event_name: 'Stop' })
+    expect(event?.payload.state).toBe('waiting')
+  })
+
+  it('resolves to done once the tool runs after approval (approval-granted path, #10997)', () => {
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'UserPromptSubmit', prompt: 'do it' })
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'ls' }
+    })
+    // Why: approval lets the tool actually run, clearing pendingPermissionRequest same as any
+    // other non-PermissionRequest event.
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PostToolUse',
+      tool_name: 'Bash',
+      tool_input: { command: 'ls' }
+    })
+
+    const event = normalizeAndAccept(state, 'claude', { hook_event_name: 'Stop' })
+    expect(event?.payload.state).toBe('done')
+  })
+
+  it('resolves to done once Claude reports the denial (denial path, #10997)', () => {
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'UserPromptSubmit', prompt: 'do it' })
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'rm -rf /' }
+    })
+    const denied = normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionDenied',
+      tool_name: 'Bash',
+      tool_input: { command: 'rm -rf /' },
+      reason: 'user_denied'
+    })
+    expect(denied?.payload.state).toBe('working')
+
+    const event = normalizeAndAccept(state, 'claude', { hook_event_name: 'Stop' })
+    expect(event?.payload.state).toBe('done')
+  })
+
+  it('does not gate a second consecutive Stop (#11352-class regression guard)', () => {
+    // Why: pendingPermissionRequest is single-shot — the gated Stop above must not wedge the
+    // pane in 'waiting' forever the way the old permission_mode heuristic (#11352) did.
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'UserPromptSubmit', prompt: 'do it' })
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'rm -rf /' }
+    })
+    const firstStop = normalizeAndAccept(state, 'claude', { hook_event_name: 'Stop' })
+    expect(firstStop?.payload.state).toBe('waiting')
+
+    const secondStop = normalizeAndAccept(state, 'claude', { hook_event_name: 'Stop' })
+    expect(secondStop?.payload.state).toBe('done')
+  })
+
+  it('keeps a lead Stop gated to waiting while a sibling child still has a pending PermissionRequest (#10997 child-agent gap)', () => {
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'UserPromptSubmit', prompt: 'do it' })
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionRequest',
+      agent_id: 'child-a',
+      tool_name: 'Bash',
+      tool_input: { command: 'ls' }
+    })
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionRequest',
+      agent_id: 'child-b',
+      tool_name: 'Bash',
+      tool_input: { command: 'pwd' }
+    })
+
+    // Child A's own denial clears only child A's pending entry. The pane's reported state
+    // still reflects the lead's own cached status (still 'waiting', mid-turn) - that's the
+    // pre-existing cached-lead-status behavior for any child event, not what this fix changes.
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionDenied',
+      agent_id: 'child-a',
+      tool_name: 'Bash',
+      tool_input: { command: 'ls' },
+      reason: 'user_denied'
+    })
+
+    // Child B never resolved its own request, so the lead Stop must still gate to waiting.
+    const event = normalizeAndAccept(state, 'claude', { hook_event_name: 'Stop' })
+    expect(event?.payload.state).toBe('waiting')
+  })
+
+  it('does not let an unrelated sibling event clear a different agent pending PermissionRequest', () => {
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'UserPromptSubmit', prompt: 'do it' })
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionRequest',
+      agent_id: 'child-a',
+      tool_name: 'Bash',
+      tool_input: { command: 'rm -rf /' }
+    })
+    // Child B runs an unrelated, already-approved tool - must not touch child A's entry.
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PostToolUse',
+      agent_id: 'child-b',
+      tool_name: 'Read',
+      tool_input: { file_path: '/etc/hosts' }
+    })
+
+    const event = normalizeAndAccept(state, 'claude', { hook_event_name: 'Stop' })
+    expect(event?.payload.state).toBe('waiting')
+  })
+
+  it('resolves the lead Stop to done once every agent with a pending PermissionRequest has cleared its own', () => {
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'UserPromptSubmit', prompt: 'do it' })
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionRequest',
+      agent_id: 'child-a',
+      tool_name: 'Bash',
+      tool_input: { command: 'ls' }
+    })
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionRequest',
+      agent_id: 'child-b',
+      tool_name: 'Bash',
+      tool_input: { command: 'pwd' }
+    })
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionDenied',
+      agent_id: 'child-a',
+      tool_name: 'Bash',
+      tool_input: { command: 'ls' },
+      reason: 'user_denied'
+    })
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionDenied',
+      agent_id: 'child-b',
+      tool_name: 'Bash',
+      tool_input: { command: 'pwd' },
+      reason: 'user_denied'
+    })
+    // Why: both children finish (not just resolve their permission) so resolveClaudePaneState's
+    // separate, pre-existing "roster still has a working child" override doesn't independently
+    // keep the pane at 'working' - that's unrelated to this fix, isolating what it actually tests.
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'SubagentStop', agent_id: 'child-a' })
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'SubagentStop', agent_id: 'child-b' })
+
+    const event = normalizeAndAccept(state, 'claude', { hook_event_name: 'Stop' })
+    expect(event?.payload.state).toBe('done')
+  })
+
+  it('restores the pane from waiting once its sole pending child denies, without needing a later lead Stop (#10997 child-agent gap)', () => {
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'UserPromptSubmit', prompt: 'do it' })
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionRequest',
+      agent_id: 'child-a',
+      tool_name: 'Bash',
+      tool_input: { command: 'rm -rf /' }
+    })
+
+    // Why: with no sibling still pending, the child's own denial must itself restore the
+    // pane out of 'waiting' - otherwise it stays cache-rendered 'waiting' forever, since
+    // nothing else re-evaluates state until the next real lead-level Stop/StopFailure.
+    const denied = normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionDenied',
+      agent_id: 'child-a',
+      tool_name: 'Bash',
+      tool_input: { command: 'rm -rf /' },
+      reason: 'user_denied'
+    })
+    expect(denied?.payload.state).toBe('working')
+  })
+
+  it('keeps a sibling pending PermissionRequest alive when a different child gets its own approval-granted tool run (#10997 child-agent gap)', () => {
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'UserPromptSubmit', prompt: 'do it' })
+    // child-b requests first, then child-a - child-a becomes the tracked waitingAgentId.
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionRequest',
+      agent_id: 'child-b',
+      tool_name: 'Bash',
+      tool_input: { command: 'pwd' }
+    })
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionRequest',
+      agent_id: 'child-a',
+      tool_name: 'Bash',
+      tool_input: { command: 'ls' }
+    })
+
+    // child-a's own tool runs (approval granted) - must not wipe child-b's still-pending
+    // request just because it happens to be the one lead.waitingAgentId currently tracks.
+    const approved = normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PostToolUse',
+      agent_id: 'child-a',
+      tool_name: 'Bash',
+      tool_input: { command: 'ls' }
+    })
+    expect(approved?.payload.state).toBe('waiting')
+
+    const event = normalizeAndAccept(state, 'claude', { hook_event_name: 'Stop' })
+    expect(event?.payload.state).toBe('waiting')
+  })
+
+  it('clears an earlier-requesting child pending id even after a later sibling displaces it from waitingAgentId (#10997 child-agent gap, round 2)', () => {
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'UserPromptSubmit', prompt: 'do it' })
+    // child-a requests first (becomes waitingAgentId), child-b requests second and overwrites
+    // waitingAgentId to child-b - child-a is now "displaced" but still has a pending entry.
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionRequest',
+      agent_id: 'child-a',
+      tool_name: 'Bash',
+      tool_input: { command: 'ls' }
+    })
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionRequest',
+      agent_id: 'child-b',
+      tool_name: 'Bash',
+      tool_input: { command: 'pwd' }
+    })
+
+    // child-a's own approval-granted tool run resolves ITS pending request, even though it no
+    // longer equals lead.waitingAgentId (that single slot now points at child-b).
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PostToolUse',
+      agent_id: 'child-a',
+      tool_name: 'Bash',
+      tool_input: { command: 'ls' }
+    })
+    // child-b resolves too.
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionDenied',
+      agent_id: 'child-b',
+      tool_name: 'Bash',
+      tool_input: { command: 'pwd' },
+      reason: 'user_denied'
+    })
+
+    // Why: both children finish (not just resolve their permission) so resolveClaudePaneState's
+    // separate, pre-existing "roster still has a working child" override doesn't independently
+    // keep the pane at 'working' - unrelated to this fix, isolates what it actually tests.
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'SubagentStop', agent_id: 'child-a' })
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'SubagentStop', agent_id: 'child-b' })
+
+    // Both cleared - the pane must not be wedged at 'waiting' forever.
+    const event = normalizeAndAccept(state, 'claude', { hook_event_name: 'Stop' })
+    expect(event?.payload.state).toBe('done')
+  })
+
+  it('un-wedges the lead once the tracked wait owner is no longer the last pending agent, in either resolution order (#10997, round 5)', () => {
+    // Reverse of the "displaced earlier requester" test above: here the LATER requester
+    // (still tracked as waitingAgentId) resolves FIRST, and the EARLIER requester (no longer
+    // tracked) resolves LAST - the exact ordering both independent reviewers found still broken
+    // after round 4 (gate 1's restore only fired when subagentOriginId === waitingAgentId).
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'UserPromptSubmit', prompt: 'do it' })
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionRequest',
+      agent_id: 'child-a',
+      tool_name: 'Bash',
+      tool_input: { command: 'ls' }
+    })
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionRequest',
+      agent_id: 'child-b',
+      tool_name: 'Bash',
+      tool_input: { command: 'pwd' }
+    })
+
+    // child-b (the tracked waitingAgentId) resolves first via its own approval-granted tool run.
+    const bResolved = normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PostToolUse',
+      agent_id: 'child-b',
+      tool_name: 'Bash',
+      tool_input: { command: 'pwd' }
+    })
+    expect(bResolved?.payload.state).toBe('waiting')
+
+    // child-a (displaced from waitingAgentId, never re-tracked) resolves last - this is the one
+    // that used to stay wedged at 'waiting' forever.
+    const aResolved = normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PostToolUse',
+      agent_id: 'child-a',
+      tool_name: 'Bash',
+      tool_input: { command: 'ls' }
+    })
+    expect(aResolved?.payload.state).toBe('working')
+
+    // Why: both children finish (not just resolve their permission) so resolveClaudePaneState's
+    // separate, pre-existing "roster still has a working child" override doesn't independently
+    // keep the pane at 'working' - unrelated to this fix, isolates what it actually tests.
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'SubagentStop', agent_id: 'child-a' })
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'SubagentStop', agent_id: 'child-b' })
+
+    const event = normalizeAndAccept(state, 'claude', { hook_event_name: 'Stop' })
+    expect(event?.payload.state).toBe('done')
+  })
+
+  it('lets an interrupt still win over a pending PermissionRequest on Claude Stop', () => {
+    normalizeAndAccept(state, 'claude', { hook_event_name: 'UserPromptSubmit', prompt: 'do it' })
+    normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'rm -rf /' }
+    })
+
+    const event = normalizeAndAccept(state, 'claude', {
+      hook_event_name: 'Stop',
+      is_interrupt: true
+    })
+    expect(event?.payload.state).toBe('done')
+    expect(event?.payload.interrupted).toBe(true)
+  })
+
   it('normalizes a Claude-compatible StopFailure to done without copying provider error text', () => {
     normalizeHookPayload(
       state,

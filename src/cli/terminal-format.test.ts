@@ -1,5 +1,21 @@
 import { describe, expect, it } from 'vitest'
-import { formatTerminalClose, formatTerminalFocus } from './terminal-format'
+import { formatTerminalClose, formatTerminalFocus, formatTerminalSend } from './terminal-format'
+
+describe('formatTerminalSend', () => {
+  it('confirms delivery only when the write was settlement-verified', () => {
+    expect(
+      formatTerminalSend({
+        send: { handle: 'term_a', accepted: true, bytesWritten: 19, submissionVerified: true }
+      })
+    ).toBe('Sent 19 bytes to term_a. Delivery confirmed.')
+  })
+
+  it('does not claim confirmation for an unverified best-effort write', () => {
+    expect(
+      formatTerminalSend({ send: { handle: 'term_a', accepted: true, bytesWritten: 19 } })
+    ).toBe('Sent 19 bytes to term_a.')
+  })
+})
 
 describe('formatTerminalFocus', () => {
   it('distinguishes superseded navigation from a winning focus', () => {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { mapRuntimeError } from './errors'
+import { OrchestrationError } from '../orchestration/orchestration-error'
 import {
   ARTIFACT_SHARING_DISABLED_CODE,
   ARTIFACT_SHARING_DISABLED_MESSAGE,
@@ -39,6 +40,25 @@ describe('mapRuntimeError', () => {
     'preserves the durable terminal tab close failure %s',
     (code) => {
       expect(mapRuntimeError('req_1', { runtimeId: 'runtime-1' }, new Error(code))).toMatchObject({
+        ok: false,
+        error: { code, message: code }
+      })
+    }
+  )
+
+  // Why (#14809): these disambiguate a concurrent-mint loss from a concurrent pane-claim loss
+  // on orchestration.dispatch --inject - without passthrough both collapse to a generic
+  // runtime_error and the caller can no longer tell them apart, defeating the point of minting
+  // two distinct codes for them. OrchestrationError sets a structured `.code`, so (unlike the
+  // plain-Error/message-is-the-code codes above) these route through
+  // STRUCTURED_RUNTIME_PASSTHROUGH_CODES, not RUNTIME_PASSTHROUGH_CODES - a plain `new
+  // Error(code)` would not actually exercise that path.
+  it.each(['dispatch_pane_reused', 'dispatch_capability_already_minted'])(
+    'preserves the dispatch-context reuse race code %s',
+    (code) => {
+      expect(
+        mapRuntimeError('req_1', { runtimeId: 'runtime-1' }, new OrchestrationError(code, code))
+      ).toMatchObject({
         ok: false,
         error: { code, message: code }
       })

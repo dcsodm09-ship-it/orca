@@ -9,6 +9,8 @@ export function updateTaskStatus(
   status: TaskStatus,
   result?: string
 ): TaskRow | undefined {
+  // Why: 'cancelled'/'superseded' go through cancelTask (db/tasks/task-cancel.ts), not here —
+  // keep this narrow to the two statuses settleActiveDispatchesForTask's dispatch CHECK allows.
   const terminalStatus = status === 'completed' || status === 'failed'
   const requiresActiveDispatch = status === 'dispatched'
   const permitsActiveDispatch = terminalStatus || requiresActiveDispatch

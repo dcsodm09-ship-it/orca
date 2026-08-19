@@ -124,11 +124,16 @@ export function settleWorkerReportInTransaction(
       reason: `Dispatch ${params.dispatchId} changed while its worker report was settling.`
     }
   }
+  // Why (#13364): a worker row can be 'stop_unknown' from an earlier report that was
+  // rejected for a benign, recoverable reason (missing/stale capability) rather than
+  // because the worker died. All the guards above already proved this report is the
+  // legitimate, authoritative settlement for this dispatch, so heal the worker row here
+  // too instead of leaving it stuck out of sync with the task/dispatch this just settled.
   this.db
     .prepare(
       `UPDATE worker_dispatches
        SET state = ?, stage = 'settled', updated_at = datetime('now')
-       WHERE dispatch_id = ? AND state = 'ready'`
+       WHERE dispatch_id = ? AND state IN ('ready', 'stop_unknown')`
     )
     .run(params.outcome === 'succeeded' ? 'succeeded' : 'failed', params.dispatchId)
   settleActiveDispatchesForTask(

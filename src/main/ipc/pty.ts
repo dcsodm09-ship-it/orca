@@ -2568,7 +2568,11 @@ export function registerPtyHandlers(
         clearProviderPtyState(id)
         ptyOwnership.delete(id)
         markClaudePtyExited(id)
-        runtime?.onPtyExit(id, code, incarnationId)
+        if (consumePendingOperatorTermination(id)) {
+          runtime?.onPtyExit(id, code, incarnationId, { terminatedBy: 'operator' })
+        } else {
+          runtime?.onPtyExit(id, code, incarnationId)
+        }
       },
       onData: (id, data, timestamp, sequenceChars, transformed) =>
         runtime?.onPtyData(id, data, timestamp, sequenceChars ?? data.length, transformed)
@@ -3679,6 +3683,36 @@ export function registerPtyHandlers(
     return true
   }
 
+  // Why (#15048): kill/stopAndWait only carry terminatedBy into the synthetic exit they report
+  // themselves — the common case is the provider's own onExit firing first (a real live process
+  // actually dying), which reports through the plain 3-arg onPtyExit call sites and would
+  // otherwise lose the operator provenance entirely. Remember the intent here and let the real
+  // onExit handlers pick it up once, so an operator-initiated close still gets attributed even
+  // when the provider observes the exit itself.
+  const pendingOperatorTerminationPtyIds = new Map<string, NodeJS.Timeout>()
+
+  function rememberPendingOperatorTermination(id: string): void {
+    const existing = pendingOperatorTerminationPtyIds.get(id)
+    if (existing) {
+      clearTimeout(existing)
+    }
+    const cleanupTimer = setTimeout(() => {
+      pendingOperatorTerminationPtyIds.delete(id)
+    }, SYNTHETIC_KILL_EXIT_DUPLICATE_WINDOW_MS)
+    cleanupTimer.unref?.()
+    pendingOperatorTerminationPtyIds.set(id, cleanupTimer)
+  }
+
+  function consumePendingOperatorTermination(id: string): boolean {
+    const cleanupTimer = pendingOperatorTerminationPtyIds.get(id)
+    if (!cleanupTimer) {
+      return false
+    }
+    clearTimeout(cleanupTimer)
+    pendingOperatorTerminationPtyIds.delete(id)
+    return true
+  }
+
   function preparePtyExitForRenderer(payload: { id: string; code: number }): (() => void) | null {
     if (mainWindow.isDestroyed()) {
       sshOutputIntake?.transferPtyProjections(payload.id, 'renderer-destroyed')
@@ -3970,7 +4004,8 @@ export function registerPtyHandlers(
     },
     finalizeExit: (event) => {
       runtime?.onPtyExit(event.id, event.code, event.ptyIncarnation, {
-        hostExitConfirmed: true
+        hostExitConfirmed: true,
+        ...(consumePendingOperatorTermination(event.id) ? { terminatedBy: 'operator' } : {})
       })
       finalizePtyExitForRenderer(event)
     },
@@ -4113,7 +4148,13 @@ export function registerPtyHandlers(
         clearProviderPtyState(payload.id)
         ptyOwnership.delete(payload.id)
         markClaudePtyExited(payload.id)
-        runtime?.onPtyExit(payload.id, payload.code, payload.incarnationId)
+        if (consumePendingOperatorTermination(payload.id)) {
+          runtime?.onPtyExit(payload.id, payload.code, payload.incarnationId, {
+            terminatedBy: 'operator'
+          })
+        } else {
+          runtime?.onPtyExit(payload.id, payload.code, payload.incarnationId)
+        }
       }
       sendPtyExitToRenderer(payload)
     })
@@ -5582,10 +5623,22 @@ export function registerPtyHandlers(
         return false
       }
     },
-    kill: (ptyId) => {
+    kill: (ptyId, opts) => {
       let connectionId: string | null | undefined = ptyOwnership.get(ptyId)
       const parsedSshId = connectionId === undefined ? parseAppSshPtyId(ptyId) : null
       connectionId ??= parsedSshId?.connectionId
+      // Why: the provider's own onExit commonly fires before this function gets a chance to
+      // report its own synthetic exit below — remember the provenance so that real-exit path
+      // (consumePendingOperatorTermination) can still attribute it correctly (#15048).
+      if (opts?.terminatedBy) {
+        rememberPendingOperatorTermination(ptyId)
+      }
+      // Why: keep the common (no provenance) call 3-ary — an explicit trailing
+      // undefined would still change call-arity for exact-call assertions.
+      const reportPtyExit = (code: number, incarnationId?: string): void =>
+        opts?.terminatedBy
+          ? runtime?.onPtyExit(ptyId, code, incarnationId, { terminatedBy: opts.terminatedBy })
+          : runtime?.onPtyExit(ptyId, code, incarnationId)
       const killWithCurrentProvider = (): boolean => {
         let provider: IPtyProvider
         try {
@@ -5598,7 +5651,7 @@ export function registerPtyHandlers(
             // relay PTY outlives its provider, so report an unconfirmed stop
             // rather than a kill nobody performed.
             const incarnationId = finishPtyShutdown(ptyId, connectionId, store)
-            runtime?.onPtyExit(ptyId, -1, incarnationId)
+            reportPtyExit(-1, incarnationId)
             rememberSyntheticKillExit(ptyId)
             sendPtyExitToRenderer({ id: ptyId, code: -1 })
             runtime?.markPtyLivenessUnverifiable?.(ptyId, SSH_PROVIDER_UNREGISTERED_REASON)
@@ -5612,7 +5665,7 @@ export function registerPtyHandlers(
             const retired = retiredRejectedPtyIds.has(ptyId)
             const incarnationId = finishPtyShutdown(ptyId, connectionId, store)
             if (!providerExitObserved && !retired) {
-              runtime?.onPtyExit(ptyId, -1, incarnationId)
+              reportPtyExit(-1, incarnationId)
               rememberSyntheticKillExit(ptyId)
               sendPtyExitToRenderer({ id: ptyId, code: -1 })
             }
@@ -5622,7 +5675,7 @@ export function registerPtyHandlers(
             if (isPtyAlreadyGoneError(err)) {
               const incarnationId = finishPtyShutdown(ptyId, connectionId, store)
               if (!retired) {
-                runtime?.onPtyExit(ptyId, -1, incarnationId)
+                reportPtyExit(-1, incarnationId)
                 rememberSyntheticKillExit(ptyId)
                 sendPtyExitToRenderer({ id: ptyId, code: -1 })
               }
@@ -5640,7 +5693,7 @@ export function registerPtyHandlers(
                   err instanceof Error ? err.message : String(err)
                 )
               }
-              runtime?.onPtyExit(ptyId, -1, ptyIncarnationById.get(ptyId))
+              reportPtyExit(-1, ptyIncarnationById.get(ptyId))
             }
           })
         return true
@@ -5659,7 +5712,7 @@ export function registerPtyHandlers(
                 err instanceof Error ? err.message : String(err)
               )
             }
-            runtime?.onPtyExit(ptyId, -1, ptyIncarnationById.get(ptyId))
+            reportPtyExit(-1, ptyIncarnationById.get(ptyId))
           }
         })
         return true
@@ -5723,6 +5776,19 @@ export function registerPtyHandlers(
       // below; each RPC leaf converts it to the remaining time when it issues, so
       // sequential RPCs share the budget and cannot overrun the sweep deadline.
       const deadlineMs = opts?.deadlineMs
+      // Why: the provider's own onExit commonly fires during shutdownProviderAndDetectExit
+      // below (providerExitObserved=true) before this function reports its own synthetic
+      // exit — remember the provenance so that real-exit path (consumePendingOperatorTermination)
+      // can still attribute it correctly (#15048).
+      if (opts?.terminatedBy) {
+        rememberPendingOperatorTermination(ptyId)
+      }
+      // Why: keep the common (no provenance) call 3-ary — an explicit trailing
+      // undefined would still change call-arity for exact-call assertions.
+      const reportPtyExit = (code: number, incarnationId?: string): void =>
+        opts?.terminatedBy
+          ? runtime?.onPtyExit(ptyId, code, incarnationId, { terminatedBy: opts.terminatedBy })
+          : runtime?.onPtyExit(ptyId, code, incarnationId)
       const startupPromise = getLocalPtyProviderStartupPromise(connectionId)
       if (startupPromise) {
         // Why: exact-stop must resolve the provider after daemon startup just
@@ -5755,7 +5821,7 @@ export function registerPtyHandlers(
           // provider is lost contact — the remote PTY is designed to survive it,
           // so nothing here observed an exit to report as a confirmed stop.
           const incarnationId = finishPtyShutdown(ptyId, connectionId, store)
-          runtime?.onPtyExit(ptyId, -1, incarnationId)
+          reportPtyExit(-1, incarnationId)
           rememberSyntheticKillExit(ptyId)
           sendPtyExitToRenderer({ id: ptyId, code: -1 })
           runtime?.markPtyLivenessUnverifiable?.(ptyId, SSH_PROVIDER_UNREGISTERED_REASON)
@@ -5806,7 +5872,7 @@ export function registerPtyHandlers(
       if (!providerExitObserved) {
         // The owning provider's fresh inventory observed absence, so this is a
         // death certificate even when its exit event was missed.
-        runtime?.onPtyExit(ptyId, 0, incarnationId)
+        reportPtyExit(0, incarnationId)
         rememberSyntheticKillExit(ptyId)
         sendPtyExitToRenderer({ id: ptyId, code: 0 })
       }

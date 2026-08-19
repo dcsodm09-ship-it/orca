@@ -45,6 +45,7 @@ import type { SchemaMigrateMethods } from './schema/migrate'
 import type { SchemaColumnProbesMethods } from './schema/schema-column-probes'
 import type { TaskStoreMethods } from './tasks/task-store'
 import type { TaskStatusTransitionMethods } from './tasks/task-status-transition'
+import type { TaskCancelMethods } from './tasks/task-cancel'
 import type { FederatedWorkerStartReconcileMethods } from './worker-dispatch/federated-worker-start-reconcile'
 import type { WorkerDispatchAbandonMethods } from './worker-dispatch/worker-dispatch-abandon'
 import type { WorkerDispatchAuthorityMethods } from './worker-dispatch/worker-dispatch-authority'
@@ -89,6 +90,7 @@ export type OrchestrationDbMethods = CreateTablesMethods &
   QuestionThreadsMethods &
   TaskStoreMethods &
   TaskStatusTransitionMethods &
+  TaskCancelMethods &
   WorkerDispatchStartMethods &
   WorkerDispatchStageMethods &
   WorkerDispatchAuthorityMethods &

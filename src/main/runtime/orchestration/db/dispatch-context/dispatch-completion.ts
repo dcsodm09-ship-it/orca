@@ -49,11 +49,23 @@ export function failActiveDispatchForTask(
 }
 
 // Why: only bump status='dispatched' — a zombie heartbeat from a finished dispatch would mask a hung retry from the stale detector (§5.3.4).
+// Why: clears stale_escalated_at too — a fresh heartbeat ends the stale episode so a later relapse escalates again (#14829).
 export function recordHeartbeat(this: OrchestrationDb, dispatchId: string, at: string): void {
   this.db
     .prepare(
-      "UPDATE dispatch_contexts SET last_heartbeat_at = ? WHERE id = ? AND status = 'dispatched'"
+      "UPDATE dispatch_contexts SET last_heartbeat_at = ?, stale_escalated_at = NULL WHERE id = ? AND status = 'dispatched'"
     )
+    .run(at, dispatchId)
+}
+
+// Why: warnStaleDispatches uses this to escalate a given stale spell exactly once (#14829).
+export function markDispatchStaleEscalated(
+  this: OrchestrationDb,
+  dispatchId: string,
+  at: string
+): void {
+  this.db
+    .prepare('UPDATE dispatch_contexts SET stale_escalated_at = ? WHERE id = ?')
     .run(at, dispatchId)
 }
 
@@ -77,7 +89,7 @@ export function failDispatch(
   this: OrchestrationDb,
   ctxId: string,
   error: string,
-  options: { workerProcessExited?: boolean } = {}
+  options: { workerProcessExited?: boolean; terminatedBy?: 'operator' } = {}
 ): DispatchContextRow | undefined {
   this.db.exec(`SAVEPOINT ${FAIL_DISPATCH_SAVEPOINT}`)
   try {
@@ -89,6 +101,13 @@ export function failDispatch(
              completed_at = COALESCE(completed_at, datetime('now')),
              capability_revoked_at = COALESCE(capability_revoked_at, datetime('now'))
          WHERE id = ? AND status IN ('pending', 'dispatched')
+           AND NOT EXISTS (
+             -- Why (#15048): a 'stopping' worker is orchestration.workerStop's to
+             -- settle via settleWorkerStop; failing it here on the exit that stop
+             -- caused would race that call into an uncaught dispatch_inactive.
+             SELECT 1 FROM worker_dispatches worker
+             WHERE worker.dispatch_id = dispatch_contexts.id AND worker.state = 'stopping'
+           )
            AND (? = 1 OR NOT EXISTS (
              SELECT 1 FROM worker_dispatches worker
              WHERE worker.dispatch_id = dispatch_contexts.id
@@ -120,11 +139,12 @@ export function failDispatch(
       this.db
         .prepare(
           `UPDATE worker_dispatches
-           SET state = 'failed', stage = 'process_exited', last_error = ?, updated_at = datetime('now')
+           SET state = 'failed', stage = 'process_exited', terminated_by = ?,
+               last_error = ?, updated_at = datetime('now')
            WHERE dispatch_id = ?
              AND state NOT IN ('failed', 'succeeded', 'stopped', 'abandoned')`
         )
-        .run(error, ctxId)
+        .run(options.terminatedBy ?? null, error, ctxId)
     }
 
     // Why: back to 'ready' not 'pending' — 'pending' would strand it since promoteReadyTasks only runs when a dep completes.
@@ -155,6 +175,7 @@ export type DispatchCompletionMethods = {
   completeActiveDispatchesForTask: typeof completeActiveDispatchesForTask
   failActiveDispatchForTask: typeof failActiveDispatchForTask
   recordHeartbeat: typeof recordHeartbeat
+  markDispatchStaleEscalated: typeof markDispatchStaleEscalated
   getStaleDispatches: typeof getStaleDispatches
   failDispatch: typeof failDispatch
 }
@@ -165,6 +186,7 @@ export function attachDispatchCompletion(ctor: { prototype: object }): void {
     completeActiveDispatchesForTask,
     failActiveDispatchForTask,
     recordHeartbeat,
+    markDispatchStaleEscalated,
     getStaleDispatches,
     failDispatch
   })

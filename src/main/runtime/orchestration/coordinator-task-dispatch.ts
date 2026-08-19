@@ -1,6 +1,6 @@
 /** Picking worker terminals, sending a task's dispatch preamble, and warning about hung dispatches. */
 import type { OrchestrationDb } from './db'
-import type { TaskRow } from './types'
+import type { DispatchContextRow, TaskRow } from './types'
 import { buildDispatchPreamble } from './preamble'
 import type { CoordinatorRuntime, WorktreeDrift } from './coordinator-runtime-contract'
 import {
@@ -13,15 +13,75 @@ export type TaskDispatchResult = 'dispatched' | 'stale-base-refused'
 // Why: 10 min = documented heartbeat cadence (5 min) × 2, so one missed heartbeat is the earliest a dispatch can look stale.
 const HUNG_THRESHOLD_MS = 10 * 60 * 1000
 
+// Why: unique per call so nested/concurrent escalations (unlikely but not impossible on a single
+// synchronous db handle) never collide on the same SAVEPOINT name.
+let escalateStaleDispatchSavepointCounter = 0
+
+// Why (#14829): mirrors orca-runtime.ts's failActiveDispatchOnExit — omitting dispatchId keeps
+// applyEscalationToDispatch's payload check from ever failing the dispatch off staleness alone;
+// this only makes the fact visible to handleEscalation and the LLM's check --wait mailbox.
+// Why (#14829/#10673): resolve `to` and insert *before* stamping — stamping first left a dispatch
+// with no resolvable target (the common case for the legacy Run) permanently unescalated, since
+// nothing ever un-stamps it short of a heartbeat.
+// Why: the insert+stamp pair is wrapped in one SAVEPOINT (mirrors insertMessages' own pattern) so
+// a failure between them can't leave a delivered escalation un-stamped (duplicate next sweep) or
+// a stamp with no delivered message (silently dropped forever, the original #14829/#10673 bug).
+function escalateStaleDispatch(
+  db: OrchestrationDb,
+  ctx: DispatchContextRow,
+  minutes: number
+): void {
+  const run = db.getRun(ctx.run_id)
+  const modernRun = run && run.legacy !== 1 ? run : undefined
+  const legacyRun = modernRun ? undefined : db.getActiveCoordinatorRun()
+  const to = modernRun ? `run:${modernRun.id}` : legacyRun?.coordinator_handle
+  if (!to) {
+    return
+  }
+  const savepoint = `escalate_stale_dispatch_${escalateStaleDispatchSavepointCounter++}`
+  db.db.exec(`SAVEPOINT ${savepoint}`)
+  try {
+    db.insertMessage({
+      from: ctx.assignee_handle ?? `dispatch:${ctx.id}`,
+      to,
+      ...(modernRun ? { runId: modernRun.id } : {}),
+      subject: `Dispatch has not reported in ~${minutes} min (no worker_done or heartbeat)`,
+      type: 'escalation',
+      priority: 'high',
+      payload: JSON.stringify({ taskId: ctx.task_id, handle: ctx.assignee_handle })
+    })
+    db.markDispatchStaleEscalated(ctx.id, new Date().toISOString())
+    db.db.exec(`RELEASE ${savepoint}`)
+  } catch (error) {
+    db.db.exec(`ROLLBACK TO ${savepoint}`)
+    db.db.exec(`RELEASE ${savepoint}`)
+    throw error
+  }
+}
+
 // Why: warn only, never auto-fail — a false positive (slow but correct worker) costs more than a false negative (hung worker holding a slot); see R6 of DESIGN_DOC_PREAMBLE_FIX.md.
-export function warnStaleDispatches(db: OrchestrationDb, onLog: (msg: string) => void): void {
+// Why (#10673): scopeRunIds is undefined for the legacy Coordinator loop (which owns the whole DB)
+// and a caller-bound Set for the orchestration.check sweep, so a check call can't escalate dispatches
+// on Runs it has nothing to do with.
+export function warnStaleDispatches(
+  db: OrchestrationDb,
+  onLog: (msg: string) => void,
+  scopeRunIds?: ReadonlySet<string>
+): void {
   const thresholdIso = new Date(Date.now() - HUNG_THRESHOLD_MS).toISOString()
   const stale = db.getStaleDispatches(thresholdIso)
+  const minutes = Math.round(HUNG_THRESHOLD_MS / 60000)
   for (const ctx of stale) {
-    const minutes = Math.round(HUNG_THRESHOLD_MS / 60000)
+    if (scopeRunIds && !scopeRunIds.has(ctx.run_id)) {
+      continue
+    }
     onLog(
       `Warning: worker ${ctx.assignee_handle ?? '<unknown>'} on task ${ctx.task_id} has not sent a heartbeat in ~${minutes} min (dispatch ${ctx.id})`
     )
+    // Why: fire once per stale spell — getStaleDispatches keeps returning this row every tick until it heals or settles.
+    if (!ctx.stale_escalated_at) {
+      escalateStaleDispatch(db, ctx, minutes)
+    }
   }
 }
 

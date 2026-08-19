@@ -10,6 +10,14 @@ export type SyntheticAgentTitleProfile = {
 }
 
 export const SYNTHETIC_AGENT_TITLE_PROFILES: Record<string, SyntheticAgentTitleProfile> = {
+  claude: {
+    workingLabel: 'Claude',
+    permissionLabel: 'Claude - action required',
+    idleLabel: 'Claude ready',
+    // Why: Claude emits working OSC titles but can miss the final frame (#9976).
+    // Only synthesize terminal states so native spinner behavior stays intact.
+    synthesizeWorkingTitle: false
+  },
   codex: {
     workingLabel: 'Codex',
     permissionLabel: 'Codex - action required',

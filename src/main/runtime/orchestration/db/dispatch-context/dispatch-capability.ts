@@ -1,7 +1,12 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { OrchestrationError } from '../../orchestration-error'
+import { parsePaneKey } from '../../../../../shared/stable-pane-id'
 import { hashDispatchCapability } from '../dispatch-capability-hash'
-import { isEquivalentPaneKey } from '../pane-key-match'
+import {
+  DISPATCH_PANE_KEY_MATCH_SUFFIX_SQL,
+  isEquivalentPaneKey,
+  paneKeyMatchSuffix
+} from '../pane-key-match'
 import type { OrchestrationDb } from '../orchestration-db'
 
 export function mintDispatchCapability(
@@ -20,19 +25,61 @@ export function mintDispatchCapability(
     )
   }
   const capability = `dcap_${randomBytes(32).toString('base64url')}`
-  this.db
+  const paneSuffix = parsePaneKey(params.paneKey) ? paneKeyMatchSuffix(params.paneKey) : null
+  // Why (#14809): the caller's reuse lookup and this mint straddle an `await`, so a concurrent
+  // --inject retry can find the same capability-less context. Gate the write on capability_hash
+  // still being NULL so only the first writer wins the single-statement race; the loser's 0-row
+  // UPDATE throws instead of silently re-minting over (and double-injecting into) the winner.
+  // Also re-check pane occupancy here, not just at the caller's earlier read: a second, independent
+  // dispatch can legitimately claim this pane in the window between that read and this rebind, since
+  // the rebind never re-validated it — mirrors the NOT EXISTS guard DISPATCH_CONTEXT_CLAIM_SQL
+  // already applies at create time.
+  const result = this.db
     .prepare(
       `UPDATE dispatch_contexts
        SET capability_hash = ?, assignee_pane_key = ?, process_incarnation = ?,
            capability_revoked_at = NULL
-       WHERE id = ?`
+       WHERE id = ? AND capability_hash IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM dispatch_contexts active
+           WHERE active.id != ?
+             AND active.status IN ('pending', 'dispatched')
+             AND (
+               active.assignee_pane_key = ?
+               OR (
+                 ? IS NOT NULL
+                 AND active.assignee_pane_key IS NOT NULL
+                 AND instr(active.assignee_pane_key, ':') > 1
+                 AND ${DISPATCH_PANE_KEY_MATCH_SUFFIX_SQL} = ?
+               )
+             )
+         )`
     )
     .run(
       hashDispatchCapability(capability),
       params.paneKey,
       params.processIncarnation,
-      params.dispatchId
+      params.dispatchId,
+      params.dispatchId,
+      params.paneKey,
+      paneSuffix,
+      paneSuffix
     )
+  if (result.changes === 0) {
+    // Why: disambiguate the two 0-row causes — a concurrent mint already claimed this row's
+    // capability, vs. a concurrent dispatch claimed this row's target pane out from under it.
+    const current = this.getDispatchContextById(params.dispatchId)
+    if (current?.capability_hash) {
+      throw new OrchestrationError(
+        'dispatch_capability_already_minted',
+        `Dispatch ${params.dispatchId} already has a lifecycle capability from a concurrent request.`
+      )
+    }
+    throw new OrchestrationError(
+      'dispatch_pane_reused',
+      `Dispatch ${params.dispatchId}'s pane was claimed by another active Dispatch before this capability could bind.`
+    )
+  }
   return capability
 }
 

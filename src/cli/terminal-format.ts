@@ -159,7 +159,8 @@ function formatTerminalReadLimitedWarning(terminal: RuntimeTerminalRead): string
 }
 
 export function formatTerminalSend(result: { send: RuntimeTerminalSend }): string {
-  return `Sent ${result.send.bytesWritten} bytes to ${result.send.handle}.`
+  const base = `Sent ${result.send.bytesWritten} bytes to ${result.send.handle}.`
+  return result.send.submissionVerified ? `${base} Delivery confirmed.` : base
 }
 
 export function formatTerminalRename(result: { rename: RuntimeTerminalRename }): string {

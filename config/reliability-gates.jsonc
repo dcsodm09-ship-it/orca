@@ -9419,9 +9419,10 @@
       "motivatingLinks": [
         "https://github.com/stablyai/orca/issues/7226",
         "https://github.com/stablyai/orca/issues/13821",
-        "https://github.com/stablyai/orca/issues/14347"
+        "https://github.com/stablyai/orca/issues/14347",
+        "https://github.com/stablyai/orca/issues/9838"
       ],
-      "invariant": "Injected orchestration task prompts for recognized agent CLIs must send the prompt body inside one bracketed-paste frame, sanitize embedded ESC bytes, preserve chunk boundaries without losing the frame, and submit exactly once only after the agent can accept Enter. Claude and Codex must emit a post-paste composer marker and then settle, or reach the bounded fallback first; every other agent retains the platform delay.",
+      "invariant": "Injected orchestration task prompts for recognized agent CLIs must send the prompt body inside one bracketed-paste frame, sanitize embedded ESC bytes, preserve chunk boundaries without losing the frame, and submit exactly once only after the agent can accept Enter. Claude and Codex must emit a post-paste composer marker and then settle, or reach the bounded fallback first; every other agent retains the platform delay (#9838 tried extending generic output quiescence to every configured TUI agent but was reverted — a continuously animating composer never goes 1.5s quiet, turning every submit into the full 8s hard cap instead of the flat 500ms delay, with no live validation ever run for it; see the 2026-08-18 evidence entry below).",
       "oracle": "Runtime tests assert the exact PTY write sequence, failure cleanup, Claude/Codex marker-gated multi-frame renders, and the legacy platform delay for every other configured agent. The candidate resets settlement on later frames, gives a late marker a fresh bounded window, and still submits once at the hard deadline if output never settles. Orchestration tests assert dispatch/coordinator use the agent prompt path; the live CLI harness covers long Codex-like framing.",
       "commands": [
         "pnpm exec vitest run --config config/vitest.config.ts src/shared/agent-prompt-injection.test.ts src/main/runtime/orca-runtime.test.ts src/main/runtime/rpc/methods/orchestration-tasks-dispatch.test.ts src/main/runtime/orchestration/coordinator.test.ts",
@@ -9482,6 +9483,24 @@
         }
       ],
       "evidenceRuns": [
+        {
+          "date": "2026-08-18",
+          "runner": "local",
+          "platform": "macos",
+          "command": "pnpm exec vitest run --config config/vitest.config.ts src/shared/agent-prompt-injection.test.ts src/main/runtime/orca-runtime.test.ts src/main/runtime/rpc/methods/orchestration-tasks-dispatch.test.ts src/main/runtime/orchestration/coordinator.test.ts",
+          "result": "passed",
+          "durationSeconds": 14.5,
+          "summary": "#9838 fix reverted (independent review, P1): extending generic 1.5s-quiet/8s-cap output quiescence to every correctly-identified TUI agent (not just claude/codex) means any of the ~30 configured agents with a continuously animating status/spinner line never goes 1.5s quiet, so every prompt submit always pays the full 8s hard cap instead of the previous flat 500ms delay — a 16x per-prompt regression, and the prior evidence entry below never ran live validation against it. createAgentPromptRenderGate is scoped back to claude/codex only; every other agent is back on AGENT_PROMPT_SUBMIT_DELAY_MS."
+        },
+        {
+          "date": "2026-08-18",
+          "runner": "local",
+          "platform": "macos",
+          "command": "pnpm exec vitest run --config config/vitest.config.ts src/shared/agent-prompt-injection.test.ts src/main/runtime/orca-runtime.test.ts src/main/runtime/rpc/methods/orchestration-tasks-dispatch.test.ts src/main/runtime/orchestration/coordinator.test.ts",
+          "result": "passed",
+          "durationSeconds": 15.04,
+          "summary": "#9838 fix (later reverted, see the entry above): 4 files and 1,239 tests passed with one skipped. createAgentPromptRenderGate no longer returns null for every non-Claude/Codex agent; every correctly-identified agent now settles on generic 1.5s-quiet/8s-cap output quiescence instead of the flat AGENT_PROMPT_SUBMIT_DELAY_MS, while a fully unidentified terminal (no launchAgent/foregroundAgent) still keeps that flat delay. Claude/Codex marker-gated identity resolution (STA-4328) was not touched. Vitest-only evidence; no live Electron/Playwright/CLI journey was run in this pass."
+        },
         {
           "date": "2026-08-14",
           "runner": "local",

@@ -251,6 +251,7 @@ import { OrchestrationMailboxNotificationCoordinator } from './orchestration/mai
 import { OrchestrationMailboxDeliveryTarget } from './orchestration/mailbox-delivery-target'
 import {
   OrchestrationMailboxPointerDelivery,
+  type OrchestrationMailboxDeliveryOrigin,
   type OrchestrationMessageWaiter
 } from './orchestration/mailbox-pointer-delivery'
 import { selectExactWorkerProviderSession } from './orchestration/worker-provider-session'
@@ -1880,11 +1881,11 @@ type RuntimePtyController = {
    *  to main without a renderer pane; never creates, resizes, or focuses.
    *  False on doubt (absent session, SSH-scoped id, non-daemon provider). */
   attach?(ptyId: string): Promise<boolean>
-  kill(ptyId: string): boolean
+  kill(ptyId: string, opts?: { terminatedBy?: 'operator' }): boolean
   retireRejectedPty?(ptyId: string, stopConfirmed: boolean): void
   stopAndWait?(
     ptyId: string,
-    opts?: { keepHistory?: boolean; deadlineMs?: number }
+    opts?: { keepHistory?: boolean; deadlineMs?: number; terminatedBy?: 'operator' }
   ): Promise<boolean>
   markReversibleStops?(ptyIds: readonly string[]): () => void
   getCwd?(ptyId: string): Promise<string | null>
@@ -3149,8 +3150,8 @@ export class OrcaRuntimeService {
       getTabTitle: (tabId) => this.tabs.get(tabId)?.title,
       getTerminalHandleForLeafKey: (leafKey) => this.handleByLeafKey.get(leafKey),
       isLeafPtyProvenAbsent: (ptyId) => this.isLeafPtyProvenAbsent(ptyId),
-      redriveMailbox: (mailboxHandle, reservedTypes) =>
-        this.deliverPendingMessagesForHandle(mailboxHandle, reservedTypes),
+      redriveMailbox: (mailboxHandle, reservedTypes, origin) =>
+        this.deliverPendingMessagesForHandle(mailboxHandle, reservedTypes, origin),
       writePty: (ptyId, data) => this.writeOrchestrationPointerPty(ptyId, data)
     })
   private readonly orchestrationMailboxNotifications =
@@ -14927,7 +14928,7 @@ export class OrcaRuntimeService {
     ptyId: string,
     exitCode: number,
     exitIncarnationId?: PtyIncarnationId,
-    options?: { hostExitConfirmed?: boolean }
+    options?: { hostExitConfirmed?: boolean; terminatedBy?: 'operator' }
   ): void {
     const pty = this.ptysById.get(ptyId)
     if (exitIncarnationId && pty?.incarnationId && exitIncarnationId !== pty.incarnationId) {
@@ -15105,7 +15106,7 @@ export class OrcaRuntimeService {
       leaf.lastAgentStatusObservedLive = false
       this.resolveExitWaiters(leaf)
       if (!preservesAbnormalSshSurface) {
-        this.failActiveDispatchOnExit(leaf, exitCode)
+        this.failActiveDispatchOnExit(leaf, exitCode, { terminatedBy: options?.terminatedBy })
       }
     }
     this.pruneDisconnectedPtyRecords()
@@ -16717,7 +16718,11 @@ export class OrcaRuntimeService {
   // dispatch contexts immediately, rather than waiting for the coordinator's
   // next poll cycle. This catches agent crashes and unexpected exits within
   // milliseconds. The task is set back to 'pending' so it can be re-dispatched.
-  private failActiveDispatchOnExit(leaf: RuntimeLeafRecord, exitCode: number): void {
+  private failActiveDispatchOnExit(
+    leaf: RuntimeLeafRecord,
+    exitCode: number,
+    options?: { terminatedBy?: 'operator' }
+  ): void {
     if (!this._orchestrationDb) {
       return
     }
@@ -16732,27 +16737,55 @@ export class OrcaRuntimeService {
       return
     }
 
-    const errorContext = `Agent exited with code ${exitCode}`
-    this._orchestrationDb.failDispatch(dispatch.id, errorContext, { workerProcessExited: true })
-
-    // Why: create an escalation message so the coordinator is notified about
-    // the unexpected exit on its next check cycle, even if the circuit breaker
-    // hasn't tripped yet.
-    const run = this._orchestrationDb.getActiveCoordinatorRun()
-    if (run) {
-      this._orchestrationDb.insertMessage({
-        from: handle,
-        to: run.coordinator_handle,
-        subject: `Agent exited unexpectedly (code ${exitCode})`,
-        type: 'escalation',
-        priority: 'high',
-        payload: JSON.stringify({
-          taskId: dispatch.task_id,
-          exitCode,
-          handle
-        })
-      })
+    // Why (#15048): a worker mid-graceful-stop already owns this transition via
+    // orchestration.workerStop's settleWorkerStop; failing here on the exit it
+    // caused would race it into an uncaught dispatch_inactive.
+    const worker = this._orchestrationDb.getWorkerDispatch(dispatch.id)
+    if (worker?.state === 'stopping') {
+      return
     }
+
+    const terminatedByOperator = options?.terminatedBy === 'operator'
+    const errorContext = terminatedByOperator
+      ? 'Terminal closed before the agent finished'
+      : `Agent exited with code ${exitCode}`
+    this._orchestrationDb.failDispatch(dispatch.id, errorContext, {
+      workerProcessExited: true,
+      terminatedBy: options?.terminatedBy
+    })
+
+    // Why (#8984/#15049): resolve the escalation target from the dying
+    // Dispatch's own Run first — getActiveCoordinatorRun() only ever sees the
+    // single legacy coordinator_runs row, so it silently drops this message
+    // for both CLI/manual dispatch (no coordinator loop) and the recommended
+    // lightweight Run flow (run-create/run-use never touches coordinator_runs).
+    // The auto-seeded legacy Run row never carries a coordinator_handle, so it
+    // falls through to the legacy lookup just like before.
+    const run = this._orchestrationDb.getRun(dispatch.run_id)
+    const modernRun = run && run.legacy !== 1 ? run : undefined
+    const legacyRun = modernRun ? undefined : this._orchestrationDb.getActiveCoordinatorRun()
+    const to = modernRun ? `run:${modernRun.id}` : legacyRun?.coordinator_handle
+    if (!to) {
+      return
+    }
+    this._orchestrationDb.insertMessage({
+      from: handle,
+      to,
+      // Why: getOrCreateRunDelivery matches messages by (run_id, to_handle)
+      // together — a 'run:<id>' address with the default legacy run_id would
+      // never surface in that Run's own delivery poll.
+      ...(modernRun ? { runId: modernRun.id } : {}),
+      subject: terminatedByOperator
+        ? 'Agent terminal closed before finishing'
+        : `Agent exited unexpectedly (code ${exitCode})`,
+      type: 'escalation',
+      priority: 'high',
+      payload: JSON.stringify({
+        taskId: dispatch.task_id,
+        exitCode,
+        handle
+      })
+    })
   }
 
   async listTerminals(
@@ -18253,7 +18286,7 @@ export class OrcaRuntimeService {
         }
       )
       const bytesWritten = Buffer.byteLength(payload, 'utf8') + submits
-      return { handle, accepted: true, bytesWritten }
+      return { handle, accepted: true, bytesWritten, submissionVerified: true }
     }
 
     const { leaf } = this.getLiveLeafForHandle(handle)
@@ -18273,7 +18306,7 @@ export class OrcaRuntimeService {
       return await this.writeTerminalAgentPrompt(handle, leaf.ptyId!, generation, payload, options)
     })
     const bytesWritten = Buffer.byteLength(payload, 'utf8') + submits
-    return { handle, accepted: true, bytesWritten }
+    return { handle, accepted: true, bytesWritten, submissionVerified: true }
   }
 
   async getTerminalAgentStatus(handle: string): Promise<RuntimeTerminalAgentStatus> {
@@ -19013,6 +19046,14 @@ export class OrcaRuntimeService {
   } | null {
     const pty = this.ptysById.get(ptyId)
     const agent = pty?.launchAgent ?? pty?.foregroundAgent
+    // Why (#9838 follow-up): generic 1.5s-quiet/8s-cap output quiescence was extended to every
+    // correctly-identified TUI agent, not just claude/codex, on Vitest-only evidence with no live
+    // Electron/Playwright/CLI validation. Any of the ~30 configured agents that renders a
+    // continuously animating status/spinner line never goes 1.5s quiet, so every prompt submit
+    // always pays the full 8s hard cap instead of the previous flat 500ms delay — a 16x
+    // regression on every dispatch/worker-start/terminal-send prompt to those agents. Scope the
+    // render-gate back to claude/codex, which are validated via their own post-paste marker, and
+    // leave every other agent on the flat platform delay until this has live evidence.
     if (!isTerminalSendSettlementAgent(agent)) {
       return null
     }
@@ -28960,7 +29001,10 @@ export class OrcaRuntimeService {
       let stopped = false
       if (this.ptyController?.stopAndWait) {
         try {
-          stopped = await this.ptyController.stopAndWait(ptyId, { deadlineMs })
+          stopped = await this.ptyController.stopAndWait(ptyId, {
+            deadlineMs,
+            terminatedBy: 'operator'
+          })
         } catch (error) {
           this.markPtyLivenessUnverifiable(
             ptyId,
@@ -28973,7 +29017,7 @@ export class OrcaRuntimeService {
             verdict?.status === 'unverifiable' &&
             verdict.reason === SSH_PROVIDER_UNREGISTERED_REASON
           if (!providerAlreadyRetiredPty) {
-            this.ptyController.kill(ptyId)
+            this.ptyController.kill(ptyId, { terminatedBy: 'operator' })
             if (!verdict || verdict.status === 'live') {
               this.markPtyLivenessUnverifiable(
                 ptyId,
@@ -28983,7 +29027,7 @@ export class OrcaRuntimeService {
           }
         }
       } else {
-        stopped = this.ptyController?.kill(ptyId) ?? false
+        stopped = this.ptyController?.kill(ptyId, { terminatedBy: 'operator' }) ?? false
       }
       if (ptyId === addressedPtyId) {
         addressedPtyStopped = stopped
@@ -34088,8 +34132,12 @@ export class OrcaRuntimeService {
     return this.getLeavesForPty(ptyId)[0] ?? null
   }
 
-  deliverPendingMessagesForHandle(handle: string, reservedTypes?: ReadonlySet<string>): void {
-    this.orchestrationMailboxNotifications.deliverForHandle(handle, reservedTypes)
+  deliverPendingMessagesForHandle(
+    handle: string,
+    reservedTypes?: ReadonlySet<string>,
+    origin?: OrchestrationMailboxDeliveryOrigin
+  ): void {
+    this.orchestrationMailboxNotifications.deliverForHandle(handle, reservedTypes, origin)
   }
 
   private writeOrchestrationPointerPty(ptyId: string, data: string): boolean | Promise<boolean> {
@@ -34722,11 +34770,17 @@ export class OrcaRuntimeService {
           return
         }
         // Foreground fallback: a reported non-shell process with quiet output is treated as idle.
+        // Why: claude/codex can sit output-quiet for 3s+ mid cold-start render; skip this
+        // heuristic for them and require an explicit idle/ready-prompt signal instead (#9976).
+        const leafTrackedPty = leaf.ptyId ? this.ptysById.get(leaf.ptyId) : null
         if (
           leaf.lastAgentStatus === null &&
           leaf.ptyId &&
           this.ptyController &&
-          !foregroundPollInFlight
+          !foregroundPollInFlight &&
+          !isTerminalSendSettlementAgent(
+            leafTrackedPty?.launchAgent ?? leafTrackedPty?.foregroundAgent
+          )
         ) {
           foregroundPollInFlight = true
           startedForegroundPoll = true
@@ -34793,7 +34847,14 @@ export class OrcaRuntimeService {
           this.resolveWaiter(waiter, buildPtyTerminalWaitResult(waiter.handle, 'tui-idle', pty))
           return
         }
-        if (pty.lastAgentStatus === null && this.ptyController && !foregroundPollInFlight) {
+        // Why: claude/codex can sit output-quiet for 3s+ mid cold-start render; skip this
+        // heuristic for them and require an explicit idle/ready-prompt signal instead (#9976).
+        if (
+          pty.lastAgentStatus === null &&
+          this.ptyController &&
+          !foregroundPollInFlight &&
+          !isTerminalSendSettlementAgent(pty.launchAgent ?? pty.foregroundAgent)
+        ) {
           foregroundPollInFlight = true
           startedForegroundPoll = true
           const fg = await this.ptyController.getForegroundProcess(pty.ptyId)

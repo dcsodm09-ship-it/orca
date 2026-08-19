@@ -84,7 +84,10 @@ describe('runRemoteOrcaCli', () => {
       getActiveDispatchMailboxOwners: vi.fn(() => []),
       getCurrentRunForPane: vi.fn(() => undefined),
       getRunMailboxOwnerIdsForHandle: vi.fn(() => []),
-      findActiveRemoteAttachmentForPane: vi.fn(() => undefined)
+      findActiveRemoteAttachmentForPane: vi.fn(() => undefined),
+      // Why (#14829/#10673): orchestration.check now sweeps for stale dispatches as a side
+      // effect (non-empty by default would drive escalation writes this fake doesn't model).
+      getStaleDispatches: vi.fn(() => [])
     }
     const runtime = {
       getRuntimeId: () => 'runtime-test',

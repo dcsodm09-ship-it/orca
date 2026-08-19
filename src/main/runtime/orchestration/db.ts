@@ -14,6 +14,7 @@ export type {
 export type { MessageInsert } from './db/messages/message-insert'
 export type { LegacyAdoptedMailboxOwner } from './db/runs/run-lookup'
 
+export { TERMINAL_TASK_STATUSES, isTerminalTaskStatus } from './types'
 export type {
   MessageType,
   MessagePriority,

@@ -1,5 +1,6 @@
 import type { OrchestrationDb } from './db'
 import type { MessageRow, CoordinatorStatus } from './types'
+import { isTerminalTaskStatus } from './types'
 import { reconcileLifecycleMessage } from './lifecycle-reconciliation'
 import type { CoordinatorRuntime, WorktreeDrift } from './coordinator-runtime-contract'
 import { applyEscalationToDispatch } from './coordinator-escalation-triage'
@@ -113,15 +114,36 @@ export class Coordinator {
 
       // Why: an early stop leaves tasks incomplete, so the run counts as failed.
       const tasks = this.db.listTasks()
-      const allDone = tasks.every((t) => t.status === 'completed' || t.status === 'failed')
+      const allDone = tasks.every((t) => isTerminalTaskStatus(t.status))
       const failedTasks = [
         ...new Set([
           ...this.state.failedTasks,
           ...tasks.filter((task) => task.status === 'failed').map((task) => task.id)
         ])
       ]
+      // Why (#14548): cancelled/superseded are terminal but not successful - a deliberately
+      // ended task didn't complete the work, so a Run containing one must not report
+      // finalStatus 'completed'. The one exception: a superseded task whose replacement
+      // actually completed represents work that DID finish, just under a different task id.
+      // Kept separate from `failedTasks` above (an existing, narrower "status=failed" contract
+      // callers already rely on) rather than folding cancelled/superseded ids into it.
+      const tasksById = new Map(tasks.map((task) => [task.id, task]))
+      const hasUnsuccessfulCancellation = tasks.some((task) => {
+        if (task.status === 'cancelled') {
+          return true
+        }
+        if (task.status === 'superseded') {
+          const replacement = task.replacement_task_id
+            ? tasksById.get(task.replacement_task_id)
+            : undefined
+          return replacement?.status !== 'completed'
+        }
+        return false
+      })
       const finalStatus =
-        this.stopped || failedTasks.length > 0 || !allDone ? 'failed' : 'completed'
+        this.stopped || failedTasks.length > 0 || hasUnsuccessfulCancellation || !allDone
+          ? 'failed'
+          : 'completed'
       this.db.updateCoordinatorRun(runId, finalStatus)
       this.opts.onLog(`Coordinator run ${runId} ${finalStatus}`)
 

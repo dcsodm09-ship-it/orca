@@ -53,11 +53,20 @@ export function messagesTypeCheckAllowsQuestion(this: OrchestrationDb): boolean 
   return !!row && row.sql.includes("'question'")
 }
 
+// Why: sqlite_master holds the table's CREATE SQL incl. the CHECK — cheapest reliable probe for whether it already allows 'cancelled' (#14548).
+export function tasksStatusCheckAllowsCancelled(this: OrchestrationDb): boolean {
+  const row = this.db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'")
+    .get() as { sql: string } | undefined
+  return !!row && row.sql.includes("'cancelled'")
+}
+
 export type SchemaColumnProbesMethods = {
   hasColumn: typeof hasColumn
   createMailboxDeliveryIndexesIfPossible: typeof createMailboxDeliveryIndexesIfPossible
   messagesTypeCheckAllowsHeartbeat: typeof messagesTypeCheckAllowsHeartbeat
   messagesTypeCheckAllowsQuestion: typeof messagesTypeCheckAllowsQuestion
+  tasksStatusCheckAllowsCancelled: typeof tasksStatusCheckAllowsCancelled
 }
 
 export function attachSchemaColumnProbes(ctor: { prototype: object }): void {
@@ -65,6 +74,7 @@ export function attachSchemaColumnProbes(ctor: { prototype: object }): void {
     hasColumn,
     createMailboxDeliveryIndexesIfPossible,
     messagesTypeCheckAllowsHeartbeat,
-    messagesTypeCheckAllowsQuestion
+    messagesTypeCheckAllowsQuestion,
+    tasksStatusCheckAllowsCancelled
   })
 }

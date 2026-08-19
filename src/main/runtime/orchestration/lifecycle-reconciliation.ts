@@ -13,7 +13,9 @@ function isSamePane(assigneePaneKey: string, senderPaneKey: string): boolean {
   return Boolean(assigneeLeaf && senderLeaf && assigneeLeaf === senderLeaf)
 }
 
-function hasLifecycleAuthority(
+// Why: exported so the send-path RPC can gate a stuck-state cleanup (#13364) and
+// a missing-id dispatch fallback (#7429) on the same identity check used here.
+export function hasLifecycleAuthority(
   dispatch: { assignee_handle: string | null; assignee_pane_key: string | null },
   msg: MessageRow
 ): boolean {

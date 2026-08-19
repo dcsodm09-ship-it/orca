@@ -16,7 +16,22 @@ export type MessagePriority = 'normal' | 'high' | 'urgent'
 
 export type MessageDeliveryContract = 'legacy_direct' | 'current_delivery' | 'audit_only'
 
-export type TaskStatus = 'pending' | 'ready' | 'dispatched' | 'completed' | 'failed' | 'blocked'
+export type TaskStatus =
+  | 'pending'
+  | 'ready'
+  | 'dispatched'
+  | 'completed'
+  | 'failed'
+  | 'blocked'
+  | 'cancelled'
+  | 'superseded'
+
+// Why: single source of truth — every "is this Task done" check must agree on which statuses are terminal (#14548).
+export const TERMINAL_TASK_STATUSES = ['completed', 'failed', 'cancelled', 'superseded'] as const
+
+export function isTerminalTaskStatus(status: TaskStatus): boolean {
+  return (TERMINAL_TASK_STATUSES as readonly TaskStatus[]).includes(status)
+}
 
 export type DispatchStatus = 'pending' | 'dispatched' | 'completed' | 'failed' | 'circuit_broken'
 
@@ -155,6 +170,7 @@ export type WorkerDispatchRow = {
   residual_resources: string
   start_options: string
   last_error: string | null
+  terminated_by: string | null
   created_at: string
   updated_at: string
 }
@@ -258,6 +274,8 @@ export type TaskRow = {
   result: string | null
   created_at: string
   completed_at: string | null
+  terminal_reason: string | null
+  replacement_task_id: string | null
 }
 
 export type DispatchContextRow = {
@@ -278,6 +296,7 @@ export type DispatchContextRow = {
   completed_at: string | null
   created_at: string
   last_heartbeat_at: string | null
+  stale_escalated_at: string | null
 }
 
 export type DecisionGateRow = {

@@ -1,3 +1,4 @@
+import type { OrchestrationMailboxDeliveryOrigin } from './mailbox-pointer-delivery-origin'
 import type { OrchestrationMailboxLeaf } from './mailbox-owner'
 
 export type OrchestrationMailboxDeliveryFlight = {
@@ -7,6 +8,7 @@ export type OrchestrationMailboxDeliveryFlight = {
 
 export type ParkedOrchestrationMailboxDelivery = {
   leaf: OrchestrationMailboxLeaf
+  origin: OrchestrationMailboxDeliveryOrigin
   reservedTypes?: ReadonlySet<string>
 }
 
@@ -54,6 +56,7 @@ export class OrchestrationMailboxPointerState {
     ptyId: string,
     mailboxHandle: string,
     leaf: OrchestrationMailboxLeaf,
+    origin: OrchestrationMailboxDeliveryOrigin,
     reservedTypes?: ReadonlySet<string>
   ): void {
     const parked = this.parkedDeliveriesByPtyId.get(ptyId) ?? new Map()
@@ -66,7 +69,13 @@ export class OrchestrationMailboxPointerState {
     } else if (prior && current) {
       merged = new Set([...prior, ...current])
     }
-    parked.set(mailboxHandle, { leaf, reservedTypes: merged })
+    // Why: an idle-transition request stays eligible for a dispatch: pointer even if a
+    // later notification-origin request parks against the same in-flight PTY write.
+    const mergedOrigin =
+      priorEntry?.origin === 'idle-transition' || origin === 'idle-transition'
+        ? 'idle-transition'
+        : origin
+    parked.set(mailboxHandle, { leaf, origin: mergedOrigin, reservedTypes: merged })
     this.parkedDeliveriesByPtyId.set(ptyId, parked)
   }
 
@@ -146,12 +155,18 @@ export class OrchestrationMailboxPointerState {
     return parkedTypes ?? null
   }
 
+  // Why: a mailbox can be parked behind this PTY's in-flight write without ever being the
+  // watermark owner itself (only the in-flight mailbox gets watermarked; others waiting are
+  // merely parked) - returning parkedDeliveries lets the caller redrive those too instead of
+  // silently dropping them along with the deleted map.
   retirePty(ptyId: string): {
     flight: OrchestrationMailboxDeliveryFlight | undefined
     releasedMailboxes: string[]
+    parkedDeliveries: Map<string, ParkedOrchestrationMailboxDelivery>
   } {
     const flight = this.flightsByPtyId.get(ptyId)
     this.flightsByPtyId.delete(ptyId)
+    const parkedDeliveries = this.parkedDeliveriesByPtyId.get(ptyId) ?? new Map()
     this.parkedDeliveriesByPtyId.delete(ptyId)
     const releasedMailboxes: string[] = []
     for (const mailboxHandle of this.watermarkMailboxesByPtyId.get(ptyId) ?? []) {
@@ -161,7 +176,7 @@ export class OrchestrationMailboxPointerState {
       }
     }
     this.watermarkMailboxesByPtyId.delete(ptyId)
-    return { flight, releasedMailboxes }
+    return { flight, releasedMailboxes, parkedDeliveries }
   }
 
   private removeWatermarkPtyIndex(mailbox: string, ptyId: string): void {

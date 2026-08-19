@@ -419,6 +419,44 @@ describe('shared agent-hook-listener', () => {
       expect(stopped?.payload.state).toBe('working')
     })
 
+    it('clears only its own pending permission on SubagentStop, preserving a sibling not owning the tracked wait (#10997, round 5)', () => {
+      claudeEvent({ hook_event_name: 'UserPromptSubmit', prompt: 'guarded task' })
+      claudeEvent({
+        hook_event_name: 'PermissionRequest',
+        agent_id: 'child-a',
+        tool_name: 'Bash',
+        tool_input: { command: 'ls' }
+      })
+      // child-b requests second - it becomes the tracked waitingAgentId, displacing child-a.
+      claudeEvent({
+        hook_event_name: 'PermissionRequest',
+        agent_id: 'child-b',
+        tool_name: 'Bash',
+        tool_input: { command: 'pwd' }
+      })
+
+      // child-a dies without ever resolving its own request - it is NOT the tracked wait owner,
+      // so the old single-slot-only logic did nothing at all for it.
+      const stopped = claudeEvent({ hook_event_name: 'SubagentStop', agent_id: 'child-a' })
+      // child-b is still genuinely pending, so the pane must stay 'waiting'.
+      expect(stopped?.payload.state).toBe('waiting')
+
+      // child-b resolves too - now nothing is pending, the pane must un-wedge.
+      const resolved = claudeEvent({
+        hook_event_name: 'PermissionDenied',
+        agent_id: 'child-b',
+        tool_name: 'Bash',
+        tool_input: { command: 'pwd' },
+        reason: 'user_denied'
+      })
+      claudeEvent({ hook_event_name: 'SubagentStop', agent_id: 'child-b' })
+      // Why: nothing is pending anymore (child-a cleared via SubagentStop above, child-b just
+      // resolved) - the pane must un-wedge, not stay 'waiting'.
+      expect(resolved?.payload.state).toBe('working')
+      const finalStop = claudeEvent({ hook_event_name: 'Stop' })
+      expect(finalStop?.payload.state).toBe('done')
+    })
+
     it('restores a finished lead to done after a child permission wait clears', () => {
       claudeEvent({ hook_event_name: 'UserPromptSubmit', prompt: 'bg task' })
       claudeEvent({
@@ -673,6 +711,42 @@ describe('shared agent-hook-listener', () => {
       expect(childDriven?.payload.state).toBe('working')
       expect(childDriven?.payload.toolName).toBeUndefined()
       expect(childDriven?.payload.interactivePrompt).toBeUndefined()
+    })
+
+    it('preserves an unrelated agent pending PermissionRequest when a different child AskUserQuestion is answered (#10997, round 5)', () => {
+      claudeEvent({ hook_event_name: 'UserPromptSubmit', prompt: 'go' })
+      // child-a has a genuinely pending permission request throughout this test.
+      claudeEvent({
+        hook_event_name: 'PermissionRequest',
+        agent_id: 'child-a',
+        tool_name: 'Bash',
+        tool_input: { command: 'rm -rf /' }
+      })
+      // child-b separately asks the user a question - a different mechanism entirely.
+      const wait = claudeEvent({
+        hook_event_name: 'PreToolUse',
+        tool_name: 'AskUserQuestion',
+        agent_id: 'child-b',
+        tool_input: { questions: [{ question: 'Continue?' }] }
+      })
+      expect(wait?.payload.state).toBe('waiting')
+
+      // Answering child-b's question must not silently resolve child-a's unrelated permission.
+      clearClaudeAnsweredQuestionWait(state, PANE_KEY)
+
+      normalizeHookPayload(
+        state,
+        'claude',
+        { paneKey: PANE_KEY, payload: { hook_event_name: 'SubagentStop', agent_id: 'child-b' } },
+        'production'
+      )
+      const event = normalizeHookPayload(
+        state,
+        'claude',
+        { paneKey: PANE_KEY, payload: { hook_event_name: 'Stop' } },
+        'production'
+      )
+      expect(event?.payload.state).toBe('waiting')
     })
 
     it('restores the stashed lead state for an answered child question', () => {

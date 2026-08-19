@@ -163,6 +163,30 @@ describe('OrchestrationDb Run state', () => {
       expect(replacement?.messages.map((message) => message.subject)).toEqual(['one'])
     })
 
+    it('stamps delivered_at on acknowledgment so polled Run mail is not misread as never delivered', () => {
+      const d = createDb()
+      const run = createBoundRun(d)
+      const inserted = d.insertMessage({
+        from: 'a',
+        to: `run:${run.id}`,
+        subject: 'polled',
+        runId: run.id
+      })
+      expect(d.getMessageById(inserted.id)?.delivered_at).toBeNull()
+
+      const delivery = d.getOrCreateRunDelivery({
+        runId: run.id,
+        consumerGeneration: run.consumer_generation
+      })!
+      d.acknowledgeRunDelivery({
+        runId: run.id,
+        consumerGeneration: run.consumer_generation,
+        deliveryId: delivery.delivery.id
+      })
+
+      expect(d.getMessageById(inserted.id)?.delivered_at).not.toBeNull()
+    })
+
     it('does not move a mismatched Run through another Run Dispatch mailbox', () => {
       const d = createDb()
       const runA = createBoundRun(d)

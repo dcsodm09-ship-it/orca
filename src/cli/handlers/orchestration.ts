@@ -79,7 +79,9 @@ const TASK_STATUS_VALUES = [
   'dispatched',
   'completed',
   'failed',
-  'blocked'
+  'blocked',
+  'cancelled',
+  'superseded'
 ] as const
 
 // Why: mirrors WorkerTerminalListState (orchestration/types.ts) so a bad --terminal-state fails before the RPC.
@@ -871,7 +873,10 @@ export const ORCHESTRATION_HANDLERS: Record<string, CommandHandler> = {
         status,
         result: getOptionalStringFlag(flags, 'result'),
         run: getOptionalStringFlag(flags, 'run'),
-        callerTerminalHandle: await resolveCoordinatorTerminalHandle(flags, cwd, client)
+        callerTerminalHandle: await resolveCoordinatorTerminalHandle(flags, cwd, client),
+        // Why (#14548): only meaningful with --status cancelled|superseded.
+        reason: getOptionalStringFlag(flags, 'reason'),
+        replacementTaskId: getOptionalStringFlag(flags, 'replacement-task-id')
       }
     )
     printResult(result, json, (r) => `Updated ${r.task.id} -> ${r.task.status}`)
@@ -1112,6 +1117,14 @@ export const ORCHESTRATION_HANDLERS: Record<string, CommandHandler> = {
       const base = `Dispatched ${r.dispatch?.task_id} -> ${r.dispatch?.id} [${r.dispatch?.status}]`
       return r.preamble ? `${base}\n\n--- Preamble ---\n${r.preamble}` : base
     })
+    // Why (#14809): an un-injected dispatch still commits and claims the terminal's one
+    // active-dispatch slot, so a coordinator watching stdout alone can miss that nothing
+    // actually reached the agent.
+    if (!json && !result.result.dryRun && result.result.injected === false) {
+      console.error(
+        `warning: dispatch ${result.result.dispatch?.id} was committed but not injected into ${to}; retry with --inject to actually deliver it.`
+      )
+    }
   },
 
   'orchestration ask': async ({ flags, client, cwd, json }) => {

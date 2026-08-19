@@ -473,6 +473,9 @@ describe('orchestration dispatch coordinator handle', () => {
     })
   })
 
+  // The injected:false stderr warning (#14809) has dedicated coverage in
+  // orchestration-dispatch-inject-warning.test.ts.
+
   it('retires the legacy coordinator command without runtime effects', async () => {
     await expect(
       invokeRun(new Map<string, string | boolean>([['spec', 'run the plan']]))

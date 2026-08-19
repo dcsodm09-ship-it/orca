@@ -105,6 +105,11 @@ const STRUCTURED_RUNTIME_PASSTHROUGH_CODES: ReadonlySet<string> = new Set([
   'capability_unsupported',
   'relay_quota_exceeded',
   'dispatch_capability_invalid',
+  // Why (#14809): newly minted this session, disambiguating a concurrent-mint loss from a
+  // concurrent pane-claim loss on `orchestration.dispatch --inject` - without passthrough both
+  // collapse to a generic runtime_error and the caller loses the distinction entirely.
+  'dispatch_pane_reused',
+  'dispatch_capability_already_minted',
   'agent_unconfigured',
   'terminal_worktree_mismatch',
   'request_mismatch',

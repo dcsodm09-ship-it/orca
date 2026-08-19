@@ -1,5 +1,6 @@
 /** Whether the task DAG has finished, and the stuck-DAG warning when it can never finish. */
 import type { OrchestrationDb } from './db'
+import { isTerminalTaskStatus } from './types'
 
 export type DagConvergence = 'empty' | 'all-done' | 'active'
 
@@ -12,7 +13,7 @@ export function evaluateDagConvergence(
     return 'empty'
   }
 
-  const allDone = tasks.every((t) => t.status === 'completed' || t.status === 'failed')
+  const allDone = tasks.every((t) => isTerminalTaskStatus(t.status))
   if (allDone) {
     return 'all-done'
   }

@@ -205,6 +205,64 @@ describe('registerPtyHandlers', () => {
 
         expect(runtime.onPtyExit).toHaveBeenCalledWith('local-incarnated', 0, 'incarnation-live')
       })
+      it('attributes terminatedBy: operator to the provider real exit event, not just a synthetic one (#15048)', async () => {
+        const exitListeners = new Set<
+          (payload: { id: string; code: number; incarnationId?: string }) => void
+        >()
+        const provider = {
+          spawn: vi.fn(async () => ({ id: 'local-incarnated', incarnationId: 'incarnation-live' })),
+          write: vi.fn(),
+          resize: vi.fn(),
+          shutdown: vi.fn(async () => {
+            // Why: simulate the provider's own onExit observing the real process death —
+            // the common case when an operator closes a still-live worker tab.
+            for (const listener of exitListeners) {
+              listener({ id: 'local-incarnated', code: 0 })
+            }
+          }),
+          sendSignal: vi.fn(),
+          getCwd: vi.fn(),
+          getInitialCwd: vi.fn(),
+          clearBuffer: vi.fn(),
+          acknowledgeDataEvent: vi.fn(),
+          hasChildProcesses: vi.fn(),
+          getForegroundProcess: vi.fn(),
+          serialize: vi.fn(),
+          revive: vi.fn(),
+          onData: vi.fn(() => () => {}),
+          onReplay: vi.fn(() => () => {}),
+          onExit: vi.fn((listener) => {
+            exitListeners.add(listener)
+            return () => exitListeners.delete(listener)
+          }),
+          listProcesses: vi.fn(async () => []),
+          attach: vi.fn(),
+          getDefaultShell: vi.fn(),
+          getProfiles: vi.fn()
+        }
+        setLocalPtyProvider(provider as never)
+        const runtime = {
+          setPtyController: vi.fn(),
+          onPtyExit: vi.fn(),
+          registerPty: vi.fn(),
+          onPtySpawned: vi.fn()
+        }
+        handlers.clear()
+        registerPtyHandlers(mainWindow as never, runtime as never)
+        const controller = runtime.setPtyController.mock.calls[0]?.[0] as {
+          spawn: (args: { cols: number; rows: number }) => Promise<{ id: string }>
+          stopAndWait: (ptyId: string, opts?: { terminatedBy?: 'operator' }) => Promise<boolean>
+        }
+
+        await controller.spawn({ cols: 80, rows: 24 })
+        await expect(
+          controller.stopAndWait('local-incarnated', { terminatedBy: 'operator' })
+        ).resolves.toBe(true)
+
+        expect(runtime.onPtyExit).toHaveBeenCalledWith('local-incarnated', 0, 'incarnation-live', {
+          terminatedBy: 'operator'
+        })
+      })
       it('runtime controller kill routes app-scoped SSH ids through the parsed provider when ownership is absent', async () => {
         const localShutdown = vi.fn()
         setLocalPtyProvider({

@@ -373,6 +373,9 @@ describe('Coordinator', () => {
     expect(db.getTask(task.id)?.status).toBe('failed')
   })
 
+  // Why: split into coordinator-cancel-supersede-final-status.test.ts to keep this file under
+  // the max-lines budget (#14548's cancelled/superseded finalStatus coverage lives there).
+
   it('handles decision gate blocking and resolution', async () => {
     db = new OrchestrationDb(':memory:')
     const runtime = createMockRuntime()

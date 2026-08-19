@@ -39,6 +39,30 @@ describe('coordinator escalation authority', () => {
     expect(logs.at(-1)).toContain('Rejected escalation from term_attacker')
   })
 
+  it('drops an escalation targeting an already-cancelled Task (#14548)', () => {
+    db = new OrchestrationDb(':memory:')
+    const task = db.createTask({ spec: 'cancelled before escalation' })
+    const dispatch = db.createDispatchContext(task.id, 'term_worker')
+    db.cancelTask(task.id, 'cancelled', { reason: 'scope cut' })
+    const logs: string[] = []
+
+    const result = applyEscalationToDispatch(
+      db,
+      db.insertMessage({
+        from: 'term_worker',
+        to: 'term_coordinator',
+        subject: 'stale escalation',
+        type: 'escalation',
+        payload: JSON.stringify({ taskId: task.id, dispatchId: dispatch.id })
+      }),
+      (message) => logs.push(message)
+    )
+
+    expect(result).toBeNull()
+    expect(db.getTask(task.id)?.status).toBe('cancelled')
+    expect(logs).toEqual([])
+  })
+
   it('accepts the canonical sender of an imported federated Dispatch', () => {
     db = new OrchestrationDb(':memory:')
     const task = db.createTask({ spec: 'remote escalation target' })

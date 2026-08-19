@@ -153,6 +153,8 @@ export function listTasksWithDispatch(
 ): (TaskRow & {
   assignee_handle: string | null
   dispatch_id: string | null
+  last_dispatch_status: string | null
+  last_dispatch_failure: string | null
 })[] {
   const whereClauses: string[] = []
   const params: Database.BindValue[] = []
@@ -167,11 +169,16 @@ export function listTasksWithDispatch(
     params.push(filter.status)
   }
   const where = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : ''
+  // Why (#8984): a Dispatch that failed on exit reverts its Task to 'ready' with
+  // no active Dispatch row, so the active-only join above goes blank — surface
+  // the most recent Dispatch's outcome too, so a dead worker stays visible.
   const sql = `
     SELECT
       t.*,
       d.assignee_handle AS assignee_handle,
-      d.id              AS dispatch_id
+      d.id              AS dispatch_id,
+      last_d.status       AS last_dispatch_status,
+      last_d.last_failure AS last_dispatch_failure
     FROM tasks t
     LEFT JOIN dispatch_contexts d ON d.rowid = (
       SELECT candidate.rowid
@@ -181,12 +188,21 @@ export function listTasksWithDispatch(
       ORDER BY candidate.rowid DESC
       LIMIT 1
     )
+    LEFT JOIN dispatch_contexts last_d ON last_d.rowid = (
+      SELECT candidate.rowid
+      FROM dispatch_contexts candidate
+      WHERE candidate.task_id = t.id
+      ORDER BY candidate.rowid DESC
+      LIMIT 1
+    )
     ${where}
     ORDER BY t.created_at
   `
   return this.db.prepare(sql).all(...params) as (TaskRow & {
     assignee_handle: string | null
     dispatch_id: string | null
+    last_dispatch_status: string | null
+    last_dispatch_failure: string | null
   })[]
 }
 

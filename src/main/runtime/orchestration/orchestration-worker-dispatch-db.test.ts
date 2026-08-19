@@ -288,6 +288,35 @@ describe('OrchestrationDb worker Dispatch state', () => {
     })
   })
 
+  // Why (#13364): markWorkerReportRejectedUnknown (a rejected worker_done with a benign,
+  // recoverable capability miss) and the startup orphan sweep (#15048) both land a worker on
+  // 'stop_unknown'. The documented recovery ("worker-stop --dispatch <id> and inspect again")
+  // depends on beginWorkerStop accepting that state the same way it already accepts
+  // 'start_unknown' above.
+  it('allows explicit stop recovery from a rejected-report stop_unknown worker', () => {
+    const d = createDb()
+    const task = d.createTask({ spec: 'rejected report recovery' })
+    const started = d.createStartingWorkerDispatch({ taskId: task.id, startOptions: {} })
+    d.prepareStartingWorkerAuthority({
+      dispatchId: started.dispatch.id,
+      handle: 'term_worker',
+      paneKey: 'tab_worker:leaf_worker',
+      processIncarnation: 'runtime:pty:1',
+      worktreeId: 'repo::worktree',
+      setupState: 'not_applicable',
+      effects: []
+    })
+    d.markWorkerDispatchReady(started.dispatch.id)
+    d.markWorkerReportRejectedUnknown(started.dispatch.id, 'The Dispatch capability is missing.')
+    expect(d.getWorkerDispatch(started.dispatch.id)?.state).toBe('stop_unknown')
+
+    expect(d.beginWorkerStop(started.dispatch.id)).toMatchObject({
+      disposition: 'stopping',
+      worker: { state: 'stopping' }
+    })
+    expect(d.settleWorkerStop(started.dispatch.id).state).toBe('stopped')
+  })
+
   it('bounds remote attachment lookup across pane remints and malformed suffix collisions', () => {
     const d = createDb()
     const leafId = '11111111-1111-4111-8111-111111111111'

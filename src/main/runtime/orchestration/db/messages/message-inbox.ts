@@ -86,6 +86,43 @@ export function convertLifecycleMessageToRejection(
   return this.getMessageById(messageId)
 }
 
+// #7429: a worker_done sent without taskId/dispatchId can still resolve to the
+// sender's one active Dispatch at send time; persisting those ids onto the row
+// (rather than only reconciling in-memory) keeps a later replay — e.g. the
+// orchestration.check re-read of an unread message — from re-deriving identity
+// against whatever Dispatch is active by then instead of the one that was live
+// when this worker_done actually arrived.
+export function adoptWorkerDoneDispatchIdentity(
+  this: OrchestrationDb,
+  messageId: string,
+  taskId: string,
+  dispatchId: string
+): MessageRow | undefined {
+  const message = this.getMessageById(messageId)
+  if (!message || message.type !== 'worker_done') {
+    return message
+  }
+  // Why: this function's contract is "adopt ids INTO an existing object payload," not
+  // "replace whatever payload is there" — a non-object payload (malformed JSON, an array)
+  // must no-op here so reconcileLifecycleMessage's own invalid_payload rejection still
+  // fires on the message's real content instead of it being silently overwritten with a
+  // bare {taskId, dispatchId} that drops fields like outcome.
+  let parsed: Record<string, unknown>
+  try {
+    const value: unknown = message.payload ? JSON.parse(message.payload) : {}
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return message
+    }
+    parsed = value as Record<string, unknown>
+  } catch {
+    return message
+  }
+  this.db
+    .prepare('UPDATE messages SET payload = ? WHERE id = ?')
+    .run(JSON.stringify({ ...parsed, taskId, dispatchId }), messageId)
+  return this.getMessageById(messageId)
+}
+
 // Why: delivered_at IS NULL filter — push-on-idle delivers each row at most once; read (set only by check) wouldn't prevent replay.
 export function getUndeliveredUnreadMessages(
   this: OrchestrationDb,
@@ -263,6 +300,7 @@ export function getThreadMessagesFor(
 export type MessageInboxMethods = {
   getUnreadMessages: typeof getUnreadMessages
   convertLifecycleMessageToRejection: typeof convertLifecycleMessageToRejection
+  adoptWorkerDoneDispatchIdentity: typeof adoptWorkerDoneDispatchIdentity
   getUndeliveredUnreadMessages: typeof getUndeliveredUnreadMessages
   getUndeliveredUnreadMailboxHandles: typeof getUndeliveredUnreadMailboxHandles
   getAllMessages: typeof getAllMessages
@@ -281,6 +319,7 @@ export function attachMessageInbox(ctor: { prototype: object }): void {
   Object.assign(ctor.prototype, {
     getUnreadMessages,
     convertLifecycleMessageToRejection,
+    adoptWorkerDoneDispatchIdentity,
     getUndeliveredUnreadMessages,
     getUndeliveredUnreadMailboxHandles,
     getAllMessages,

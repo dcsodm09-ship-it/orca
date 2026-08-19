@@ -88,6 +88,12 @@ export const CLAUDE_EVENTS = [
   {
     eventName: 'PermissionRequest',
     definition: { matcher: '*', hooks: [{ type: 'command', command: '' }] }
+  },
+  // Why: distinct from PermissionRequest — fires once a permission decision resolves to deny,
+  // so a following bare Stop with no other signal isn't mistaken for a still-pending approval (#10997).
+  {
+    eventName: 'PermissionDenied',
+    definition: { matcher: '*', hooks: [{ type: 'command', command: '' }] }
   }
 ] as const
 

@@ -772,4 +772,28 @@ describe('orchestration notification mailbox consistency', () => {
     expect(db.getMessageById(question.id)?.to_handle).toBe(`dispatch:${dispatch.id}`)
     db.close()
   })
+
+  it('pushes an idle pointer for dispatch:-addressed mail, not only run:-addressed mail', async () => {
+    const db = createDatabase('orca-mailbox-dispatch-push-on-idle-')
+    const harness = createRuntime(db)
+    const run = db.createRun({
+      objective: 'Dispatch push on idle',
+      coordinatorHandle: 'term_coordinator_dispatch_push',
+      coordinatorPaneKey:
+        '55555555-5555-4555-8555-555555555555:66666666-6666-4666-8666-666666666666'
+    })
+    const task = db.createTask({ spec: 'Worker task', runId: run.id })
+    const dispatch = db.createDispatchContext(task.id, TERMINAL_HANDLE, PANE_KEY)
+    db.insertMessage({
+      from: 'term_coordinator_dispatch_push',
+      to: `dispatch:${dispatch.id}`,
+      subject: 'Worker instructions',
+      runId: run.id
+    })
+
+    await driveToLiveIdle(harness.runtime)
+
+    expect(pointerCount(harness.write)).toBeGreaterThan(0)
+    db.close()
+  })
 })

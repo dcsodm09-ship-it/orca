@@ -8,6 +8,7 @@ import {
 } from './runs/run-coordinator-mail-routing'
 import { createTables } from './schema/create-tables'
 import { migrate } from './schema/migrate'
+import { reconcileOrphanedStoppingWorkersOnStartup } from './worker-dispatch/worker-dispatch-stop'
 
 class OrchestrationDbCore {
   db: Database.Database
@@ -30,6 +31,7 @@ class OrchestrationDbCore {
     migrate.call(this as unknown as OrchestrationDb)
     createCoordinatorMailRoutingTrigger.call(this as unknown as OrchestrationDb)
     rememberCurrentRunCoordinatorHandles.call(this as unknown as OrchestrationDb)
+    reconcileOrphanedStoppingWorkersOnStartup.call(this as unknown as OrchestrationDb)
     hardenOrchestrationDatabaseFiles(dbPath)
   }
 

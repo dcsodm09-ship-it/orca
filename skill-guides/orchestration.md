@@ -162,12 +162,14 @@ A Run is the namespace/inbox, a Task is the work item, and a Dispatch assigns on
 orca orchestration run-create --objective <text> --json
 orca orchestration task-create --spec <text> [--deps <json_array>] [--parent <task_id>] [--json]
 orca orchestration task-list [--status <status>] [--ready] [--brief] [--json]
-orca orchestration task-update --id <task_id> --status <status> [--result <json>] [--json]
+orca orchestration task-update --id <task_id> --status <status> [--result <json>] [--reason <text>] [--replacement-task-id <task_id>] [--json]
 orca orchestration dispatch --task <task_id> --to <handle> [--from <handle>] [--inject] [--json]
 orca orchestration dispatch-show --task <task_id> [--json]
 ```
 
-Task statuses: `pending`, `ready`, `dispatched`, `completed`, `failed`, `blocked`.
+Task statuses: `pending`, `ready`, `dispatched`, `completed`, `failed`, `blocked`, `cancelled`, `superseded`. `--reason` and `--replacement-task-id` apply only to `--status cancelled|superseded`.
+
+`cancelled`/`superseded` are for deliberately-ended-not-completed work: any active supervised Dispatch on the task settles as `failed` (not `completed` — it never finished), and any `pending` task that depends on the cancelled one cascades to the same terminal status so it never gets silently stuck waiting on a dependency that will never complete. `--replacement-task-id` must belong to the same Run, or the call is rejected. If a supervised worker's liveness is currently untrusted (`worker-show` reports `stop_unknown` — see the recovery section below), cancelling is blocked the same as for a genuinely live worker; run `worker-stop --dispatch <id>` first to resolve it, then cancel.
 
 Dispatch rules:
 
@@ -175,6 +177,8 @@ Dispatch rules:
 - If the target is a bare shell, omit `--inject`, dispatch for tracking if needed, then send the prompt manually with `orca terminal send --terminal <handle> --text <prompt> --enter --json`.
 - After 3 consecutive failures on one task, the dispatch context circuit-breaks and the task is marked failed.
 - Use `task-list --brief --json` for coordinator sweeps; it collapses whitespace and caps each echoed spec at 160 characters (`spec_truncated` marks shortened rows). Omit `--brief` when the full spec is required, or when an older CLI rejects it as an unknown flag.
+- `--inject` can fail with `worker_identity_changed` if the target terminal's process/pane changed while Orca was confirming an agent is running there (a race, not a permanent failure) — just retry the dispatch.
+- A `worker_done` that omits both `--task`/`--dispatch` identity falls back to the sender's sole active Dispatch and persists the resolved ids onto the message; this is a recovery fallback for agents that cannot echo the preamble's ids back, not the normal contract — prefer an agent that reports its real `taskId`/`dispatchId` when possible.
 
 ## Preferred Supervised Worker Loop
 
@@ -266,7 +270,15 @@ Recovery is conditional, never a fixed destructive sequence:
 - `worker-show --dispatch <id>` says `ready`: keep waiting or read bounded output.
 - It proves `failed` or `stopped`: start a replacement with `worker-start --task <task> --retry-of <id>` plus an explicit `--on`/`--worktree` and `--agent`/`--terminal` choice. Retry does not silently inherit placement.
 - It remains `outcome_unknown`: either `worker-stop --dispatch <id>` and inspect again, or explicitly `worker-abandon --dispatch <id>` while accepting that resources may still be live. Abandon performs no remote, process, or filesystem action.
+- It reports `stop_unknown` (a `worker_done` was rejected only for a missing/invalid capability, not a wrong pane/task): this self-heals — a later, correctly-authenticated `worker_done` retry settles it normally with no intervention needed. If it never arrives, the same `worker-stop --dispatch <id>` recovery applies.
 - `worker-stop` closes only the exact supervised agent terminal. It never deletes the worktree, setup terminal, configured tabs, or unrelated processes.
+
+A worker can also go idle without ever running the reporting command: `worker-show` stays `ready` forever, no `worker_done`, heartbeat, or escalation ever arrives, and `check --wait` never wakes because nothing was ever sent. Orca does not auto-settle this from idle time or missing heartbeats alone — a false positive (a slow but genuinely working agent) costs more than the wait, so only step in once you have independently judged the worker is actually stuck, not merely quiet:
+
+1. `orca orchestration worker-stop --dispatch <dispatch_id> --json` — stops the supervised agent terminal and clears the active-worker guard that otherwise blocks a direct status override.
+2. `orca orchestration task-update --id <task_id> --status failed --result "<why you intervened>" --json` (or `--status ready` to let it re-dispatch, or `worker-start --task <task_id> --retry-of <dispatch_id> ...` for an immediate retry with an explicit placement). Reach for `--status completed` only when you independently verified the work happened — never infer success from silence.
+
+This same gap exists whether or not a worker is under `worker-start`'s supervision: `coordinator-start`/`run` (below) are retired, so no polling loop is watching dispatch heartbeats between your calls. `orchestration check` (non-`--peek`) does sweep for dispatches stale ~10+ min and post one escalation message per stale spell to your own bound Run — but only as a side effect of you calling `check`, not on a timer — so you still need to call `check` yourself at a cadence matched to each task's expected duration; sustained silence across your own checks is your cue to look closer, not something Orca will proactively page you about.
 
 Low-level `worktree create`, `terminal create`, and `dispatch --inject` remain valid recipes for custom argv or topology that `worker-start` does not express.
 

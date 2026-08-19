@@ -61,7 +61,9 @@ describe('agent prompt submission runtime', () => {
     const submission = runtime.sendTerminalAgentPrompt(handle, 'review this')
     await vi.runAllTimersAsync()
 
-    await expect(submission).resolves.toMatchObject({ accepted: true })
+    // Why (#13805): a real settlement-verified submission must say so, not
+    // read identically to a fire-and-forget write.
+    await expect(submission).resolves.toMatchObject({ accepted: true, submissionVerified: true })
     expect(writes.filter((data) => data === '\r')).toHaveLength(1)
   })
 

@@ -116,6 +116,49 @@ export function createDispatchContext(
   }
 }
 
+// Why (#14809): a dispatch --to without --inject already committed status='dispatched' and
+// claimed the terminal's one active-dispatch slot without ever touching it; an --inject retry
+// on the identical task+terminal reuses that context instead of hitting the occupied-slot guard.
+// Reuse bypasses DISPATCH_CONTEXT_CLAIM_SQL entirely, and mintDispatchCapability unconditionally
+// rebinds the reused row's assignee_pane_key/process_incarnation to the terminal's CURRENT pane —
+// so a handle remint that lands on a pane another active Dispatch already owns must not reuse
+// silently (two active Dispatches would end up sharing one pane). Re-run the same pane-identity
+// guards the claim SQL enforces at create time; on a collision, return undefined so the caller's
+// createDispatchContext takes over and fails loudly via its own occupied-slot guard instead.
+export function findReusableUninjectedDispatchContext(
+  this: OrchestrationDb,
+  taskId: string,
+  assigneeHandle: string,
+  assigneePaneKey?: string
+): DispatchContextRow | undefined {
+  const existing = this.findActiveDispatchForAssignee(assigneeHandle)
+  if (!existing || existing.task_id !== taskId || existing.capability_hash !== null) {
+    return undefined
+  }
+  if (!assigneePaneKey) {
+    return existing
+  }
+  const paneSuffix = parsePaneKey(assigneePaneKey) ? paneKeyMatchSuffix(assigneePaneKey) : null
+  const collision = this.db
+    .prepare(
+      `SELECT 1 FROM dispatch_contexts active
+       WHERE active.id != ?
+         AND active.status IN ('pending', 'dispatched')
+         AND (
+           active.assignee_pane_key = ?
+           OR (
+             ? IS NOT NULL
+             AND active.assignee_pane_key IS NOT NULL
+             AND instr(active.assignee_pane_key, ':') > 1
+             AND ${DISPATCH_PANE_KEY_MATCH_SUFFIX_SQL} = ?
+           )
+         )
+       LIMIT 1`
+    )
+    .get(existing.id, assigneePaneKey, paneSuffix, paneSuffix)
+  return collision ? undefined : existing
+}
+
 export function getDispatchContext(
   this: OrchestrationDb,
   taskId: string
@@ -167,6 +210,7 @@ export function commitDispatchLaunchTokenHash(
 
 export type DispatchContextStoreMethods = {
   createDispatchContext: typeof createDispatchContext
+  findReusableUninjectedDispatchContext: typeof findReusableUninjectedDispatchContext
   getDispatchContext: typeof getDispatchContext
   getDispatchContextById: typeof getDispatchContextById
   commitDispatchLaunchTokenHash: typeof commitDispatchLaunchTokenHash
@@ -175,6 +219,7 @@ export type DispatchContextStoreMethods = {
 export function attachDispatchContextStore(ctor: { prototype: object }): void {
   Object.assign(ctor.prototype, {
     createDispatchContext,
+    findReusableUninjectedDispatchContext,
     getDispatchContext,
     getDispatchContextById,
     commitDispatchLaunchTokenHash

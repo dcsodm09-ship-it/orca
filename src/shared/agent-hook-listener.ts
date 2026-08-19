@@ -160,6 +160,8 @@ export type ClaudeLeadTurnState = {
   turnCompletedAt?: number
   /** Lead state a child-induced wait displaced, restored when the wait clears; can't invent 'working' since the done-gate only downgrades done→working, never back. */
   stateBeforeWait?: Pick<ClaudeLeadTurnState, 'state' | 'interrupted' | 'turnCompletedAt'>
+  /** Agent ids (lead = '') with an outstanding PermissionRequest that agent hasn't itself resolved yet; gates one bare Stop to 'waiting' instead of 'done' so an unresolved approval can't be silently overwritten (#10997). Keyed per-agent so one child's PermissionDenied/tool activity can't dismiss a sibling's still-pending request. Self-healing per agent: that agent's own next event always clears its entry. */
+  pendingPermissionRequestAgentIds?: readonly string[]
 }
 
 type CodexLeadTurnState = {
@@ -2738,20 +2740,60 @@ export function reapRestoredClaudeSubagentsForDeadPane(
   return true
 }
 
-/** Drop a child-owned waiting state when the child stops/idles, restoring the displaced lead state. */
+// Why (#10997, round 5): every path that restores/replaces the lead's cached turn state must
+// carry forward pending permission ids for agents OTHER than the one(s) resolving right now, or
+// a sibling's still-outstanding PermissionRequest silently vanishes and wedges every future Stop
+// at 'waiting' forever. Four rounds of point patches on individual call sites each left a
+// different one of these broken (see the report's §9.4b-9.4d history) - this is the single choke
+// point every restore/clear site must go through instead of calling
+// `state.claudeLeadStateByPaneKey.set` directly. `resolves` is optional: omit it to preserve
+// every pending id untouched (e.g. clearing an unrelated AskUserQuestion wait); pass it to also
+// drop the id(s) it matches (e.g. the specific agent whose own event resolved its request).
+function restoreClaudeLeadState(
+  state: HookListenerState,
+  paneKey: string,
+  restored: ClaudeLeadTurnState,
+  resolves?: (agentId: string) => boolean
+): void {
+  const previous = state.claudeLeadStateByPaneKey.get(paneKey)
+  const remainingIds = (previous?.pendingPermissionRequestAgentIds ?? []).filter(
+    (id) => !resolves?.(id)
+  )
+  // Why: always explicitly set (never conditionally omit) - `restored` itself may already carry
+  // a stale, non-empty `pendingPermissionRequestAgentIds` from before this clear (e.g. a caller
+  // passing the pre-clear lead object as the base); omitting the key on the empty-remainder path
+  // would silently leave that stale value in place instead of actually clearing it.
+  state.claudeLeadStateByPaneKey.set(paneKey, {
+    ...restored,
+    pendingPermissionRequestAgentIds: remainingIds.length ? remainingIds : undefined
+  })
+}
+
+/** Drop a child-owned waiting state when the child stops/idles, restoring the displaced lead state. Also clears the stopped agent's own pending-permission entry (if any) even when it wasn't the tracked wait owner - a stopped child will never resolve its request some other way. */
 function clearClaudePendingWaitForAgent(
   state: HookListenerState,
   paneKey: string,
   ownsWait: (waitingAgentId: string) => boolean
 ): void {
   const lead = state.claudeLeadStateByPaneKey.get(paneKey)
-  if (lead?.state !== 'waiting' || !lead.waitingAgentId || !ownsWait(lead.waitingAgentId)) {
+  if (!lead) {
     return
   }
-  state.claudeLeadStateByPaneKey.set(paneKey, lead.stateBeforeWait ?? { state: 'working' })
+  const isWaitOwner =
+    lead.state === 'waiting' && !!lead.waitingAgentId && ownsWait(lead.waitingAgentId)
+  const hasOwnPending = lead.pendingPermissionRequestAgentIds?.some(ownsWait) ?? false
+  if (!isWaitOwner && !hasOwnPending) {
+    return
+  }
+  restoreClaudeLeadState(
+    state,
+    paneKey,
+    isWaitOwner ? (lead.stateBeforeWait ?? { state: 'working' }) : lead,
+    ownsWait
+  )
 }
 
-/** Clear an AskUserQuestion wait after the answer is typed (answering emits no hook event; the caller infers it from the submit keystroke). Restores the stashed pre-wait lead state or 'working', drops the cached card, and returns the pane state to emit (gated up to 'working' while children run). */
+/** Clear an AskUserQuestion wait after the answer is typed (answering emits no hook event; the caller infers it from the submit keystroke). Restores the stashed pre-wait lead state or 'working', drops the cached card, and returns the pane state to emit (gated up to 'working' while children run). Preserves every agent's pending-permission entry untouched - answering a question resolves no one's permission request. */
 export function clearClaudeAnsweredQuestionWait(
   state: HookListenerState,
   paneKey: string
@@ -2761,7 +2803,7 @@ export function clearClaudeAnsweredQuestionWait(
     lead?.state === 'waiting'
       ? (lead.stateBeforeWait ?? { state: 'working' as const })
       : { state: 'working' as const }
-  state.claudeLeadStateByPaneKey.set(paneKey, { ...restored })
+  restoreClaudeLeadState(state, paneKey, { ...restored })
   const previousTool = state.lastToolByPaneKey.get(paneKey)
   state.lastToolByPaneKey.set(
     paneKey,
@@ -2816,6 +2858,20 @@ function buildClaudeCachedLeadStatusPayload(
     // Why: draining the last background child is this turn's all-clear; the stamp lets a consumer pair it with the announcement already sent.
     turnCompletedAt: lead?.turnCompletedAt
   })
+}
+
+// Why (#10997 child-agent gap): each agent's pending PermissionRequest is single-shot and
+// tracked independently by id (lead = '') - only that same agent's own next event (denial,
+// tool activity, anything but another PermissionRequest) clears its entry, so an unrelated
+// sibling's PermissionDenied/PostToolUse on a different agent_id can't dismiss it.
+function nextPendingPermissionRequestAgentIds(
+  eventName: unknown,
+  eventAgentId: string | undefined,
+  previousIds: readonly string[] | undefined
+): readonly string[] {
+  const agentKey = eventAgentId ?? ''
+  const withoutSelf = previousIds?.filter((id) => id !== agentKey) ?? []
+  return eventName === 'PermissionRequest' ? [...withoutSelf, agentKey] : withoutSelf
 }
 
 function normalizeClaudeEvent(
@@ -2894,14 +2950,26 @@ function normalizeClaudeEvent(
     eventName === 'PostToolUse' ||
     eventName === 'PostToolUseFailure' ||
     eventName === 'PreCompact' ||
+    // Why: a denial resolves the pending approval same as an allow would (#10997); this also
+    // clears pendingPermissionRequest below since only PermissionRequest re-sets it.
+    eventName === 'PermissionDenied' ||
     (eventName === 'PostCompact' && hookPayload.trigger === 'auto') ||
     (eventName === 'PreToolUse' && !isAskUserQuestion)
       ? 'working'
       : eventName === 'PermissionRequest' || isAskUserQuestion
         ? 'waiting'
-        : isTurnBoundary || (eventName === 'PostCompact' && hookPayload.trigger === 'manual')
-          ? 'done'
-          : null
+        : // Why: a bare Stop right after an unanswered PermissionRequest, with no denial/tool
+          // event in between, means the CLI never told us how it resolved — don't let it read as
+          // done (#10997). Single-shot: the flag isn't carried into this Stop's own stored state,
+          // so a second consecutive Stop resolves normally (#11352-class regression guard).
+          eventName === 'Stop' &&
+            eventAgentId === undefined &&
+            !interrupted &&
+            (previousLead?.pendingPermissionRequestAgentIds?.length ?? 0) > 0
+          ? 'waiting'
+          : isTurnBoundary || (eventName === 'PostCompact' && hookPayload.trigger === 'manual')
+            ? 'done'
+            : null
 
   if (!reportedStateName) {
     return null
@@ -2958,7 +3026,44 @@ function normalizeClaudeEvent(
     )
   }
   if (subagentOriginId) {
+    const leadBeforeClear = state.claudeLeadStateByPaneKey.get(paneKey)
+    // Why (#10997, round 5): clear this agent's own pending-permission entry unconditionally,
+    // via the shared helper - regardless of whether it's the single-slot tracked waitingAgentId.
+    // Two independent things can now be true after this: (a) this agent WAS the tracked wait
+    // owner - the "approval granted" UI-restore logic below still applies, gated on that; (b) the
+    // pending set is now completely empty - REGARDLESS of (a), nothing is blocking anymore and
+    // the lead must be un-wedged from 'waiting'. Round 4 only handled (a); a sibling requesting
+    // AFTER this agent (so this agent is no longer the tracked owner) and resolving LAST left the
+    // pane stuck at 'waiting' forever because that case fell through the (a)-only gate below.
+    const hadOwnPendingEntry =
+      leadBeforeClear?.pendingPermissionRequestAgentIds?.includes(subagentOriginId) ?? false
+    if (hadOwnPendingEntry && leadBeforeClear) {
+      restoreClaudeLeadState(state, paneKey, leadBeforeClear, (id) => id === subagentOriginId)
+    }
     const lead = state.claudeLeadStateByPaneKey.get(paneKey)
+    const stillPending = (lead?.pendingPermissionRequestAgentIds?.length ?? 0) > 0
+    // Why: gate on hadOwnPendingEntry too - this agent may simply never have been in the
+    // permission-tracking set at all (e.g. a plain AskUserQuestion wait, an older mechanism this
+    // one doesn't touch), in which case "pending is empty" is just the normal case and must NOT
+    // be read as "this agent's own request was the last one, safe to un-wedge the lead."
+    if (
+      hadOwnPendingEntry &&
+      lead?.state === 'waiting' &&
+      !stillPending &&
+      lead.waitingAgentId !== subagentOriginId
+    ) {
+      // Why: this agent wasn't the tracked wait owner, so the UI-restore logic below (gated on
+      // waitingAgentId match) never runs for it - but if it was the LAST pending permission,
+      // nothing is blocking the lead anymore regardless of which slot waitingAgentId points at.
+      const restored = lead.stateBeforeWait ?? { state: 'working' as const }
+      state.claudeLeadStateByPaneKey.set(paneKey, restored)
+      return buildClaudeStatusPayload(state, eventName, promptText, paneKey, hookPayload, {
+        stateName: resolveClaudePaneState(state, paneKey, restored),
+        updateToolSnapshot: true,
+        interrupted: restored.interrupted,
+        turnCompletedAt: restored.turnCompletedAt
+      })
+    }
     if (lead?.state !== 'waiting' || lead.waitingAgentId !== subagentOriginId) {
       return buildClaudeCachedLeadStatusPayload(state, eventName, paneKey, hookPayload, {
         workingChildEvidence: true
@@ -2976,7 +3081,14 @@ function normalizeClaudeEvent(
     }
     // Why: approval granted — update the tool snapshot (drop the pending card) as the lead's own next tool event would.
     // Restore the stashed lead state, not this child's 'working': the lead may already be done, and the done-gate never upgrades working back to done once the roster drains.
-    const restored = lead.stateBeforeWait ?? { state: 'working' as const }
+    // Why (#10997 child-agent gap): a sibling's still-outstanding PermissionRequest must survive
+    // this restore - subagentOriginId's own entry was already cleared above, so any ids left
+    // here belong to OTHER agents and must not be silently dropped by wholesale-replacing the
+    // entry with `restored` (which carries no pendingPermissionRequestAgentIds) - that would let
+    // a later bare Stop read as done while a sibling is still genuinely waiting on a decision.
+    const restored: ClaudeLeadTurnState = lead.pendingPermissionRequestAgentIds?.length
+      ? lead
+      : (lead.stateBeforeWait ?? { state: 'working' as const })
     state.claudeLeadStateByPaneKey.set(paneKey, restored)
     return buildClaudeStatusPayload(state, eventName, promptText, paneKey, hookPayload, {
       stateName: resolveClaudePaneState(state, paneKey, restored),
@@ -2988,6 +3100,27 @@ function normalizeClaudeEvent(
 
   // Why: lead events never carry agent_id; even a child missed by lifecycle tracking cannot own the lead turn or its background-work evidence.
   if (eventAgentId && !isWaitingInducing) {
+    // Why (#10997 child-agent gap): this branch returns before the spread further down ever
+    // runs, so a child's own resolving event (denial, tool activity, anything but another
+    // PermissionRequest) would never clear its pendingPermissionRequestAgentIds entry there -
+    // clear it here instead, scoped to only this agent_id. If a sibling still has a pending
+    // request, only the id list shrinks and the pane correctly stays 'waiting'. If this was
+    // the last one, restore the lead to what it actually was before the wait displaced it -
+    // otherwise the pane stays cache-rendered 'waiting' forever, since nothing else ever
+    // re-evaluates `state` until the next real lead-level Stop/StopFailure.
+    const cachedLead = state.claudeLeadStateByPaneKey.get(paneKey)
+    if (cachedLead?.pendingPermissionRequestAgentIds?.includes(eventAgentId)) {
+      // Why: only fully restore off 'waiting' once NO agent has a pending entry left - a
+      // sibling's still-outstanding id must keep the lead at 'waiting', not just shrink the list.
+      const remainingIds = cachedLead.pendingPermissionRequestAgentIds.filter(
+        (id) => id !== eventAgentId
+      )
+      const base =
+        remainingIds.length === 0 && cachedLead.state === 'waiting'
+          ? (cachedLead.stateBeforeWait ?? { state: 'working' as const })
+          : cachedLead
+      restoreClaudeLeadState(state, paneKey, base, (id) => id === eventAgentId)
+    }
     return buildClaudeCachedLeadStatusPayload(state, eventName, paneKey, hookPayload, {
       workingChildEvidence: claudeRosterHasRuntimeWorkingSubagent(
         state.claudeSubagentRosterByPaneKey.get(paneKey)
@@ -3048,7 +3181,17 @@ function normalizeClaudeEvent(
     ...(isWaitingInducing && eventAgentId ? { waitingAgentId: eventAgentId } : {}),
     ...(isAskUserQuestionWait && waitingToolUseId !== undefined ? { waitingToolUseId } : {}),
     ...(stateBeforeWait ? { stateBeforeWait } : {}),
-    ...(turnCompletedAt !== undefined ? { turnCompletedAt } : {})
+    ...(turnCompletedAt !== undefined ? { turnCompletedAt } : {}),
+    // Why: per-agent, not spread wholesale from previousLead - each agent's own next event
+    // clears only its own entry (see nextPendingPermissionRequestAgentIds).
+    ...(() => {
+      const ids = nextPendingPermissionRequestAgentIds(
+        eventName,
+        eventAgentId,
+        previousLead?.pendingPermissionRequestAgentIds
+      )
+      return ids.length ? { pendingPermissionRequestAgentIds: ids } : {}
+    })()
   })
 
   const effectiveRoster = state.claudeSubagentRosterByPaneKey.get(paneKey)

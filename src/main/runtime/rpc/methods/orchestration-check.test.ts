@@ -517,6 +517,58 @@ describe('orchestration RPC methods', () => {
       expect(() => method.params!.parse({ unread: true, peek: true })).toThrow(/read mode/)
     })
 
+    // Why (#14829/#10673): warnStaleDispatches used to run only inside the retired Coordinator
+    // polling loop, so the documented worker-start/check workflow never escalated a hung
+    // dispatch. `check` is the RPC that workflow calls repeatedly, so it must sweep for stale
+    // dispatches itself — but only within the caller's own Run.
+    function makeStaleDispatch(assigneeHandle: string) {
+      const { dispatch } = createDispatchedTask(assigneeHandle)
+      const sqlite = (
+        db as unknown as { db: { prepare: (s: string) => { run: (...a: unknown[]) => void } } }
+      ).db
+      const staleIso = new Date(Date.now() - 60 * 60 * 1000).toISOString()
+      sqlite
+        .prepare('UPDATE dispatch_contexts SET dispatched_at = ? WHERE id = ?')
+        .run(staleIso, dispatch.id)
+      return dispatch
+    }
+
+    it('escalates a stale dispatch as a side effect of a check call bound to its own Run', async () => {
+      setup()
+      const dispatch = makeStaleDispatch('term_stale_worker')
+
+      await call('orchestration.check', { terminal: 'term_coord' })
+
+      expect(db.getDispatchContextById(dispatch.id)?.stale_escalated_at).toBeTruthy()
+      const escalations = db
+        .getRunMailboxHistory(dispatch.run_id, 10)
+        .filter((message) => message.type === 'escalation')
+      expect(escalations).toHaveLength(1)
+      expect(escalations[0]?.subject).toMatch(/has not reported/)
+    })
+
+    it('does not escalate a stale dispatch on an unrelated Run as a side effect of an unbound check call (#10673)', async () => {
+      setup()
+      const dispatch = makeStaleDispatch('term_stale_worker')
+
+      await call('orchestration.check', { terminal: 'term_someone_else' })
+
+      expect(db.getDispatchContextById(dispatch.id)?.stale_escalated_at).toBeFalsy()
+      const escalations = db
+        .getRunMailboxHistory(dispatch.run_id, 10)
+        .filter((message) => message.type === 'escalation')
+      expect(escalations).toHaveLength(0)
+    })
+
+    it('does not escalate a stale dispatch as a --peek write side effect (#10673)', async () => {
+      setup()
+      const dispatch = makeStaleDispatch('term_stale_worker')
+
+      await call('orchestration.check', { terminal: 'term_coord', peek: true })
+
+      expect(db.getDispatchContextById(dispatch.id)?.stale_escalated_at).toBeFalsy()
+    })
+
     it('default (unread only) marks returned rows as read', async () => {
       setup()
       db.insertMessage({ from: 'a', to: 'b', subject: 'one' })

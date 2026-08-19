@@ -15,6 +15,14 @@ describe('synthetic agent titles', () => {
     expect(shouldDriveSyntheticAgentTitleFromHook('codex', 'done')).toBe(true)
   })
 
+  it('gives Claude the same hook-driven idle/permission backstop as Codex (#9976)', () => {
+    expect(getSyntheticAgentTerminalTitle('claude', 'done')).toBe('Claude ready')
+    expect(getSyntheticAgentTerminalTitle('claude', 'waiting')).toBe('Claude - action required')
+    expect(shouldDriveSyntheticAgentTitleFromHook('claude', 'working')).toBe(false)
+    expect(shouldDriveSyntheticAgentTitleFromHook('claude', 'done')).toBe(true)
+    expect(shouldDriveSyntheticAgentTitleFromHook('claude', 'waiting')).toBe(true)
+  })
+
   it('does not synthesize OpenCode titles over native session titles', () => {
     expect(getSyntheticAgentTerminalTitle('opencode', 'done')).toBeNull()
     expect(getSyntheticAgentTerminalTitle('opencode', 'waiting')).toBeNull()

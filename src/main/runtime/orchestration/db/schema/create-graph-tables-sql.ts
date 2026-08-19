@@ -98,13 +98,15 @@ CREATE TABLE IF NOT EXISTS tasks (
   spec          TEXT NOT NULL,
   status        TEXT NOT NULL DEFAULT 'pending'
     CHECK(status IN (
-      'pending', 'ready', 'dispatched',
-      'completed', 'failed', 'blocked'
+      'pending', 'ready', 'dispatched', 'completed', 'failed', 'blocked',
+      'cancelled', 'superseded'
     )),
   deps          TEXT NOT NULL DEFAULT '[]',
   result        TEXT,
   created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-  completed_at  TEXT
+  completed_at  TEXT,
+  terminal_reason      TEXT,
+  replacement_task_id  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -128,7 +130,8 @@ CREATE TABLE IF NOT EXISTS dispatch_contexts (
   dispatched_at       TEXT,
   completed_at        TEXT,
   created_at          TEXT NOT NULL DEFAULT (datetime('now')),
-  last_heartbeat_at   TEXT
+  last_heartbeat_at   TEXT,
+  stale_escalated_at  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_dispatch_task ON dispatch_contexts(task_id);

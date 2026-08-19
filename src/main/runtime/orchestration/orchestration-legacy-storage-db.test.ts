@@ -502,6 +502,48 @@ describe('OrchestrationDb legacy contract storage', () => {
     expect(db!.getLegacyCompatibilityPrincipal(state.workerPrincipalId)?.status).toBe('settled')
   })
 
+  it('resolves a duplicate legacy worker_report retry against a since-cancelled dispatch as failed, not succeeded (#14548)', () => {
+    const state = openAdoptedFixture()
+    const taskId = db!.getDispatchContextById(state.fixture.legacyDispatchId)!.task_id
+    const accepted = db!.insertMessage({
+      runId: state.adoptedRunId,
+      deliveryContract: 'legacy_direct',
+      from: 'term_legacy_worker',
+      to: 'term_legacy_coord',
+      subject: 'Completed',
+      type: 'worker_done'
+    })
+
+    db!.cancelTask(taskId, 'cancelled', { reason: 'scope cut mid-flight' })
+    expect(db!.getDispatchContextById(state.fixture.legacyDispatchId)?.status).toBe('failed')
+
+    const retry = db!.commitLegacyLifecycleOperation({
+      principalId: state.workerPrincipalId,
+      operationKey: 'settlement_after_cancel',
+      method: 'orchestration.send',
+      payloadHash: 'settlement_after_cancel_payload',
+      message: {
+        existingId: accepted.id,
+        to: 'term_legacy_coord',
+        subject: 'Completed',
+        type: 'worker_done'
+      },
+      lifecycle: {
+        kind: 'worker_report',
+        taskId,
+        outcome: 'succeeded',
+        result: 'stale retry after cancel'
+      }
+    })
+
+    // Why: dispatch.status === 'failed' (not the pre-fix false 'completed') must route the retry
+    // to the 'failed' persisted-outcome branch, not fabricate a 'succeeded' one (#14548).
+    expect(retry).toMatchObject({
+      duplicate: false,
+      settlement: { action: 'settled', outcome: 'failed', duplicate: true }
+    })
+  })
+
   it('reconstructs a read pre-takeover completion through its original legacy route', () => {
     const state = openAdoptedFixture()
     const taskId = db!.getDispatchContextById(state.fixture.legacyDispatchId)!.task_id

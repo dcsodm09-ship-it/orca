@@ -13579,6 +13579,185 @@ describe('OrcaRuntimeService', () => {
     expect(listProcesses).toHaveBeenCalledTimes(3)
   })
 
+  describe('failActiveDispatchOnExit escalation routing and termination provenance', () => {
+    function syncSingleWorkerGraph(
+      runtime: OrcaRuntimeService,
+      tabId: string,
+      leafId: string,
+      ptyId: string
+    ): void {
+      runtime.attachWindow(1)
+      runtime.syncWindowGraph(1, {
+        tabs: [
+          {
+            tabId,
+            worktreeId: TEST_WORKTREE_ID,
+            title: 'worker',
+            activeLeafId: leafId,
+            layout: null
+          }
+        ],
+        leaves: [{ tabId, worktreeId: TEST_WORKTREE_ID, leafId, paneRuntimeId: 1, ptyId }]
+      })
+    }
+
+    // #15049: run-create/run-use never touches coordinator_runs, so the exit
+    // escalation must resolve its target from the Dispatch's own Run.
+    it('addresses the exit escalation to a lightweight Run mailbox instead of dropping it', () => {
+      const runtime = new OrcaRuntimeService(store)
+      const ptyId = 'pty-lightweight-run-worker'
+      const workerHandle = runtime.preAllocateHandleForPty(ptyId)
+      const db = new OrchestrationDb(':memory:')
+      try {
+        const run = db.createRun({
+          objective: 'lightweight run flow',
+          coordinatorHandle: 'term_coordinator_placeholder',
+          coordinatorPaneKey: 'tab_coord:11111111-1111-4111-8111-111111111111'
+        })
+        const task = db.createTask({ spec: 'do the work', runId: run.id })
+        const dispatch = db.createDispatchContext(task.id, workerHandle)
+        runtime.setOrchestrationDb(db)
+        syncSingleWorkerGraph(runtime, 'tab-worker', '22222222-2222-4222-8222-222222222222', ptyId)
+
+        runtime.onPtyExit(ptyId, 1)
+
+        expect(db.getDispatchContextById(dispatch.id)?.status).toBe('failed')
+        const messages = db.getAllMessagesForHandle(`run:${run.id}`)
+        expect(messages).toHaveLength(1)
+        expect(messages[0]).toMatchObject({
+          from_handle: workerHandle,
+          run_id: run.id,
+          subject: 'Agent exited unexpectedly (code 1)',
+          type: 'escalation'
+        })
+      } finally {
+        db.close()
+      }
+    })
+
+    // #8984: CLI/manual dispatch with no coordinator loop has nowhere to escalate —
+    // failDispatch must still settle the Dispatch even though no mail can be sent.
+    it('fails the Dispatch without throwing when no coordinator loop can receive the escalation', () => {
+      const runtime = new OrcaRuntimeService(store)
+      const ptyId = 'pty-legacy-cli-worker'
+      const workerHandle = runtime.preAllocateHandleForPty(ptyId)
+      const db = new OrchestrationDb(':memory:')
+      try {
+        const task = db.createTask({ spec: 'manual cli dispatch' })
+        const dispatch = db.createDispatchContext(task.id, workerHandle)
+        runtime.setOrchestrationDb(db)
+        syncSingleWorkerGraph(runtime, 'tab-worker', '33333333-3333-4333-8333-333333333333', ptyId)
+
+        expect(() => runtime.onPtyExit(ptyId, 1)).not.toThrow()
+
+        expect(db.getDispatchContextById(dispatch.id)?.status).toBe('failed')
+        expect(db.getInbox()).toHaveLength(0)
+      } finally {
+        db.close()
+      }
+    })
+
+    // Legacy fallback stays reachable: an active coordinator_runs loop still gets the mail directly.
+    it('falls back to an active legacy coordinator_runs loop when the Dispatch has no modern Run', () => {
+      const runtime = new OrcaRuntimeService(store)
+      const ptyId = 'pty-legacy-coordinated-worker'
+      const workerHandle = runtime.preAllocateHandleForPty(ptyId)
+      const db = new OrchestrationDb(':memory:')
+      try {
+        const task = db.createTask({ spec: 'manual cli dispatch with a coordinator loop' })
+        const dispatch = db.createDispatchContext(task.id, workerHandle)
+        db.createCoordinatorRun({
+          spec: 'legacy loop',
+          coordinatorHandle: 'term_legacy_coordinator'
+        })
+        runtime.setOrchestrationDb(db)
+        syncSingleWorkerGraph(runtime, 'tab-worker', '44444444-4444-4444-8444-444444444444', ptyId)
+
+        runtime.onPtyExit(ptyId, 1)
+
+        expect(db.getDispatchContextById(dispatch.id)?.status).toBe('failed')
+        const messages = db.getAllMessagesForHandle('term_legacy_coordinator')
+        expect(messages).toHaveLength(1)
+        expect(messages[0]).toMatchObject({ from_handle: workerHandle, type: 'escalation' })
+      } finally {
+        db.close()
+      }
+    })
+
+    // #15048: a worker orchestration.workerStop already put in 'stopping' owns its own
+    // transition via settleWorkerStop — the exit that stop caused must not race it.
+    it('defers entirely to an in-progress orchestration.workerStop instead of failing the Dispatch', () => {
+      const runtime = new OrcaRuntimeService(store)
+      const ptyId = 'pty-stopping-worker'
+      const workerHandle = runtime.preAllocateHandleForPty(ptyId)
+      const db = new OrchestrationDb(':memory:')
+      try {
+        const task = db.createTask({ spec: 'graceful stop in flight' })
+        const started = db.createStartingWorkerDispatch({ taskId: task.id, startOptions: {} })
+        db.prepareStartingWorkerAuthority({
+          dispatchId: started.dispatch.id,
+          handle: workerHandle,
+          paneKey: makePaneKey('tab-worker', '55555555-5555-4555-8555-555555555555'),
+          processIncarnation: 'worker:1',
+          worktreeId: 'repo::worker',
+          effects: [],
+          setupState: 'not_applicable',
+          terminalOwnership: 'created'
+        })
+        db.markWorkerDispatchReady(started.dispatch.id)
+        db.beginWorkerStop(started.dispatch.id)
+        db.createCoordinatorRun({
+          spec: 'legacy loop',
+          coordinatorHandle: 'term_legacy_coordinator'
+        })
+        runtime.setOrchestrationDb(db)
+        syncSingleWorkerGraph(runtime, 'tab-worker', '55555555-5555-4555-8555-555555555555', ptyId)
+
+        runtime.onPtyExit(ptyId, -1)
+
+        expect(db.getDispatchContextById(started.dispatch.id)?.status).toBe('dispatched')
+        expect(db.getWorkerDispatch(started.dispatch.id)?.state).toBe('stopping')
+        expect(db.getInbox()).toHaveLength(0)
+        expect(() => db.settleWorkerStop(started.dispatch.id)).not.toThrow()
+      } finally {
+        db.close()
+      }
+    })
+
+    // #15048: an operator-initiated terminal.close carries known provenance —
+    // the failure text must not read as an unexplained crash.
+    it('uses non-crash-shaped text for an operator-initiated close', () => {
+      const runtime = new OrcaRuntimeService(store)
+      const ptyId = 'pty-operator-closed-worker'
+      const workerHandle = runtime.preAllocateHandleForPty(ptyId)
+      const db = new OrchestrationDb(':memory:')
+      try {
+        const run = db.createRun({
+          objective: 'operator close flow',
+          coordinatorHandle: 'term_coordinator_placeholder',
+          coordinatorPaneKey: 'tab_coord:66666666-6666-4666-8666-666666666666'
+        })
+        const task = db.createTask({ spec: 'do the work', runId: run.id })
+        const dispatch = db.createDispatchContext(task.id, workerHandle)
+        runtime.setOrchestrationDb(db)
+        syncSingleWorkerGraph(runtime, 'tab-worker', '77777777-7777-4777-8777-777777777777', ptyId)
+
+        runtime.onPtyExit(ptyId, -1, undefined, { terminatedBy: 'operator' })
+
+        expect(db.getDispatchContextById(dispatch.id)).toMatchObject({
+          status: 'failed',
+          last_failure: 'Terminal closed before the agent finished'
+        })
+        expect(db.getWorkerDispatch(dispatch.id)).toBeUndefined()
+        const messages = db.getAllMessagesForHandle(`run:${run.id}`)
+        expect(messages).toHaveLength(1)
+        expect(messages[0].subject).toBe('Agent terminal closed before finishing')
+      } finally {
+        db.close()
+      }
+    })
+  })
+
   it('passes cached view colors to background agent spawns for source-owned startup replies', async () => {
     setTerminalViewAttributes({
       foreground: [0xff, 0xff, 0xff],
@@ -16743,6 +16922,71 @@ describe('OrcaRuntimeService', () => {
       await vi.advanceTimersByTimeAsync(6_000)
 
       await waitAssertion
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // #9976: bare output quiescence is unreliable for claude/codex, which can sit
+  // quiet for 3s+ mid cold-start render; they must wait for a precise idle signal.
+  it.each(['claude', 'codex'] as const)(
+    'does not resolve tui-idle for a %s PTY from output quiescence alone',
+    async (agent) => {
+      vi.useFakeTimers()
+      try {
+        const runtime = new OrcaRuntimeService(store)
+        runtime.setPtyController({
+          spawn: vi.fn().mockResolvedValue({ id: 'pty-bg' }),
+          write: () => true,
+          kill: () => true,
+          getForegroundProcess: async () => agent
+        })
+        const { handle } = await runtime.createTerminal(`path:${TEST_WORKTREE_PATH}`, {
+          launchAgent: agent
+        })
+        runtime.onPtyData('pty-bg', 'rendering splash art\n', Date.now())
+
+        const waitPromise = runtime.waitForTerminal(handle, {
+          condition: 'tui-idle',
+          timeoutMs: 6_000
+        })
+        const timeoutAssertion = expect(waitPromise).rejects.toThrow('timeout')
+
+        // Why: past the 3s generic quiescence window a non-classified agent would
+        // already have resolved idle here.
+        await vi.advanceTimersByTimeAsync(6_001)
+
+        await timeoutAssertion
+      } finally {
+        vi.useRealTimers()
+      }
+    }
+  )
+
+  it('does not resolve tui-idle for a daemon-hosted Codex leaf from output quiescence alone', async () => {
+    vi.useFakeTimers()
+    try {
+      const runtime = new OrcaRuntimeService(store)
+      runtime.setPtyController({
+        spawn: vi.fn().mockResolvedValue({ id: 'pty-bg' }),
+        write: () => true,
+        kill: () => true,
+        getForegroundProcess: async () => 'codex'
+      })
+      await runtime.createTerminal(`path:${TEST_WORKTREE_PATH}`, { launchAgent: 'codex' })
+      syncSinglePty(runtime, 'pty-bg', { tabTitle: 'work', paneTitle: null })
+      const [terminal] = (await runtime.listTerminals()).terminals
+      runtime.onPtyData('pty-bg', 'rendering splash art\n', Date.now())
+
+      const waitPromise = runtime.waitForTerminal(terminal.handle, {
+        condition: 'tui-idle',
+        timeoutMs: 6_000
+      })
+      const timeoutAssertion = expect(waitPromise).rejects.toThrow('timeout')
+
+      await vi.advanceTimersByTimeAsync(6_001)
+
+      await timeoutAssertion
     } finally {
       vi.useRealTimers()
     }
@@ -29092,7 +29336,7 @@ describe('OrcaRuntimeService', () => {
       tabId: 'laptop-tab',
       ptyKilled: true
     })
-    expect(kill).toHaveBeenCalledWith('laptop-created-pty')
+    expect(kill).toHaveBeenCalledWith('laptop-created-pty', { terminatedBy: 'operator' })
     expect(closeTerminal).toHaveBeenCalledWith('laptop-tab')
   })
 
@@ -29340,7 +29584,7 @@ describe('OrcaRuntimeService', () => {
       tabId: terminal.tabId,
       ptyKilled: true
     })
-    expect(kill).toHaveBeenCalledWith('floating-created-pty')
+    expect(kill).toHaveBeenCalledWith('floating-created-pty', { terminatedBy: 'operator' })
     expect(closeTerminalTab).not.toHaveBeenCalled()
   })
 

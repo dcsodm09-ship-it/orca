@@ -52,7 +52,11 @@ export function beginWorkerStop(
       this.db.exec('COMMIT')
       return { disposition: 'already_settled', worker, dispatch }
     }
-    if (!['ready', 'start_unknown'].includes(worker.state)) {
+    // Why: 'stop_unknown' means a prior stop/report outcome was never confirmed (lost
+    // contact, an orphaned restart sweep, or #13364's capability-miss rejection) — the
+    // documented recovery path ("worker-stop --dispatch <id> and inspect again") depends
+    // on re-entering 'stopping' from here, the same as the pre-existing 'start_unknown' case.
+    if (!['ready', 'start_unknown', 'stop_unknown'].includes(worker.state)) {
       throw new OrchestrationError(
         'dispatch_inactive',
         `Dispatch ${dispatchId} cannot stop from ${worker.state}.`
@@ -62,7 +66,7 @@ export function beginWorkerStop(
       .prepare(
         `UPDATE worker_dispatches
          SET state = 'stopping', stage = 'stop_requested', updated_at = datetime('now')
-         WHERE dispatch_id = ? AND state IN ('ready', 'start_unknown')`
+         WHERE dispatch_id = ? AND state IN ('ready', 'start_unknown', 'stop_unknown')`
       )
       .run(dispatchId)
     this.db
@@ -215,6 +219,54 @@ export function markWorkerStopUnknown(
   return this.getWorkerDispatch(dispatchId) as WorkerDispatchRow
 }
 
+// #13364: a worker_done rejected as dispatch_capability_invalid never reaches
+// reconcileLifecycleMessage's settlement, so 'ready'/'starting' would otherwise
+// sit forever with no dead-worker signal. Reuses 'stop_unknown' (no schema
+// change) so existing stop/recovery paths already treat it as needing review.
+// Callers must have already confirmed sender identity via hasLifecycleAuthority
+// — this is a best-effort cleanup, so it no-ops rather than throws on a state
+// that already moved on (e.g. a concurrent settlement or manual stop).
+export function markWorkerReportRejectedUnknown(
+  this: OrchestrationDb,
+  dispatchId: string,
+  reason: string
+): WorkerDispatchRow | undefined {
+  const worker = this.getWorkerDispatch(dispatchId)
+  if (!worker || !['ready', 'starting'].includes(worker.state)) {
+    return worker
+  }
+  this.db
+    .prepare(
+      `UPDATE worker_dispatches
+       SET state = 'stop_unknown', stage = 'worker_report_rejected', last_error = ?,
+           updated_at = datetime('now')
+       WHERE dispatch_id = ? AND state IN ('ready', 'starting')`
+    )
+    .run(reason, dispatchId)
+  return this.getWorkerDispatch(dispatchId)
+}
+
+// Why (#15048 follow-up): OrchestrationDb is opened once per runtime lifetime, so a
+// worker_dispatches row still 'stopping' when this process starts cannot belong to a stop
+// in flight in this process — it can only be orphaned by a previous lifetime's
+// orchestration.workerStop that never reached settleWorkerStop (app quit/crash mid-flight).
+// Left as 'stopping' it can never resolve on its own: beginWorkerStop refuses to re-enter, and
+// failDispatch/failActiveDispatchOnExit now correctly refuse to auto-fail a dispatch whose
+// worker might still be mid-stop. Downgrading to 'stop_unknown' here is the same
+// outcome-unconfirmed state markWorkerStopUnknown already uses for every other lost-contact
+// case; it is safe exactly because no live process can still be racing this transition.
+export function reconcileOrphanedStoppingWorkersOnStartup(this: OrchestrationDb): void {
+  this.db
+    .prepare(
+      `UPDATE worker_dispatches
+       SET state = 'stop_unknown', stage = 'stop_outcome_unknown',
+           last_error = 'App restarted while a stop was in flight; outcome unknown',
+           updated_at = datetime('now')
+       WHERE state = 'stopping'`
+    )
+    .run()
+}
+
 export type WorkerDispatchStopMethods = {
   isDispatchProcessCurrent: typeof isDispatchProcessCurrent
   beginWorkerStop: typeof beginWorkerStop
@@ -222,6 +274,8 @@ export type WorkerDispatchStopMethods = {
   reconcileFederatedWorkerStop: typeof reconcileFederatedWorkerStop
   resumeFederatedWorkerForTerminalRelay: typeof resumeFederatedWorkerForTerminalRelay
   markWorkerStopUnknown: typeof markWorkerStopUnknown
+  markWorkerReportRejectedUnknown: typeof markWorkerReportRejectedUnknown
+  reconcileOrphanedStoppingWorkersOnStartup: typeof reconcileOrphanedStoppingWorkersOnStartup
 }
 
 export function attachWorkerDispatchStop(ctor: { prototype: object }): void {
@@ -231,6 +285,8 @@ export function attachWorkerDispatchStop(ctor: { prototype: object }): void {
     settleWorkerStop,
     reconcileFederatedWorkerStop,
     resumeFederatedWorkerForTerminalRelay,
-    markWorkerStopUnknown
+    markWorkerStopUnknown,
+    markWorkerReportRejectedUnknown,
+    reconcileOrphanedStoppingWorkersOnStartup
   })
 }
