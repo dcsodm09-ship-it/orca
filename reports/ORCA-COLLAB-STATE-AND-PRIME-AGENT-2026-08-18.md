@@ -1337,6 +1337,49 @@ registry 依赖包内容级别的残留文档描述依然准确、本轮未变�
 文件曾经存在过的窗口大小，不要再犯"只讲清楚覆盖到的部分"这种
 选择性精确。
 
+### Round 32：把 launch guard 和 wrapper 生成字节钉进去（已验证关闭，未独立复核）
+
+**修法**：`_install_locked_within_release_dir()` 里
+`managed_launch_guard_script(...)`/`managed_entrypoint_script(...)`
+现在各只调用一次，返回值捕获成 `launch_guard_raw`/
+`command_wrapper_raw`，`sha256_bytes()` **直接对这份字节对象**求值，
+在它被 `atomic_create_private_file()` 真正写盘之前——这比其余被
+钉住的文件（那些是从下载的 tarball 里早期观察到的）处境更强：这里
+安装器本身就是这份字节的**源头**，不是提前观察者，从设计上就不存在
+"生成一次、算摘要又重新生成一次导致假阳性不一致"这类风险。两份摘要
+加进 `release_relative_pinned_digests`（键为
+`bin/prime-agent-launch-guard.py`、`bin/prime-agent`），round 29/30
+那套"同一次读取即验证即基线"机制自动覆盖它们，不需要新机制。新增
+两个 receipt 字段 `launch_guard_sha256`/`command_wrapper_sha256`，
+和 `node_sha256`/`npm_cli_sha256`/`entrypoint_sha256` 对齐；
+`verify()` 的执行前摘要检查也加上这两项，独立于 `tree_digest()` 之外
+再提供一层纵深防御。把 round 30 那句被判定为"选择性精确"的残留注释
+改正：现在明确写清楚每一条真正会被执行的路径（node、npm-cli、入口
+文件、launch guard、command wrapper）全部覆盖，剩下的窗口专指
+`package.json`/`package-lock.json`/`LICENSE`/
+`upstream-package-lock.json`/非 node·npm-cli 的工具链文件——这些
+安装完之后没有任何东西会读取或执行它们的内容，装机时被篡改只会留下
+"记录了但没人用"的漂移，被整树摘要测得到、不构成 RCE，属于本轮
+round 31 判定的信息性 P3、本轮范围之外未处理。
+
+2 条新回归测试（分别在 launch guard、command wrapper 创建之后、
+基线锁定之前的窗口里原地篡改内容，沿用 round 29/30 的"包一层真实
+`atomic_create_private_file()`"手法）都确认对 round-31 基线
+`035ef5dad5` 可复现（装完、篡改字节被写进 receipt）、对修复后的代码
+正确报错拒绝。116/116 测试（114 条既有 + 2 条新增）在两个解释器下
+各跑两次、共 4 次运行零失败，`py_compile` 在两个解释器下对
+`install_prime_agent.py`、`tests/test_install_prime_agent.py`、
+`tests/sandbox_e2e.py` 都干净。round 24-30 的 7 条既有回归测试逐条
+抽查仍然通过。真实（非 mock）`sandbox_e2e.py` 生命周期回放跑了
+两次，均 `exit 0`/`ok:true`、26911 个条目一致，**新钉住的
+guard/wrapper 零假阳性**（两次运行 `release_tree_sha256` 不同，是
+因为每次运行用的临时 `SSD_ROOT` 路径本来就会被写进生成脚本里，属于
+跨运行的正常差异，不是同一次运行内的不确定性——本轮修复本身特别对
+这类"脚本内容含运行时路径导致假阳性"的风险做了针对性验证，确认摘要
+真的是对"这一次运行即将写盘的确切字节"求值，不是缓存/重新生成出来
+的值）。已提交 `a3430db740`。
+**已派发 round 33 双复核。**
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
