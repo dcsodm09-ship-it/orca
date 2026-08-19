@@ -454,6 +454,71 @@ def read_private_ssd_file(path: Path, *, max_bytes: int = 4 * 1024 * 1024) -> by
     return read_private_file(resolve_ssd(path), max_bytes=max_bytes)
 
 
+def tighten_generated_private_file_mode(path: Path, mode: int = 0o600) -> tuple[int, int]:
+    """Tighten an existing file's permission bits to `mode` in place, right
+    after an external process this installer does not control (`npm`) has
+    just generated it at whatever mode that process's own ambient umask
+    happened to produce, and return the (st_dev, st_ino) identity it was
+    tightened at.
+
+    Every OTHER private SSD state file this installer itself writes is
+    published already at the intended private mode by atomic_write()/
+    atomic_create_private_file(), which fchmod() the open descriptor before
+    any content is ever visible at the final path -- so there is never a
+    window where such a file exists on disk at a permissive mode. This
+    installer cannot apply that same discipline to package-lock.json: it is
+    not written by this installer at all, but generated in place by `npm
+    install --package-lock-only` (that is the entire point of that step),
+    so the mode can only be fixed strictly AFTER npm has already created it.
+
+    A real `npm install --package-lock-only` writes package-lock.json at
+    whatever mode the invoking process's ambient umask allows -- empirically
+    0o644 under the common umask 0o022 -- npm has no notion of this
+    installer's private-file discipline. Left untightened, the very next
+    read of the file, verify_unchanged_private_ssd_file() (which reads it
+    back via read_private_file()'s `st_mode & 0o077 == 0` requirement),
+    fails closed on every real, non-mocked install (round 18, 2026-08-19,
+    P1: the first real, non-mocked exercise of this npm step surfaced this;
+    all 96 prior unit tests mocked lock-file generation in a way that
+    bypassed real npm's actual default-umask output mode). package.json
+    never hits this gap because atomic_create_private_file() publishes it
+    at 0o600 before npm ever touches it.
+
+    Uses the same O_NOFOLLOW-open-then-fstat-identity-check discipline
+    read_private_file() itself uses before trusting a descriptor, rather
+    than a bare os.chmod(path, mode): a bare chmod-by-path follows a
+    symlink, so a same-UID actor who swapped this path for a symlink in the
+    instant between npm's write and this call would have this call silently
+    tighten (or fabricate a false sense of privacy for) some unrelated
+    target instead of failing closed on the substitution -- the same
+    failure mode every other private-file operation in this file already
+    refuses to allow.
+    """
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise PrimeInstallError(f"cannot inspect generated file before tightening: {path}") from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or before.st_uid != os.getuid()
+    ):
+        raise PrimeInstallError(f"unsafe generated file: {path}")
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise PrimeInstallError(f"generated file identity changed before tightening: {path}")
+        os.fchmod(descriptor, mode)
+    except OSError as exc:
+        raise PrimeInstallError(f"cannot tighten generated file mode: {path}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return (before.st_dev, before.st_ino)
+
+
 def verify_unchanged_private_ssd_file(
     path: Path, expected_raw: bytes, expected_identity: tuple[int, int]
 ) -> None:
@@ -4104,8 +4169,19 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
         install_tmp,
     )
     lock_path = RELEASE_DIR / "package-lock.json"
-    generated_lock_raw = lock_path.read_bytes()
-    lock_stat = lock_path.lstat()
+    # `npm install --package-lock-only` just generated this file itself, at
+    # whatever mode the subprocess's own ambient umask allows (empirically
+    # 0o644 under the common umask 0o022) -- unlike every other private SSD
+    # state file this installer writes, which atomic_write()/
+    # atomic_create_private_file() already publish at 0o600 before any
+    # content is ever visible at the final path. Tighten it to that same
+    # 0o600 right now, before the plain read below or
+    # verify_unchanged_private_ssd_file() further down apply
+    # read_private_file()'s `st_mode & 0o077 == 0` private-file requirement
+    # to it -- otherwise every real (non-mocked) install fails closed here
+    # with "unsafe private file" (round 18, 2026-08-19, P1; see
+    # tighten_generated_private_file_mode()).
+    #
     # Deliberately NOT named `lock_identity`: this function's own parameter
     # is ALSO named `lock_identity` and carries the managed LIFECYCLE lock's
     # (st_dev, st_ino) identity all the way through to the
@@ -4122,7 +4198,8 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     # by both a Claude opus/max review and a separate Codex QA pass). Keep
     # this name distinct from the `lock_identity` parameter for the same
     # reason `manifest_identity` above is not named `lock_identity` either.
-    package_lock_identity = (lock_stat.st_dev, lock_stat.st_ino)
+    package_lock_identity = tighten_generated_private_file_mode(lock_path)
+    generated_lock_raw = lock_path.read_bytes()
     generated_lock = strict_json(generated_lock_raw)
     if not isinstance(generated_lock, dict):
         raise PrimeInstallError("generated lock is invalid")

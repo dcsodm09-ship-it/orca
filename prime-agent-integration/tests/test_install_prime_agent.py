@@ -6545,6 +6545,161 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                         manifest_path_b, original_b, identity_b
                     )
 
+    def test_tighten_generated_private_file_mode_fixes_real_npm_umask_output(
+        self,
+    ) -> None:
+        # Regression for round 18, 2026-08-19, P1: a real `npm install
+        # --package-lock-only` writes package-lock.json at whatever mode
+        # the subprocess's own ambient umask allows -- empirically 0o644
+        # under the common umask 0o022 -- because npm has no notion of
+        # this installer's private-file discipline. _install_locked() used
+        # to hand that file straight to
+        # verify_unchanged_private_ssd_file(), whose read_private_file()
+        # requires `st_mode & 0o077 == 0`, so every real (non-mocked)
+        # install failed closed with "unsafe private file" immediately
+        # after the lock was generated. None of the 96 pre-existing unit
+        # tests caught this because their fake `npm install` fixtures
+        # write the lock file and then immediately `os.chmod(..., 0o600)`
+        # it directly, bypassing real npm's actual default-umask output
+        # mode entirely.
+        #
+        # This fixture instead spawns a REAL `/bin/sh` subprocess with the
+        # exact umask the bug report empirically measured (022), and lets
+        # the KERNEL apply that umask to an unrestricted 0o666 open request
+        # the same way any real subprocess (including real npm) actually
+        # would -- rather than a lazy `os.chmod(path, 0o644)` stand-in that
+        # would only prove the test's own assumption about npm's mode, not
+        # exercise the real umask mechanism that produces it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "release"
+            release.mkdir(mode=0o700)
+            lock_path = release / "package-lock.json"
+
+            # Step 1: create the file the way a real subprocess with a
+            # real umask actually would -- an unrestricted create request,
+            # narrowed only by the shell subprocess's own umask, not by
+            # this test process's ambient umask (which is unrelated and
+            # must not make this test flaky on machines configured
+            # differently).
+            create = subprocess.run(
+                ["/bin/sh", "-c", 'umask 022 && : > "$1"', "sh", os.fspath(lock_path)],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(
+                create.returncode, 0, f"fixture shell failed: {create.stderr}"
+            )
+            self.assertTrue(lock_path.is_file())
+            observed_created_mode = stat.S_IMODE(lock_path.lstat().st_mode)
+            self.assertEqual(
+                observed_created_mode,
+                0o644,
+                "fixture did not reproduce npm's real umask-022 output mode "
+                f"(observed {oct(observed_created_mode)}); the rest of this "
+                "test would not actually exercise the reported bug",
+            )
+
+            # Step 2: write the real generated-lock content into the
+            # already-created file, exactly like npm writing its own
+            # output into the file it just created -- this must not by
+            # itself change the mode captured above (opening an EXISTING
+            # path for writing never touches its permission bits, only
+            # O_CREAT does).
+            generated_lock_raw = installer.canonical_json(
+                {"lockfileVersion": 3, "packages": {}}
+            )
+            with open(lock_path, "r+b") as handle:
+                handle.write(generated_lock_raw)
+                handle.truncate()
+            self.assertEqual(
+                stat.S_IMODE(lock_path.lstat().st_mode), 0o644
+            )
+
+            before_stat = lock_path.lstat()
+            before_identity = (before_stat.st_dev, before_stat.st_ino)
+
+            # Sanity: this is really the bug -- the exact, unmodified
+            # security gate _install_locked() hands this file to
+            # (verify_unchanged_private_ssd_file(), via
+            # read_private_file()'s `st_mode & 0o077 == 0` requirement)
+            # really does reject a real npm-umask-022 file. If this
+            # assertion itself ever stopped failing, the rest of this test
+            # would no longer be proving anything about the reported bug.
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "unsafe private file"
+                ):
+                    installer.verify_unchanged_private_ssd_file(
+                        lock_path, generated_lock_raw, before_identity
+                    )
+
+            # Step 3: the actual fix, called exactly the way
+            # _install_locked() calls it -- immediately after npm
+            # generates the file and before any security re-check reads
+            # it.
+            returned_identity = installer.tighten_generated_private_file_mode(
+                lock_path
+            )
+
+            after_stat = lock_path.lstat()
+            self.assertEqual(
+                stat.S_IMODE(after_stat.st_mode),
+                0o600,
+                "tighten_generated_private_file_mode() did not tighten the "
+                "real npm-umask-022 output to 0o600",
+            )
+            # Identity (dev, ino) must be the SAME inode npm created --
+            # this is an in-place chmod, not a replace.
+            self.assertEqual(
+                (after_stat.st_dev, after_stat.st_ino), before_identity
+            )
+            self.assertEqual(returned_identity, before_identity)
+            # Content must be completely untouched by the chmod.
+            self.assertEqual(lock_path.read_bytes(), generated_lock_raw)
+
+            # Step 4: confirm the FIX actually fixes the real, unmodified
+            # downstream security gate -- not that the gate happens to be
+            # lenient. Same call as the sanity check above, same file,
+            # same expected bytes and identity; only the mode changed.
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                installer.verify_unchanged_private_ssd_file(
+                    lock_path, generated_lock_raw, returned_identity
+                )
+
+    def test_tighten_generated_private_file_mode_refuses_symlink(self) -> None:
+        # Regression safety net alongside round 18's fix: chmod-by-path
+        # follows a symlink, so if a same-UID actor swapped
+        # RELEASE_DIR/package-lock.json for a symlink in the instant
+        # between npm's write and this call, a bare `os.chmod(path, mode)`
+        # would silently tighten (or fabricate a false sense of privacy
+        # for) whatever the symlink points at instead of failing closed --
+        # exactly the class of gap this file's established
+        # O_NOFOLLOW-open-then-fstat-identity-check discipline (see
+        # read_private_file()) exists to refuse everywhere else. Confirms
+        # tighten_generated_private_file_mode() refuses a symlink outright
+        # and never touches the link's target.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            victim = root / "victim-outside-release"
+            victim.write_bytes(b"do-not-touch")
+            os.chmod(victim, 0o644)
+            link_path = root / "release-package-lock.json"
+            link_path.symlink_to(victim)
+
+            with self.assertRaisesRegex(
+                installer.PrimeInstallError, "unsafe generated file"
+            ):
+                installer.tighten_generated_private_file_mode(link_path)
+
+            # The symlink target must be completely untouched -- neither
+            # its mode nor its content.
+            self.assertEqual(stat.S_IMODE(victim.lstat().st_mode), 0o644)
+            self.assertEqual(victim.read_bytes(), b"do-not-touch")
+
 
 if __name__ == "__main__":
     unittest.main()
