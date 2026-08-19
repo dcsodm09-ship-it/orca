@@ -35,14 +35,15 @@ export function stageOrchestrationMailboxPointer<TWaiter extends OrchestrationMe
   leaf: OrchestrationMailboxLeaf,
   mailboxHandle: string,
   unread: readonly { id: string; type: string; sequence: number }[],
-  newestSequence: number
+  newestSequence: number,
+  reservedTypes?: ReadonlySet<string>
 ): void {
   const ptyId = leaf.ptyId
   if (!ptyId) {
     return
   }
   const leafKey = deps.getLeafKey(leaf.tabId, leaf.leafId)
-  const flight = deps.state.beginFlight(ptyId)
+  const flight = deps.state.beginFlight(ptyId, mailboxHandle, reservedTypes)
   const writeResult = deps.writePty(ptyId, formatMessagePointer(unread.length, mailboxHandle))
   const finish = (accepted: boolean): void =>
     finishPointerWrite(
@@ -93,7 +94,14 @@ function finishPointerWrite<TWaiter extends OrchestrationMessageWaiter>(
     }
     flight.stagedMessageIds = unread.map((message) => message.id)
     db.markAsDelivered(flight.stagedMessageIds)
-    deps.state.setWatermark(mailboxHandle, newestSequence, ptyId, leafKey)
+    // Why: carry this delivery's staged ids and reservedTypes onto the watermark record itself,
+    // not just the flight - if settlement later deactivates (rather than clears) the watermark,
+    // the flight is already gone by then and retirement needs the watermark to still know what
+    // to roll back and what to redrive with (#14548 mailbox round).
+    deps.state.setWatermark(mailboxHandle, newestSequence, ptyId, leafKey, {
+      stagedMessageIds: flight.stagedMessageIds,
+      reservedTypes: flight.reservedTypes
+    })
     if (
       [leaf.lastOscTitle, leaf.paneTitle, deps.getTabTitle(leaf.tabId)].some(isCursorAgentTitle)
     ) {

@@ -1120,9 +1120,16 @@ export const ORCHESTRATION_HANDLERS: Record<string, CommandHandler> = {
     // Why (#14809): an un-injected dispatch still commits and claims the terminal's one
     // active-dispatch slot, so a coordinator watching stdout alone can miss that nothing
     // actually reached the agent.
+    // Why (round 6): the CLI can't tell "forgot --inject on a live agent terminal" apart from
+    // the skill-guide's own documented bare-shell recipe (dispatch without --inject, then
+    // `orca terminal send --enter` manually) - both produce this identical injected:false
+    // response. The old wording ("retry with --inject") was flatly wrong advice for the
+    // bare-shell case (it throws: "no recognized agent detected"). Condition the advice on
+    // both real outcomes instead of asserting one.
     if (!json && !result.result.dryRun && result.result.injected === false) {
       console.error(
-        `warning: dispatch ${result.result.dispatch?.id} was committed but not injected into ${to}; retry with --inject to actually deliver it.`
+        `note: dispatch ${result.result.dispatch?.id} was committed but not injected into ${to}; ` +
+          `if ${to} runs an agent, retry with --inject to deliver it - if it's a bare shell, send the prompt manually with orca terminal send.`
       )
     }
   },

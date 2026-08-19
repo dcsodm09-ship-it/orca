@@ -30,7 +30,7 @@ import {
   resolveBareOrchestrationRecipient,
   type SendRecipientWarning
 } from './orchestration-recipient-routing'
-import { resolveRunScope } from './orchestration-run-scope'
+import { assertCallerHandleMatchesEvidence, resolveRunScope } from './orchestration-run-scope'
 import { ORCHESTRATION_RUN_METHODS } from './orchestration-runs'
 import { ORCHESTRATION_WORKER_METHODS } from './orchestration-worker-methods'
 import { ORCHESTRATION_FEDERATION_METHODS } from './orchestration-federation-methods'
@@ -248,29 +248,23 @@ const TaskListParams = z.object({
 
 const TaskUpdateParams = z.object({
   id: requiredString('Missing --id'),
-  status: z
-    .unknown()
-    .transform((v) => {
-      if (typeof v === 'string' && TASK_STATUSES.includes(v as TaskStatus)) {
-        return v as TaskStatus
-      }
-      return ''
+  // Why: distinguish "--status was never supplied" from "a value was supplied but this host
+  // doesn't recognize it" (e.g. an old host talking to a client that sent 'cancelled'/
+  // 'superseded' before those existed) - collapsing both into "Missing --status" tells the
+  // caller they typed nothing when they typed something real.
+  status: z.unknown().transform((v, ctx) => {
+    if (typeof v === 'string' && TASK_STATUSES.includes(v as TaskStatus)) {
+      return v as TaskStatus
+    }
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        v === undefined || v === null || v === ''
+          ? 'Missing --status'
+          : `Unrecognized --status ${JSON.stringify(v)}; expected one of: ${TASK_STATUSES.join(', ')}`
     })
-    .pipe(
-      z.enum(
-        [
-          'pending',
-          'ready',
-          'dispatched',
-          'completed',
-          'failed',
-          'blocked',
-          'cancelled',
-          'superseded'
-        ],
-        { message: 'Missing --status' }
-      )
-    ),
+    return z.NEVER
+  }),
   result: OptionalString,
   // Why (#14548): only meaningful for status=cancelled|superseded, routed to cancelTask below.
   reason: OptionalString,
@@ -979,6 +973,20 @@ export const ORCHESTRATION_METHODS: RpcMethod[] = [
     ) => {
       const db = runtime.getOrchestrationDb()
       const handle = params.terminal ?? 'unknown'
+      // Why (round 3 of this hole): `handle` is itself client-declared (`params.terminal`) — round
+      // 1 fixed `params.run` and round 2 fixed `params.terminalPaneKey` leaking into the sweep
+      // below, but both still resolved scope through this same unvalidated `handle`. Only check
+      // when the caller actually supplied --terminal (the common omitted case falls back to the
+      // 'unknown' placeholder, which resolves no pane/Run and stays harmless) — this is the exact
+      // guard resolveRunScope applies further down for the read/routing path, hoisted here so it
+      // also covers the stale-dispatch sweep that runs before resolveRunScope is ever reached.
+      if (params.terminal) {
+        assertCallerHandleMatchesEvidence(
+          runtime,
+          params.terminal,
+          orchestrationCompatibilityEvidence
+        )
+      }
       const typeFilter = parseMessageTypes(params.types)
       const routeDirectSnapshot = async (
         runId: string,
@@ -1757,21 +1765,14 @@ export const ORCHESTRATION_METHODS: RpcMethod[] = [
         throw new Error(`Task ${params.task} is ${task.status}; only ready tasks can be dispatched`)
       }
 
-      // Why: injecting the preamble into a bare shell dumps it as shell commands (gibberish), so require a detected agent first.
-      if (params.inject) {
-        const hasAgent = await runtime.isTerminalRunningAgent(to)
-        if (!hasAgent) {
-          throw new Error(
-            `Cannot dispatch --inject to terminal ${to}: no recognized agent detected. ` +
-              'Start an agent CLI (e.g. claude, codex, gemini, droid, cursor) in the terminal first, ' +
-              'or dispatch without --inject and send the prompt manually.'
-          )
-        }
-        // Why: the await above can span a process replacement (e.g. the terminal's live
-        // pane/process changes mid-check) - the authority snapshotted before it may no longer
-        // describe what `to` actually resolves to now. Re-snapshot and require an exact match
-        // before minting a capability against it; otherwise the DB would bind lifecycle
-        // authority to a process the real injected write never reaches (or vice versa).
+      // Why (round 6, dispatch-authority race): shared by the post-agent-detection re-snapshot
+      // below AND passed as sendTerminalAgentPrompt's beforeWrite hook further down - the mint
+      // above only closes the gap up to itself, but the actual PTY write(s) still happen after
+      // further internal awaits (input-size check, submission-queue serialization) the runtime
+      // already re-verifies pty/generation identity synchronously right before, via that same
+      // hook; reusing this comparison here means a mid-write identity change also fails this
+      // dispatch instead of silently landing a capability-authenticated write on the wrong process.
+      const requireUnchangedDispatchAuthority = () => {
         const currentAuthority = runtime.getOrchestrationDispatchAuthority(to)
         if (
           !currentAuthority?.paneKey ||
@@ -1788,9 +1789,32 @@ export const ORCHESTRATION_METHODS: RpcMethod[] = [
             `Terminal ${to} changed process while dispatch injection was being validated; retry the dispatch.`
           )
         }
+        return currentAuthority
+      }
+
+      // Why: injecting the preamble into a bare shell dumps it as shell commands (gibberish), so require a detected agent first.
+      if (params.inject) {
+        const hasAgent = await runtime.isTerminalRunningAgent(to)
+        if (!hasAgent) {
+          throw new Error(
+            `Cannot dispatch --inject to terminal ${to}: no recognized agent detected. ` +
+              'Start an agent CLI (e.g. claude, codex, gemini, droid, cursor) in the terminal first, ' +
+              'or dispatch without --inject and send the prompt manually.'
+          )
+        }
+        // Why: the await above can span a process replacement (e.g. the terminal's live
+        // pane/process changes mid-check) - the authority snapshotted before it may no longer
+        // describe what `to` actually resolves to now. Re-snapshot and require an exact match
+        // before minting a capability against it; otherwise the DB would bind lifecycle
+        // authority to a process the real injected write never reaches (or vice versa).
+        const currentAuthority = requireUnchangedDispatchAuthority()
         dispatchAuthority = currentAuthority
-        assigneePaneKey = currentAuthority.paneKey
-        processIncarnation = currentAuthority.processIncarnation
+        // Why: currentAuthority.paneKey/processIncarnation are guaranteed non-null by the throw
+        // guard inside requireUnchangedDispatchAuthority, but its inferred return type doesn't
+        // carry that narrowing across the function boundary - `?? undefined` normalizes the
+        // (unreachable) null case the same way the outer `string | undefined` fields expect.
+        assigneePaneKey = currentAuthority.paneKey ?? undefined
+        processIncarnation = currentAuthority.processIncarnation ?? undefined
       }
 
       if (params.inject && (!assigneePaneKey || !processIncarnation)) {
@@ -1833,7 +1857,11 @@ export const ORCHESTRATION_METHODS: RpcMethod[] = [
       let injected = false
       if (params.inject) {
         try {
-          const submission = await runtime.sendTerminalAgentPrompt(to, preamble)
+          const submission = await runtime.sendTerminalAgentPrompt(to, preamble, {
+            beforeWrite: () => {
+              requireUnchangedDispatchAuthority()
+            }
+          })
           // Why (#10416): byte count only ever grows (padding, never truncation) so it can never
           // catch a bad write; submissionVerified is the real settlement signal.
           if (submission.submissionVerified !== true) {

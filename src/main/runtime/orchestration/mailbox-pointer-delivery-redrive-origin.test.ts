@@ -37,7 +37,9 @@ function buildFakeDb(messages: { id: string; type: string; sequence: number }[])
 
 // Builds a pointer-delivery instance whose redriveMailbox dependency loops straight back
 // into deliverForHandle, mirroring the orca-runtime wiring (redriveMailbox -> deliverPendingMessagesForHandle -> deliverForHandle).
-function buildHarness() {
+function buildHarness(overrides?: {
+  writePty?: (ptyId: string, data: string) => boolean | Promise<boolean>
+}) {
   const leaf: OrchestrationMailboxLeaf = {
     tabId: TAB_ID,
     leafId: LEAF_ID,
@@ -48,7 +50,7 @@ function buildHarness() {
     lastOscTitle: null,
     paneTitle: null
   }
-  const writePty = vi.fn(() => true)
+  const writePty = vi.fn(overrides?.writePty ?? (() => true))
   const db = buildFakeDb([{ id: 'm1', type: 'status', sequence: 1 }])
   const mailboxOwner = new OrchestrationMailboxOwner({
     getDb: () => db,
@@ -89,7 +91,7 @@ function buildHarness() {
     redriveMailbox,
     writePty
   })
-  return { pointerDelivery, writePty, redriveMailbox, leaf }
+  return { pointerDelivery, writePty, redriveMailbox, leaf, db }
 }
 
 describe('mailbox redrive origin', () => {
@@ -156,5 +158,95 @@ describe('mailbox redrive origin', () => {
     expect(isMailboxHandleDeliverableForOrigin(MAILBOX_HANDLE, 'notification')).toBe(false)
     expect(isMailboxHandleDeliverableForOrigin('run:run_redrive', 'idle-transition')).toBe(true)
     expect(isMailboxHandleDeliverableForOrigin('run:run_redrive', 'notification')).toBe(true)
+  })
+
+  it('rolls back the pending write if the pty retires before a watermark ever exists', async () => {
+    let resolveWrite!: (accepted: boolean) => void
+    const pendingWrite = new Promise<boolean>((resolve) => {
+      resolveWrite = resolve
+    })
+    const { pointerDelivery, redriveMailbox, leaf, db } = buildHarness({
+      writePty: () => pendingWrite
+    })
+
+    // The PTY write is still in flight - finishPointerWrite (and thus setWatermark and
+    // db.markAsDelivered) has not run yet, so only the flight itself, not a watermark or any
+    // delivered-but-unrolled-back message id, knows about this reservation.
+    pointerDelivery.deliver(leaf, { mailboxHandle: MAILBOX_HANDLE, origin: 'idle-transition' })
+
+    pointerDelivery.retirePty(PTY_ID)
+    await Promise.resolve()
+
+    // Nothing was ever marked delivered, so there is nothing to roll back - but the mailbox
+    // must still be redriven, or it is stranded forever behind a flight that will never settle.
+    expect(db.markAsUndelivered).not.toHaveBeenCalled()
+    expect(redriveMailbox).toHaveBeenCalledWith(MAILBOX_HANDLE, undefined, 'idle-transition')
+
+    // Let the stale write settle after retirement without throwing.
+    resolveWrite(true)
+    await Promise.resolve()
+  })
+
+  it('rolls back a deactivated watermark (submission settled without ever sending Enter)', async () => {
+    vi.useFakeTimers()
+    try {
+      const { pointerDelivery, writePty, redriveMailbox, leaf, db } = buildHarness()
+
+      pointerDelivery.deliver(leaf, { mailboxHandle: MAILBOX_HANDLE, origin: 'idle-transition' })
+      expect(writePty).toHaveBeenCalledTimes(1)
+
+      // Before the 500ms auto-submit timer fires, the agent stops being idle - submission
+      // settles via deactivateWatermark (not clearWatermark), and the flight itself is
+      // already gone (settled) by the time this pty later retires.
+      leaf.lastAgentStatus = 'working'
+      await vi.advanceTimersByTimeAsync(500)
+      // The auto-submit path never wrote '\r' - only the original pointer write counts.
+      expect(writePty).toHaveBeenCalledTimes(1)
+
+      pointerDelivery.retirePty(PTY_ID)
+      await Promise.resolve()
+
+      // Without the watermark itself carrying stagedMessageIds, this delivered-but-never-
+      // submitted message would stay marked 'delivered' forever once its pty is gone.
+      expect(db.markAsUndelivered).toHaveBeenCalledWith(['m1'])
+      expect(redriveMailbox).toHaveBeenCalledWith(MAILBOX_HANDLE, undefined, 'idle-transition')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('coalesces a mailbox reserved through both its flight/watermark and a separate parked entry into one redrive', async () => {
+    const { pointerDelivery, writePty, redriveMailbox, leaf } = buildHarness()
+
+    // First delivery becomes the flight owner and (synchronously, in this harness) the
+    // watermark owner too, reserving 'type_a'.
+    pointerDelivery.deliver(leaf, {
+      mailboxHandle: MAILBOX_HANDLE,
+      origin: 'idle-transition',
+      reservedTypes: new Set(['type_a'])
+    })
+    expect(writePty).toHaveBeenCalledTimes(1)
+
+    // A second request for the SAME mailbox arrives while the first's flight is still
+    // in-flight (delayed by its auto-submit timer): deliver() parks it separately, reserving
+    // 'type_b', instead of re-watermarking.
+    pointerDelivery.deliver(leaf, {
+      mailboxHandle: MAILBOX_HANDLE,
+      origin: 'idle-transition',
+      reservedTypes: new Set(['type_b'])
+    })
+    expect(writePty).toHaveBeenCalledTimes(1)
+
+    pointerDelivery.retirePty(PTY_ID)
+    await Promise.resolve()
+
+    // Retirement must redrive this mailbox exactly once, with the union of every source's
+    // reservation - not once per source (double-delivery) and not with only one side's types.
+    expect(redriveMailbox).toHaveBeenCalledTimes(1)
+    expect(redriveMailbox).toHaveBeenCalledWith(
+      MAILBOX_HANDLE,
+      new Set(['type_a', 'type_b']),
+      'idle-transition'
+    )
   })
 })

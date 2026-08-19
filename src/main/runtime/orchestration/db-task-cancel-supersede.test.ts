@@ -122,6 +122,37 @@ describe('Task cancel/supersede (#14548 Phase 1)', () => {
     }
   )
 
+  // Why (round 6): updateTaskStatus is the OTHER half of orchestration.taskUpdate's routing
+  // (cancelled/superseded go through cancelTask; every other requested status goes here) - the
+  // RPC routing decides purely off the REQUESTED status, never the task's current one, so
+  // without this guard a taskUpdate call naming 'completed'/'ready'/etc. against an
+  // already-cancelled/superseded task could resurrect it with none of cancelTask's own fencing
+  // (dependent cascade, replacement bookkeeping) ever re-applied.
+  it.each(['cancelled', 'superseded'] as const)(
+    "refuses to resurrect a %s task via updateTaskStatus (the taskUpdate RPC's non-cancel routing branch)",
+    (priorStatus) => {
+      const { db } = createDatabase()
+      const task = db.createTask({ spec: 'terminated work' })
+      db.cancelTask(task.id, priorStatus, { reason: 'stopped' })
+
+      const result = db.updateTaskStatus(task.id, 'completed', 'sneaks past as success')
+
+      expect(result?.status).toBe(priorStatus)
+      expect(result?.result).not.toBe('sneaks past as success')
+      expect(db.getTask(task.id)?.status).toBe(priorStatus)
+    }
+  )
+
+  it('still allows updateTaskStatus to terminalize a live (non-terminal) task normally', () => {
+    const { db } = createDatabase()
+    const task = db.createTask({ spec: 'in-flight work' })
+
+    const result = db.updateTaskStatus(task.id, 'completed', 'done')
+
+    expect(result?.status).toBe('completed')
+    expect(result?.result).toBe('done')
+  })
+
   it('rolls back a supersede when Dispatch settlement fails', () => {
     const { db } = createDatabase()
     const task = db.createTask({ spec: 'atomic supersede' })
@@ -178,6 +209,62 @@ describe('Task cancel/supersede (#14548 Phase 1)', () => {
 
     expect(db.getTask(middle.id)?.status).toBe('superseded')
     expect(db.getTask(leaf.id)?.status).toBe('superseded')
+  })
+
+  it('does not cascade a supersede-with-replacement to pending dependents, and promotes them once the replacement completes (#14548 round 6)', () => {
+    const { db } = createDatabase()
+    const original = db.createTask({ spec: 'old approach' })
+    const dependent = db.createTask({ spec: 'waits on original', deps: [original.id] })
+    const replacement = db.createTask({ spec: 'new approach' })
+
+    db.cancelTask(original.id, 'superseded', { replacementTaskId: replacement.id })
+
+    // Why: the replacement continues the work under a new id - killing the dependent here
+    // would be wrong if the replacement later actually completes.
+    expect(db.getTask(dependent.id)?.status).toBe('pending')
+
+    db.updateTaskStatus(replacement.id, 'completed')
+
+    // Why: the dependent's `deps` still names the original (superseded) id, not the
+    // replacement - promoteReadyTasks must follow that one-level-back link to unstick it.
+    expect(db.getTask(dependent.id)?.status).toBe('ready')
+  })
+
+  it('does not promote a supersede-with-replacement dependent while the replacement is still unfinished', () => {
+    const { db } = createDatabase()
+    const original = db.createTask({ spec: 'old approach' })
+    const dependent = db.createTask({ spec: 'waits on original', deps: [original.id] })
+    const replacement = db.createTask({ spec: 'new approach' })
+
+    db.cancelTask(original.id, 'superseded', { replacementTaskId: replacement.id })
+    expect(db.getTask(dependent.id)?.status).toBe('pending')
+
+    // Some unrelated task completing must not spuriously promote the dependent.
+    const unrelated = db.createTask({ spec: 'unrelated' })
+    db.updateTaskStatus(unrelated.id, 'completed')
+    expect(db.getTask(dependent.id)?.status).toBe('pending')
+  })
+
+  it('creates a new task as ready when its dependency is already superseded with a completed replacement (#14548 round 6)', () => {
+    const { db } = createDatabase()
+    const original = db.createTask({ spec: 'old approach' })
+    const replacement = db.createTask({ spec: 'new approach' })
+    db.updateTaskStatus(replacement.id, 'completed')
+    db.cancelTask(original.id, 'superseded', { replacementTaskId: replacement.id })
+
+    const task = db.createTask({ spec: 'new work', deps: [original.id] })
+
+    expect(task.status).toBe('ready')
+  })
+
+  it('still cascades a supersede with no replacement (bare supersession) to pending dependents', () => {
+    const { db } = createDatabase()
+    const original = db.createTask({ spec: 'old approach' })
+    const dependent = db.createTask({ spec: 'waits on original', deps: [original.id] })
+
+    db.cancelTask(original.id, 'superseded', { reason: 'abandoned, no replacement' })
+
+    expect(db.getTask(dependent.id)?.status).toBe('superseded')
   })
 
   it('does not cascade past a dependent that already left pending', () => {

@@ -569,6 +569,33 @@ describe('orchestration RPC methods', () => {
       expect(db.getDispatchContextById(dispatch.id)?.stale_escalated_at).toBeFalsy()
     })
 
+    // Why (round 6, third vector of this hole): rounds 1/2 fixed `params.run` and
+    // `params.terminalPaneKey` scoping the sweep before resolveRunScope's authorization ran -
+    // both still resolved scope through the equally client-declared `params.terminal`/`handle`
+    // itself. An attested caller (`term_attacker`) naming a DIFFERENT real terminal's handle in
+    // --terminal must be rejected before the sweep ever runs against that terminal's Run.
+    it('rejects a check call naming a different terminal than the attested caller (params.terminal leak)', async () => {
+      setup()
+      const dispatch = makeStaleDispatch('term_stale_worker')
+      vi.spyOn(runtime, 'verifyOrchestrationCompatibilityCaller').mockReturnValue({
+        hostScope: { local: true },
+        paneKey: 'tab_attacker:11111111-1111-4111-8111-111111111111',
+        terminalHandle: 'term_attacker',
+        processIncarnation: 'runtime_test:term_attacker:1',
+        launchTokenHash: 'irrelevant-mock-returns-fixed-identity'
+      } as never)
+      // Why: the local `call()` wrapper always reads the outer `ctx` closure - mutate it in
+      // place (fresh per test via setup()) rather than passing a third argument it ignores.
+      ctx.orchestrationCompatibilityEvidence = { terminalHandle: 'term_attacker' } as never
+
+      await expect(call('orchestration.check', { terminal: 'term_coord' })).rejects.toMatchObject({
+        code: 'consumer_fenced'
+      })
+
+      // No sweep mutation must have leaked through before the rejection.
+      expect(db.getDispatchContextById(dispatch.id)?.stale_escalated_at).toBeFalsy()
+    })
+
     it('default (unread only) marks returned rows as read', async () => {
       setup()
       db.insertMessage({ from: 'a', to: 'b', subject: 'one' })

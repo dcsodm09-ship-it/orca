@@ -100,7 +100,8 @@ describe('orchestration RPC methods', () => {
       })
       expect(runtime.sendTerminalAgentPrompt).toHaveBeenCalledWith(
         'term_worker',
-        expect.stringContaining('--dispatch-capability dcap_')
+        expect.stringContaining('--dispatch-capability dcap_'),
+        expect.objectContaining({ beforeWrite: expect.any(Function) })
       )
     })
 

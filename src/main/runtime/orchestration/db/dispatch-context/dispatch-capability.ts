@@ -34,12 +34,19 @@ export function mintDispatchCapability(
   // dispatch can legitimately claim this pane in the window between that read and this rebind, since
   // the rebind never re-validated it — mirrors the NOT EXISTS guard DISPATCH_CONTEXT_CLAIM_SQL
   // already applies at create time.
+  // Why (dispatch-authority race): the earlier `getDispatchContextById` read above is a separate
+  // statement from this UPDATE, so a concurrent writer on another connection (a second Orca window
+  // or host sharing this DB file) can flip `status` between the two — e.g. a stale-dispatch sweep
+  // failing this exact context. Re-check status IN the same UPDATE, not just at the read above;
+  // must allow the same two statuses as the initial guard ('pending' covers the composed-worker
+  // startup path via prepareStartingWorkerAuthority, 'dispatched' covers the plain --inject path).
   const result = this.db
     .prepare(
       `UPDATE dispatch_contexts
        SET capability_hash = ?, assignee_pane_key = ?, process_incarnation = ?,
            capability_revoked_at = NULL
        WHERE id = ? AND capability_hash IS NULL
+         AND status IN ('pending', 'dispatched')
          AND NOT EXISTS (
            SELECT 1 FROM dispatch_contexts active
            WHERE active.id != ?
@@ -66,10 +73,18 @@ export function mintDispatchCapability(
       paneSuffix
     )
   if (result.changes === 0) {
-    // Why: disambiguate the two 0-row causes — a concurrent mint already claimed this row's
-    // capability, vs. a concurrent dispatch claimed this row's target pane out from under it.
+    // Why: disambiguate the three 0-row causes, status first — a concurrent mint already claimed
+    // this row's capability, a concurrent dispatch claimed this row's target pane out from under
+    // it, or (dispatch-authority race) the row left 'pending'/'dispatched' entirely between the
+    // read above and this UPDATE (e.g. a concurrent stale-dispatch sweep failed it).
     const current = this.getDispatchContextById(params.dispatchId)
-    if (current?.capability_hash) {
+    if (!current || (current.status !== 'pending' && current.status !== 'dispatched')) {
+      throw new OrchestrationError(
+        'dispatch_inactive',
+        `Dispatch ${params.dispatchId} is not active.`
+      )
+    }
+    if (current.capability_hash) {
       throw new OrchestrationError(
         'dispatch_capability_already_minted',
         `Dispatch ${params.dispatchId} already has a lifecycle capability from a concurrent request.`

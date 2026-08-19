@@ -58,7 +58,21 @@ export function createTask(
            LEFT JOIN tasks dependency ON dependency.id = requested.value
            WHERE dependency.id IS NULL
               OR dependency.run_id <> ?
-              OR dependency.status <> 'completed'
+              -- Why (#14548 round 6): a dependency that was superseded, with its replacement
+              -- already completed, represents finished work under a different task id — treat
+              -- it the same as 'completed' rather than leaving every future dependent stuck.
+              OR (
+                dependency.status <> 'completed'
+                AND NOT (
+                  dependency.status = 'superseded'
+                  AND dependency.replacement_task_id IS NOT NULL
+                  AND EXISTS (
+                    SELECT 1 FROM tasks replacement
+                    WHERE replacement.id = dependency.replacement_task_id
+                      AND replacement.status = 'completed'
+                  )
+                )
+              )
          ) THEN 'pending' ELSE 'ready' END,
          ?
        )`
@@ -207,20 +221,37 @@ export function listTasksWithDispatch(
 }
 
 // Why: runs in the status-update transaction, so a completed task never leaves its ready children unpromoted.
+// Why (#14548 round 6): a pending task can depend on a task id that was superseded before it ever
+// completed - its replacement completing is what actually unblocks the dependent, but the
+// dependent's `deps` array still names the ORIGINAL (superseded) id, not the replacement. Without
+// resolving that one-level-back link, a completing replacement would never re-check dependents of
+// the task it replaced. Only one level is followed (matches the readiness CASE in createTask
+// above) - a chain of multiple supersessions is a known, accepted limit of this minimal fix.
 export function promoteReadyTasks(this: OrchestrationDb, completedTaskId: string): void {
+  const supersededPredecessors = this.db
+    .prepare("SELECT id FROM tasks WHERE status = 'superseded' AND replacement_task_id = ?")
+    .all(completedTaskId) as { id: string }[]
+  const triggerIds = new Set([completedTaskId, ...supersededPredecessors.map((t) => t.id)])
+
   const candidates = this.db
     .prepare("SELECT * FROM tasks WHERE status = 'pending'")
     .all() as TaskRow[]
 
   for (const task of candidates) {
     const deps: string[] = JSON.parse(task.deps)
-    if (!deps.includes(completedTaskId)) {
+    if (!deps.some((depId) => triggerIds.has(depId))) {
       continue
     }
 
     const allDepsCompleted = deps.every((depId) => {
       const dep = this.getTask(depId)
-      return dep?.status === 'completed'
+      if (dep?.status === 'completed') {
+        return true
+      }
+      if (dep?.status === 'superseded' && dep.replacement_task_id) {
+        return this.getTask(dep.replacement_task_id)?.status === 'completed'
+      }
+      return false
     })
     if (allDepsCompleted) {
       this.db.prepare("UPDATE tasks SET status = 'ready' WHERE id = ?").run(task.id)

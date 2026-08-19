@@ -229,6 +229,14 @@ describe('orchestration RPC methods', () => {
       ).rejects.toThrow('was not found')
     })
 
+    it('distinguishes a missing --status from an unrecognized one', () => {
+      const method = findMethod('orchestration.taskUpdate')
+      expect(() => method.params!.parse({ id: 'task_1' })).toThrow('Missing --status')
+      expect(() => method.params!.parse({ id: 'task_1', status: 'done-ish' })).toThrow(
+        /Unrecognized --status .*done-ish/
+      )
+    })
+
     // Why (#14548): cancelled/superseded are stored terminal statuses but were never reachable
     // through this RPC (nor the CLI's --status enum) — route through cancelTask, not
     // updateTaskStatus, so its reason/replacement-task-id fencing actually runs.
@@ -411,6 +419,55 @@ describe('orchestration RPC methods', () => {
       expect(db.getActiveDispatchForTerminal('term_a')).toBeUndefined()
     })
 
+    // Why (round 6, dispatch-authority race): the identity re-check above closes the gap up to
+    // the capability mint, but sendTerminalAgentPrompt's actual PTY write happens after further
+    // internal awaits the mint can't see across. Simulate the runtime's real beforeWrite
+    // contract (it calls the hook synchronously right before each write) to prove a process
+    // change surfacing there is caught too, not just one surfacing during agent detection.
+    it('rejects inject if the terminal process changes between mint and the real PTY write', async () => {
+      setup()
+      provideInjectIdentity()
+      const task = db.createTask({ spec: 'work' })
+      vi.spyOn(runtime, 'isTerminalRunningAgent').mockResolvedValue(true)
+      let processIncarnation = 'runtime_test:term_a:1'
+      vi.spyOn(runtime, 'getOrchestrationDispatchAuthority').mockImplementation((candidate) =>
+        candidate === 'term_a'
+          ? ({
+              terminalHandle: 'term_a',
+              paneKey: 'tab_worker:term_a',
+              processIncarnation,
+              launchTokenHash: null
+            } as never)
+          : null
+      )
+      const mint = vi.spyOn(db, 'mintDispatchCapability')
+      vi.spyOn(runtime, 'sendTerminalAgentPrompt').mockImplementation(
+        async (handle, _prompt, options) => {
+          // Mirrors writeTerminalAgentPrompt: identity changes underneath this in-flight send
+          // (e.g. the pane's process was replaced) before the runtime's own pre-write hook fires.
+          processIncarnation = 'runtime_test:term_a:2'
+          await options?.beforeWrite?.('pty_a')
+          return { handle, accepted: true, bytesWritten: 100, submissionVerified: true }
+        }
+      )
+
+      const dispatching = call('orchestration.dispatch', {
+        task: task.id,
+        to: 'term_a',
+        inject: true
+      })
+
+      await expect(dispatching).rejects.toMatchObject({ code: 'worker_identity_changed' })
+      // The mint itself still succeeded (identity was unchanged at that point) - this is a
+      // post-mint failure, so the dispatch must be actively failed/rolled back, not left dangling.
+      expect(mint).toHaveBeenCalledOnce()
+      expect(db.getTask(task.id)?.status).toBe('ready')
+      expect(db.getActiveDispatchForTerminal('term_a')).toBeUndefined()
+      const ctx = db.getDispatchContext(task.id)
+      expect(ctx?.status).toBe('failed')
+      expect(ctx?.capability_revoked_at).not.toBeNull()
+    })
+
     it('rolls back active dispatch when injection fails', async () => {
       setup()
       provideInjectIdentity()
@@ -480,7 +537,8 @@ describe('orchestration RPC methods', () => {
 
       expect(send).toHaveBeenCalledWith(
         'term_a',
-        expect.stringContaining('orca-dev orchestration send')
+        expect.stringContaining('orca-dev orchestration send'),
+        expect.objectContaining({ beforeWrite: expect.any(Function) })
       )
     })
 
@@ -524,7 +582,8 @@ describe('orchestration RPC methods', () => {
 
       expect(agentPrompt).toHaveBeenCalledWith(
         'term_a',
-        expect.stringContaining('line one\nline two')
+        expect.stringContaining('line one\nline two'),
+        expect.objectContaining({ beforeWrite: expect.any(Function) })
       )
       expect(rawSend).not.toHaveBeenCalled()
     })

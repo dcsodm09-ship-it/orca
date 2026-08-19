@@ -14,16 +14,25 @@ const CANCEL_TASK_SAVEPOINT = 'cancel_task'
 // A) is fully unstuck by cancelling one ancestor. Only 'pending' tasks are eligible: a task that
 // already reached 'ready'/'dispatched' had its dependencies satisfied at the time, so cancelling
 // one afterward does not retroactively invalidate it.
+// Why (round 6): a superseded task WITH a replacement is different — the replacement continues
+// the work under a new id, so a pending dependent must NOT be killed; it stays 'pending' and
+// promoteReadyTasks/the readiness CASE (both extended below) follow the replacement_task_id chain
+// to unstick it once the replacement actually completes. Only a bare cancellation, or a supersede
+// with no replacement, means the work really isn't happening — those still cascade as before.
 function cascadeCancelPendingDependents(
   db: OrchestrationDb,
   cancelledTaskId: string,
   status: 'cancelled' | 'superseded',
-  reason: string
+  reason: string,
+  replacementTaskId?: string
 ): void {
   const pending = db.db.prepare("SELECT * FROM tasks WHERE status = 'pending'").all() as TaskRow[]
   for (const task of pending) {
     const deps: string[] = JSON.parse(task.deps)
     if (!deps.includes(cancelledTaskId)) {
+      continue
+    }
+    if (status === 'superseded' && replacementTaskId) {
       continue
     }
     const result = db.db
@@ -119,7 +128,8 @@ export function cancelTask(
       status,
       options.reason
         ? `Dependency ${id} was ${status}: ${options.reason}`
-        : `Dependency ${id} was ${status}`
+        : `Dependency ${id} was ${status}`,
+      options.replacementTaskId
     )
     const task = this.getTask(id)
     this.db.exec(`RELEASE ${CANCEL_TASK_SAVEPOINT}`)

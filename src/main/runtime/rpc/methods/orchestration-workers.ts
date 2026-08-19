@@ -231,7 +231,29 @@ export const ORCHESTRATION_WORKER_START_METHODS: RpcMethod[] = [
           devMode: params.devMode,
           cliCommand: runtime.getTerminalOrchestrationCliCommand(terminalHandle)
         })
-        await runtime.sendTerminalAgentPrompt(terminalHandle, preamble)
+        // Why (round 6, dispatch-authority race): terminalAuthority was captured before
+        // prepareStartingWorkerAuthority minted the DB-side capability against it - the actual
+        // PTY write still happens after further internal awaits (input-size check, submission
+        // queue) that can span a process replacement. Mirrors orchestration.ts's
+        // requireUnchangedDispatchAuthority, applied to this composed-worker startup path.
+        // Why `const`: `terminalHandle` above is a reassignable `let` narrowed to `string` by an
+        // earlier guard - that narrowing doesn't cross into this closure, so a fresh `const`
+        // capture is what TS (and correctness, since it can't silently change under us) needs.
+        const startedTerminalHandle: string = terminalHandle
+        await runtime.sendTerminalAgentPrompt(startedTerminalHandle, preamble, {
+          beforeWrite: () => {
+            const current = runtime.getOrchestrationDispatchAuthority(startedTerminalHandle)
+            if (
+              current?.paneKey !== terminalAuthority.paneKey ||
+              current?.processIncarnation !== terminalAuthority.processIncarnation
+            ) {
+              throw new OrchestrationError(
+                'worker_identity_changed',
+                `Terminal ${startedTerminalHandle} changed process while dispatch injection was being validated; retry the dispatch.`
+              )
+            }
+          }
+        })
         effects.push({
           kind: 'dispatch_input',
           role: 'agent',

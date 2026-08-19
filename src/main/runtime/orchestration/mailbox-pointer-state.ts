@@ -2,6 +2,8 @@ import type { OrchestrationMailboxDeliveryOrigin } from './mailbox-pointer-deliv
 import type { OrchestrationMailboxLeaf } from './mailbox-owner'
 
 export type OrchestrationMailboxDeliveryFlight = {
+  mailboxHandle: string
+  reservedTypes?: ReadonlySet<string>
   enterTimer: ReturnType<typeof setTimeout> | null
   stagedMessageIds: string[]
 }
@@ -12,16 +14,44 @@ export type ParkedOrchestrationMailboxDelivery = {
   reservedTypes?: ReadonlySet<string>
 }
 
+type WatermarkOwner = {
+  ptyId: string
+  sequence: number
+  leafKey: string
+  active: boolean
+  // Why (retirement round): a watermark can go inactive (submission settled without an Enter,
+  // e.g. the agent stopped being idle) while its flight already settled - retirement's rollback
+  // needs these to mark the right rows undelivered even with no current flight left to read them
+  // from.
+  stagedMessageIds: string[]
+  reservedTypes?: ReadonlySet<string>
+}
+
+export type OrchestrationMailboxPtyRetirement = {
+  flight: OrchestrationMailboxDeliveryFlight | undefined
+  stagedMessageIds: string[]
+  redrives: Map<string, ReadonlySet<string> | undefined>
+}
+
+// Why: undefined means "unfiltered" everywhere reservedTypes is merged - an unfiltered
+// reservation always dominates a filtered one, and a filtered union just needs both sets.
+function mergeReservedTypes(
+  a: ReadonlySet<string> | undefined,
+  b: ReadonlySet<string> | undefined
+): ReadonlySet<string> | undefined {
+  if (a === undefined || b === undefined) {
+    return undefined
+  }
+  return new Set([...a, ...b])
+}
+
 export class OrchestrationMailboxPointerState {
   private readonly flightsByPtyId = new Map<string, OrchestrationMailboxDeliveryFlight>()
   private readonly parkedDeliveriesByPtyId = new Map<
     string,
     Map<string, ParkedOrchestrationMailboxDelivery>
   >()
-  private readonly watermarkByMailbox = new Map<
-    string,
-    { ptyId: string; sequence: number; leafKey: string; active: boolean }
-  >()
+  private readonly watermarkByMailbox = new Map<string, WatermarkOwner>()
   private readonly watermarkMailboxesByPtyId = new Map<string, Set<string>>()
   private readonly parkedTypesByMailbox = new Map<string, ReadonlySet<string> | null>()
 
@@ -29,8 +59,17 @@ export class OrchestrationMailboxPointerState {
     return this.flightsByPtyId.has(ptyId)
   }
 
-  beginFlight(ptyId: string): OrchestrationMailboxDeliveryFlight {
-    const flight = { enterTimer: null, stagedMessageIds: [] }
+  beginFlight(
+    ptyId: string,
+    mailboxHandle: string,
+    reservedTypes?: ReadonlySet<string>
+  ): OrchestrationMailboxDeliveryFlight {
+    const flight = {
+      mailboxHandle,
+      reservedTypes: reservedTypes && reservedTypes.size > 0 ? new Set(reservedTypes) : undefined,
+      enterTimer: null,
+      stagedMessageIds: []
+    }
     this.flightsByPtyId.set(ptyId, flight)
     return flight
   }
@@ -101,12 +140,28 @@ export class OrchestrationMailboxPointerState {
     )
   }
 
-  setWatermark(mailbox: string, sequence: number, ptyId: string, leafKey: string): void {
+  setWatermark(
+    mailbox: string,
+    sequence: number,
+    ptyId: string,
+    leafKey: string,
+    reservation: { stagedMessageIds: readonly string[]; reservedTypes?: ReadonlySet<string> }
+  ): void {
     const prior = this.watermarkByMailbox.get(mailbox)
     if (prior && prior.ptyId !== ptyId) {
       this.removeWatermarkPtyIndex(mailbox, prior.ptyId)
     }
-    this.watermarkByMailbox.set(mailbox, { ptyId, sequence, leafKey, active: true })
+    this.watermarkByMailbox.set(mailbox, {
+      ptyId,
+      sequence,
+      leafKey,
+      active: true,
+      stagedMessageIds: [...reservation.stagedMessageIds],
+      reservedTypes:
+        reservation.reservedTypes && reservation.reservedTypes.size > 0
+          ? new Set(reservation.reservedTypes)
+          : undefined
+    })
     const mailboxes = this.watermarkMailboxesByPtyId.get(ptyId) ?? new Set<string>()
     mailboxes.add(mailbox)
     this.watermarkMailboxesByPtyId.set(ptyId, mailboxes)
@@ -155,28 +210,62 @@ export class OrchestrationMailboxPointerState {
     return parkedTypes ?? null
   }
 
-  // Why: a mailbox can be parked behind this PTY's in-flight write without ever being the
-  // watermark owner itself (only the in-flight mailbox gets watermarked; others waiting are
-  // merely parked) - returning parkedDeliveries lets the caller redrive those too instead of
-  // silently dropping them along with the deleted map.
-  retirePty(ptyId: string): {
-    flight: OrchestrationMailboxDeliveryFlight | undefined
-    releasedMailboxes: string[]
-    parkedDeliveries: Map<string, ParkedOrchestrationMailboxDelivery>
-  } {
+  // Why: a mailbox's delivery reservation can be spread across up to three places when its PTY
+  // retires - the current (possibly still-unsettled) flight, a watermark it owns (active or
+  // deactivated), and a separate parked-delivery entry - and any of those can exist without the
+  // others. Coalesce all three into one redrive per mailbox with merged reservations and
+  // deduplicated staged ids, instead of the three previous independent loops that could redrive
+  // the same mailbox twice (dropping one side's reservations) or silently lose whichever source
+  // had no watermark/flight yet.
+  retirePty(ptyId: string): OrchestrationMailboxPtyRetirement {
     const flight = this.flightsByPtyId.get(ptyId)
     this.flightsByPtyId.delete(ptyId)
-    const parkedDeliveries = this.parkedDeliveriesByPtyId.get(ptyId) ?? new Map()
-    this.parkedDeliveriesByPtyId.delete(ptyId)
-    const releasedMailboxes: string[] = []
+
+    const redrives = new Map<string, ReadonlySet<string> | undefined>()
+    const stagedMessageIds = new Set<string>()
+    const addRedrive = (mailboxHandle: string, reservedTypes: ReadonlySet<string> | undefined) => {
+      redrives.set(mailboxHandle, mergeReservedTypes(redrives.get(mailboxHandle), reservedTypes))
+    }
+    // mergeReservedTypes(undefined-on-first-call, x) must yield x, not "unfiltered" - only treat
+    // the merge as unfiltered once TWO real sources disagree. Track first-seen separately.
+    const seenOnce = new Set<string>()
+    const addRedriveMerged = (
+      mailboxHandle: string,
+      reservedTypes: ReadonlySet<string> | undefined
+    ) => {
+      if (!seenOnce.has(mailboxHandle)) {
+        seenOnce.add(mailboxHandle)
+        redrives.set(mailboxHandle, reservedTypes)
+      } else {
+        addRedrive(mailboxHandle, reservedTypes)
+      }
+    }
+
+    if (flight) {
+      addRedriveMerged(flight.mailboxHandle, flight.reservedTypes)
+      for (const id of flight.stagedMessageIds) {
+        stagedMessageIds.add(id)
+      }
+    }
+
     for (const mailboxHandle of this.watermarkMailboxesByPtyId.get(ptyId) ?? []) {
       const owner = this.watermarkByMailbox.get(mailboxHandle)
       if (owner?.ptyId === ptyId && this.clearWatermark(mailboxHandle, owner.sequence, ptyId)) {
-        releasedMailboxes.push(mailboxHandle)
+        addRedriveMerged(mailboxHandle, owner.reservedTypes)
+        for (const id of owner.stagedMessageIds) {
+          stagedMessageIds.add(id)
+        }
       }
     }
     this.watermarkMailboxesByPtyId.delete(ptyId)
-    return { flight, releasedMailboxes, parkedDeliveries }
+
+    const parkedDeliveries = this.parkedDeliveriesByPtyId.get(ptyId) ?? new Map()
+    this.parkedDeliveriesByPtyId.delete(ptyId)
+    for (const [mailboxHandle, delivery] of parkedDeliveries) {
+      addRedriveMerged(mailboxHandle, delivery.reservedTypes)
+    }
+
+    return { flight, stagedMessageIds: [...stagedMessageIds], redrives }
   }
 
   private removeWatermarkPtyIndex(mailbox: string, ptyId: string): void {

@@ -23,6 +23,15 @@ export function updateTaskStatus(
          SET status = ?, result = COALESCE(?, result),
              completed_at = COALESCE(?, completed_at)
          WHERE id = ?
+           -- Why (round 6): a taskUpdate RPC call to this function is routed purely off the
+           -- REQUESTED status (orchestration.ts), never the task's current one - without this,
+           -- a taskUpdate naming any OTHER status could resurrect a cancelled/superseded task
+           -- with none of cancelTask's own fencing (dependent cascade, replacement bookkeeping)
+           -- ever re-applied. Deliberately narrower than cancelTask's own guard: reopening a
+           -- 'completed'/'failed' task back to 'ready' for a fresh attempt is an existing,
+           -- legitimate pattern this function must keep allowing (e.g. legacy A/B pinned-worker
+           -- reconciliation) - only 'cancelled'/'superseded' carry fencing this function can't redo.
+           AND status NOT IN ('cancelled', 'superseded')
            AND (
              ? = 0 OR EXISTS (
                SELECT 1 FROM dispatch_contexts
@@ -57,6 +66,14 @@ export function updateTaskStatus(
       )
     if (update.changes !== 1) {
       const task = this.getTask(id)
+      // Why: mirrors cancelTask's own idempotent-terminal-noop path, narrowed to the two
+      // statuses THIS guard protects (see the WHERE clause above) - a late/duplicate call
+      // against an already-cancelled/superseded task returns its real state as-is instead of
+      // falling into the dispatch/worker diagnostics below (which describe an unrelated cause).
+      if (task && (task.status === 'cancelled' || task.status === 'superseded')) {
+        this.db.exec('RELEASE update_task_status')
+        return task
+      }
       const active = this.db
         .prepare(
           `SELECT id FROM dispatch_contexts

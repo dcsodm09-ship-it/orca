@@ -152,7 +152,14 @@ export class OrchestrationMailboxPointerDelivery<TWaiter extends OrchestrationMe
     ) {
       return
     }
-    stageOrchestrationMailboxPointer(this.writeDeps(), leaf, mailboxHandle, unread, newestSequence)
+    stageOrchestrationMailboxPointer(
+      this.writeDeps(),
+      leaf,
+      mailboxHandle,
+      unread,
+      newestSequence,
+      options.reservedTypes
+    )
   }
 
   parkRedelivery(mailboxHandle: string, reservedTypes?: ReadonlySet<string>): void {
@@ -160,22 +167,24 @@ export class OrchestrationMailboxPointerDelivery<TWaiter extends OrchestrationMe
   }
 
   retirePty(ptyId: string): void {
-    const { flight, releasedMailboxes, parkedDeliveries } = this.state.retirePty(ptyId)
+    const { flight, stagedMessageIds, redrives } = this.state.retirePty(ptyId)
     if (flight?.enterTimer != null) {
       clearTimeout(flight.enterTimer)
     }
-    if (flight?.stagedMessageIds.length) {
-      this.deps.getDb()?.markAsUndelivered(flight.stagedMessageIds)
+    if (stagedMessageIds.length) {
+      // Why: staged ids can come from the in-flight flight AND/OR a deactivated watermark
+      // (submission settled without ever sending Enter) - both leave messages marked
+      // 'delivered' with no live PTY left to submit them, so both must roll back here or
+      // they are lost for good once this ptyId is gone (#14548 mailbox round).
+      this.deps.getDb()?.markAsUndelivered(stagedMessageIds)
     }
-    for (const mailboxHandle of releasedMailboxes) {
+    // Why: a mailbox's reservation can be spread across the flight, a watermark it owns, and a
+    // separately parked delivery - state.retirePty() already coalesced those into one redrive
+    // per mailbox with merged reservedTypes, so redrive each exactly once here instead of the
+    // three independent loops this used to be (which could double-redrive or drop a source).
+    for (const [mailboxHandle, reservedTypes] of redrives) {
+      this.parkRedelivery(mailboxHandle, reservedTypes)
       this.redrive(mailboxHandle, true)
-    }
-    // Why: a mailbox merely parked behind this PTY's in-flight write (not the watermark owner
-    // itself) used to be silently dropped along with the deleted parked-deliveries map - mirror
-    // settle()'s park-then-redrive branch so it gets a real retry instead of vanishing.
-    for (const [mailboxHandle, delivery] of parkedDeliveries) {
-      this.parkRedelivery(mailboxHandle, delivery.reservedTypes)
-      this.redrive(mailboxHandle)
     }
   }
 

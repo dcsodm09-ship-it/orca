@@ -37,6 +37,11 @@ describe('orchestration dispatch injected:false warning', () => {
     )
 
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('not injected'))
+    // Why (round 6): the skill-guide's own documented bare-shell recipe is exactly this call
+    // shape (no --inject) - the old wording ("retry with --inject") was wrong advice for that
+    // case (it throws: no recognized agent detected). Must condition on both real outcomes.
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('bare shell'))
+    expect(errorSpy).not.toHaveBeenCalledWith(expect.stringMatching(/^warning: dispatch/))
     errorSpy.mockRestore()
   })
 

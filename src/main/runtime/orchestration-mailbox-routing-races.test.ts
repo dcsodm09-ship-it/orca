@@ -394,7 +394,7 @@ describe('orchestration mailbox routing races', () => {
     const state = new OrchestrationMailboxPointerState()
     const leaf = {} as never
 
-    const unfilteredFirst = state.beginFlight('pty_unfiltered_first')
+    const unfilteredFirst = state.beginFlight('pty_unfiltered_first', 'run:run_test')
     state.parkDelivery('pty_unfiltered_first', 'run:run_test', leaf, 'notification', new Set())
     state.parkDelivery(
       'pty_unfiltered_first',
@@ -409,7 +409,7 @@ describe('orchestration mailbox routing races', () => {
         ?.reservedTypes
     ).toBeUndefined()
 
-    const unfilteredLast = state.beginFlight('pty_unfiltered_last')
+    const unfilteredLast = state.beginFlight('pty_unfiltered_last', 'run:run_test')
     state.parkDelivery(
       'pty_unfiltered_last',
       'run:run_test',

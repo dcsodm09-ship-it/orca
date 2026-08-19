@@ -22,7 +22,14 @@ const POST_V6_COLUMNS = [
   ['legacy_adoptions', 'source_run_id'],
   ['legacy_compatibility_principals', 'id'],
   ['legacy_operation_receipts', 'principal_id'],
-  ['legacy_mail_receipts', 'principal_id']
+  ['legacy_mail_receipts', 'principal_id'],
+  // Why: migrate-task-terminal-states.ts's INSERT-SELECT explicitly names these three columns -
+  // without probing for them here, a DB missing only this later v13-v28 addition would still be
+  // judged "post-v6, skip re-migrating" and then crash the whole OrchestrationDb constructor
+  // (not just createTask()) the first time that later migration runs against it.
+  ['tasks', 'created_by_pane_key'],
+  ['tasks', 'created_by_process_incarnation'],
+  ['tasks', 'created_by_run_generation']
 ] as const
 
 const VERSIONED_POST_V6_COLUMNS = [
