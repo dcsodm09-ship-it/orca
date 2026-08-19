@@ -276,4 +276,199 @@ describe('OrchestrationDb version-skew migration', () => {
 
     raw.close()
   })
+
+  // Why (round 11): the v9 boundary (messagesAllowQuestions) can't use the generic drop-a-
+  // column/index matrix below - it's a CHECK constraint, not a probeable column, so simulating
+  // "a real v8 database" means rebuilding messages with the pre-v9 constraint that excludes
+  // 'question', mirroring what migrate-v2-v12.ts's own v9 block actually rebuilds FROM.
+  it('does not rewind a healthy v8 database whose messages CHECK constraint predates the v9 question type', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'orca-db-version-skew-pre-v9-'))
+    const dbPath = join(tempDir, 'orchestration.db')
+    const seed = new OrchestrationDb(dbPath)
+    seed.close()
+    const raw = new Database(dbPath)
+    raw.exec(`
+      CREATE TABLE messages_pre_v9 (
+        id            TEXT NOT NULL,
+        run_id        TEXT NOT NULL,
+        from_handle   TEXT NOT NULL,
+        to_handle     TEXT NOT NULL,
+        subject       TEXT NOT NULL,
+        body          TEXT NOT NULL DEFAULT '',
+        type          TEXT NOT NULL DEFAULT 'status'
+          CHECK(type IN (
+            'status', 'dispatch', 'worker_done', 'merge_ready',
+            'escalation', 'handoff', 'decision_gate', 'heartbeat'
+          )),
+        priority      TEXT NOT NULL DEFAULT 'normal'
+          CHECK(priority IN ('normal', 'high', 'urgent')),
+        thread_id     TEXT,
+        payload       TEXT,
+        read          INTEGER NOT NULL DEFAULT 0,
+        sequence      INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        delivered_at  TEXT,
+        sender_pane_key TEXT
+      );
+      INSERT INTO messages_pre_v9 (
+        id, run_id, from_handle, to_handle, subject, body, type, priority,
+        thread_id, payload, read, sequence, created_at, delivered_at, sender_pane_key
+      )
+      SELECT
+        id, run_id, from_handle, to_handle, subject, body, type, priority,
+        thread_id, payload, read, sequence, created_at, delivered_at, sender_pane_key
+      FROM messages;
+      DROP TABLE messages;
+      ALTER TABLE messages_pre_v9 RENAME TO messages;
+      CREATE UNIQUE INDEX idx_messages_id ON messages(id);
+      CREATE INDEX idx_inbox ON messages(to_handle, read);
+      CREATE INDEX idx_thread ON messages(thread_id);
+      CREATE INDEX idx_messages_run_sequence ON messages(run_id, sequence);
+    `)
+    raw.pragma('user_version = 8')
+
+    expect(resolveOrchestrationMigrationStartVersion(raw, 8, SCHEMA_VERSION)).toBe(8)
+
+    raw.close()
+  })
+
+  // Why (round 11, fix for a real bug a genuinely-independent review found beyond what round
+  // 9/10's own sweeps covered): round 9's sweep only grepped 3 migration files and stopped at
+  // v27; it never checked migrate.ts itself (which has its own inline v29-v31 blocks, not
+  // delegated to migrate-v13-v28.ts despite that file's name) nor v11's/v22's/v25's/v28's
+  // artifacts. A full version-by-version matrix - not just a couple of spot-checks - is what
+  // actually catches this class of gap, since each version's structures are independent and a
+  // spot-check only proves the versions it happens to pick. Every version boundary this file's
+  // VERSIONED_POST_V6_COLUMNS/VERSIONED_POST_V6_INDEXES lists reference gets its own case here:
+  // strip back a fully-current database to exactly what a real database AT that version (one
+  // version below the boundary) would have, and confirm the resolver trusts it instead of
+  // rewinding to 6.
+  const VERSION_BOUNDARY_DROPS: {
+    version: number
+    columns?: [string, string][]
+    indexes?: string[]
+    tables?: string[]
+  }[] = [
+    {
+      version: 8,
+      columns: [['question_threads', 'run_id']],
+      indexes: [
+        'idx_deliveries_one_outstanding',
+        'idx_deliveries_run_created',
+        'idx_questions_dispatch_status'
+      ]
+    },
+    {
+      version: 10,
+      columns: [
+        ['dispatch_contexts', 'capability_hash'],
+        ['dispatch_contexts', 'process_incarnation'],
+        ['dispatch_contexts', 'capability_revoked_at']
+      ]
+    },
+    // Why table drops, not column drops: message_id/singleton/transport are each their table's
+    // PRIMARY KEY, which SQLite refuses to DROP COLUMN - dropping the whole table simulates "this
+    // table doesn't exist yet" just as accurately (hasOrchestrationColumn returns false either way).
+    { version: 11, tables: ['mutation_receipts'] },
+    { version: 13, columns: [['worker_dispatches', 'runtime_epoch']] },
+    {
+      version: 15,
+      columns: [
+        ['federated_dispatches', 'to_home_imported_sequence'],
+        ['remote_dispatch_attachments', 'to_worker_imported_sequence']
+      ],
+      indexes: ['idx_federation_relay_pending']
+    },
+    {
+      version: 16,
+      tables: ['remote_questions'],
+      indexes: ['idx_remote_questions_dispatch_status']
+    },
+    { version: 17, columns: [['remote_dispatch_attachments', 'protocol_version']] },
+    {
+      version: 19,
+      columns: [
+        ['messages', 'delivery_contract'],
+        ['coordinator_runs', 'scheduler_lost_at'],
+        ['dispatch_contexts', 'contract_version'],
+        ['dispatch_contexts', 'launch_token_hash']
+      ],
+      // Why these 4 extra indexes: all reference messages.delivery_contract in their own
+      // definition (createMailboxDeliveryIndexesIfPossible only creates them once that column
+      // exists) - SQLite refuses to drop a column an index still references, so they have to go
+      // first. A genuine pre-v19 database never has any of them, for the same reason.
+      indexes: [
+        'idx_messages_delivery_contract',
+        'idx_messages_undelivered_direct_run',
+        'idx_messages_unread_current_inbox',
+        'idx_messages_unread_current_inbox_type',
+        'idx_messages_unread_current_run_type'
+      ]
+    },
+    { version: 22, indexes: ['idx_dispatch_assignee_handle'] },
+    {
+      version: 24,
+      columns: [
+        ['tasks', 'created_by_pane_key'],
+        ['tasks', 'created_by_process_incarnation'],
+        ['tasks', 'created_by_run_generation']
+      ]
+    },
+    { version: 25, indexes: ['idx_dispatch_active_assignee_handle'] },
+    {
+      version: 26,
+      tables: ['mutation_receipt_ledger'],
+      indexes: ['idx_mutation_receipts_completed_updated']
+    },
+    { version: 27, columns: [['federated_dispatches', 'to_home_acknowledged_sequence']] },
+    { version: 28, tables: ['mutation_caller_identities'] },
+    {
+      version: 29,
+      columns: [
+        ['tasks', 'terminal_reason'],
+        ['tasks', 'replacement_task_id']
+      ]
+    },
+    { version: 30, columns: [['worker_dispatches', 'terminated_by']] },
+    { version: 31, columns: [['dispatch_contexts', 'stale_escalated_at']] }
+  ]
+
+  it.each(VERSION_BOUNDARY_DROPS)(
+    'does not rewind a healthy database exactly one version below the v$version boundary',
+    ({ version, columns, indexes, tables }) => {
+      tempDir = mkdtempSync(join(tmpdir(), `orca-db-version-skew-pre-v${version}-`))
+      const dbPath = join(tempDir, 'orchestration.db')
+      const seed = new OrchestrationDb(dbPath)
+      seed.close()
+      const raw = new Database(dbPath)
+      // Why indexes/triggers before columns: anything whose definition references a column
+      // blocks that column's DROP COLUMN until it's gone too - messages.delivery_contract is
+      // also read by a trigger, not just indexes.
+      for (const index of indexes ?? []) {
+        raw.exec(`DROP INDEX ${index}`)
+      }
+      for (const trigger of raw
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+        .all() as { name: string }[]) {
+        raw.exec(`DROP TRIGGER ${trigger.name}`)
+      }
+      for (const [table, column] of columns ?? []) {
+        raw.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`)
+      }
+      for (const table of tables ?? []) {
+        raw.exec(`DROP TABLE ${table}`)
+      }
+      const storedVersion = version - 1
+      raw.pragma(`user_version = ${storedVersion}`)
+
+      expect(() =>
+        resolveOrchestrationMigrationStartVersion(raw, storedVersion, SCHEMA_VERSION)
+      ).not.toThrow()
+      expect(resolveOrchestrationMigrationStartVersion(raw, storedVersion, SCHEMA_VERSION)).toBe(
+        storedVersion
+      )
+
+      raw.close()
+    }
+  )
 })

@@ -57,7 +57,24 @@ const VERSIONED_POST_V6_COLUMNS = [
   { version: 24, table: 'tasks', column: 'created_by_pane_key' },
   { version: 24, table: 'tasks', column: 'created_by_process_incarnation' },
   { version: 24, table: 'tasks', column: 'created_by_run_generation' },
-  { version: 27, table: 'federated_dispatches', column: 'to_home_acknowledged_sequence' }
+  { version: 27, table: 'federated_dispatches', column: 'to_home_acknowledged_sequence' },
+  // Why (round 11, fix for the SAME regression class a genuinely re-verified independent review
+  // found beyond what round 9's "complete" sweep covered): round 9 only grepped
+  // migrate-v2-v12.ts/migrate-v13-v28.ts/migrate-legacy-contract-storage.ts and stopped at v27 -
+  // it never checked migrate.ts itself (which has its own inline v29-v31 blocks, not delegated to
+  // migrate-v13-v28.ts despite that file's name) nor v11's/v28's table-creation blocks. mutation_
+  // receipts is created at v11 (migrate-v2-v12.ts); mutation_caller_identities at v28
+  // (migrate-v13-v28.ts); tasks.terminal_reason/replacement_task_id at v29
+  // (migrate-task-terminal-states.ts, called from migrate.ts's `if (current < 29)`);
+  // worker_dispatches.terminated_by at v30 and dispatch_contexts.stale_escalated_at at v31 (both
+  // inline in migrate.ts).
+  { version: 11, table: 'mutation_receipts', column: 'state' },
+  { version: 26, table: 'mutation_receipt_ledger', column: 'singleton' },
+  { version: 28, table: 'mutation_caller_identities', column: 'transport' },
+  { version: 29, table: 'tasks', column: 'terminal_reason' },
+  { version: 29, table: 'tasks', column: 'replacement_task_id' },
+  { version: 30, table: 'worker_dispatches', column: 'terminated_by' },
+  { version: 31, table: 'dispatch_contexts', column: 'stale_escalated_at' }
 ] as const
 
 // Why (round 10, fix for the SAME regression class an independent review's follow-up audit
@@ -79,13 +96,19 @@ const POST_V6_INDEXES = [
 // idx_messages_delivery_contract alongside v19's messages.delivery_contract - all verified
 // against migrate-v2-v12.ts/migrate-v13-v28.ts/migrate-legacy-contract-storage.ts, mirroring
 // VERSIONED_POST_V6_COLUMNS's own fix.
+// Why the rest (round 11, same follow-up-audit fix as the columns above): idx_dispatch_
+// assignee_handle at v22, idx_dispatch_active_assignee_handle at v25, idx_mutation_receipts_
+// completed_updated alongside v26's mutation_receipt_ledger - all in migrate-v13-v28.ts.
 const VERSIONED_POST_V6_INDEXES = [
   { version: 8, index: 'idx_deliveries_one_outstanding' },
   { version: 8, index: 'idx_deliveries_run_created' },
   { version: 8, index: 'idx_questions_dispatch_status' },
   { version: 15, index: 'idx_federation_relay_pending' },
   { version: 16, index: 'idx_remote_questions_dispatch_status' },
-  { version: 19, index: 'idx_messages_delivery_contract' }
+  { version: 19, index: 'idx_messages_delivery_contract' },
+  { version: 22, index: 'idx_dispatch_assignee_handle' },
+  { version: 25, index: 'idx_dispatch_active_assignee_handle' },
+  { version: 26, index: 'idx_mutation_receipts_completed_updated' }
 ] as const
 
 function hasOrchestrationColumn(db: Database.Database, table: string, column: string): boolean {
