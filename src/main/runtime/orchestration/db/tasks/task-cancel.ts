@@ -2,6 +2,7 @@ import { OrchestrationError } from '../../orchestration-error'
 import type { TaskRow } from '../../types'
 import { isTerminalTaskStatus } from '../../types'
 import { settleActiveDispatchesForTask } from '../dispatch-context/dispatch-completion'
+import { walkReplacementPredecessorChain } from './task-store'
 import type { OrchestrationDb } from '../orchestration-db'
 
 const CANCEL_TASK_SAVEPOINT = 'cancel_task'
@@ -61,30 +62,42 @@ function cascadeCancelPendingDependents(
 //    original had been bare-cancelled with no replacement at all.
 // Exported so both cancelTask (below) and updateTaskStatus (task-status-transition.ts) can call
 // it after their own terminal transition commits.
+// Why (round 8, fix for a real bug an independent review found and reproduced): a multi-hop
+// chain (original -> replacement1 -> replacement2) calls this once for replacement1 too, when
+// replacement1 itself gets superseded by replacement2 - at THAT point replacement1's own status
+// is 'superseded' with a replacement_task_id set, which used to look identical to "this
+// replacement failed" and wrongly cascaded 'cancelled' onto `original`'s dependents even when
+// replacement2 (the chain's real end) had already completed successfully. A task that is itself
+// superseded WITH a further replacement is not a known outcome yet — the chain continues, and
+// whichever task eventually settles at the chain's TRUE end re-triggers this same function from
+// there, which (via walkReplacementPredecessorChain) resolves every hop back to `original` at
+// once. Deciding here, one hop at a time, is exactly what produced the bug.
 export function reconcileReplacementOutcome(db: OrchestrationDb, settledTaskId: string): void {
-  const originals = db.db
-    .prepare('SELECT id FROM tasks WHERE replacement_task_id = ?')
-    .all(settledTaskId) as { id: string }[]
-  if (originals.length === 0) {
+  const settled = db.getTask(settledTaskId)
+  if (!settled) {
     return
   }
-  const replacement = db.getTask(settledTaskId)
-  if (!replacement) {
+  if (settled.status === 'superseded' && settled.replacement_task_id) {
     return
   }
-  if (replacement.status === 'completed') {
+  const chain = walkReplacementPredecessorChain(db, settledTaskId)
+  chain.delete(settledTaskId)
+  if (chain.size === 0) {
+    return
+  }
+  if (settled.status === 'completed') {
     db.promoteReadyTasks(settledTaskId)
     return
   }
-  if (!isTerminalTaskStatus(replacement.status)) {
+  if (!isTerminalTaskStatus(settled.status)) {
     return
   }
-  for (const { id: originalId } of originals) {
+  for (const originalId of chain) {
     cascadeCancelPendingDependents(
       db,
       originalId,
       'cancelled',
-      `Replacement ${settledTaskId} for ${originalId} did not complete (${replacement.status})`
+      `Replacement chain for ${originalId} did not complete (ended at ${settledTaskId}: ${settled.status})`
     )
   }
 }

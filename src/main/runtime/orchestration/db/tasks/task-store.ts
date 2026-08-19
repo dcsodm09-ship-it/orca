@@ -224,14 +224,36 @@ export function listTasksWithDispatch(
 // Why (#14548 round 6): a pending task can depend on a task id that was superseded before it ever
 // completed - its replacement completing is what actually unblocks the dependent, but the
 // dependent's `deps` array still names the ORIGINAL (superseded) id, not the replacement. Without
-// resolving that one-level-back link, a completing replacement would never re-check dependents of
-// the task it replaced. Only one level is followed (matches the readiness CASE in createTask
-// above) - a chain of multiple supersessions is a known, accepted limit of this minimal fix.
+// resolving that link, a completing replacement would never re-check dependents of the task it
+// replaced.
+// Why (round 8, fix for a real bug an independent review found): the whole predecessor chain is
+// walked, not just one hop - a multi-hop supersession (original -> replacement1 -> replacement2)
+// needs `original`'s dependents to promote too once replacement2 (the chain's true end) completes,
+// not just replacement1's direct dependents. A one-hop-only version left a completed chain's
+// earlier-hop dependents stuck 'pending' forever, AND (worse) reconcileReplacementOutcome's own
+// cascade-on-failure path could wrongly cancel them before this ever got a chance to run, because
+// it couldn't tell "chain still resolving" apart from "chain failed" without this same walk.
+// Why exported: task-cancel.ts's reconcileReplacementOutcome needs the identical walk to find
+// every original transitively linked through a multi-hop chain, not just the immediate one.
+export function walkReplacementPredecessorChain(db: OrchestrationDb, taskId: string): Set<string> {
+  const chain = new Set<string>([taskId])
+  let frontier = [taskId]
+  while (frontier.length > 0) {
+    const placeholders = frontier.map(() => '?').join(',')
+    const predecessors = db.db
+      .prepare(
+        `SELECT id FROM tasks WHERE status = 'superseded' AND replacement_task_id IN (${placeholders})`
+      )
+      .all(...frontier) as { id: string }[]
+    const fresh = predecessors.map((p) => p.id).filter((id) => !chain.has(id))
+    fresh.forEach((id) => chain.add(id))
+    frontier = fresh
+  }
+  return chain
+}
+
 export function promoteReadyTasks(this: OrchestrationDb, completedTaskId: string): void {
-  const supersededPredecessors = this.db
-    .prepare("SELECT id FROM tasks WHERE status = 'superseded' AND replacement_task_id = ?")
-    .all(completedTaskId) as { id: string }[]
-  const triggerIds = new Set([completedTaskId, ...supersededPredecessors.map((t) => t.id)])
+  const triggerIds = walkReplacementPredecessorChain(this, completedTaskId)
 
   const candidates = this.db
     .prepare("SELECT * FROM tasks WHERE status = 'pending'")
@@ -244,14 +266,13 @@ export function promoteReadyTasks(this: OrchestrationDb, completedTaskId: string
     }
 
     const allDepsCompleted = deps.every((depId) => {
-      const dep = this.getTask(depId)
-      if (dep?.status === 'completed') {
-        return true
+      let dep = this.getTask(depId)
+      const seen = new Set<string>()
+      while (dep?.status === 'superseded' && dep.replacement_task_id && !seen.has(dep.id)) {
+        seen.add(dep.id)
+        dep = this.getTask(dep.replacement_task_id)
       }
-      if (dep?.status === 'superseded' && dep.replacement_task_id) {
-        return this.getTask(dep.replacement_task_id)?.status === 'completed'
-      }
-      return false
+      return dep?.status === 'completed'
     })
     if (allDepsCompleted) {
       this.db.prepare("UPDATE tasks SET status = 'ready' WHERE id = ?").run(task.id)

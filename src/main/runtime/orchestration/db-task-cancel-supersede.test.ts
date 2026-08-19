@@ -277,6 +277,43 @@ describe('Task cancel/supersede (#14548 Phase 1)', () => {
     expect(db.getTask(dependent.id)?.status).toBe('cancelled')
   })
 
+  // Why (#14548 round 8, fix for a real bug an independent review found and reproduced): a
+  // 2-hop chain (original -> replacement1 -> replacement2, replacement2 already completed)
+  // must promote the dependent, not wrongly cancel it - the moment replacement1 itself gets
+  // superseded by replacement2 used to look identical to "replacement1's substitution failed"
+  // and cascaded a cancellation on top of a chain that had actually already succeeded.
+  it('promotes a pending dependent through a 2-hop replacement chain whose true end already completed', () => {
+    const { db } = createDatabase()
+    const original = db.createTask({ spec: 'old approach' })
+    const dependent = db.createTask({ spec: 'waits on original', deps: [original.id] })
+    const replacement1 = db.createTask({ spec: 'newer approach' })
+    const replacement2 = db.createTask({ spec: 'final approach' })
+
+    db.updateTaskStatus(replacement2.id, 'completed')
+    db.cancelTask(original.id, 'superseded', { replacementTaskId: replacement1.id })
+    expect(db.getTask(dependent.id)?.status).toBe('pending')
+
+    db.cancelTask(replacement1.id, 'superseded', { replacementTaskId: replacement2.id })
+
+    expect(db.getTask(dependent.id)?.status).toBe('ready')
+  })
+
+  it('cascades a pending dependent through a 2-hop replacement chain whose true end fails', () => {
+    const { db } = createDatabase()
+    const original = db.createTask({ spec: 'old approach' })
+    const dependent = db.createTask({ spec: 'waits on original', deps: [original.id] })
+    const replacement1 = db.createTask({ spec: 'newer approach' })
+    const replacement2 = db.createTask({ spec: 'final approach' })
+
+    db.cancelTask(original.id, 'superseded', { replacementTaskId: replacement1.id })
+    db.cancelTask(replacement1.id, 'superseded', { replacementTaskId: replacement2.id })
+    expect(db.getTask(dependent.id)?.status).toBe('pending')
+
+    db.updateTaskStatus(replacement2.id, 'failed')
+
+    expect(db.getTask(dependent.id)?.status).toBe('cancelled')
+  })
+
   it('does not promote a supersede-with-replacement dependent while the replacement is still unfinished', () => {
     const { db } = createDatabase()
     const original = db.createTask({ spec: 'old approach' })
