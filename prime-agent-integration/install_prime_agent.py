@@ -514,7 +514,11 @@ def open_verified_generated_file_parent(
 
 
 def tighten_generated_private_file_mode(
-    path: Path, mode: int = 0o600, *, expected_parent_identity: tuple[int, int]
+    path: Path,
+    mode: int = 0o600,
+    *,
+    expected_parent_identity: tuple[int, int],
+    parent_dir_fd: int | None = None,
 ) -> tuple[int, int]:
     """Tighten an existing file's permission bits to `mode` in place, right
     after an external process this installer does not control (`npm`) has
@@ -602,10 +606,47 @@ def tighten_generated_private_file_mode(
     P1; round 21's own Claude opus/max review tested only symlink swaps
     and swaps at other points in the walk, not a same-UID rename-swap to
     another real, well-formed directory).
+
+    `parent_dir_fd`, when given, is a caller-held, already-open,
+    already-verified directory descriptor for `path`'s parent (e.g.
+    _install_locked()'s own release_dir_fd, opened on RELEASE_DIR
+    immediately after creating it and held open for the entire install) --
+    used directly via os.dup() instead of re-deriving a parent descriptor
+    through open_verified_generated_file_parent()'s SSD_ROOT-rooted
+    ancestor walk. This is strictly stronger than even the identity-pinned
+    walk: the walk re-resolves each ancestor component by NAME and only
+    then compares the terminal descriptor's inode against
+    `expected_parent_identity`, so it can only detect a swap that has
+    already happened by the time the walk runs; a caller-held descriptor
+    was never re-resolved by name at all after the moment it was first
+    opened, so there is no walk-time window left to narrow (independent
+    Codex sol/max round-23 review, 2026-08-19, P1-1/P1-2; see
+    assert_release_dir_fd_identity()). Defaults to None so every existing
+    caller that only has a captured (st_dev, st_ino) VALUE for `path`'s
+    parent -- not a live descriptor -- keeps using the ancestor-walk path
+    unchanged.
     """
-    parent_descriptor = open_verified_generated_file_parent(
-        path, expected_identity=expected_parent_identity
-    )
+    if parent_dir_fd is not None:
+        try:
+            held = os.fstat(parent_dir_fd)
+        except OSError as exc:
+            raise PrimeInstallError(
+                f"managed release directory descriptor is invalid: {path}"
+            ) from exc
+        if (held.st_dev, held.st_ino) != expected_parent_identity:
+            raise PrimeInstallError(
+                f"managed release directory identity changed before tightening: {path}"
+            )
+        try:
+            parent_descriptor = os.dup(parent_dir_fd)
+        except OSError as exc:
+            raise PrimeInstallError(
+                f"cannot duplicate managed release directory descriptor: {path}"
+            ) from exc
+    else:
+        parent_descriptor = open_verified_generated_file_parent(
+            path, expected_identity=expected_parent_identity
+        )
     try:
         name = path.name
         try:
@@ -693,6 +734,109 @@ def assert_release_dir_identity(expected_identity: tuple[int, int]) -> None:
             "install; a same-UID actor may have replaced it with a "
             "different directory"
         )
+
+
+def assert_release_dir_fd_identity(release_dir_fd: int) -> None:
+    """Re-assert, right now, that the lexical RELEASE_DIR path still
+    resolves to the EXACT directory object `release_dir_fd` was opened on.
+
+    assert_release_dir_identity() (above) already does this by comparing
+    two plain (st_dev, st_ino) VALUE tuples -- one captured at open time,
+    one re-read now. That is sufficient to detect a same-UID swap, but it
+    is still a comparison between two independently-resolved snapshots:
+    nothing stops the ORIGINAL directory from being deleted (dropping its
+    link count to zero) and, in a sufficiently long-lived, sufficiently
+    busy filesystem, a brand-new object eventually reusing the exact same
+    (st_dev, st_ino) pair the kernel already recycled. This function
+    instead holds the actual open file descriptor `release_dir_fd` --
+    obtained via os.open(RELEASE_DIR, O_DIRECTORY | O_NOFOLLOW) at the
+    moment _install_locked() itself created RELEASE_DIR, and kept open for
+    the remainder of the install -- and compares the CURRENT lexical
+    path's identity against os.fstat() of that live descriptor. As long as
+    the descriptor stays open, the kernel guarantees the underlying inode
+    it refers to cannot be reused for anything else, so this is not merely
+    "the same value happened to be observed twice" but "this is
+    provably the same directory object, continuously, for the entire
+    install" -- the architectural fix independent Codex sol/max round-23
+    review, 2026-08-19, recommended over repeatedly re-deriving and
+    re-comparing point-in-time (st_dev, st_ino) snapshots: "Opening an
+    O_DIRECTORY|O_NOFOLLOW fd at creation, fstat()-ing it once, and doing
+    all release-relative work through dir_fd= would close all of these at
+    once -- the machinery already exists in this file."
+
+    Threaded through run_npm() (bracketing each of the two `npm`
+    subprocess invocations _install_locked() makes -- immediately before
+    AND immediately after each one) and called directly at every other
+    point _install_locked() currently calls assert_release_dir_identity(),
+    as an ADDITIONAL, strictly stronger check layered on top of -- not a
+    replacement for -- the existing value-tuple comparison, so every
+    existing caller and test of assert_release_dir_identity() keeps
+    working unchanged.
+
+    This still cannot detect a same-UID racer swapping the CONTENT of a
+    file reachable through RELEASE_DIR without ever touching RELEASE_DIR's
+    own directory entry (e.g. overwriting toolchain/bin/node or
+    node_modules/prime-agent/dist/bundle/cli.js in place) -- that is a
+    different residual this round closes separately, via per-file content
+    digests captured at the earliest trustworthy moment and re-verified
+    immediately before each subsequent use (see extract_node_toolchain()'s
+    node_sha256/npm_cli_sha256 and capture_private_ssd_asset_digest(), used
+    together with verify_unchanged_private_ssd_asset_digest()).
+    """
+    try:
+        held = os.fstat(release_dir_fd)
+    except OSError as exc:
+        raise PrimeInstallError(
+            "managed Prime Agent release directory descriptor became invalid during install"
+        ) from exc
+    try:
+        current = RELEASE_DIR.lstat()
+    except OSError as exc:
+        raise PrimeInstallError(
+            "managed Prime Agent release directory became unavailable during install"
+        ) from exc
+    if (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino):
+        raise PrimeInstallError(
+            "managed Prime Agent release directory identity changed during "
+            "install; a same-UID actor may have replaced it with a "
+            "different directory"
+        )
+
+
+def capture_private_ssd_asset_digest(path: Path) -> tuple[str, tuple[int, int]]:
+    """Capture a private SSD file's current content digest and (st_dev,
+    st_ino) identity, through the SAME O_NOFOLLOW-open-then-fstat-identity-
+    check discipline read_private_file() already applies to every other
+    private-file read in this file (via read_private_ssd_file()), rather
+    than a bare Path.read_bytes()/sha256_file() pair -- so the digest this
+    returns is tied to one single, atomic, identity-verified read of the
+    exact file this installer is about to trust as a future baseline, not
+    two independent, independently-raceable filesystem accesses.
+
+    Used to anchor a generated file's content to the EARLIEST point its
+    final, trustworthy value can be known -- e.g. immediately after an
+    external `npm ci` subprocess this installer does not control returns,
+    strictly before any further installer-side operation (moving
+    node_modules, chmod'ing the entrypoint, generating the launch guard)
+    gives a same-UID racer more time to swap it in place. Downstream re-
+    checks compare against the (digest, identity) pair this returns via
+    verify_unchanged_private_ssd_asset_digest() (independent Codex sol/max
+    round-23 review, 2026-08-19, P1-2: RELEASE_DIR's own identity check
+    proves the DIRECTORY was not swapped, but says nothing about a same-UID
+    racer overwriting node_modules/prime-agent/dist/bundle/cli.js's CONTENT
+    in place between npm ci returning and this installer publishing it --
+    tree_digest(), the only other content check in this file's path,
+    RECORDS whatever is on disk at its own call time rather than COMPARING
+    against a value captured before the vulnerable window, so it silently
+    treats a swap that happened before its first call as the legitimate
+    baseline).
+    """
+    raw = read_private_ssd_file(path, max_bytes=MAX_TAR_EXPANDED_BYTES)
+    try:
+        after = path.lstat()
+    except OSError as exc:
+        raise PrimeInstallError(f"cannot inspect generated asset: {path}") from exc
+    return sha256_bytes(raw), (after.st_dev, after.st_ino)
 
 
 def verify_unchanged_private_ssd_file(
@@ -1716,7 +1860,38 @@ def safe_extract_main_asset(
     return package_dir, manifest, content_digests, dir_modes
 
 
-def extract_node_toolchain(asset: Path, destination: Path, expected_sha256: str) -> tuple[Path, Path]:
+def extract_node_toolchain(
+    asset: Path, destination: Path, expected_sha256: str
+) -> tuple[Path, Path, str, str]:
+    """Returns (node, npm_cli, node_sha256, npm_cli_sha256).
+
+    node_sha256/npm_cli_sha256 are SHA-256 content digests of `node`/
+    `npm_cli`'s own bytes, captured WHILE those exact bytes are streamed
+    from the digest-verified tarball to disk below (the same idiom
+    safe_extract_main_asset() already uses for its own content_digests) --
+    not a separate, later re-read of the freshly-written file. This is the
+    ONE point in the entire install where this installer has independent,
+    tarball-derived proof of what the pinned Node/npm runtime's bytes are
+    SUPPOSED to be, with no window between "trusted content is known" and
+    "digest captured" for a same-UID racer to exploit.
+
+    _install_locked() re-verifies both digests, via
+    verify_unchanged_private_ssd_asset_digest(), immediately before EACH
+    subsequent point either binary is exec'd (both exact_tool_version()
+    version-probe calls, and both run_npm() invocations), and bakes them
+    into the generated launch guard (managed_launch_guard_script()) so
+    every FUTURE real invocation re-verifies them too. Independent Codex
+    sol/max round-23 review, 2026-08-19, P1-1: node/npm were previously
+    validated once, structurally, right here (regular file, not a symlink,
+    owned by this UID -- no content digest at all) and then exec'd by bare
+    lexical path at every one of those later points with no re-check; a
+    same-UID racer who swapped RELEASE_DIR/toolchain/bin/node's CONTENT in
+    place between the two `npm` subprocess invocations (measured real
+    window: 3m34s) went undetected because round 22's RELEASE_DIR-identity
+    guard only proves the DIRECTORY was not swapped, not that every file
+    reachable through it still holds the content this function itself
+    wrote.
+    """
     expected_root = f"node-v{NODE_VERSION}-darwin-arm64"
     # Must be freshly created, never a pre-existing directory: see
     # create_fresh_private_dir's docstring for why ensure_private_dir()'s
@@ -1774,6 +1949,12 @@ def extract_node_toolchain(asset: Path, destination: Path, expected_sha256: str)
             selected.append((member, relative))
         if regular_bytes > MAX_TAR_EXPANDED_BYTES:
             raise PrimeInstallError("Node.js archive expands beyond the approved limit")
+        # Content digest of each regular file's bytes, captured while they
+        # are streamed from the digest-verified tarball to disk -- see this
+        # function's own docstring for why node_sha256/npm_cli_sha256 (the
+        # two entries this call site actually needs) are pulled from this
+        # dict below rather than computed via a second, independent read.
+        content_digests: dict[Path, str] = {}
         for member, relative in sorted(selected, key=lambda item: (len(item[1].parts), os.fspath(item[1]))):
             target = destination / relative
             if member.isdir():
@@ -1789,6 +1970,7 @@ def extract_node_toolchain(asset: Path, destination: Path, expected_sha256: str)
             try:
                 mode = 0o700 if member.mode & 0o111 else 0o600
                 os.fchmod(descriptor, mode)
+                digest = hashlib.sha256()
                 with os.fdopen(descriptor, "wb", closefd=True) as output:
                     remaining = member.size
                     while remaining:
@@ -1796,6 +1978,7 @@ def extract_node_toolchain(asset: Path, destination: Path, expected_sha256: str)
                         if not chunk:
                             break
                         output.write(chunk)
+                        digest.update(chunk)
                         remaining -= len(chunk)
                     output.flush()
                     os.fsync(output.fileno())
@@ -1803,6 +1986,7 @@ def extract_node_toolchain(asset: Path, destination: Path, expected_sha256: str)
                     raise PrimeInstallError(f"short Node.js archive member: {member.name}")
                 os.replace(temp_path, target)
                 os.chmod(target, mode)
+                content_digests[relative] = digest.hexdigest()
             except BaseException:
                 try:
                     os.close(descriptor)
@@ -1827,6 +2011,8 @@ def extract_node_toolchain(asset: Path, destination: Path, expected_sha256: str)
     assert_tree_has_no_symlinks(destination)
     node = destination / "bin/node"
     npm_cli = destination / "lib/node_modules/npm/bin/npm-cli.js"
+    node_relative = Path("bin/node")
+    npm_cli_relative = Path("lib/node_modules/npm/bin/npm-cli.js")
     for name, path in (("node", node), ("npm", npm_cli)):
         try:
             info = path.lstat()
@@ -1834,7 +2020,22 @@ def extract_node_toolchain(asset: Path, destination: Path, expected_sha256: str)
             raise PrimeInstallError(f"pinned {name} runtime is missing") from exc
         if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
             raise PrimeInstallError(f"pinned {name} runtime is unsafe")
-    return node, npm_cli
+    try:
+        node_sha256 = content_digests[node_relative]
+        npm_cli_sha256 = content_digests[npm_cli_relative]
+    except KeyError as exc:
+        # Unreachable in practice: the lstat/regular-file checks just above
+        # already require `node`/`npm_cli` to exist as regular files, and
+        # the only way a path in `destination` becomes a regular file is
+        # through the write loop above, which always records a digest
+        # before advancing to the next member. A KeyError here would mean
+        # this function's own bookkeeping is wrong, not that a same-UID
+        # actor tampered with anything -- fail closed rather than silently
+        # skip digest pinning for the pinned runtime.
+        raise PrimeInstallError(
+            "pinned Node.js runtime digest capture is incomplete"
+        ) from exc
+    return node, npm_cli, node_sha256, npm_cli_sha256
 
 
 def managed_npm_environment(
@@ -2355,6 +2556,7 @@ def run_npm(
     *,
     timeout: int = 300,
     child_umask: int | None = None,
+    release_dir_fd: int | None = None,
 ) -> None:
     """`child_umask`, when given, is applied to the CHILD process only, via
     `preexec_fn` running after fork() and before exec() -- the parent
@@ -2374,7 +2576,38 @@ def run_npm(
     0o022-tolerant gates -- scoping the tighter umask to only this one
     call avoids any risk of an unrelated, unreviewed behavior change to
     npm's other output across the rest of this file.
+
+    `release_dir_fd`, when given, is a caller-held, already-open,
+    already-verified O_DIRECTORY|O_NOFOLLOW descriptor for `cwd` (RELEASE_DIR
+    for both real call sites), re-checked via assert_release_dir_fd_identity()
+    both immediately BEFORE constructing the subprocess call and immediately
+    AFTER it returns. subprocess.Popen/run has no dir_fd-based way to set a
+    child's cwd -- only a lexical path -- so `cwd` itself is still handed to
+    it by name; this cannot make npm's OWN internal path resolution
+    dir_fd-bound. What it does do is narrow the specific gap independent
+    Codex sol/max round-23 review, 2026-08-19 (P1-1), measured at a real
+    3m34s: a same-UID racer who renames RELEASE_DIR aside and renames a
+    different, real, legitimately-owned, correctly-permissioned directory
+    into its place DURING this exact subprocess's run is now caught the
+    instant it returns, before this installer trusts anything the process
+    produced -- rather than being caught only much later (or never, for the
+    node/npm binaries themselves -- see extract_node_toolchain()'s digest
+    pinning for that companion fix) by a check placed far downstream of the
+    actual window. The pre-call check additionally catches a swap that
+    happened in the gap between the previous checkpoint and this call.
+    Documented residual: the subprocess's own execution window -- between
+    this function handing `cwd` to subprocess.run() and npm's own first
+    internal path resolution -- is narrowed but not eliminated, because
+    execve()/chdir() semantics for an external, unmodified `npm` process are
+    inherently lexical-path-based; a full fix would require running npm
+    inside a fchdir(release_dir_fd)'d child, which is a larger change than
+    this round scopes (see this file's `validate_exec_target()` docstring in
+    managed_launch_guard_script() for the same class of documented,
+    intentionally-not-hidden residual). Defaults to None so every existing
+    caller/test without a held descriptor is unaffected.
     """
+    if release_dir_fd is not None:
+        assert_release_dir_fd_identity(release_dir_fd)
     environment = managed_npm_environment(
         node_path, cache, install_home, install_tmp
     )
@@ -2396,6 +2629,8 @@ def run_npm(
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise PrimeInstallError("npm execution failed") from exc
+    if release_dir_fd is not None:
+        assert_release_dir_fd_identity(release_dir_fd)
     if result.returncode != 0:
         tail = " ".join(result.stdout.splitlines()[-5:])[:1_000]
         raise PrimeInstallError(f"npm failed with exit {result.returncode}: {tail}")
@@ -2820,13 +3055,34 @@ def managed_entrypoint_script(
     return "\n".join(lines).encode("utf-8")
 
 
-def managed_launch_guard_script(node: Path, cli: Path) -> bytes:
+def managed_launch_guard_script(
+    node: Path, cli: Path, node_sha256: str, cli_sha256: str
+) -> bytes:
+    """`node_sha256`/`cli_sha256` are SHA-256 content digests -- for NODE,
+    captured at extraction time by extract_node_toolchain() (before any
+    `npm` subprocess this installer does not control ever ran); for CLI,
+    captured via capture_private_ssd_asset_digest() immediately after `npm
+    ci` returns and re-verified at every subsequent step before this call
+    (see _install_locked()) -- baked into the generated script as
+    NODE_SHA256/CLI_SHA256 and checked by validate_exec_target() before
+    EVERY future real invocation of the managed command, not merely during
+    this install. Round 22's launch guard validated NODE/CLI structurally
+    (no symlink, inside SSD_ROOT, regular file, owned by this UID, private
+    mode) but never their CONTENT, so a same-UID racer who won the
+    install-time race this round's other fixes now close, or who swaps
+    either file's content at any point AFTER a legitimate install
+    completes, previously exec'd undetected forever after (independent
+    Codex sol/max round-23 review, 2026-08-19, P1-1/P1-2: "...launch
+    guard's baked-in NODE= points at the attacker binary, verify()
+    passes").
+    """
     lock = lifecycle_lock_path()
     ssd_root = SSD_ROOT
     source = f'''#!/usr/bin/python3
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import os
 import stat
 import subprocess
@@ -2836,6 +3092,9 @@ LOCK = {os.fspath(lock)!r}
 SSD_ROOT = {os.fspath(ssd_root)!r}
 NODE = {os.fspath(node)!r}
 CLI = {os.fspath(cli)!r}
+NODE_SHA256 = {node_sha256!r}
+CLI_SHA256 = {cli_sha256!r}
+MAX_EXEC_TARGET_BYTES = {MAX_TAR_EXPANDED_BYTES!r}
 RESOURCE_GUARD_ENV = "ORCA_PRIME_AGENT_RESOURCE_GUARD"
 RESOURCE_GUARDS = ("--no-extensions", "--no-skills", "--no-prompt-templates")
 # Single source of truth shared with managed_entrypoint_script()'s generated
@@ -3315,7 +3574,7 @@ def guarded_arguments(arguments: list[str]) -> list[str]:
     return [*prefix, *RESOURCE_GUARDS, *remaining]
 
 
-def validate_exec_target(path: str, root: str) -> str | None:
+def validate_exec_target(path: str, root: str, expected_sha256: str) -> str | None:
     # Round 13/14, 2026-08-18 (independent review, P2): NODE and CLI are the
     # two paths that matter MOST in this whole script -- they are what
     # actually gets exec'd -- yet, unlike LOCK just above (~15 lines of
@@ -3335,15 +3594,33 @@ def validate_exec_target(path: str, root: str) -> str | None:
     # exception type this standalone generated script never defines)
     # rather than introducing a new error-handling convention.
     #
+    # Round 23, 2026-08-19 (independent Codex sol/max review, P1-1/P1-2):
+    # these structural checks alone never verified CONTENT -- only that
+    # whatever currently sits at `path` is a private, non-symlinked regular
+    # file this UID owns. A same-UID racer who swapped the file's bytes in
+    # place (same inode or not) while leaving every structural property
+    # intact went undetected forever, both during install (see run_npm()'s
+    # release_dir_fd bracketing and extract_node_toolchain()'s digest
+    # capture for the install-time half of this fix) and for every real
+    # invocation of the managed command after a legitimate install
+    # completed. `expected_sha256` -- NODE_SHA256/CLI_SHA256, baked in by
+    # managed_launch_guard_script() from a digest captured at the earliest
+    # trustworthy moment (extraction time for NODE; immediately after `npm
+    # ci` returns for CLI) -- closes that: this function now also reads
+    # `path`'s full content, through the SAME O_NOFOLLOW-opened descriptor
+    # used to re-confirm the leaf identity (not a second, independent
+    # lexical open), and refuses unless its digest matches exactly.
+    #
     # This still leaves the same small, structural residual gap LOCK's own
-    # descriptor-bound flock() does NOT have: subprocess.run() ultimately
-    # re-resolves `path` by name a second time to exec it, so a same-UID
-    # racer that wins the narrow window between this check returning and
-    # that later, independent exec could still swap the target underneath
-    # it. Fully closing that would mean exec'ing through an already-open,
-    # already-validated file descriptor (e.g. Darwin's /dev/fd/<n>) instead
-    # of a path at all -- a larger structural change than this P2-scoped
-    # addition, documented here rather than silently left unmentioned.
+    # descriptor-bound flock() does NOT have, now applied to content as well
+    # as identity: subprocess.run() ultimately re-resolves `path` by name a
+    # second time to exec it, so a same-UID racer that wins the narrow
+    # window between this check returning and that later, independent exec
+    # could still swap the target underneath it. Fully closing that would
+    # mean exec'ing through an already-open, already-validated file
+    # descriptor (e.g. Darwin's /dev/fd/<n>) instead of a path at all -- a
+    # larger structural change than this P1-scoped addition, documented
+    # here rather than silently left unmentioned.
     if os.path.realpath(path) != os.path.abspath(path):
         return f"managed exec target contains a symlink: {{path}}"
     if os.path.commonpath((root, os.path.realpath(path))) != root:
@@ -3358,6 +3635,27 @@ def validate_exec_target(path: str, root: str) -> str | None:
         or info.st_mode & 0o077
     ):
         return f"managed exec target is unsafe: {{path}}"
+    if info.st_size > MAX_EXEC_TARGET_BYTES:
+        return f"managed exec target exceeds the approved size: {{path}}"
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            return f"managed exec target identity changed before verification: {{path}}"
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    except OSError:
+        return f"managed exec target became unreadable: {{path}}"
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if digest.hexdigest() != expected_sha256:
+        return f"managed exec target content changed: {{path}}"
     return None
 
 
@@ -3397,10 +3695,10 @@ def main() -> int:
         after_flock = os.lstat(LOCK)
         if (after_flock.st_dev, after_flock.st_ino) != (opened.st_dev, opened.st_ino):
             return fail("managed lifecycle lock identity changed while held")
-        node_error = validate_exec_target(NODE, root)
+        node_error = validate_exec_target(NODE, root, NODE_SHA256)
         if node_error is not None:
             return fail(node_error)
-        cli_error = validate_exec_target(CLI, root)
+        cli_error = validate_exec_target(CLI, root, CLI_SHA256)
         if cli_error is not None:
             return fail(cli_error)
         completed = subprocess.run(
@@ -4340,6 +4638,65 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     # either -- see the comment at package_lock_identity's own capture.
     release_dir_stat = RELEASE_DIR.lstat()
     release_dir_identity = (release_dir_stat.st_dev, release_dir_stat.st_ino)
+    # Round 24, 2026-08-19 (independent Codex sol/max round-23 review,
+    # P1-1/P1-2 root-cause fix): hold an O_DIRECTORY|O_NOFOLLOW file
+    # descriptor on RELEASE_DIR itself, opened immediately after this
+    # installer creates it, for the ENTIRE remainder of this install -- not
+    # merely a captured (st_dev, st_ino) VALUE re-checked at isolated
+    # points (release_dir_identity, above, and assert_release_dir_identity(),
+    # both kept unchanged for their existing checkpoints and regression
+    # tests) but the literal open file descriptor, so the kernel itself
+    # guarantees the underlying directory object cannot be deleted-and-
+    # reused out from under this install for as long as it stays open. See
+    # assert_release_dir_fd_identity() for the full reasoning, and
+    # _install_locked_within_release_dir() -- the rest of this function's
+    # body, split out so this descriptor can be closed via a plain
+    # try/finally around the call rather than needing that entire body
+    # re-indented under one -- for how it is threaded through every
+    # subsequent release-relative operation: bracketing both `npm`
+    # subprocess invocations (run_npm()'s release_dir_fd parameter), used
+    # directly (via os.dup(), bypassing the SSD_ROOT ancestor re-walk
+    # entirely) by tighten_generated_private_file_mode(), and used for the
+    # post-`npm ci` directory operations (moving node_modules into place,
+    # creating bin/) that used to resolve RELEASE_DIR by lexical path with
+    # no identity binding at all.
+    try:
+        release_dir_fd = os.open(
+            RELEASE_DIR, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        )
+    except OSError as exc:
+        raise PrimeInstallError(
+            "cannot open managed Prime Agent release directory"
+        ) from exc
+    try:
+        assert_release_dir_fd_identity(release_dir_fd)
+        return _install_locked_within_release_dir(
+            lock_identity, evidence, release_dir_identity, release_dir_fd
+        )
+    finally:
+        try:
+            os.close(release_dir_fd)
+        except OSError:
+            pass
+
+
+def _install_locked_within_release_dir(
+    lock_identity: tuple[int, int],
+    evidence: dict[str, Any],
+    release_dir_identity: tuple[int, int],
+    release_dir_fd: int,
+) -> dict[str, Any]:
+    """The remainder of _install_locked(): every step from RELEASE_DIR's
+    subdirectories being created through the final pending-install journal
+    write, run while `release_dir_fd` -- an O_DIRECTORY|O_NOFOLLOW
+    descriptor opened on RELEASE_DIR immediately after _install_locked()
+    itself created it, strictly before either external `npm` subprocess
+    below ever runs -- is held open by the caller for this call's entire
+    duration. See assert_release_dir_fd_identity() for why holding the
+    live descriptor is strictly stronger than only re-comparing captured
+    (st_dev, st_ino) value tuples, and _install_locked() for how it is
+    opened and closed.
+    """
     assets_dir = ensure_private_dir(RELEASE_DIR / "assets")
     cache = ensure_private_dir(TOOL_ROOT / "npm-cache")
     install_home = ensure_private_dir(TOOL_ROOT / "install-home")
@@ -4362,9 +4719,30 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
         NODE_ASSET_SHA256,
         max_bytes=MAX_NODE_DOWNLOAD_BYTES,
     )
-    node, npm_cli = extract_node_toolchain(
+    node, npm_cli, node_sha256, npm_cli_sha256 = extract_node_toolchain(
         assets_dir / NODE_ASSET, RELEASE_DIR / "toolchain", NODE_ASSET_SHA256
     )
+    # Round 24, 2026-08-19 (independent Codex sol/max round-23 review,
+    # P1-1): node_sha256/npm_cli_sha256, captured by extract_node_toolchain()
+    # directly from the digest-verified tarball's bytes as they were
+    # streamed to disk, are the ONLY independently-trustworthy record of
+    # what these two pinned runtime files' content is SUPPOSED to be --
+    # node/npm_cli themselves are bare Paths from here on, exec'd by
+    # lexical path at every point below. Re-verify BOTH digests, via
+    # verify_unchanged_private_ssd_asset_digest(), immediately before EVERY
+    # subsequent point either binary is exec'd: a same-UID racer who swaps
+    # either file's on-disk content in place at any later point -- most
+    # dangerously, during the long `npm ci` subprocess window further down
+    # (measured real window: 3m34s) -- is refused here instead of silently
+    # exec'd. Round 22's RELEASE_DIR-identity guard (release_dir_identity/
+    # release_dir_fd above) proves the DIRECTORY was never swapped; it says
+    # nothing about a same-UID overwrite of a file reachable through it,
+    # which is the gap this closes.
+    node_stat = node.lstat()
+    node_identity = (node_stat.st_dev, node_stat.st_ino)
+    npm_cli_stat = npm_cli.lstat()
+    npm_cli_identity = (npm_cli_stat.st_dev, npm_cli_stat.st_ino)
+    verify_unchanged_private_ssd_asset_digest(node, node_sha256, node_identity)
     exact_tool_version(
         [os.fspath(node), "--version"],
         NODE_VERSION,
@@ -4373,6 +4751,8 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
         install_home=install_home,
         install_tmp=install_tmp,
     )
+    verify_unchanged_private_ssd_asset_digest(node, node_sha256, node_identity)
+    verify_unchanged_private_ssd_asset_digest(npm_cli, npm_cli_sha256, npm_cli_identity)
     exact_tool_version(
         [os.fspath(node), os.fspath(npm_cli), "--version"],
         NPM_VERSION,
@@ -4447,6 +4827,8 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     # package.json just got, immediately before this same invocation
     # (round 16, 2026-08-18, P1).
     verify_patched_assets_unchanged(assets_dir, patched_assets, patched_asset_identities)
+    verify_unchanged_private_ssd_asset_digest(node, node_sha256, node_identity)
+    verify_unchanged_private_ssd_asset_digest(npm_cli, npm_cli_sha256, npm_cli_identity)
     run_npm(
         os.fspath(npm_cli),
         os.fspath(node),
@@ -4466,6 +4848,7 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
         # and is deliberately not applied to the `npm ci` call further down
         # (see run_npm()'s own docstring for why).
         child_umask=0o077,
+        release_dir_fd=release_dir_fd,
     )
     lock_path = RELEASE_DIR / "package-lock.json"
     # `npm install --package-lock-only` just generated this file itself, at
@@ -4498,7 +4881,9 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     # this name distinct from the `lock_identity` parameter for the same
     # reason `manifest_identity` above is not named `lock_identity` either.
     package_lock_identity = tighten_generated_private_file_mode(
-        lock_path, expected_parent_identity=release_dir_identity
+        lock_path,
+        expected_parent_identity=release_dir_identity,
+        parent_dir_fd=release_dir_fd,
     )
     generated_lock_raw = lock_path.read_bytes()
     generated_lock = strict_json(generated_lock_raw)
@@ -4515,6 +4900,8 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     # `npm ci` independently re-reads all four patched tarballs from disk
     # on its own to actually install them (round 16, 2026-08-18, P1).
     verify_patched_assets_unchanged(assets_dir, patched_assets, patched_asset_identities)
+    verify_unchanged_private_ssd_asset_digest(node, node_sha256, node_identity)
+    verify_unchanged_private_ssd_asset_digest(npm_cli, npm_cli_sha256, npm_cli_identity)
     run_npm(
         os.fspath(npm_cli),
         os.fspath(node),
@@ -4523,6 +4910,7 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
         cache,
         install_home,
         install_tmp,
+        release_dir_fd=release_dir_fd,
     )
     # `npm ci` is the SECOND long external subprocess window this install
     # exposes RELEASE_DIR to -- and everything from here through the end of
@@ -4535,22 +4923,114 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     # tighten_generated_private_file_mode() above closes for the FIRST
     # window, applied to the second (independent Codex sol/max round-21
     # review, 2026-08-19, P1 residual; see assert_release_dir_identity()).
+    # run_npm() above already re-asserted the STRONGER, fd-based identity
+    # (assert_release_dir_fd_identity()) both before and after this exact
+    # subprocess call; this value-tuple check is kept, unchanged, as an
+    # additional, independent layer and so this checkpoint's own regression
+    # coverage keeps exercising it directly (round 24, 2026-08-19).
     assert_release_dir_identity(release_dir_identity)
+    assert_release_dir_fd_identity(release_dir_fd)
+    # Also re-verify the pinned toolchain binaries one last time: `npm ci`
+    # is the longest single external-subprocess window this install exposes
+    # them to (measured real window for a same-UID content swap: 3m34s),
+    # and node is about to be baked into the launch guard as a permanent
+    # future trust anchor below.
+    verify_unchanged_private_ssd_asset_digest(node, node_sha256, node_identity)
     installed_package = RELEASE_DIR / "node_modules/prime-agent"
     if installed_package.is_symlink() or not installed_package.is_dir():
         raise PrimeInstallError("npm did not materialize a private Prime Agent package")
-    global_root = RELEASE_DIR / "lib/node_modules"
-    global_root.parent.mkdir(mode=0o700)
-    os.replace(RELEASE_DIR / "node_modules", global_root)
-    bin_dir = RELEASE_DIR / "bin"
-    bin_dir.mkdir(mode=0o700)
-    entrypoint = global_root / "prime-agent/dist/bundle/cli.js"
-    if not entrypoint.is_file():
+    # Round 24, 2026-08-19 (independent Codex sol/max round-23 review,
+    # P1-2): capture the entrypoint's content digest right NOW -- the
+    # earliest point its final, `npm ci`-produced content can be known --
+    # strictly before any further installer-side step (moving node_modules,
+    # chmod'ing the entrypoint, generating the launch guard) gives a
+    # same-UID racer more time to overwrite it in place. RELEASE_DIR's own
+    # identity checks above prove the DIRECTORY was not swapped; they say
+    # nothing about a same-UID actor rewriting THIS file's bytes while
+    # leaving RELEASE_DIR itself untouched -- tree_digest() (used later, by
+    # write_pending_install()/finalize_pending_install()) only RECORDS
+    # whatever is on disk at its own, much later call time rather than
+    # COMPARING against a value captured before this vulnerable window, so
+    # it would silently treat a swap that happened before its first call as
+    # the legitimate baseline. See capture_private_ssd_asset_digest() and
+    # verify_unchanged_private_ssd_asset_digest() for how this is
+    # re-verified at each subsequent step below.
+    pre_move_entrypoint = installed_package / "dist/bundle/cli.js"
+    if pre_move_entrypoint.is_symlink() or not pre_move_entrypoint.is_file():
         raise PrimeInstallError("Prime Agent entrypoint missing")
+    # `npm ci` just materialized this file itself, at whatever mode the
+    # published tarball's own stored permissions specify -- empirically
+    # 0o644 (world-readable) for a real prime-agent release, discovered by
+    # this round's own real, non-mocked tests/sandbox_e2e.py run, not by
+    # any mocked unit test (same root cause as round 18's package-lock.json
+    # finding -- see tighten_generated_private_file_mode()'s docstring --
+    # applied here to a DIFFERENT npm-generated file this round's new
+    # digest-capture step is the first thing in this file to ever read via
+    # the private-file discipline). capture_private_ssd_asset_digest()
+    # reads via read_private_ssd_file(), which requires `st_mode & 0o077
+    # == 0`; left untightened, it fails closed here with "unsafe private
+    # file" on every real (non-mocked) install. Tighten to 0o700 -- the
+    # SAME mode the original, pre-round-24 code already chmod'ed this file
+    # to, just applied here instead of after the move -- right now, in
+    # place, before any read of this file is attempted.
+    os.chmod(pre_move_entrypoint, 0o700)
+    entrypoint_sha256, entrypoint_identity = capture_private_ssd_asset_digest(
+        pre_move_entrypoint
+    )
+    global_root = RELEASE_DIR / "lib/node_modules"
+    # Round 24, 2026-08-19: create "lib" and rename node_modules into it
+    # via dir_fd-relative operations bound to release_dir_fd, rather than
+    # RELEASE_DIR-prefixed lexical paths -- threading the held descriptor
+    # through this publication step too, matching the established
+    # rename_noreplace_dir_fd() no-clobber idiom this file already uses
+    # elsewhere (remove_exact_symlink()) instead of silently downgrading to
+    # plain os.rename()'s replace-if-present semantics.
+    os.mkdir("lib", 0o700, dir_fd=release_dir_fd)
+    lib_descriptor = os.open(
+        "lib",
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=release_dir_fd,
+    )
+    try:
+        rename_noreplace_dir_fd(
+            release_dir_fd,
+            "node_modules",
+            lib_descriptor,
+            "node_modules",
+            display_destination=global_root,
+        )
+    finally:
+        os.close(lib_descriptor)
+    os.mkdir("bin", 0o700, dir_fd=release_dir_fd)
+    bin_dir = RELEASE_DIR / "bin"
+    entrypoint = global_root / "prime-agent/dist/bundle/cli.js"
+    # The rename above moves node_modules -> lib/node_modules as a single
+    # directory-entry rename; no descendant (including cli.js) is itself
+    # re-created, so its inode -- and therefore the identity
+    # capture_private_ssd_asset_digest() captured above, pre-move -- is
+    # unchanged by the move itself. Re-verify anyway, immediately after the
+    # move and again immediately before this content digest is baked into
+    # the launch guard as a permanent trust anchor, rather than assuming
+    # the rename's own atomicity is sufficient proof nothing else raced in
+    # between.
+    verify_unchanged_private_ssd_asset_digest(
+        entrypoint, entrypoint_sha256, entrypoint_identity
+    )
+    if entrypoint.is_symlink() or not entrypoint.is_file():
+        raise PrimeInstallError("Prime Agent entrypoint missing")
+    # Already tightened to 0o700 above, pre-move; re-asserting it here is
+    # now a harmless, defense-in-depth no-op (rename preserves mode) kept
+    # for parity with the original, pre-round-24 chmod call site.
     os.chmod(entrypoint, 0o700)
+    verify_unchanged_private_ssd_asset_digest(
+        entrypoint, entrypoint_sha256, entrypoint_identity
+    )
+    verify_unchanged_private_ssd_asset_digest(node, node_sha256, node_identity)
     launch_guard = bin_dir / "prime-agent-launch-guard.py"
     atomic_create_private_file(
-        launch_guard, managed_launch_guard_script(node, entrypoint), 0o700
+        launch_guard,
+        managed_launch_guard_script(node, entrypoint, node_sha256, entrypoint_sha256),
+        0o700,
     )
     atomic_create_private_file(
         bin_dir / "prime-agent",
@@ -4575,6 +5055,21 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
         "lifecycle_lock": os.fspath(lifecycle_lock_path()),
         "node_target": os.fspath(node),
         "npm_target": os.fspath(npm_cli),
+        # Provenance only, round 24 (2026-08-19): the content digests
+        # captured at extraction time (node/npm_cli) and immediately after
+        # `npm ci` returned (the entrypoint) -- see extract_node_toolchain()
+        # and capture_private_ssd_asset_digest(). The actual enforcement
+        # these values back happens DURING install, at each re-verification
+        # point above, and permanently at every future real invocation via
+        # the digests baked into the launch guard
+        # (managed_launch_guard_script()'s NODE_SHA256/CLI_SHA256) -- not
+        # here; tree_digest()'s release_tree_sha256/release_tree_entries
+        # (below, via write_pending_install()) already covers the complete
+        # release tree, including these same three files, for every future
+        # verify() call.
+        "node_sha256": node_sha256,
+        "npm_cli_sha256": npm_cli_sha256,
+        "entrypoint_sha256": entrypoint_sha256,
         "probe_home": os.fspath(PROBE_HOME),
         "session_dir": os.fspath(managed_session_dir()),
         "asset_sha256": ASSETS,
