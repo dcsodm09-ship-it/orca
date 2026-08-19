@@ -855,6 +855,58 @@ package-lock.json 自带的 SRI 完整性哈希重新核验落盘的第三方包
 关卡），并如实、精确地在代码注释/文档字符串里写清楚具体覆盖到哪里、
 还剩什么没覆盖——不允许再出现 round 24 那种"最早可信时点"式的过度断言。
 
+### Round 26：修好 P1-A，P1-B 做有边界的缓解 + 如实标注剩余残留（已验证关闭，未独立复核）
+
+**R25-P1-A（已修好）**：`make_patched_asset()` 现在多返回一个值——
+`content_digests`，也就是 `safe_extract_main_asset()` 本来就从已验证
+摘要的**原始** tarball 算好、之前被丢弃的逐文件摘要表，在 `npm ci` 跑
+之前就已经拿在手里。`_install_locked_within_release_dir()` 把这份表
+一路传下去，npm ci 返回后：读磁盘上现有的 `cli.js`（`observed_
+entrypoint_sha256`）、从表里查出 `dist/bundle/cli.js` 对应的**钉住**
+摘要（`pinned_entrypoint_sha256`）、**两者比对，不一致就报错**——不再
+是"现读到什么就信什么"。下游（launch guard 的 `CLI_SHA256`、
+receipt 的 `entrypoint_sha256`）此后一律用**钉住的**值，不用现读的
+值。这样无论攻击者是在 npm ci 运行期间还是运行之后换的内容，都会被
+挡住，因为基线在 npm 开始跑之前就已经固定了。顺带把 round 24 那句
+"npm ci 返回后立刻捕获"="最早可信时点"的过度断言注释也一并改正——
+正是这句错误断言让 round 24 自己没能测出这个缺口。
+
+**R25-P1-B（有边界的缓解，非彻底解决，如实记录残留）**：本轮判断
+"npm ci 跑完后按 package-lock.json 的 SRI 完整性哈希重新核验落盘树"
+（原本设想的第一方案）超出本轮合理范围——SRI 哈希是按整个 tarball
+算的，不是按单个文件，从已经解压好的目录树倒推回去核验，需要重新
+拼出和 registry 分发的 tar 字节完全一致的内容才能对得上，不现实。
+改做了范围更小、但真实堵住一半攻击面的方案：新增
+`declared_top_level_node_modules_packages()`，从已验证的 lock 文件里
+推导出"应该存在哪些顶层 `node_modules/<name>`（含 `@scope/name`）
+目录"这个集合；`assert_materialized_node_modules_matches_lock()` 在
+npm ci 跑完后遍历实际落盘的树，凡是出现在树里但不在这个集合里的目录，
+直接拒绝安装。这堵住了 P1-B 复现里"攻击者在 npm ci 运行期间额外种一个
+未声明的兄弟模块"这一半。**如实标注的剩余残留**（写进了函数自己的
+文档字符串，和这份文件里 `run_npm()` 已有的"执行时 TOCTOU"残留说明
+同一种写法）：一个**已经在 lock 里声明过**的包，如果攻击者原地覆盖它
+内部文件的内容（而不是新增一个未声明的包），这个检查**捕捉不到**——
+除了 `cli.js`（P1-A 已单独关闭）之外，3 个本地补丁资产的非入口文件、
+以及约 196 个 registry 依赖包内部文件级别的内容篡改，仍然只依赖 npm
+自己的 registry 完整性校验兜底，不在本轮新增检查的覆盖范围内；嵌套的
+二级 `node_modules/`（包自身的子依赖）也没有遍历。
+
+2 条新回归测试：入口文件在 npm ci **运行期间**（不是运行之后）被换
+内容（和 round 24 那条"捕获之后再换"的测试是不同场景）、npm ci
+运行期间被种入一个未声明的兄弟模块。两条都对 round-25 基线
+`4ecd34b2bd` 做了真实复现确认可被利用（旧代码装完，receipt/发布出去
+的内容都反映攻击者的内容），对修复后的代码通过。107/107 测试（105
+条既有 + 2 条新增）在 `/usr/bin/python3`（3.9.6）和 Homebrew
+python3（3.14.6）下均通过，各跑两次确认，`py_compile` 干净。round
+1-25 的 P1 回归测试逐条重跑仍然通过，专门抽查了 round 24 的 fd 锚定
+机制（本轮完全没碰它的逻辑，新增检查在它之后独立运行）。真实（非
+mock）`sandbox_e2e.py` 生命周期回放：`ok:true`、完整走完
+install/enable/verify/disable/recover，真实 npm ci 输出零假阳性（真实
+落盘的 `cli.js` 和 pinned tarball 摘要完全一致、真实顶层
+`node_modules` 布局和 lock 声明的闭包完全一致），
+`real_user_state_changed:false`。已提交 `c1ca06e61a`。**已派发 round
+27 双复核。**
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
