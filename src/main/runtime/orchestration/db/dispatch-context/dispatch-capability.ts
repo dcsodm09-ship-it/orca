@@ -41,9 +41,13 @@ export function mintDispatchCapability(
   // INSTANCE_LOCK/dev mode, or a network-mounted userData dir; app.requestSingleInstanceLock()
   // rules this out for a normal packaged install - could flip `status` between the two, e.g.
   // failDispatch() marking this exact context 'failed'. Re-check status IN the same UPDATE, not
-  // just at the read above; must allow the same two statuses as the initial guard ('pending' is
-  // reachable via this function too - not every 'pending' dispatch takes the composed-worker
-  // path's own separate mint - 'dispatched' covers the plain --inject path).
+  // just at the read above; must match the initial guard's own allowed set exactly. This
+  // function has exactly one caller (orchestration.ts's --inject path), and in practice that
+  // caller's ctx is always 'dispatched' (from createDispatchContext, or a
+  // findReusableUninjectedDispatchContext hit, which requires capability_hash IS NULL -
+  // composed-worker's prepareStartingWorkerAuthority never leaves that true, since it writes
+  // capability_hash in the same UPDATE as assignee_handle, so its 'pending' contexts never
+  // reach this function at all) - 'pending' in the guard is defensive, not a live call path.
   const result = this.db
     .prepare(
       `UPDATE dispatch_contexts

@@ -1,9 +1,4 @@
-import {
-  isTerminalTaskStatus,
-  type DecisionGateRow,
-  type DispatchContextRow,
-  type GateStatus
-} from '../../types'
+import type { DecisionGateRow, DispatchContextRow, GateStatus } from '../../types'
 import { OrchestrationError } from '../../orchestration-error'
 import { LEGACY_RUN_ID } from '../contract-constants'
 import { generateId } from '../generated-id'
@@ -25,11 +20,20 @@ export function createGate(
     // Why (#14548 round 7, review-found pre-existing gap): the UPDATE below unconditionally
     // forces the task to 'blocked' with no status predicate, and `gate.requester` (the only
     // ownership fence in this function) is optional - orchestration.gateCreate's RPC handler
-    // calls this with none, so an already-terminal task (cancelled/superseded, or even
-    // completed/failed) could be silently reopened into 'blocked' by a late/stray gate-create
-    // call, with none of cancelTask's own fencing ever having run for this transition.
+    // calls this with none, so an already-cancelled/superseded task could be silently reopened
+    // into 'blocked' by a late/stray gate-create call, with none of cancelTask's own fencing
+    // ever having run for this transition.
+    // Why narrower than all 4 terminal statuses (round 9, fix for a real over-broad guard an
+    // independent review found): completed/failed legitimately reopen for a retry elsewhere in
+    // this codebase (updateTaskStatus's own guard explicitly protects that pattern) - opening a
+    // decision gate to review/re-route already-finished-or-failed work is the same "reopen for
+    // a fresh look" shape, not a resurrection. Only cancelled/superseded (deliberately, finally
+    // stopped or replaced work) should refuse a new gate.
     const existingTask = this.getTask(gate.taskId)
-    if (existingTask && isTerminalTaskStatus(existingTask.status)) {
+    if (
+      existingTask &&
+      (existingTask.status === 'cancelled' || existingTask.status === 'superseded')
+    ) {
       throw new OrchestrationError(
         'task_not_startable',
         `Task ${gate.taskId} cannot open a decision gate: it is already ${existingTask.status}.`,

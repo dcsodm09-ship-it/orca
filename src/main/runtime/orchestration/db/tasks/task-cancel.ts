@@ -57,9 +57,17 @@ function cascadeCancelPendingDependents(
 //    the original's dependents from THIS side of the link (e.g. it had already completed before
 //    cancelTask ever recorded the link — promoteReadyTasks only fires from the completing side,
 //    and only if the link existed yet when it ran).
-//  - it settles WITHOUT completing (failed/cancelled/superseded) — the substitution didn't pan
-//    out, so the original's still-pending dependents must be cascaded now, the same as if the
-//    original had been bare-cancelled with no replacement at all.
+//  - it settles WITHOUT completing (cancelled, or bare-superseded with no further replacement) —
+//    the substitution didn't pan out, so the original's still-pending dependents must be
+//    cascaded now, the same as if the original had been bare-cancelled with no replacement at
+//    all. Deliberately excludes 'failed': task-status-transition.ts's own guard explicitly keeps
+//    completed/failed→ready retry as a legitimate pattern (e.g. legacy A/B pinned-worker
+//    reconciliation) - cascading an irreversible 'cancelled' onto the original's dependents in
+//    reaction to a transient, retryable failure would out-live the retry (a later successful
+//    retry can never revive an already-cancelled dependent), which a review round found and
+//    reproduced as a real regression. A replacement stuck 'failed' with no retry ever coming
+//    does leave the original's dependents 'pending' rather than cascading - a known, accepted,
+//    safer-by-default trade-off (never wrongly destroy work over a maybe-temporary failure).
 // Exported so both cancelTask (below) and updateTaskStatus (task-status-transition.ts) can call
 // it after their own terminal transition commits.
 // Why (round 8, fix for a real bug an independent review found and reproduced): a multi-hop
@@ -89,7 +97,10 @@ export function reconcileReplacementOutcome(db: OrchestrationDb, settledTaskId: 
     db.promoteReadyTasks(settledTaskId)
     return
   }
-  if (!isTerminalTaskStatus(settled.status)) {
+  // Why: only 'cancelled' and bare 'superseded' (no further replacement, already excluded above)
+  // are genuinely final outcomes here - 'failed' is deliberately excluded (see the docstring
+  // above); isTerminalTaskStatus alone would also match it.
+  if (settled.status !== 'cancelled' && settled.status !== 'superseded') {
     return
   }
   for (const originalId of chain) {

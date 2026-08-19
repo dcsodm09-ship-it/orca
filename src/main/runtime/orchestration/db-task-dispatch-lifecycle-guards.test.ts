@@ -375,6 +375,24 @@ describe('Task/Dispatch lifecycle guards', () => {
     }
   )
 
+  // Why (round 9, deliberately narrower scope a review round confirmed correct): completed/
+  // failed tasks legitimately reopen for a retry elsewhere (updateTaskStatus's own guard
+  // protects that pattern) - opening a gate to review/re-route already-finished-or-failed work
+  // is the same shape, not a resurrection, so it must still be allowed.
+  it.each(['completed', 'failed'] as const)(
+    'still allows opening a decision gate on an already-%s task (legitimate reopen-for-review)',
+    (status) => {
+      const database = createDatabase()
+      const task = database.createTask({ spec: 'finished work' })
+      database.updateTaskStatus(task.id, status)
+
+      const gate = database.createGate({ taskId: task.id, question: 'Redo this?' })
+
+      expect(gate.task_id).toBe(task.id)
+      expect(database.getTask(task.id)?.status).toBe('blocked')
+    }
+  )
+
   it('rejects gate creation while a supervised worker remains active', () => {
     const database = createDatabase()
     const task = database.createTask({ spec: 'worker gate guard' })

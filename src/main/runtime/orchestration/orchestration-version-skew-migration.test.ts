@@ -214,4 +214,30 @@ describe('OrchestrationDb version-skew migration', () => {
 
     raw.close()
   })
+
+  // Why (#14548 round 9, fix for the SAME regression class found pre-existing in nearly every
+  // other originally-unversioned column, not just the 3 round 7 fixed): question_threads.run_id
+  // (v8), the dispatch_contexts capability trio (v10), worker_dispatches.runtime_epoch (v13),
+  // the federation/relay columns and table (v15), remote_questions (v16),
+  // remote_dispatch_attachments.protocol_version (v17), and the legacy-contract-storage columns
+  // and tables (v19) were ALL unversioned, so a healthy database at any intermediate version
+  // (e.g. v9, genuinely missing the v10 capability trio because it hasn't been migrated that far
+  // yet) looked "incomplete" and got rewound to 6. Spot-check one representative case (v10's
+  // capability trio) rather than one per version - the fix (moving every entry to the versioned
+  // list with its real introducing version) is uniform across all of them.
+  it('does not rewind a healthy pre-v10 database missing only the v10 dispatch capability columns', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'orca-db-version-skew-pre-v10-'))
+    const dbPath = join(tempDir, 'orchestration.db')
+    const seed = new OrchestrationDb(dbPath)
+    seed.close()
+    const raw = new Database(dbPath)
+    raw.exec('ALTER TABLE dispatch_contexts DROP COLUMN capability_hash')
+    raw.exec('ALTER TABLE dispatch_contexts DROP COLUMN process_incarnation')
+    raw.exec('ALTER TABLE dispatch_contexts DROP COLUMN capability_revoked_at')
+    raw.pragma('user_version = 9')
+
+    expect(resolveOrchestrationMigrationStartVersion(raw, 9, SCHEMA_VERSION)).toBe(9)
+
+    raw.close()
+  })
 })
