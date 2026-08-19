@@ -20,13 +20,71 @@ Live checks against official GitHub and Node.js endpoints on 2026-08-14 found:
 - four official release assets pinned by SHA-256;
 - source `package-lock.json` pinned by SHA-256;
 - upstream MIT `LICENSE` pinned from the exact release commit by SHA-256;
-- Node.js `v24.19.0` darwin-arm64 pinned by SHA-256, including npm `11.17.0`;
-- generated production closure: 200 package rows and normalized lock SHA-256
-  `f537ad6d7061987cd56faf2a268c0322b34c433ef7d257eb8052d54d3d2d224c`.
+- Node.js `v24.19.0` darwin-arm64 pinned by SHA-256, including npm `11.17.0`.
 
 The upstream main branch had already advanced beyond the release commit at the
 time of inspection. This candidate deliberately follows the stable release,
-not moving main.
+not moving main. A newer stable release, `v0.7.3` (published 2026-08-17), was
+available by the time of the 2026-08-19 re-verification below; this candidate
+deliberately stays on `v0.7.2` because all security review rounds verified
+behavior against `v0.7.2`'s exact bundled JS, and moving versions would
+invalidate that review.
+
+Re-verified 2026-08-19 (v0.7.2 remains current for every item below; nothing
+upstream-immutable changes on re-check):
+
+- the four release-tarball SHA-256 hashes above are unchanged -- confirmed
+  byte-identical via `gh api repos/PrimeIntellect-ai/prime-agent/releases/tags/v0.7.2`
+  and its `SHA256SUMS` asset (GitHub release assets are immutable once
+  published);
+- the Node.js `v24.19.0` darwin-arm64 SHA-256 pin is unchanged -- confirmed
+  against nodejs.org's own `SHASUMS256.txt` for that exact release (published
+  Node binaries are also immutable);
+- the source `package-lock.json` pin (v0.7.2's own *direct* dependencies) is
+  unchanged -- only the generated *transitive* closure below had drifted.
+
+The one stale value found and refreshed: the **generated production
+closure**. A real, isolated replay of this installer's own
+`npm install --package-lock-only` step (pinned Node `v24.19.0`/npm `11.17.0`
+toolchain, private HOME/cache/temp, no project or user npm config, same as a
+real install) against the unchanged pinned direct dependencies produced a
+different transitive resolution than the one captured on 2026-08-14, because
+npm always resolves to the *highest currently-published* version satisfying
+each floating range and five days had passed:
+
+- package-row count: **200 rows, unchanged** from the 2026-08-14 capture;
+- normalized lock SHA-256: **`d6da1eea7d0f2d0a7c14251dde34e31d799edad6c78bea6c08cf33294727ee32`**
+  (was `f537ad6d7061987cd56faf2a268c0322b34c433ef7d257eb8052d54d3d2d224c`).
+
+Diff methodology: the 2026-08-14 closure's raw JSON was never persisted
+anywhere (only its SHA-256 was pinned, so npm's registry state as of that
+exact date cannot be replayed after the fact). Every one of the 196
+non-local-asset rows in the freshly generated 2026-08-19 closure was instead
+checked against the npm registry's own per-version publish timestamp for
+that exact resolved version: a version published *after* 2026-08-14 cannot
+possibly be the one an npm resolution on 2026-08-14 picked, so it is a
+provable change; a version published on or before 2026-08-14 was, with high
+confidence, already the highest-satisfying version back then too (npm
+performs a fresh, no-prior-lockfile resolution here every time, so a floating
+range simply keeps whatever was already newest unless something newer
+appeared). Result: **6 of 196 registry rows changed** (3.1%), all in the
+`@smithy/*` scope (the AWS SDK for JS v3 runtime libraries, an existing,
+already-pinned dependency family in this same closure) --
+`@smithy/core` 3.33.1->3.33.2, `@smithy/credential-provider-imds` 4.5.1->4.5.2,
+`@smithy/fetch-http-handler` 5.7.1->5.7.2, `@smithy/node-http-handler`
+4.11.1->4.11.2, `@smithy/signature-v4` 5.7.1->5.7.2, `@smithy/types`
+4.17.1->4.17.2. Every change is a strict patch-level bump within an already-
+pinned major.minor line (no new package, no major/minor jump); all six were
+published within the same ~7-minute window on 2026-08-15 by the identical
+maintainer pair (`smithy-team` / `aws-sdk-bot`, both `@amazon.com`) via npm's
+GitHub Actions OIDC trusted-publisher mechanism, for packages 2.5-3+ years
+old with 70-160+ prior published versions each -- sampled directly against
+the npm registry API, not merely npm's local cache. No new package, maintainer
+change, unusually-new package, or other supply-chain anomaly was found. The
+remaining 190 registry rows, and all four locally patched managed-asset rows,
+are unchanged. This closure refresh, and the resulting `GENERATED_LOCK_SHA256`
+and `install_prime_agent.py` update, is itself the kind of upstream-trust
+judgment call this section exists to leave a paper trail for.
 
 ## Installation contract
 

@@ -73,8 +73,14 @@ LICENSE_SHA256 = "b288615fb31dc504623582fb790a28e6d86bc2f5c1396845af555e43386da5
 # Filled from independent darwin-arm64 replays using the pinned Node/npm toolchain.
 # The normalized hash retains the complete registry dependency graph, URLs, and
 # integrity digests while canonicalizing only path-dependent managed file assets.
-# npm ci is not allowed to run until that exact closure is reproduced.
-GENERATED_LOCK_SHA256 = "f537ad6d7061987cd56faf2a268c0322b34c433ef7d257eb8052d54d3d2d224c"
+# npm ci is not allowed to run until that exact closure is reproduced. Refreshed
+# 2026-08-19 after a real isolated replay found the 2026-08-14 value stale (npm's
+# transitive resolution had moved, not this file's own pinned direct dependencies
+# or release assets): 6 of 196 registry rows changed, all @smithy/* patch bumps
+# published 2026-08-15 by the same official aws-sdk-js maintainers via GitHub
+# Actions OIDC trusted publishing; row count is unchanged at 200. See README.md's
+# "Pinned upstream evidence" section for the full re-verification record.
+GENERATED_LOCK_SHA256 = "d6da1eea7d0f2d0a7c14251dde34e31d799edad6c78bea6c08cf33294727ee32"
 GENERATED_LOCK_PACKAGE_COUNT = 200
 ASSETS = {
     "prime-agent-0.7.2.tgz": "bc5471f2a626d727b88a45eb745fff93b10c554a3c4fc5912f25d8c64b987f5e",
