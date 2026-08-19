@@ -1063,6 +1063,80 @@ install/enable/verify/update-blocked/uninstall/recover——新的全树
 复核都通过"这个门槛在用户自己的规则里是不能被绕过的，纯 Claude
 opus/max 单路结果无论多干净都不能替代它。
 
+**Claude opus/max：NO_GO，0 P0、2 P1、3 P2、4 P3**——先独立、逐项确认了
+round 28 的三处修复本身都是真的（对着真实 npm ci 输出零假阳性重建了
+四份钉住摘要表逐一比对、真实复现 9 个嵌套容器/12 条声明吻合、tamper
+探测对四个包里"最深、最大"的非入口文件都命中、7 层深文件/零字节文件/
+点文件/无扩展名文件/unicode 文件名/删除/符号链接替换/fifo/硬链接/
+任意深度未声明文件全部能测到——round 28 那条被更新的既有测试也验证
+了没有削弱 round 24/25 那套机制的独立覆盖）。但又挖出 2 个新 P1，
+而且两个都是**在真实安装上端到端复现出来的**，不是纸面推演：
+
+- **P1-1**：round 28 新增的全树摘要扫描本身没问题，但它的结果只被
+  信任了一次——扫描完成之后到 `write_pending_install()` 第一次调用
+  `tree_digest()` 之间有一个真实存在、可被外部观察者精确触发的窗口
+  （实测约 6.8 秒：`os.mkdir("lib", …)` 这一步在扫描之后执行，本身就是
+  一个公开可观察的信号）。`tree_digest()` 在这个点上做的是**记录**，
+  不是**比对**——攻击者线程只需要轮询等 `RELEASE_DIR/lib` 出现就动手，
+  真实复现：`install: COMPLETED`、receipt 写入、攻击者内容被
+  `verify()` 判定"OK"、通过 launch guard 真实执行、标记文件被写入。
+  等于把攻击者字节永久写进了"干净"的基线里。
+- **P1-2**：`node` 二进制在 npm ci 之后有重新校验，但 `npm-cli.js`
+  **没有**——尽管代码里那行注释写的是"pinned toolchain **binaries**"
+  （复数）。`receipt["npm_cli_sha256"]` 字段被正常写入，但从来没有
+  任何地方去读它做比对。真实复现：在 `run_npm()` 的 `ci` 分支内部
+  换掉 `npm-cli.js`（和 round 24 换 `node` 会被立刻拒绝的窗口完全
+  一样长——真实 npm ci 跑了 77.35 秒），`install` 照样
+  `COMPLETED`，receipt 里存的是真实摘要、磁盘上是攻击者摘要，两者
+  不一致但从没被比较过；`verify()` 之后**真的执行了**这份被换掉的
+  `npm-cli.js`，标记文件确认攻击者代码被跑起来了。
+
+3 个 P2：(1) 嵌套 `node_modules/` 遍历只往 `<package>/node_modules`
+这一种路径走，漏掉了 `<package>/<子目录>/node_modules` 这种
+子目录锚定的容器——用真实 Node 24.19.0 现场验证，这种容器会被
+Node 的 CJS 解析**优先**命中（不需要 `package.json`），真实树上确认
+现在遍历到的容器数量在种了这种东西之后完全不变；(2) 摘要扫描函数里
+的 `sha256_file()` 是"先 `scandir()` 缓存的 stat、再普通
+`path.open("rb")`"这种两次独立解析符号链接的写法，没有走这份代码在
+别处一直坚持的单次 `O_NOFOLLOW` + fstat 身份确认（`read_private_file()`
+那套纪律）——实测把一个被钉住的常规文件在两次解析之间换成符号链接
+会被接受，之后目标内容还能再改；(3) launch guard 依然只对
+`NODE`/`CLI` 两条路径做执行前摘要校验，`cli.js` 静态 import 的
+`chunk-BAWSWWEU.js` 真实换了内容之后 wrapper 照样 `exit 0`、攻击者
+代码真的跑了（`verify()` 事后能测出"release tree drifted"，但这
+不在启动路径上）——这正是 round 27 那个论点，一直没被真正处理，也
+没被写进残留文档。4 个 P3（`KNOWN_NON_DIRECTORY_NODE_MODULES_ENTRIES`
+的例外规则实际在任意深度都生效，和它自己注释里说的"只在顶层"不符，
+但不可利用，只是范围写错；`upstream-package-lock.json` 的一处重读
+没做摘要复核，靠 `GENERATED_LOCK_SHA256` 兜底；扫描不检查文件权限位
+和未声明的空目录；`.bin/` 目录内容在任意深度都不检查，但不在托管
+PATH 上、逃逸符号链接会被 `tree_digest` 拒绝，属于已缓解）。
+
+**对残留文档的专项判断**：数字部分诚实、每一项能核实的都对得上；
+但两处过度断言——commit message 和代码注释里"任意深度的未声明包"
+这句话是错的（只覆盖包根锚定的容器，子目录锚定的这种没覆盖，见
+P2-1）；"registry 依赖靠 npm 自身 SRI 完整性校验兜底"这句话**把
+防护机制安错了对象**——npm 的 SRI 校验发生在下载/解包阶段，对
+"解包之后、同 UID 本地篡改"这个这份代码从第 1 轮起就一直在防的
+威胁模型完全没有防护效力；残留本身是真实的，只是点名的防护措施
+文不对题。
+
+opus/max 给出的最小修法都很具体：P1-1 在 `write_pending_install()`
+真正写入前把四次 `assert_locally_patched_package_matches_pinned_digests()`
+重新跑一遍，或者让 `write_pending_install()` 第一次 `tree_digest()`
+调用从"记录"改成"比对"；P1-2 在 `node` 重新校验旁边加一次
+`npm-cli.js` 的 `verify_unchanged_private_ssd_asset_digest()` 调用，
+`verify()` 在真正执行前检查 receipt 里那几个哈希字段；P2-1 让嵌套
+遍历下钻进包内部**任意位置**出现的 `node_modules`，不只是包根下的
+那一个（真实树上没有这种容器，改了不会有误报）；P2-2 把
+`sha256_file()` 换成 `read_private_file()` 那种单次 `O_NOFOLLOW`
++ fstat 身份确认的写法。
+
+**已派发 round 30**：照 opus/max 给出的四条最小修法逐条处理，重点是
+两个 P1——把"扫描一次就永久信任"改成"真正写入前再确认一次"，把
+`npm-cli.js` 补进执行前重新校验的清单，同时按本轮反馈修正残留文档，
+不要再犯"范围写得比实际覆盖的宽"这种过度断言。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
