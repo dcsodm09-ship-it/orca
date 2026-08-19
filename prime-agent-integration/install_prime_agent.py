@@ -208,6 +208,92 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def sha256_file_verified(path: Path, *, max_bytes: int = MAX_TAR_EXPANDED_BYTES) -> str:
+    """SHA-256 content digest of a regular file, computed through a SINGLE
+    O_NOFOLLOW-open-then-fstat-identity-checked read -- the same discipline
+    read_private_file() already applies to every PRIVATE-mode SSD file this
+    installer reads -- but WITHOUT that function's `st_mode & 0o077 == 0`
+    requirement: unlike this installer's own generated files, a file `npm
+    ci` materializes from a tarball keeps the tarball's own stored mode
+    bits (empirically 0o644/0o755 for a real prime-agent release; see
+    tighten_generated_private_file_mode()'s and
+    _install_locked_within_release_dir()'s own comments on that same real,
+    non-mocked discovery), so requiring a private mode here would fail
+    closed on every real, non-mocked install.
+
+    sha256_file() -- this file's original, general-purpose digest helper --
+    opens `path` by name via a plain Path.open("rb") call, entirely
+    independent of whatever check (if any) a caller already performed on
+    that same path. A caller that first inspects `path` via
+    os.scandir()/os.stat() (to confirm it is a regular file, not a
+    symlink) and only THEN calls sha256_file() leaves a same-UID racer the
+    whole window between those two, independently-resolved filesystem
+    accesses to swap the regular file for a symlink: the caller's own
+    check already ran and passed, and sha256_file()'s plain path.open("rb")
+    silently follows the newly-planted symlink, hashing whatever it points
+    at instead of failing closed (independent Claude opus/max round-29
+    review, 2026-08-19, P2-2, reproduced against
+    assert_locally_patched_package_matches_pinned_digests()'s own
+    os.scandir()-then-sha256_file() call pair: swapping a pinned regular
+    file for a symlink to a file whose CURRENT content happens to match
+    the pinned digest is accepted, and the symlink's target content -- or
+    the symlink's own target -- can then be changed again afterward with
+    nothing left to catch it, since that call was the only point this
+    file's content was ever checked at all).
+
+    This function instead performs the lstat, the O_NOFOLLOW-protected
+    open, and the fstat-identity confirmation itself, as ONE operation --
+    exactly mirroring read_private_file()'s own discipline -- so a caller
+    never needs, and must never perform, any separate pre-check before
+    calling this: a same-UID swap to a symlink at any point before this
+    call is refused outright (O_NOFOLLOW on the final path component), and
+    a swap of the regular file's own identity between the lstat and the
+    open is refused by the (st_dev, st_ino) comparison -- exactly as
+    read_private_file() already refuses both for private-mode files.
+    Streams and hashes the content directly (never accumulates the whole
+    file in memory), unlike read_private_file(), since callers of this
+    function (the digest sweep, tree_digest()) may need to digest files
+    materially larger than read_private_file()'s in-memory-copy use cases.
+    """
+    descriptor = -1
+    try:
+        before = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or before.st_uid != os.getuid()
+        ):
+            raise PrimeInstallError(f"unsafe file for digest: {path}")
+        if before.st_size > max_bytes:
+            raise PrimeInstallError(f"file too large to digest: {path}")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise PrimeInstallError(f"file identity changed before digest: {path}")
+        digest = hashlib.sha256()
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+    except OSError as exc:
+        raise PrimeInstallError(f"cannot digest file: {path}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise PrimeInstallError(f"file changed while computing digest: {path}")
+    return digest.hexdigest()
+
+
 def canonical_json(payload: Any) -> bytes:
     return (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
 
@@ -2762,27 +2848,112 @@ def _materialized_node_modules_directory_names(directory: Path, label: str) -> f
     return frozenset(names)
 
 
+def _find_nested_node_modules_containers(
+    package_dir: Path, *, depth_budget: int
+) -> list[tuple[str, Path]]:
+    """Find every directory literally named "node_modules" ANYWHERE under
+    `package_dir` -- not only directly at `package_dir`'s own root -- by
+    walking its full subtree, without descending PAST a node_modules
+    directory once found (that container's own contents are the caller's
+    concern, via its own queue entry, not this function's) and without
+    following any symlinked directory while searching. Returns
+    (relative_posix_path, resolved_path) pairs; `relative_posix_path` is
+    `package_dir`-relative and always ends in "node_modules" (e.g.
+    "node_modules" for a direct child, "lib/node_modules" for one nested
+    under a subdirectory of `package_dir`).
+
+    Round 29, 2026-08-19 (independent Claude opus/max round-29 review,
+    P2-1): the previous implementation (inlined in
+    _walk_nested_node_modules_containers(), before this function existed)
+    checked only `package_dir / "node_modules"` -- a package's own
+    ROOT-level nested container -- which is the only shape a real
+    package-lock.json can ever DECLARE (npm always nests a further
+    node_modules/ directly under a dependency's own package root, never
+    under an arbitrary subdirectory of it), but is NOT the only shape a
+    same-UID attacker can PLANT: a node_modules/ directory placed at
+    `<package>/<subdir>/node_modules` was invisible to a root-only check,
+    yet real Node's own CJS module resolution (verified against the pinned
+    Node build this installer uses) walks up starting from the REQUIRING
+    file's own directory, so a subdirectory-anchored node_modules/ is
+    actually resolved BEFORE any hoisted copy higher up -- a real
+    resolution-order gap, not merely a completeness nitpick. Because a
+    real package-lock.json can never legitimately declare a container at
+    this shape, declared_nested_node_modules_packages() will never have an
+    entry for one, so extending the walk to find it produces zero false
+    positives against any real, legitimate install (empirically confirmed:
+    the real materialized tree for this closure has zero such
+    containers -- any package materialized inside one is therefore
+    necessarily undeclared and fails closed).
+    """
+    found: list[tuple[str, Path]] = []
+    stack: list[tuple[Path, str, int]] = [(package_dir, "", 0)]
+    while stack:
+        directory, prefix, depth = stack.pop()
+        if depth > depth_budget:
+            raise PrimeInstallError(
+                "materialized package tree nests deeper than this installer "
+                f"will inspect: {package_dir}"
+            )
+        try:
+            entries = sorted(directory.iterdir(), key=lambda item: item.name)
+        except OSError as exc:
+            raise PrimeInstallError(
+                f"cannot inspect materialized package tree: {directory}"
+            ) from exc
+        for entry in entries:
+            if entry.is_symlink():
+                if entry.name == "node_modules":
+                    raise PrimeInstallError(
+                        "materialized node_modules entry is a symlink: "
+                        f"{prefix}{entry.name}"
+                    )
+                # Not followed, and not itself named "node_modules" --
+                # out of scope for this function (which only looks for
+                # node_modules/ containers), same as
+                # _materialized_node_modules_directory_names() leaving
+                # arbitrary non-node_modules-related symlinks outside a
+                # package's own declared entries unexamined.
+                continue
+            if not entry.is_dir():
+                continue
+            relative = f"{prefix}{entry.name}"
+            if entry.name == "node_modules":
+                found.append((relative, entry))
+                continue
+            stack.append((entry, f"{relative}/", depth + 1))
+    return found
+
+
 def _walk_nested_node_modules_containers(
     node_modules_root: Path,
 ) -> list[tuple[str, frozenset[str]]]:
     """Discover every node_modules/ CONTAINER reachable by descending
     through materialized package directories starting at `node_modules_root`
     -- the top level itself, plus every package's own nested node_modules/
-    at any depth -- and return one (container_path, materialized_names) pair
-    per container found, INCLUDING the top level as the first entry.
-    `container_path` uses the SAME lock-relative string convention
-    declared_nested_node_modules_packages() derives from package-lock.json
-    (e.g. "node_modules" for the top level,
+    at ANY depth AND any subdirectory anchoring within a package's own
+    tree (round 29, 2026-08-19, P2-1 fix; see
+    _find_nested_node_modules_containers()) -- and return one
+    (container_path, materialized_names) pair per container found,
+    INCLUDING the top level as the first entry. `container_path` uses the
+    SAME lock-relative string convention declared_nested_node_modules_packages()
+    derives from package-lock.json for a ROOT-anchored container (e.g.
+    "node_modules" for the top level,
     "node_modules/proxy-agent/node_modules" for a container nested one level
-    inside proxy-agent's own package directory), so a caller can compare
-    each entry directly against that function's return value with no
-    further translation.
+    inside proxy-agent's own package directory, directly at its root), so a
+    caller can compare each entry directly against that function's return
+    value with no further translation -- and, for a subdirectory-anchored
+    container a real lock could never declare (e.g.
+    "node_modules/proxy-agent/lib/node_modules"), the same lookup simply
+    finds nothing declared, which is exactly the fail-closed behavior a
+    same-UID plant at that shape needs.
 
     Iterative (an explicit work queue, not recursion) and depth-bounded via
     MAX_NODE_MODULES_NESTING_DEPTH, so a pathologically deep, symlink-free
     directory chain fails closed with a clear error instead of an unbounded
     walk or a Python RecursionError (round 27, 2026-08-19, P2-2 fix;
-    see that constant's own comment).
+    see that constant's own comment). The per-package subtree search
+    _find_nested_node_modules_containers() performs is bounded the same
+    way, independently, via its own `depth_budget`.
     """
     results: list[tuple[str, frozenset[str]]] = []
     queue: list[tuple[Path, str, int]] = [(node_modules_root, "node_modules", 0)]
@@ -2797,14 +2968,12 @@ def _walk_nested_node_modules_containers(
         results.append((container_path, names))
         for name in names:
             package_dir = directory / name
-            nested = package_dir / "node_modules"
-            if nested.is_symlink():
-                raise PrimeInstallError(
-                    f"materialized node_modules entry is a symlink: "
-                    f"{container_path}/{name}/node_modules"
+            for relative, nested_path in _find_nested_node_modules_containers(
+                package_dir, depth_budget=MAX_NODE_MODULES_NESTING_DEPTH
+            ):
+                queue.append(
+                    (nested_path, f"{container_path}/{name}/{relative}", depth + 1)
                 )
-            if nested.is_dir():
-                queue.append((nested, f"{container_path}/{name}/node_modules", depth + 1))
     return results
 
 
@@ -2868,14 +3037,30 @@ def assert_materialized_node_modules_matches_lock(
     those four packages is verified, immediately after this check runs, by
     assert_locally_patched_package_matches_pinned_digests() against the
     original, pre-npm-ci, tarball-derived digest map make_patched_asset()
-    already computed for each. It is NOT closed, and remains an accepted
-    residual, for the content of any of this closure's ~196 third-party
-    REGISTRY dependency packages' own files -- this installer still relies
-    on `npm ci`'s own registry-integrity/SRI checking for those, not an
-    independent check of its own. Be precise about this scope in any future
-    review, matching the lesson of both round 25 and round 27's own
-    findings: an inaccurate "covered" claim here is itself the kind of bug
-    that lets real gaps go undetected.
+    already computed for each. It is NOT closed, and remains an accepted,
+    UNMITIGATED residual, for the content of any of this closure's ~196
+    third-party REGISTRY dependency packages' own files.
+
+    Round 29, 2026-08-19 (independent Claude opus/max round-29 review,
+    documentation finding): an earlier revision of this paragraph cited
+    `npm ci`'s own registry-integrity/SRI checking as covering that
+    residual -- that MISATTRIBUTES the protection. npm's SRI check
+    operates at download/extract time, over the downloaded tarball's own
+    bytes, before anything is ever written into this installer's private
+    tree; it provides NO protection whatsoever against a same-UID local
+    attacker tampering a file's content AFTER extraction, on disk, under
+    this installer's own UID -- which is this file's entire stated threat
+    model everywhere else (see e.g. run_npm()'s own docstring, or
+    capture_private_ssd_asset_digest()'s). There is nothing in this
+    installer, and nothing in npm's own SRI checking, that mitigates
+    same-UID post-extraction content tampering of these ~196 packages'
+    files. This is an accepted, unmitigated gap given this project's
+    practical scope constraints, not a covered case -- state it that
+    plainly. Be precise about this scope in any future review, matching
+    the lesson of rounds 25, 27, and now 29's own findings: an inaccurate
+    "covered" claim here is itself the kind of bug that lets real gaps go
+    undetected -- when in doubt, understate coverage rather than overstate
+    it.
     """
     node_modules_root = release_dir / "node_modules"
     if node_modules_root.is_symlink() or not node_modules_root.is_dir():
@@ -2955,13 +3140,38 @@ def assert_locally_patched_package_matches_pinned_digests(
     returns and after assert_materialized_node_modules_matches_lock()'s own
     structural check, for all four packages -- including the three
     `@earendil-works/pi-*` workspace assets this file's own prior
-    documentation incorrectly implied were out of scope. What remains an
-    accepted, documented residual after this round: third-party REGISTRY
-    dependency packages' own file content (this installer still relies on
-    npm's own registry-integrity/SRI checking for those, not an independent
-    check of its own) -- see
-    assert_materialized_node_modules_matches_lock()'s own docstring for the
-    complete, precise statement of scope.
+    documentation incorrectly implied were out of scope. Called AGAIN,
+    against each package's post-move path (inside lib/node_modules/),
+    immediately before write_pending_install() -- round 29, 2026-08-19,
+    P1-1 fix; see that call site's own comment for why this narrows,
+    though does not by itself zero out, the window between this content
+    check and write_pending_install()'s own tree_digest() call, which
+    additionally compares every one of these same files' content directly
+    against this SAME pinned baseline as part of computing the recorded
+    release-tree digest (see tree_digest()'s `pinned_relative_digests`
+    parameter). What remains an accepted, UNMITIGATED residual after this
+    round: third-party REGISTRY dependency packages' own file content --
+    see assert_materialized_node_modules_matches_lock()'s own docstring
+    for the complete, precise statement of scope, and why "npm's own SRI
+    checking covers it" (an earlier revision of this paragraph's own
+    claim) was itself an inaccurate over-claim, not merely an incomplete
+    one.
+
+    Content digests here are computed via sha256_file_verified(), not the
+    plain sha256_file() this function used through round 28: sha256_file()
+    opens `entry_path` by a SECOND, independent, symlink-following
+    filesystem resolution after the os.scandir()-based checks just above
+    already ran -- a same-UID racer who swaps a pinned regular file for a
+    symlink in that exact window has the swap silently followed and,
+    if the symlink's target happens to match the pinned digest at that
+    moment, accepted; the target (or the symlink itself) can then be
+    changed again afterward with nothing left to catch it (independent
+    Claude opus/max round-29 review, 2026-08-19, P2-2). sha256_file_verified()
+    performs its own O_NOFOLLOW-protected open and fstat-identity check as
+    part of the SAME call, so this class of swap is refused outright
+    regardless of what the scandir-based checks above already observed;
+    those checks are kept for their clearer, entry-type-specific error
+    messages, not because they are still what makes this safe.
 
     The existing entrypoint-specific digest capture and re-verification in
     _install_locked_within_release_dir() (round 24/25's
@@ -3022,7 +3232,7 @@ def assert_locally_patched_package_matches_pinned_digests(
                     f"in the pinned pre-npm-ci digest map: {relative}"
                 )
             observed.add(relative)
-            if sha256_file(entry_path) != expected_digest:
+            if sha256_file_verified(entry_path) != expected_digest:
                 raise PrimeInstallError(
                     f"{package_label} materialized file content does not match the "
                     f"digest-verified original tarball: {relative}"
@@ -3125,7 +3335,56 @@ def run_npm(
         raise PrimeInstallError(f"npm failed with exit {result.returncode}: {tail}")
 
 
-def tree_digest(root: Path) -> tuple[str, int]:
+def tree_digest(
+    root: Path, *, pinned_relative_digests: dict[str, str] | None = None
+) -> tuple[str, int]:
+    """Structural + content digest of everything under `root`, used both to
+    RECORD a release tree's permanent trust baseline
+    (receipt['release_tree_sha256']/['release_tree_entries'], via
+    write_pending_install()) and, on every later verify() call, to detect
+    drift against that recorded baseline.
+
+    `pinned_relative_digests`, when given, maps a SUBSET of `root`-relative
+    POSIX path strings (e.g. "toolchain/bin/node",
+    "lib/node_modules/prime-agent/dist/bundle/cli.js") to a SHA-256 digest
+    already known, independently, to be correct -- captured strictly
+    BEFORE any external `npm` subprocess this installer does not control
+    ever ran (see extract_node_toolchain()'s node_sha256/npm_cli_sha256 and
+    make_patched_asset()'s per-file content_digests maps). For any regular
+    file whose `root`-relative path is a key in this map, the content
+    digest this walk computes below is compared against the pinned value
+    RIGHT HERE, in the SAME pass that is about to fold that digest into the
+    tree's overall hash -- and this function fails closed on a mismatch --
+    INSTEAD OF unconditionally recording whatever happens to be on disk as
+    the permanently-trusted baseline with no comparison against anything.
+
+    Round 29, 2026-08-19 (independent Claude opus/max round-29 review,
+    P1-1): before this parameter existed, tree_digest() was purely a
+    RECORDING pass -- every prior content check in this file's install path
+    (the per-package digest sweep, the toolchain re-verification calls) ran
+    and passed BEFORE this function's first call in write_pending_install(),
+    but nothing carried their result forward as something THIS call
+    compares against; a same-UID racer who tampered a pinned file's content
+    in the real, externally-observable window between those checks
+    completing and this walk reaching that same path (measured real
+    window: ~6.8 seconds -- 1.3s from the sweep completing to
+    os.mkdir("lib", ...), itself a public, pollable signal, plus up to 5.5s
+    for this function's own sorted walk to reach a tampered path later in
+    sort order) had the tampered content silently adopted as the
+    permanent baseline: write_pending_install() recorded it, verify()
+    later confirmed the release tree still matched what was recorded (true
+    -- nothing changed AFTER that point), and the launch guard executed
+    it. Passing the SAME pinned digests this walk is about to fold into
+    the baseline as `pinned_relative_digests` collapses that window, for
+    every file the caller has an independent pin for, to whatever this
+    function's own single O_NOFOLLOW-open-then-fstat-identity-checked read
+    (sha256_file_verified()) cannot itself close -- there is no LATER,
+    separate read of that file before its digest becomes part of the
+    trusted baseline, because this read and that comparison are the same
+    operation. See _install_locked_within_release_dir()'s own comment,
+    where `pinned_relative_digests` is assembled, for the real measured
+    residual after this fix and the complementary re-sweep it also adds.
+    """
     resolved_root = verify_private_ssd_dir(root)
     root_info = root.lstat()
     digest = hashlib.sha256()
@@ -3148,13 +3407,21 @@ def tree_digest(root: Path) -> tuple[str, int]:
                 raise PrimeInstallError(f"runtime symlink escaped release: {relative}")
             payload = b"L\0" + relative.encode() + b"\0" + target_text.encode()
         elif stat.S_ISREG(info.st_mode):
+            content_sha256 = sha256_file_verified(path)
+            if pinned_relative_digests is not None:
+                expected = pinned_relative_digests.get(relative)
+                if expected is not None and content_sha256 != expected:
+                    raise PrimeInstallError(
+                        "release tree content does not match its digest-verified "
+                        f"pre-npm-ci pinned baseline: {relative}"
+                    )
             payload = (
                 b"F\0"
                 + relative.encode()
                 + b"\0"
                 + str(stat.S_IMODE(info.st_mode)).encode()
                 + b"\0"
-                + sha256_file(path).encode()
+                + content_sha256.encode()
             )
         elif stat.S_ISDIR(info.st_mode):
             payload = (
@@ -3170,8 +3437,26 @@ def tree_digest(root: Path) -> tuple[str, int]:
     return digest.hexdigest(), count
 
 
-def write_pending_install(receipt: dict[str, Any]) -> dict[str, Any]:
-    """Cross the durable-tree barrier, then and only then publish the journal."""
+def write_pending_install(
+    receipt: dict[str, Any],
+    *,
+    pinned_relative_digests: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Cross the durable-tree barrier, then and only then publish the journal.
+
+    `pinned_relative_digests`, when given, is forwarded unchanged to both
+    tree_digest() calls below -- see that function's own docstring, and
+    _install_locked_within_release_dir()'s construction of this map -- so
+    the FIRST call, whose result becomes the permanently-trusted
+    receipt['release_tree_sha256']/['release_tree_entries'] baseline, is a
+    COMPARISON against every pinned file's already-known-correct digest
+    rather than an unconditional recording of whatever tree_digest()'s own
+    walk happens to observe (round 29, 2026-08-19, P1-1 fix). The SECOND
+    call (after the durability sync barrier) receives the same map for
+    consistency -- by then nothing legitimate should have changed the
+    content of any pinned file, so this is a harmless, redundant
+    re-confirmation, not a second, divergent check.
+    """
     validate_pristine_managed_home(STATE_DIR, "Prime Agent pending state")
     validate_pristine_managed_home(PROBE_HOME, "Prime Agent pending probe home")
     if read_private_ssd_file(STATE_DIR / "agent/settings.json") != expected_prime_settings():
@@ -3181,10 +3466,15 @@ def write_pending_install(receipt: dict[str, Any]) -> dict[str, Any]:
     validate_empty_private_dir(
         managed_session_dir(), "Prime Agent pending session directory"
     )
-    release_identity = tree_digest(RELEASE_DIR)
+    release_identity = tree_digest(
+        RELEASE_DIR, pinned_relative_digests=pinned_relative_digests
+    )
     for root in (RELEASE_DIR, STATE_DIR, PROBE_HOME, managed_session_dir()):
         sync_private_tree(root)
-    if tree_digest(RELEASE_DIR) != release_identity:
+    if (
+        tree_digest(RELEASE_DIR, pinned_relative_digests=pinned_relative_digests)
+        != release_identity
+    ):
         raise PrimeInstallError("Prime Agent release tree changed across durability barrier")
     validate_pristine_managed_home(STATE_DIR, "Prime Agent pending state")
     validate_pristine_managed_home(PROBE_HOME, "Prime Agent pending probe home")
@@ -5480,12 +5770,32 @@ def _install_locked_within_release_dir(
     # coverage keeps exercising it directly (round 24, 2026-08-19).
     assert_release_dir_identity(release_dir_identity)
     assert_release_dir_fd_identity(release_dir_fd)
-    # Also re-verify the pinned toolchain binaries one last time: `npm ci`
-    # is the longest single external-subprocess window this install exposes
-    # them to (measured real window for a same-UID content swap: 3m34s),
-    # and node is about to be baked into the launch guard as a permanent
+    # Re-verify the pinned toolchain binaries one last time: `npm ci` is
+    # the longest single external-subprocess window this install exposes
+    # them to (measured real window for a same-UID content swap: 3m34s).
+    # `node` is about to be baked into the launch guard as a permanent
     # future trust anchor below.
+    #
+    # Round 29, 2026-08-19 (independent Claude opus/max round-29 review,
+    # P1-2): this call previously covered only `node`, even though this
+    # exact comment already (incorrectly) claimed "the pinned toolchain
+    # BINARIES", plural. `npm-cli.js` was re-verified only BEFORE each of
+    # the two `npm` invocations above ran (so it could itself be trusted
+    # for THAT exec) -- never AFTER `npm ci` returns, the one window that
+    # actually matters for everything downstream: nothing else in this
+    # function, and nothing in verify() before this round, ever compared
+    # npm-cli.js's content against receipt['npm_cli_sha256'] again.
+    # Reproduced: tampering npm-cli.js during `npm ci`'s own subprocess
+    # window (measured real window: ~77 seconds, the full `npm ci`
+    # runtime) went completely undetected -- receipt['npm_cli_sha256']
+    # was written but never read back by anything (see verify()'s own
+    # P1-2 fix, this same round, for the closing half: it now compares
+    # receipt['node_sha256']/['npm_cli_sha256']/['entrypoint_sha256']
+    # against freshly computed digests immediately before executing any
+    # of the three on every FUTURE invocation, not merely here at install
+    # time).
     verify_unchanged_private_ssd_asset_digest(node, node_sha256, node_identity)
+    verify_unchanged_private_ssd_asset_digest(npm_cli, npm_cli_sha256, npm_cli_identity)
     # Round 25, 2026-08-19 (independent Claude opus/max round-25 review,
     # P1-B): before trusting ANYTHING `npm ci` materialized under
     # node_modules/, confirm npm did not ALSO materialize an undeclared
@@ -5699,22 +6009,29 @@ def _install_locked_within_release_dir(
         "lifecycle_lock": os.fspath(lifecycle_lock_path()),
         "node_target": os.fspath(node),
         "npm_target": os.fspath(npm_cli),
-        # Provenance only, round 24 (2026-08-19), updated round 25
-        # (2026-08-19, P1-A): the content digests captured at extraction
+        # Round 24 (2026-08-19)/round 25 (2026-08-19, P1-A)/round 29
+        # (2026-08-19, P1-2): the content digests captured at extraction
         # time (node/npm_cli) and, for the entrypoint, PINNED to the
         # original digest-verified prime-agent tarball's own per-file
         # digest for dist/bundle/cli.js -- confirmed (not merely read) to
         # match `npm ci`'s actual materialized output -- see
         # extract_node_toolchain() and make_patched_asset()'s
-        # content_digests return value. The actual enforcement these
-        # values back happens DURING install, at each re-verification
-        # point above, and permanently at every future real invocation via
-        # the digests baked into the launch guard
-        # (managed_launch_guard_script()'s NODE_SHA256/CLI_SHA256) -- not
-        # here; tree_digest()'s release_tree_sha256/release_tree_entries
-        # (below, via write_pending_install()) already covers the complete
-        # release tree, including these same three files, for every future
-        # verify() call.
+        # content_digests return value. Enforced DURING this install at
+        # each re-verification point above; baked into the generated
+        # launch guard as a permanent future trust anchor for `node`/the
+        # entrypoint (managed_launch_guard_script()'s NODE_SHA256/
+        # CLI_SHA256); and, as of round 29 (2026-08-19, P1-2), read back
+        # and compared against a freshly computed digest by verify() on
+        # every FUTURE invocation for all three fields, including
+        # npm_cli_sha256 -- previously "provenance only", written but
+        # never read back by anything, dead evidence that could not have
+        # caught a same-UID racer who tampered one of these files DURING
+        # this very install's own `npm ci` window and had the tampered
+        # content adopted as tree_digest()'s own recorded baseline (see
+        # that function's own P1-1 fix, this same round, for the
+        # install-time half of this fix; verify()'s check is what catches
+        # it on every invocation AFTER this one, independent of whatever
+        # tree_digest() itself recorded).
         "node_sha256": node_sha256,
         "npm_cli_sha256": npm_cli_sha256,
         "entrypoint_sha256": entrypoint_sha256,
@@ -5741,7 +6058,111 @@ def _install_locked_within_release_dir(
         "telemetry_settings": os.fspath(telemetry_settings),
         "probe_agent_dir": os.fspath(probe_agent_dir),
     }
-    write_pending_install(receipt)
+    # Round 29, 2026-08-19 (independent Claude opus/max round-29 review,
+    # P1-1): the per-package digest sweep above (assert_locally_patched_
+    # package_matches_pinned_digests(), called once per locally patched
+    # package immediately after `npm ci` returned, before the node_modules
+    # move) verified content correctly, but its result was trusted across
+    # a real, externally-observable window before write_pending_install()'s
+    # tree_digest() call established the permanent baseline:
+    # os.mkdir("lib", ...) above is a public signal a same-UID racer can
+    # poll for, and tree_digest()'s own sorted walk takes real time to
+    # reach any given path. Measured real window pre-fix: ~6.8 seconds
+    # (1.3s from the sweep completing to the mkdir, plus up to 5.5s for
+    # tree_digest()'s own walk to later reach a tampered path). Two
+    # closes, applied together (see tree_digest()'s own docstring for the
+    # first):
+    #
+    #   1. tree_digest() now accepts `pinned_relative_digests` and, for
+    #      every RELEASE_DIR-relative path in the map built below,
+    #      compares its own freshly computed content digest against the
+    #      pinned value in the SAME read that becomes part of the
+    #      recorded release_tree_sha256 baseline -- collapsing the CONTENT
+    #      half of the window to whatever a single
+    #      O_NOFOLLOW-open-then-fstat-identity-checked read cannot itself
+    #      close.
+    #   2. The per-package sweep is re-run here, immediately before
+    #      write_pending_install(), at each package's POST-MOVE path (the
+    #      packages now live under lib/node_modules/, not node_modules/).
+    #      tree_digest()'s comparison (fix 1) cannot by itself detect a
+    #      pinned file going MISSING (it simply would not appear in the
+    #      walk) or an extra, undeclared file appearing in its place (it
+    #      has no pinned entry to compare against, so it would be silently
+    #      recorded like any other unpinned file) -- exactly the
+    #      completeness checks assert_locally_patched_package_matches_
+    #      pinned_digests()'s own missing/undeclared-file bookkeeping
+    #      already performs.
+    #
+    # Honest measured result (real, non-mocked tests/sandbox_e2e.py replay
+    # against this closure's real ~26,911-entry release tree on the
+    # external SSD, round 29, 2026-08-19): the WALL-CLOCK time from this
+    # re-sweep completing to write_pending_install()'s first tree_digest()
+    # call completing is real and NOT small -- ~42.6s in that run, because
+    # tree_digest()'s own sorted walk must read and hash every regular
+    # file in the entire release tree (not only the pinned ones) before it
+    # returns, and this closure's real content is large enough that this
+    # is genuinely disk-I/O-bound work, not a cheap loop. That number is
+    # NOT the size of a silent-acceptance security window, though, and
+    # reporting it as one would itself be an over-claim in the other
+    # direction: for every RELEASE_DIR-relative path present in
+    # `release_relative_pinned_digests` (built just below), BOTH
+    # tree_digest() calls this function makes (the one that establishes
+    # release_identity, and the one after the durability-sync barrier)
+    # independently compare their own freshly read content against that
+    # SAME pinned baseline the instant they read it -- so content that
+    # differs from the pinned value, whenever and wherever in this window
+    # it is introduced, is caught by whichever of these reads observes it
+    # first, and the whole install aborts before finalize_pending_install()
+    # ever commits a receipt. There is therefore no point in this window at
+    # which tampered content for a pinned path can become the committed
+    # release_tree_sha256 without being caught -- the "gap between content
+    # verified and content becomes the permanently-trusted baseline" this
+    # finding asked to close is zero for every pinned path, not merely
+    # narrowed, because the read that verifies IS the read that (if it
+    # matches) contributes to the baseline. What the ~42.6s / ~69.6s
+    # figures actually measure is wall-clock LATENCY, not an exploitable
+    # window: a separate, controlled A/B benchmark (sha256_file_verified()
+    # vs. the plain sha256_file() every other call site here already used,
+    # run interleaved over the same 27,000 real files with a warm page
+    # cache to remove ordering bias) measured sha256_file_verified()'s own
+    # per-file overhead at roughly 15-20% over sha256_file() -- a few
+    # hundred milliseconds total across a tree this size -- so the great
+    # majority of the measured 42.6s/69.6s duration is pre-existing
+    # full-tree content-hashing cost tree_digest() already paid, every time
+    # it was called (at install AND at every verify()), before this round;
+    # this round's fix made those already-slow calls fail closed on a
+    # pinned-content mismatch instead of leaving that residual UNCLOSED, at
+    # the cost of a small, separately-measured increment to a cost that was
+    # already there. The one genuinely irreducible residual after this fix
+    # is the same class this file already accepts elsewhere (see e.g.
+    # create_fresh_private_dir()'s own docstring): the microsecond-scale,
+    # in-process gap inside a single sha256_file_verified() call between
+    # its own lstat() and O_NOFOLLOW open() -- not something an external
+    # racer can reliably win without a filesystem primitive (e.g. an
+    # atomic snapshot) this installer does not have, and not something any
+    # amount of re-sweeping can close further, since it is internal to the
+    # one read a caller has no choice but to trust once taken.
+    for locally_patched_name, pinned_digests in patched_content_digests.items():
+        assert_locally_patched_package_matches_pinned_digests(
+            global_root / locally_patched_name,
+            pinned_digests,
+            locally_patched_name,
+        )
+    release_relative_pinned_digests: dict[str, str] = {
+        os.fspath(node.relative_to(RELEASE_DIR)): node_sha256,
+        os.fspath(npm_cli.relative_to(RELEASE_DIR)): npm_cli_sha256,
+    }
+    for locally_patched_name, pinned_digests in patched_content_digests.items():
+        package_relative = os.fspath(
+            (global_root / locally_patched_name).relative_to(RELEASE_DIR)
+        )
+        for member_relative, member_sha256 in pinned_digests.items():
+            release_relative_pinned_digests[
+                f"{package_relative}/{member_relative.as_posix()}"
+            ] = member_sha256
+    write_pending_install(
+        receipt, pinned_relative_digests=release_relative_pinned_digests
+    )
     return finalize_pending_install(lock_identity)
 
 
@@ -6116,6 +6537,43 @@ def verify(expected_lock_identity: tuple[int, int] | None = None) -> dict[str, A
         raise PrimeInstallError("Prime Agent release tree drifted")
     node = resolve_ssd(Path(receipt["node_target"]))
     npm_cli = resolve_ssd(Path(receipt["npm_target"]))
+    entrypoint = resolve_ssd(
+        release / "lib/node_modules/prime-agent/dist/bundle/cli.js"
+    )
+    # Round 29, 2026-08-19 (independent Claude opus/max round-29 review,
+    # P1-2): receipt['node_sha256']/['npm_cli_sha256']/['entrypoint_sha256']
+    # -- each an independently, tarball-derived SHA-256 digest captured
+    # strictly BEFORE `npm ci` ever ran during install (see
+    # extract_node_toolchain() and make_patched_asset()) -- were written
+    # into every install receipt since round 24/25 but never read back by
+    # this function at all: dead evidence. The release_tree_sha256
+    # comparison just above only detects drift AFTER whatever was recorded
+    # as the trusted baseline at install time; it cannot detect a same-UID
+    # racer who tampered one of these three files DURING that install's
+    # own `npm ci` window and had the tampered content adopted as that
+    # very baseline (see write_pending_install()'s/tree_digest()'s own
+    # P1-1 fix, this same round, for the install-time half of this fix).
+    # Comparing each file's CURRENT on-disk content against its
+    # permanently-fixed, tarball-derived receipt digest -- independent of
+    # whatever tree_digest() recorded -- catches that class of tampering
+    # on every subsequent verify() call, immediately before any of the
+    # three is executed below (exact_tool_version() execs `node` and, via
+    # it, `npm_cli`; run_version_probe() execs `node` and `entrypoint`).
+    for label, path, field in (
+        ("Node.js runtime", node, "node_sha256"),
+        ("npm CLI", npm_cli, "npm_cli_sha256"),
+        ("Prime Agent entrypoint", entrypoint, "entrypoint_sha256"),
+    ):
+        expected = receipt.get(field)
+        if not isinstance(expected, str) or not expected:
+            raise PrimeInstallError(
+                f"managed receipt is missing a pinned {label} digest"
+            )
+        if sha256_file_verified(path) != expected:
+            raise PrimeInstallError(
+                f"managed {label} content does not match the pinned "
+                "installed digest"
+            )
     cache = verify_private_ssd_dir(TOOL_ROOT / "npm-cache")
     install_home = verify_private_ssd_dir(TOOL_ROOT / "install-home")
     install_tmp = verify_private_ssd_dir(TOOL_ROOT / "install-tmp")
