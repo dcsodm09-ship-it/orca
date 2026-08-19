@@ -104,7 +104,7 @@ describe('Task cancel/supersede (#14548 Phase 1)', () => {
     expect(db.getDispatchContextById(started.dispatch.id)?.status).toBe('pending')
   })
 
-  it.each(['cancelled', 'superseded', 'completed', 'failed'] as const)(
+  it.each(['cancelled', 'superseded', 'completed'] as const)(
     'is an idempotent no-op once the Task is already terminal (%s)',
     (priorStatus) => {
       const { db } = createDatabase()
@@ -121,6 +121,43 @@ describe('Task cancel/supersede (#14548 Phase 1)', () => {
       expect(result?.terminal_reason).not.toBe('second call must not apply')
     }
   )
+
+  // Why (round 10, fix for a real bug 2 independent reviews confirmed): 'failed' is deliberately
+  // NOT idempotent-no-op'd through cancelTask, unlike the 3 statuses above - it's the only
+  // working escape hatch for reconcileReplacementOutcome's "don't cascade on a merely-failed
+  // replacement" trade-off (round 9). Without this, deciding a failed replacement really is
+  // abandoned for good had no way to actually finalize it: cancelTask would silently report
+  // success-shaped output with the task still 'failed', never applying 'cancelled', and the
+  // original's pending dependents would stay stuck forever with no recovery gesture at all.
+  it('actually applies (does not silently no-op) when cancelling an already-failed Task', () => {
+    const { db } = createDatabase()
+    const task = db.createTask({ spec: 'work that failed' })
+    db.updateTaskStatus(task.id, 'failed', 'first call')
+
+    const result = db.cancelTask(task.id, 'cancelled', { reason: 'retry abandoned for good' })
+
+    expect(result).toMatchObject({
+      status: 'cancelled',
+      terminal_reason: 'retry abandoned for good'
+    })
+  })
+
+  it('cascades a pending dependent when its replacement is explicitly cancelled after failing', () => {
+    const { db } = createDatabase()
+    const original = db.createTask({ spec: 'old approach' })
+    const dependent = db.createTask({ spec: 'waits on original', deps: [original.id] })
+    const replacement = db.createTask({ spec: 'new approach' })
+    db.cancelTask(original.id, 'superseded', { replacementTaskId: replacement.id })
+    db.updateTaskStatus(replacement.id, 'failed')
+    expect(db.getTask(dependent.id)?.status).toBe('pending')
+
+    // Why: the operator decides the failed replacement really is abandoned for good (no retry
+    // coming) - this must actually finalize it and cascade, not silently no-op.
+    db.cancelTask(replacement.id, 'cancelled', { reason: 'retry abandoned for good' })
+
+    expect(db.getTask(replacement.id)?.status).toBe('cancelled')
+    expect(db.getTask(dependent.id)?.status).toBe('cancelled')
+  })
 
   // Why (round 6): updateTaskStatus is the OTHER half of orchestration.taskUpdate's routing
   // (cancelled/superseded go through cancelTask; every other requested status goes here) - the

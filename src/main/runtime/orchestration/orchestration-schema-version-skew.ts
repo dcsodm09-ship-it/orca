@@ -6,9 +6,9 @@ import type Database from '../../sqlite/sync-database'
 // migration past the original v6 schema) - anything added by a LATER migration belongs in
 // VERSIONED_POST_V6_COLUMNS below instead, or a healthy database at any version between v7 and
 // that column's real introduction gets wrongly judged "incomplete" and rewound to 6. Verified:
-// only these 4 - plus the 2 already-correct `run_id` entries used in the v7 backfill loop -
-// actually land at v7 (`if (current < 7)` in migrate-v2-v12.ts); every other entry that used to
-// be here turned out to be a later addition and has been moved down.
+// these 4 `run_id` columns are the ONLY entries that actually land at v7 (`if (current < 7)`'s
+// ALTER loop in migrate-v2-v12.ts); every other entry that used to be here turned out to be a
+// later addition and has been moved down.
 const POST_V6_COLUMNS = [
   ['messages', 'run_id'],
   ['tasks', 'run_id'],
@@ -60,27 +60,32 @@ const VERSIONED_POST_V6_COLUMNS = [
   { version: 27, table: 'federated_dispatches', column: 'to_home_acknowledged_sequence' }
 ] as const
 
-// Why NOT fixed this round (flagging, not silently leaving): this list is checked
-// unconditionally, same shape as POST_V6_COLUMNS before round 9's fix - by inspection,
-// idx_messages_delivery_contract/idx_deliveries_one_outstanding/idx_deliveries_run_created/
-// idx_questions_dispatch_status/idx_federation_relay_pending/idx_remote_questions_dispatch_status
-// look like they were likely introduced alongside the same later-version tables/columns above
-// (v8's question_threads/deliveries, v15's federation_relay_items, v16's remote_questions), which
-// would make them subject to the identical false-incomplete-rewind bug for a healthy database at
-// an intermediate version. NOT independently verified against the migration files the way every
-// POST_V6_COLUMNS entry above was this round - a real candidate for the next pass, not confirmed.
+// Why (round 10, fix for the SAME regression class an independent review's follow-up audit
+// confirmed): only these 5 are genuine v7 baseline indexes (migrate-v2-v12.ts's
+// `if (current < 7)` block) - the other 6 that used to be listed here are later additions and
+// have been moved to VERSIONED_POST_V6_INDEXES below.
 const POST_V6_INDEXES = [
   'idx_messages_run_sequence',
-  'idx_messages_delivery_contract',
   'idx_tasks_run_status',
   'idx_dispatch_run_status',
   'idx_gates_run_status',
-  'idx_runs_coordinator_pane',
-  'idx_deliveries_one_outstanding',
-  'idx_deliveries_run_created',
-  'idx_questions_dispatch_status',
-  'idx_federation_relay_pending',
-  'idx_remote_questions_dispatch_status'
+  'idx_runs_coordinator_pane'
+] as const
+
+// Why versioned: idx_deliveries_one_outstanding/idx_deliveries_run_created/
+// idx_questions_dispatch_status are created alongside the v8 `deliveries`/`question_threads`
+// tables; idx_federation_relay_pending alongside v15's federation_relay_items;
+// idx_remote_questions_dispatch_status alongside v16's remote_questions;
+// idx_messages_delivery_contract alongside v19's messages.delivery_contract - all verified
+// against migrate-v2-v12.ts/migrate-v13-v28.ts/migrate-legacy-contract-storage.ts, mirroring
+// VERSIONED_POST_V6_COLUMNS's own fix.
+const VERSIONED_POST_V6_INDEXES = [
+  { version: 8, index: 'idx_deliveries_one_outstanding' },
+  { version: 8, index: 'idx_deliveries_run_created' },
+  { version: 8, index: 'idx_questions_dispatch_status' },
+  { version: 15, index: 'idx_federation_relay_pending' },
+  { version: 16, index: 'idx_remote_questions_dispatch_status' },
+  { version: 19, index: 'idx_messages_delivery_contract' }
 ] as const
 
 function hasOrchestrationColumn(db: Database.Database, table: string, column: string): boolean {
@@ -92,6 +97,10 @@ function hasOrchestrationIndex(db: Database.Database, index: string): boolean {
   return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(index)
 }
 
+// Why gated at v9 (round 10, fix for a real bug 2 independent reviews confirmed): the messages
+// table only gains the 'question' CHECK-constraint member at v9 (migrate-v2-v12.ts's
+// `if (current < 9 && !this.messagesTypeCheckAllowsQuestion())` rebuild) - calling this
+// unconditionally judged every healthy v7-v8 database "incomplete" too.
 function messagesAllowQuestions(db: Database.Database): boolean {
   const row = db
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'")
@@ -99,6 +108,18 @@ function messagesAllowQuestions(db: Database.Database): boolean {
   return !!row && row.sql.includes("'question'")
 }
 
+// Why gated at v19, and why NOT just "wrongly judged incomplete" like the other probes (round 10,
+// fix for a real bug 2 independent reviews confirmed): `legacy_adoptions` itself is created at
+// v19 (migrate-legacy-contract-storage.ts, called from migrate-v13-v28.ts's
+// `if (current < 19)`) - querying it unconditionally on a genuine pre-v19 database doesn't just
+// misjudge completeness, it throws `no such table: legacy_adoptions`, uncaught, straight out of
+// resolveOrchestrationMigrationStartVersion and through the whole OrchestrationDb constructor.
+// This was masked as long as POST_V6_INDEXES stayed unconditional too (its own v19 entry,
+// idx_messages_delivery_contract, already short-circuited `&&` before reaching this function for
+// any pre-v19 database) - fixing the index list without ALSO gating this would have traded a
+// spurious rewind for a startup crash. A database that hasn't reached v19 cannot have an
+// inconsistent v19-era adoption record (the table doesn't exist yet), so treat it as trivially
+// consistent rather than attempting the query at all.
 function hasConsistentLegacyAdoption(db: Database.Database): boolean {
   const sourceRunId = 'run_legacy_local'
   const sourceGraph = db
@@ -134,8 +155,11 @@ function hasCompletePostV6Schema(db: Database.Database, storedVersion: number): 
         storedVersion < version || hasOrchestrationColumn(db, table, column)
     ) &&
     POST_V6_INDEXES.every((index) => hasOrchestrationIndex(db, index)) &&
-    messagesAllowQuestions(db) &&
-    hasConsistentLegacyAdoption(db)
+    VERSIONED_POST_V6_INDEXES.every(
+      ({ version, index }) => storedVersion < version || hasOrchestrationIndex(db, index)
+    ) &&
+    (storedVersion < 9 || messagesAllowQuestions(db)) &&
+    (storedVersion < 19 || hasConsistentLegacyAdoption(db))
   )
 }
 

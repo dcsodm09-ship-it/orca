@@ -42,12 +42,15 @@ export function mintDispatchCapability(
   // rules this out for a normal packaged install - could flip `status` between the two, e.g.
   // failDispatch() marking this exact context 'failed'. Re-check status IN the same UPDATE, not
   // just at the read above; must match the initial guard's own allowed set exactly. This
-  // function has exactly one caller (orchestration.ts's --inject path), and in practice that
-  // caller's ctx is always 'dispatched' (from createDispatchContext, or a
-  // findReusableUninjectedDispatchContext hit, which requires capability_hash IS NULL -
-  // composed-worker's prepareStartingWorkerAuthority never leaves that true, since it writes
-  // capability_hash in the same UPDATE as assignee_handle, so its 'pending' contexts never
-  // reach this function at all) - 'pending' in the guard is defensive, not a live call path.
+  // function has exactly one caller (orchestration.ts's --inject path); in practice that
+  // caller's ctx is always 'dispatched' - not because 'pending' contexts are unreachable in
+  // general (composed-worker's own createStartingWorkerDispatch does insert 'pending' rows, and
+  // prepareStartingWorkerAuthority - its own separate, BEGIN IMMEDIATE-wrapped minter - can be
+  // skipped entirely on a worktree/terminal/setup failure, leaving them 'pending' indefinitely),
+  // but because those specific rows have `assignee_handle IS NULL`, which the reuse lookup here
+  // filters on with an exact-match WHERE clause that a NULL can never satisfy. 'pending' in the
+  // guard is still correct to keep (matches the initial guard above, and this exclusion mechanism
+  // is incidental, not a documented contract) - just don't read too much into why it's unreached.
   const result = this.db
     .prepare(
       `UPDATE dispatch_contexts

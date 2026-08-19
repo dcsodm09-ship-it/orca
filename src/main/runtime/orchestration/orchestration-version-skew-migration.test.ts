@@ -222,10 +222,16 @@ describe('OrchestrationDb version-skew migration', () => {
   // remote_dispatch_attachments.protocol_version (v17), and the legacy-contract-storage columns
   // and tables (v19) were ALL unversioned, so a healthy database at any intermediate version
   // (e.g. v9, genuinely missing the v10 capability trio because it hasn't been migrated that far
-  // yet) looked "incomplete" and got rewound to 6. Spot-check one representative case (v10's
-  // capability trio) rather than one per version - the fix (moving every entry to the versioned
-  // list with its real introducing version) is uniform across all of them.
-  it('does not rewind a healthy pre-v10 database missing only the v10 dispatch capability columns', () => {
+  // yet) looked "incomplete" and got rewound to 6.
+  // Why the index drop too (round 10, fix for an independent review's finding that THIS test was
+  // a false positive): only dropping columns left every POST_V6_INDEXES entry present (all 11
+  // were still unconditional when this test was first written, but a v9 DB - via createTables
+  // building a FULL current schema first before this seed-then-strip approach even ran - had them
+  // all anyway), so the test passed for the wrong reason and never actually exercised the index
+  // gate at all. `idx_messages_delivery_contract` (v19) is the specific index a genuine pre-v19
+  // database can never have - drop it explicitly so this test would fail if that gate ever
+  // regressed back to unconditional.
+  it('does not rewind a healthy pre-v10 database missing the v10 dispatch capability columns and later indexes', () => {
     tempDir = mkdtempSync(join(tmpdir(), 'orca-db-version-skew-pre-v10-'))
     const dbPath = join(tempDir, 'orchestration.db')
     const seed = new OrchestrationDb(dbPath)
@@ -234,9 +240,39 @@ describe('OrchestrationDb version-skew migration', () => {
     raw.exec('ALTER TABLE dispatch_contexts DROP COLUMN capability_hash')
     raw.exec('ALTER TABLE dispatch_contexts DROP COLUMN process_incarnation')
     raw.exec('ALTER TABLE dispatch_contexts DROP COLUMN capability_revoked_at')
+    raw.exec('DROP INDEX idx_messages_delivery_contract')
+    raw.exec('DROP INDEX idx_federation_relay_pending')
+    raw.exec('DROP INDEX idx_remote_questions_dispatch_status')
     raw.pragma('user_version = 9')
 
     expect(resolveOrchestrationMigrationStartVersion(raw, 9, SCHEMA_VERSION)).toBe(9)
+
+    raw.close()
+  })
+
+  // Why (round 10, fix for a real bug 2 independent reviews confirmed): hasConsistentLegacyAdoption
+  // queries the v19 `legacy_adoptions` table with no existence guard - a genuine pre-v19 database
+  // doesn't have that table at all, so calling this unconditionally doesn't just misjudge
+  // completeness, it THROWS ("no such table: legacy_adoptions") straight out of
+  // resolveOrchestrationMigrationStartVersion. This was masked as long as an unversioned
+  // POST_V6_INDEXES entry (idx_messages_delivery_contract, also v19) short-circuited first for
+  // any pre-v19 database - fixing the index gate without ALSO gating this function would have
+  // traded a spurious rewind for an uncaught constructor crash.
+  it('does not throw (or rewind) for a healthy pre-v19 database with no legacy_adoptions table at all', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'orca-db-version-skew-pre-v19-'))
+    const dbPath = join(tempDir, 'orchestration.db')
+    const seed = new OrchestrationDb(dbPath)
+    seed.close()
+    const raw = new Database(dbPath)
+    raw.exec('DROP TABLE legacy_adoptions')
+    raw.exec('DROP TABLE legacy_compatibility_principals')
+    raw.exec('DROP TABLE legacy_operation_receipts')
+    raw.exec('DROP TABLE legacy_mail_receipts')
+    raw.exec('DROP INDEX idx_messages_delivery_contract')
+    raw.pragma('user_version = 18')
+
+    expect(() => resolveOrchestrationMigrationStartVersion(raw, 18, SCHEMA_VERSION)).not.toThrow()
+    expect(resolveOrchestrationMigrationStartVersion(raw, 18, SCHEMA_VERSION)).toBe(18)
 
     raw.close()
   })

@@ -1,6 +1,5 @@
 import { OrchestrationError } from '../../orchestration-error'
 import type { TaskRow } from '../../types'
-import { isTerminalTaskStatus } from '../../types'
 import { settleActiveDispatchesForTask } from '../dispatch-context/dispatch-completion'
 import { walkReplacementPredecessorChain } from './task-store'
 import type { OrchestrationDb } from '../orchestration-db'
@@ -117,6 +116,14 @@ export function reconcileReplacementOutcome(db: OrchestrationDb, settledTaskId: 
 // fences any active context-only Dispatch instead of asking callers to compose worker-stop + task-update.
 // Idempotent: a Task already terminal (by cancel or otherwise) is left untouched, mirroring the
 // updateTaskStatus guard that keeps a late actor from mutating a Task that has already settled (#11499).
+// Why 'failed' is NOT treated as terminal here (round 10, fix for a real bug 2 independent
+// reviews confirmed): reconcileReplacementOutcome deliberately excludes 'failed' from its cascade
+// trigger (see its own docstring) so a transiently-failed replacement's retry can still succeed -
+// but without this, that trade-off had no working escape hatch. If a caller decides a 'failed'
+// replacement really IS abandoned for good (no retry coming), calling cancelTask on it must
+// actually finalize it and cascade, not silently no-op and report success-shaped output with the
+// task still 'failed'. 'completed'/'cancelled'/'superseded' remain genuinely final here; only
+// 'failed' is deliberately mutable through this specific function.
 export function cancelTask(
   this: OrchestrationDb,
   id: string,
@@ -141,7 +148,7 @@ export function cancelTask(
              replacement_task_id = COALESCE(?, replacement_task_id),
              completed_at = COALESCE(completed_at, datetime('now'))
          WHERE id = ?
-           AND status NOT IN ('completed', 'failed', 'cancelled', 'superseded')
+           AND status NOT IN ('completed', 'cancelled', 'superseded')
            AND NOT EXISTS (
              SELECT 1
              FROM dispatch_contexts active
@@ -154,7 +161,13 @@ export function cancelTask(
       .run(status, options.reason ?? null, options.replacementTaskId ?? null, id)
     if (update.changes !== 1) {
       const task = this.getTask(id)
-      if (task && isTerminalTaskStatus(task.status)) {
+      // Why not isTerminalTaskStatus: 'failed' is deliberately excluded here too (see the
+      // docstring above) - a 0-row result while the task is 'failed' means something else
+      // blocked the write (e.g. an active worker), not that there's nothing left to do.
+      if (
+        task &&
+        (task.status === 'completed' || task.status === 'cancelled' || task.status === 'superseded')
+      ) {
         this.db.exec(`RELEASE ${CANCEL_TASK_SAVEPOINT}`)
         return task
       }
