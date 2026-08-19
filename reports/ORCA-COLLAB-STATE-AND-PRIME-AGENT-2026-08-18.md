@@ -688,9 +688,57 @@ release 目录改名挪开，拿一个**同样属主、同样 0700 权限、货�
 符号链接"这一种具体呈现方式。
 
 Codex 汇报这条发现时用的是 `escalation` 消息（不是正式 `worker_done`），
-说明还在继续跑完整套复核（双解释器测试、真实 sandbox E2E、调用点审计、
-通读）——这条已经足够严重，先派 round 22 处理，等 Codex 完整报告出来后
-再补全细节。
+后续这个 worker 又被内容策略卡住，干净收尾（已拿到关键发现，不需要死等）。
+
+### Round 22：修复"目录身份连续性"+ 自己审计出的更严重变体（已验证关闭）
+
+`open_verified_ancestor_chain()` 加了可选 `expected_identity` 参数，走完
+祖先链之后用 `os.fstat()` 比对 `(st_dev, st_ino)`；`tighten_generated_
+private_file_mode()` 现在要求必传 `expected_parent_identity`；
+`_install_locked()` 在 `ensure_private_dir(RELEASE_DIR)` **创建**它之后
+立刻捕获身份，npm 还没开始跑之前。**审计过程中自己又挖出一个更严重的
+变体**：npm ci 跑完之后的整段流程（挪 `node_modules`、给入口文件
+chmod、写 launch guard）完全按字面路径信任 RELEASE_DIR，零身份校验——
+复现出整个 `install()` 能悄悄成功（exit 0、`ok:true`、receipt 已写），
+但发布出去的其实是攻击者控制的诱饵目录里的 `cli.js`。新增
+`assert_release_dir_identity()`，npm ci 返回后立刻调用。102/102 测试，
+真实生命周期回放确认修复后依然完整跑通。已提交 `4d73ffd192`。
+
+### Round 23：Claude opus/max 又挑出 2 个新 P1，Codex 这路被基础设施问题挡住
+
+**Claude opus/max：NO_GO，0 P0、2 P1、4 P2、6 P3**——这次轮到 opus/max
+自己挑出问题了（不是 Codex）：
+
+- **P1-1**：锁定的 node/npm 工具链二进制本身，解压时校验过一次，之后
+  在多处按字面路径直接 `exec`，从没在真正执行前重新校验过。实测出一个
+  **3 分 34 秒**的真实窗口——攻击者在两次 npm 调用之间换掉
+  `RELEASE_DIR/toolchain/bin/node`，因为这次换的是 RELEASE_DIR *里面*
+  的文件、不是 RELEASE_DIR 本身，round 22 的目录身份校验对此完全无感。
+- **P1-2**：`assert_release_dir_identity()` 只绑定了目录本身的 inode，
+  没绑定目录里的内容——`npm ci` 跑完之后、真正发布之前，原地覆盖
+  `node_modules/prime-agent/dist/bundle/cli.js` 的内容，目录身份检查
+  照样通过。
+
+两个都是从 round 1 就一直存在、22 轮都没测到的真实缺口，真实生命周期
+回放本身依然是 exit 0/`ok:true`（NO_GO 是因为这两个真实复现的 P1，
+不是因为跑不通）。opus/max 自己给出的根因诊断很关键："RELEASE_DIR 是
+一个路径，每一轮修复都只是把这条路径校验得更严——真正该做的是创建时
+就开一个 `O_DIRECTORY|O_NOFOLLOW` 的文件描述符，`fstat` 一次，剩下的
+release 相关操作全部走 `dir_fd=`，而不是每次都重新按路径解析。"
+
+**Codex 这一路被一个和候选本身无关的基础设施问题挡住**：管理这个
+Codex 账号的 `hooks.json` 在约 25 分钟前被改动过（大概率是本机另一个
+并发会话正在做的 `claude-codex-memory-bridge`/`install_bridge.py`
+hook 桥接工作），触发了一个交互式"hook 需要审查"确认提示，导致
+Orca 的 agent 就绪检测在几秒内就判定启动失败——连续 3 次全新派发
+复现了同样的结果。**没有去动那个共享的 hook 信任配置**（那正是
+`install_bridge.py` 自己十轮复核在小心保护的东西，不该被我绕过），
+只是如实记录这条路暂时走不通，等共享状态自己解决。
+
+**已派发 round 24**，照 opus/max 给出的架构性方向做：整个安装过程
+attach 住一个 RELEASE_DIR 的文件描述符、给工具链二进制加解压时摘要+
+执行前重新校验、把身份校验传播到 recovery 路径——一次性把这整类问题
+解决，而不是继续一个个路径打补丁。
 
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
