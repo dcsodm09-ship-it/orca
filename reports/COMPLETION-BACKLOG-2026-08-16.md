@@ -144,7 +144,7 @@ opus+max 与 Codex sol+max 独立只读双复核才能过。
 |---|---|---|
 | 已装 memory daemon 必须能从具体 git commit 确定性重建（markdown 唯一真相源纪律） | `BLOCKED_HUMAN_DECISION` | 定为新验收门禁前需用户认可方向 |
 | `context_pack()` 从固定字节截断升级为"规划→检索→合并重排→有界证据包+覆盖/缺口信号" | `BLOCKED_DUAL_REVIEW`（架构级，触碰热路径） | 需先立项出候选，再走 opus+max / sol+max 双复核 |
-| 给 L1-L3 记忆条目加 `kind` 字段（preference/identity/fact/procedure/blocker/reference，纯 additive） | `SAFE_NOW`（可作为独立小候选） | 可在下一轮直接起草 schema 扩展候选，走常规测试流程 |
+| 给 L1-L3 记忆条目加 `kind` 字段（preference/identity/fact/procedure/blocker/reference，纯 additive） | ~~`SAFE_NOW`（未开始）~~ → **`DONE`（本仓库校验层）+ 与已知 P0 同根（活跃 daemon）**（2026-08-19 复核发现） | **不需要起草新候选**：`orca-context-bridge/scripts/build_startup_bundle.py:1010` 的 `normalize_reviewed_items()` 已经校验一个开放式 `kind` 字段（`re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", kind)`，非固定枚举，比 holaOS 建议的 6 类更宽松），且本会话实际收到的多条 `ORCA_AGENT_MEMORY_CONTEXT_PACK_V1` 系统提醒里每条记忆项本来就带着真实 `kind` 值（`"kind":"profile"`、`"kind":"scenario"`、`"kind":"decision"`）——说明这个字段在**活跃、正在服务真实会话的记忆系统**里早就存在并在用。但这些具体取值（profile/scenario/decision）在本仓库 `orca-context-bridge/scripts/*.py` 里搜不到任何赋值来源，说明产出这些记忆项的其实是本节上一行已经点名的**那个已知 P0**——"正在服务真实会话的已装 memory daemon，哈希与任何源码分支都不一致、不在任何 git 分支上"；这个 `kind` 字段就活在那份不可追溯源码的活跃构建里，不在本仓库任何候选分支中。结论：这不是一个还没做的独立小候选，是同一个已经 `BLOCKED_HUMAN_DECISION` 的根源问题的又一处体现，不需要也不应该在本仓库重新起草一份重复/可能冲突的 schema 扩展；真正的下一步跟上一行一样——先决定"已装 daemon 是否要能从具体 git commit 确定性重建"这个方向。 |
 | 给 claude-codex-memory-bridge 补命名空间路径 allowlist（拒绝 `..`/绝对路径/跨工作区） | `DONE`（修复已实施，见第 6 节候选行）→ `BLOCKED_DUAL_REVIEW`（等双复核回执） | 已随该候选 commit `b9ce3e1e62` 一起送审，见上 |
 
 ### 2026-08-18 补充：`ORCA_CONTEXT_NACK_V1`（wiki 新鲜度不匹配）根因 + SKILL.md 文档纠错
