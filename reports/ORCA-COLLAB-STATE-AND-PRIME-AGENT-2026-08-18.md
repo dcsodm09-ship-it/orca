@@ -1177,6 +1177,82 @@ opus/max 给出的最小修法都很具体：P1-1 在 `write_pending_install()`
 `npm-cli.js` 补进执行前重新校验的清单，同时按本轮反馈修正残留文档，
 不要再犯"范围写得比实际覆盖的宽"这种过度断言。
 
+### Round 30：把"扫描一次永久信任"改成"验证的那次读取本身就是基线"+ 补 npm-cli.js（已验证关闭，未独立复核）
+
+**P1-1 修复**：新增 `sha256_file_verified()`——单次 `O_NOFOLLOW` 打开
++ fstat 身份确认的摘要读取（沿用 `read_private_file()` 那套纪律，去掉
+它对私有文件权限位的要求，因为 npm 落盘的文件本来就是 `0o644`/
+`0o755`）。`tree_digest()` 新增可选参数 `pinned_relative_digests`：
+对树里任何一个在这个表里出现的相对路径，它这一次现读到的摘要（就是
+`sha256_file_verified()` 这一次调用读到的）**当场**和钉住的值比对，
+比对完才折进正在累积的整树摘要——对钉住路径而言，不再存在"验证的
+那次读"和"变成永久基线的那次读"是两次独立操作这回事，它们就是
+同一次。`write_pending_install()` 的两次 `tree_digest()` 调用（写入
+耐久屏障前后各一次）都把这个参数传下去。
+`_install_locked_within_release_dir()` 在 `write_pending_install()`
+之前，对四个包各自搬移后的最终路径**再跑一次**逐包摘要扫描（这一步
+补的是"纯内容比对测不出来的缺失/多余文件"这类问题），然后把四个
+本地补丁包的全部逐文件摘要表 + node/npm-cli 自己的钉住摘要一起拼成
+`release_relative_pinned_digests`，作为同一套机制的顺手延伸传下去。
+
+**P1-2 修复**：npm ci 返回后立刻新增
+`verify_unchanged_private_ssd_asset_digest(npm_cli, ...)` 调用，和
+`node` 原有的那次对齐（原来的注释就写着"binaries"复数，现在终于
+名副其实了，顺带把这处误导性注释改正）。`verify()` 现在会先解析
+`entrypoint`，在 `exact_tool_version()`/`run_version_probe()` 真正
+执行任何东西之前，把 `node`/`npm_cli`/`entrypoint` 的现读摘要和
+`receipt['node_sha256']`/`['npm_cli_sha256']`/`['entrypoint_sha256']`
+逐一比对——用 `grep` 确认了修复前这三个字段确实哪里都没被读过，是
+彻头彻尾的"死证据"，现在变成了每次调用前真正生效的门槛。
+
+**P2-1 修复**：新增 `_find_nested_node_modules_containers()`，遍历一个
+包**整棵**子树里所有字面叫 `node_modules` 的目录，不再只看包根这
+一层——补上"子目录锚定的容器对老的只查包根的检查完全不可见"这个洞。
+
+**P2-2 修复**：`assert_locally_patched_package_matches_pinned_digests()`
+和 `tree_digest()` 都改用 `sha256_file_verified()` 而不是老的
+`sha256_file()`，堵上"scandir 缓存的 stat 和之后普通 open 是两次
+独立解析"这条符号链接替换竞争。
+
+**文档过度断言修正**：`assert_materialized_node_modules_matches_lock()`
+和 `assert_locally_patched_package_matches_pinned_digests()` 的文档
+字符串不再引用 npm 自身 SRI 校验作为约 196 个第三方 registry 依赖包
+残留的防护措施——改成如实说明这是一个**未被缓解**的已知残留（npm 的
+SRI 校验只在下载阶段生效，对"解包之后、同 UID 本地篡改"这个威胁完全
+没有防护力）。
+
+4 条新回归测试（P1-1：在两次扫描之后、基线锁定之前的窗口里换内容；
+P1-2：npm ci 运行期间换 `npm-cli.js`；P2-1：子目录锚定的嵌套
+`node_modules/` 里种未声明的包；P2-2：摘要读取期间做符号链接替换），
+全部确认对 round-29 基线 `ea8004f820`（隔离 worktree 里跑）可复现、
+对修复后的代码通过。114/114 测试（110 条既有 + 4 条新增）在
+`/usr/bin/python3`（3.9.6）和 Homebrew python3（3.14.6）下各跑两次、
+共 4 次运行零失败，两个文件在两个解释器下都编译干净。round 24-28
+的 7 条既有回归测试逐条抽查仍然通过。真实（非 mock）
+`sandbox_e2e.py` 生命周期回放跑了两次，均 `exit 0`/`ok:true`，
+`production_lock_sha256` 吻合、26911 个条目两次一致。
+
+**残留窗口的如实、量化说明**：给真实生命周期加了计时探针，实测"最后
+一次重新扫描"到"`write_pending_install()` 第一次 `tree_digest()`
+调用完成"约 42.65 秒、`write_pending_install()` 整体约 69.6 秒——
+但这是墙钟耗时，不是安全窗口，把它当成"窗口"报告本身就是另一个方向
+的过度断言：对每一个被钉住的路径，验证的那次读取和贡献基线的那次
+读取现在是**同一次操作**，"内容已验证"和"内容成为永久信任基线"
+之间的间隙是零，不是"缩小了"。专门做了一次对照实验（
+`sha256_file_verified()` vs 老的 `sha256_file()`，交叉跑在约 27000
+个真实文件上、热页面缓存排除顺序偏差）：本轮新增的开销只占每文件
+15-20%，那 42.65/69.6 秒里绝大部分是 `tree_digest()` 本来就要付的
+全树哈希成本（它在装机和每次 `verify()` 时本来就会把每个文件都哈希
+一遍），本轮的改动只是让这些本来就在做的调用碰到不一致时真的报错
+拒绝，而不是留一个口子，额外代价是单独量出来的、很小的一块。**唯一
+真正不可消除的残留**：单次 `sha256_file_verified()` 调用内部、自己
+的 `lstat()` 和 `O_NOFOLLOW` `open()` 之间那个微秒级的进程内间隙——
+和这份代码在别处（比如 `create_fresh_private_dir()` 的文档字符串）
+已经接受的同一类残留，不上操作系统级的原子快照原语无法消除，再多扫
+一遍也缩小不了，因为它就在调用者别无选择只能信任的那一次读取内部。
+
+已提交 `035ef5dad5`。**已派发 round 31 双复核。**
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
