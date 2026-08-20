@@ -4530,12 +4530,37 @@ def assert_no_unexpected_ancestor_node_modules(release_dir: Path) -> None:
     locations should ever exist, so there is nothing to legitimately
     distinguish between "existed at install time" and "appeared later" --
     both are equally wrong.
+
+    Round 43, 2026-08-20 (independent Claude opus/max round-42 review,
+    P1-B): the ancestor walk above models `Module._nodeModulePaths` only.
+    Real Node's actual resolution (`Module._resolveLookupPaths`) is that
+    walk PLUS `Module.globalPaths` -- confirmed empirically against this
+    installer's exact pinned Node binary (real
+    `require('module').globalPaths` output, `env -i` with/without HOME
+    set): `$HOME/.node_modules`, `$HOME/.node_libraries` (only when HOME
+    is a non-empty string -- real Node's own `if (homeDir)` check treats
+    unset and empty identically, mirrored by `node_global_folder_paths()`
+    below), and a third path derived from the Node binary's own install
+    location (`path.resolve(process.execPath, '..', '..')` + "lib/node"),
+    which on this installer's fixed toolchain layout
+    (`RELEASE_DIR/toolchain/bin/node`) is `RELEASE_DIR/toolchain/lib/node`
+    -- itself INSIDE `release_dir`, not an ancestor, so the walk above
+    never reaches it. Confirmed against the real pinned Node darwin-arm64
+    tarball's own contents that extraction never creates a "lib/node"
+    directory there (only "lib/node_modules") -- the same "must never
+    legitimately exist" property the ancestor walk itself already relies
+    on, so this refuses on ANY presence exactly the same way. NODE_PATH-
+    derived `globalPaths` entries are deliberately not modeled here:
+    NODE_PATH is unconditionally removed by the generated launch guard's
+    `scrubbed_node_environment()` before the one real exec that ever
+    matters, so real Node will see no NODE_PATH for that invocation and
+    contributes no such entries to its own `globalPaths`.
     """
     current = os.fspath(release_dir)
     while True:
         parent = os.path.dirname(current)
         if parent == current:
-            return
+            break
         current = parent
         candidate = os.path.join(current, "node_modules")
         if os.path.lexists(candidate):
@@ -4543,6 +4568,39 @@ def assert_no_unexpected_ancestor_node_modules(release_dir: Path) -> None:
                 "unexpected node_modules directory on Node's module "
                 f"resolution ancestor chain outside the managed release: {candidate}"
             )
+    for candidate in node_global_folder_paths(release_dir):
+        if os.path.lexists(candidate):
+            raise PrimeInstallError(
+                "unexpected item on Node's own global module-resolution "
+                f"path outside the managed release: {candidate}"
+            )
+
+
+def node_global_folder_paths(release_dir: Path) -> list[str]:
+    """The three locations `Module.globalPaths` adds to real Node's module
+    resolution beyond the plain ancestor `node_modules` walk -- see
+    `assert_no_unexpected_ancestor_node_modules()`'s round-43 docstring
+    paragraph just above for how each was empirically confirmed. Uses
+    `os.environ.get("HOME")` -- the SAME value the generated launch
+    guard's `scrubbed_node_environment()` passes through unscrubbed to the
+    one real Node invocation that matters -- rather than any other notion
+    of "home directory", so this checks exactly what that future real
+    launch will actually see. `release_dir/"toolchain/lib/node"` mirrors
+    this installer's own fixed, hardcoded toolchain layout (matching
+    `RELEASE_DIR / "toolchain/bin/node"` used elsewhere, e.g. this
+    installer's own `node_target` receipt field) rather than re-deriving
+    it from a live NODE path, since this function -- unlike the generated
+    launch guard's own independent copy -- has no validated, symlink-free
+    NODE path available to it (verify() calls this before it resolves
+    `node` from the receipt at all).
+    """
+    paths: list[str] = []
+    home = os.environ.get("HOME")
+    if home:
+        paths.append(os.path.join(home, ".node_modules"))
+        paths.append(os.path.join(home, ".node_libraries"))
+    paths.append(os.path.join(os.fspath(release_dir), "toolchain", "lib", "node"))
+    return paths
 
 
 def write_pending_install(
@@ -5194,59 +5252,192 @@ RUNTIME_NO_GUARD_COMMANDS = frozenset(
     )
 )
 # Round 40, 2026-08-20 (independent Claude opus/max round-39 review, P1-2
-# item 1): every one of these directly influences, or (NODE_OPTIONS) can
+# item 1): NODE_OPTIONS/NODE_PATH/NODE_PRESERVE_SYMLINKS(_MAIN)/
+# NODE_REPL_EXTERNAL_MODULE each directly influence, or (NODE_OPTIONS) can
 # inject arbitrary code into, Node's own startup and module resolution --
-# https://nodejs.org/api/cli.html#node_optionsoptions,
-# https://nodejs.org/api/cli.html#node_pathpath,
-# https://nodejs.org/api/cli.html#node_preserve_symlinks1,
-# https://nodejs.org/api/cli.html#node_preserve_symlinks_main1,
-# https://nodejs.org/api/repl.html#repl_node_repl_external_module --
 # independent of anything validate_exec_target() below checks (that only
 # ever inspects NODE/CLI themselves, never the environment they run in).
-# See scrubbed_node_environment()'s own docstring for why these are
-# explicitly removed from a COPY of the real environment rather than this
-# script exec'ing NODE/CLI with a wholesale-replaced, minimal one the way
-# managed_npm_environment() does for install-time npm invocations: this is
-# the user's real interactive session, and CLI legitimately needs whatever
-# else that session provides (credentials, PATH, TERM, ...).
-NODE_ENV_SCRUB_KEYS = (
-    "NODE_OPTIONS",
-    "NODE_PATH",
-    "NODE_PRESERVE_SYMLINKS",
-    "NODE_PRESERVE_SYMLINKS_MAIN",
-    "NODE_REPL_EXTERNAL_MODULE",
+#
+# Round 43, 2026-08-20 (independent Claude opus/max round-42 review,
+# P1-A): round 40's approach above was a DENYLIST -- start from the full
+# environment, remove five named keys. Node/OpenSSL/npm's own
+# environment-variable surface is large and not fully enumerable by this
+# installer, so a denylist can only ever be as complete as whatever this
+# installer's authors already happened to know about. Reproduced for real
+# against this installer's exact pinned Node binary (v24.19.0
+# darwin-arm64): with a real self-signed TLS certificate and a real
+# loopback TLS server, NODE_TLS_REJECT_UNAUTHORIZED=0 and
+# NODE_EXTRA_CA_CERTS -- real, documented Node environment variables
+# (https://nodejs.org/api/cli.html#node_tls_reject_unauthorizedvalue,
+# https://nodejs.org/api/cli.html#node_extra_ca_certsfile) -- each
+# silently changed a real TLS trust decision when inherited unscrubbed,
+# exactly like the NODE_OPTIONS finding round 40 already fixed; and
+# NODE_COMPILE_CACHE (https://nodejs.org/api/module.html#module-compile-
+# cache) -- only ever indirectly blocked via this installer's own,
+# separate NODE_DISABLE_COMPILE_CACHE=1 export, never itself in round 40's
+# denylist -- really did write real V8 compile-cache files to an
+# attacker-chosen directory when set (all three reproduced with the real
+# pinned Node binary; see this round's regression tests). None of round
+# 40's five denied keys covered any of these.
+#
+# NODE_ENV_ALLOWED_NAMES/NODE_ENV_ALLOWED_PREFIXES below replace the
+# denylist with an ALLOWLIST: scrubbed_node_environment() now starts from
+# nothing and copies across only a name this installer has positively
+# reviewed and can justify, instead of starting full and trying to
+# enumerate everything dangerous. This is deliberately NOT a minimal,
+# wholesale-replaced environment the way managed_npm_environment() builds
+# for install-time npm invocations (see that function's own docstring) --
+# this exec is the user's real interactive session, and the real,
+# materialized upstream CLI bundle (dist/bundle/cli.js and its own
+# dependencies, inspected directly for this round) genuinely reads a
+# wide, but bounded and reviewed, set of session/locale/terminal/
+# credential variables to function as an interactive, TUI, multi-provider
+# AI coding agent. What is explicitly, deliberately excluded regardless:
+# every Node/V8/OpenSSL/native-addon-loading environment variable this
+# round found documented (or, for OPENSSL_CONF, previously reported) to
+# influence code loading, TLS trust, or module resolution -- round 40's
+# original five, this round's three newly reproduced above, plus
+# OPENSSL_CONF, OPENSSL_MODULES, OPENSSL_ENGINES, SSL_CERT_FILE,
+# SSL_CERT_DIR, NODE_ICU_DATA, NODE_REDIRECT_WARNINGS, NODE_V8_COVERAGE,
+# NODE_REPL_HISTORY, and NAPI_RS_NATIVE_LIBRARY_PATH (a native-addon
+# dlopen() path override the real upstream bundle's own dependency tree
+# reads -- the same "attacker-controlled path gets dlopen()'d" shape as
+# the Node/OpenSSL items, just for a native addon instead of a Node
+# module or OpenSSL provider).
+#
+# OPENSSL_CONF specifically: this round built a real, compiled, harmless
+# marker .dylib and a real OpenSSL 3.x `[provider_sect]` config activating
+# it, and confirmed the *mechanism* is real -- the real system `openssl`
+# CLI (a dynamically-linked OpenSSL 3.6.3 build) genuinely dlopen()'d it
+# and ran its constructor. Against THIS installer's exact pinned Node
+# binary specifically, though, that same config/exec chain did not
+# reproduce (confirmed: `process.config.variables.openssl_is_fips` is
+# false, and this Node build's statically-linked OpenSSL did not visibly
+# consult OPENSSL_CONF for provider auto-activation for a plain script or
+# for `--openssl-config=<file>` in real testing) -- Node's own docs hedge
+# this exact variable's effect as being "among other uses... to enable
+# FIPS-compliant crypto if Node.js is built with ./configure
+# --openssl-fips", consistent with what was observed. OPENSSL_CONF is
+# excluded from the allowlist regardless: it costs nothing to exclude, it
+# is Node's own documented environment variable for exactly this
+# influence-code-loading category, and this installer does not control
+# what a future Node version, build configuration, or FIPS mode does with
+# it -- only that this round's own regression tests could not reproduce
+# live exploitation against the one pinned binary this installer actually
+# ships is recorded here as an honest, narrower finding than initially
+# suspected, not a reason to allow it.
+NODE_ENV_ALLOWED_PREFIXES = ("LC_",)
+
+NODE_ENV_ALLOWED_NAMES = frozenset(
+    (
+        # Session/OS basics.
+        "HOME", "PATH", "PWD", "OLDPWD", "SHELL", "USER", "LOGNAME",
+        "TMPDIR", "TEMP", "TMP", "EDITOR", "VISUAL",
+        "XDG_DATA_HOME", "XDG_CACHE_HOME",
+        # Locale (LC_* itself is covered by NODE_ENV_ALLOWED_PREFIXES).
+        "LANG", "LANGUAGE",
+        # Terminal/TUI detection -- prime-agent is a TUI application (see
+        # README.md's own "TUI release" wording); the real bundle reads
+        # every one of these to detect terminal capabilities correctly.
+        "TERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "COLUMNS", "LINES",
+        "COLORTERM", "COLORFGBG", "TMUX", "TMUX_SESSION_ID",
+        "ITERM_SESSION_ID", "WEZTERM_PANE", "KITTY_WINDOW_ID",
+        "GHOSTTY_RESOURCES_DIR", "TERMUX_VERSION", "OSTYPE",
+        "SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY", "CI",
+        # Network -- corporate/proxied network access to a model provider
+        # is a real, legitimate use case; these are data (destination
+        # host), not code-loading or trust-relevant.
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "no_proxy",
+        # Node's own vars confirmed NOT to influence code loading, TLS
+        # trust, or module resolution: NODE_ENV is not even a Node-core
+        # var (an app-level convention only); NODE_DEBUG only toggles
+        # extra diagnostic printing for named core modules
+        # (https://nodejs.org/api/all.html#node_debugmodule);
+        # NODE_DISABLE_COMPILE_CACHE only ever *disables* the compile
+        # cache this installer already wants disabled (the opposite
+        # direction from the excluded NODE_COMPILE_CACHE above), and is
+        # exported by managed_entrypoint_script() itself.
+        "NODE_ENV", "NODE_DEBUG", "NODE_DISABLE_COMPILE_CACHE",
+        # This installer's own env, generated by managed_entrypoint_script()
+        # and required for the managed wrapper's own documented contract
+        # (README.md "For session starts it also:").
+        "PRIME_AGENT_CODING_AGENT_DIR", "PRIME_AGENT_LAUNCHER_PATH",
+        "PRIME_AGENT_SESSION_DIR", "PRIME_AGENT_CODING_AGENT_SESSION_DIR",
+        "PRIME_AGENT_TELEMETRY", "DO_NOT_TRACK", "PI_SKIP_VERSION_CHECK",
+        "PI_OFFLINE", "PYTHONDONTWRITEBYTECODE",
+        "ORCA_PRIME_AGENT_RESOURCE_GUARD",
+        # Model-provider credentials/endpoints -- read directly by the
+        # real, materialized upstream dist/bundle/cli.js and its own
+        # dependencies (confirmed by inspecting the real extracted
+        # v0.7.2 release tree for this round); without these the CLI
+        # cannot call any model at all. Pure data (keys, IDs, URLs, file
+        # paths to credential/token files) -- none of these load code,
+        # change TLS trust, or affect Node's own module resolution.
+        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_LOG",
+        "OPENAI_API_KEY", "OPENAI_ADMIN_KEY", "OPENAI_ORG_ID",
+        "OPENAI_PROJECT_ID", "OPENAI_API_VERSION", "OPENAI_BASE_URL",
+        "OPENAI_WEBHOOK_SECRET", "OPENAI_LOG",
+        "AZURE_API_KEY", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_BASE_URL",
+        "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_DEPLOYMENT_NAME_MAP",
+        "AZURE_OPENAI_RESOURCE_NAME", "AZURE_OPENAI_API_VERSION",
+        "AZURE_ENDPOINT",
+        "GEMINI_API_KEY", "GEMINI_NEXT_GEN_API_BASE_URL",
+        "GEMINI_NEXT_GEN_API_LOG",
+        "MISTRAL_API_KEY", "MISTRAL_BASE_URL",
+        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+        "AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION", "AWS_DEFAULT_REGION",
+        "AWS_PROFILE", "AWS_BEDROCK_BASE_URL",
+        "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+        "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_QUOTA_PROJECT",
+        "GOOGLE_CLOUD_PROJECT", "GOOGLE_PROJECT_ID", "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_CLOUD_API_KEY", "GCLOUD_PROJECT", "CLOUDSDK_CONFIG",
+        # Debug/diagnostic toggles that are pure data (no path or
+        # code-loading implication).
+        "DEBUG", "DEBUG_AUTH", "LOG_TOKENS",
+    )
 )
 
 
 def scrubbed_node_environment() -> dict[str, str]:
-    """A copy of this process's real environment with every key in
-    NODE_ENV_SCRUB_KEYS removed, for the SOLE subprocess this script ever
-    execs: `NODE CLI ...`. Round 40, 2026-08-20 (independent Claude
-    opus/max round-39 review, P1-2 item 1): before this round,
+    """An ALLOWLIST-filtered copy of this process's real environment --
+    only a key in NODE_ENV_ALLOWED_NAMES, or starting with a prefix in
+    NODE_ENV_ALLOWED_PREFIXES, survives -- for the SOLE subprocess this
+    script ever execs: `NODE CLI ...`. Round 40, 2026-08-20 (independent
+    Claude opus/max round-39 review, P1-2 item 1): before that round,
     `subprocess.run([NODE, CLI, ...])` in main() below passed no `env=`
     argument at all, so the child inherited this process's FULL
-    environment unscrubbed -- a same-UID actor who set NODE_OPTIONS (e.g.
-    to "--require=/path/to/attacker.js") anywhere upstream of this exec
-    (the calling shell's own exported environment, a wrapper script, an
-    inherited launchd/tmux/orchestration environment) had that flag
-    consumed by Node BEFORE CLI's own first line ever ran, and every check
-    this script performs above (LOCK identity, NODE/CLI structural and
-    content validation) reports success regardless, because none of them
-    inspects the process environment at all. NODE_PATH is the equally
-    direct analogue for module resolution rather than code injection: it
-    adds arbitrary, attacker-named directories to Node's own search path,
-    unconditionally, ahead of (or interleaved with) the ancestor
-    node_modules walk unexpected_ancestor_node_modules() below separately
-    addresses. NODE_PRESERVE_SYMLINKS(_MAIN) is scrubbed for the same
-    "never let the environment silently change how modules resolve"
-    reasoning, even though this installer's own symlink handling (see
-    tree_digest()'s round-40 fix) does not depend on Node's own
-    preserve-symlinks setting one way or the other.
+    environment completely unfiltered -- a same-UID actor who set
+    NODE_OPTIONS (e.g. to "--require=/path/to/attacker.js") anywhere
+    upstream of this exec (the calling shell's own exported environment,
+    a wrapper script, an inherited launchd/tmux/orchestration
+    environment) had that flag consumed by Node BEFORE CLI's own first
+    line ever ran, and every check this script performs above (LOCK
+    identity, NODE/CLI structural and content validation) reports success
+    regardless, because none of them inspects the process environment at
+    all. Round 43, 2026-08-20 (independent Claude opus/max round-42
+    review, P1-A): round 40's fix was a five-key denylist, which missed
+    OPENSSL_CONF/NODE_TLS_REJECT_UNAUTHORIZED/NODE_EXTRA_CA_CERTS/
+    NODE_COMPILE_CACHE and could not, by construction, ever be complete --
+    see NODE_ENV_ALLOWED_NAMES's own comment just above for the full
+    reasoning and the real-Node reproductions behind this round's switch
+    to an allowlist. Deliberately avoids a dict/set-literal comprehension
+    here (a plain loop plus `dict()`, with no curly-brace literal at all)
+    purely to keep this source text simple to review -- functionally
+    identical to a filtering comprehension.
     """
-    environment = dict(os.environ)
-    for key in NODE_ENV_SCRUB_KEYS:
-        environment.pop(key, None)
-    return environment
+    allowed: dict[str, str] = dict()
+    for key, value in os.environ.items():
+        if key in NODE_ENV_ALLOWED_NAMES or any(
+            key.startswith(prefix) for prefix in NODE_ENV_ALLOWED_PREFIXES
+        ):
+            allowed[key] = value
+    return allowed
 
 
 def unexpected_ancestor_node_modules() -> str | None:
@@ -5280,16 +5471,72 @@ def unexpected_ancestor_node_modules() -> str | None:
     about current filesystem permissions. Returns the first offending
     "<ancestor>/node_modules" path found, or None if the whole chain is
     clean.
+
+    Round 43, 2026-08-20 (independent Claude opus/max round-42 review,
+    P1-B): the ancestor walk above models `Module._nodeModulePaths` only.
+    Real Node's actual resolution (`Module._resolveLookupPaths`) is that
+    walk PLUS `Module.globalPaths` -- see node_global_folder_paths()'s own
+    docstring just below for how each of its three locations was
+    empirically confirmed against this exact pinned Node binary. Checked
+    here too, after the ancestor walk finds nothing, with the identical
+    refuse-on-any-presence logic -- none of the three should ever
+    legitimately exist either.
     """
     current = RELEASE_DIR
     while True:
         parent = os.path.dirname(current)
         if parent == current:
-            return None
+            break
         current = parent
         candidate = os.path.join(current, "node_modules")
         if os.path.lexists(candidate):
             return candidate
+    for candidate in node_global_folder_paths():
+        if os.path.lexists(candidate):
+            return candidate
+    return None
+
+
+def node_global_folder_paths() -> list[str]:
+    """The three locations `Module.globalPaths` adds to real Node's own
+    module resolution beyond the plain ancestor `node_modules` walk --
+    empirically confirmed against this installer's exact pinned Node
+    binary (v24.19.0 darwin-arm64): real `require('module').globalPaths`
+    output, captured under `env -i` both with and without HOME/NODE_PATH
+    set, rather than assumed from memory, since this is version- and
+    platform-dependent. `$HOME/.node_modules` and `$HOME/.node_libraries`
+    only when HOME is a non-empty string -- real Node's own `if
+    (homeDir)` check treats an unset HOME and an empty one identically
+    (both confirmed empirically), so `os.environ.get("HOME")` -- exactly
+    the value scrubbed_node_environment() passes through unscrubbed to
+    the one real Node invocation that matters -- is used the same way
+    here. The third is derived from the Node binary's own install
+    location, exactly the way real Node itself derives it
+    (`path.resolve(process.execPath, '..', '..')` + "lib/node") --
+    `os.path.dirname(os.path.dirname(NODE))` here, safe to use directly
+    (rather than needing `os.path.realpath(NODE)` first) because NODE has
+    already been confirmed symlink-free by validate_exec_target() before
+    this is ever called from main() below, so NODE already equals its own
+    realpath. On this installer's fixed toolchain layout
+    (RELEASE_DIR/toolchain/bin/node) this resolves to
+    RELEASE_DIR/toolchain/lib/node -- itself INSIDE RELEASE_DIR, not an
+    ancestor, so the ancestor walk above never reaches it; confirmed
+    against the real pinned Node darwin-arm64 tarball's own contents that
+    extraction never creates a "lib/node" directory there (only
+    "lib/node_modules"), so this is exactly as safe to refuse-on-presence
+    as every other location this script checks. NODE_PATH-derived
+    globalPaths entries are deliberately not modeled here: NODE_PATH is
+    unconditionally removed by scrubbed_node_environment() before this
+    exact exec, so real Node will see no NODE_PATH at all for this
+    invocation and contributes no such entries to its own globalPaths.
+    """
+    paths: list[str] = []
+    home = os.environ.get("HOME")
+    if home:
+        paths.append(os.path.join(home, ".node_modules"))
+        paths.append(os.path.join(home, ".node_libraries"))
+    paths.append(os.path.join(os.path.dirname(os.path.dirname(NODE)), "lib", "node"))
+    return paths
 
 
 def fail(message: str) -> int:
@@ -5783,17 +6030,18 @@ def main() -> int:
         if cli_error is not None:
             return fail(cli_error)
         # Round 40, 2026-08-20 (independent Claude opus/max round-39
-        # review, P1-2 item 4): see unexpected_ancestor_node_modules()'s
-        # own docstring -- refuses to exec at all if Node's own module
-        # resolution ancestor chain (which reaches well outside RELEASE_DIR
-        # and everything the two validate_exec_target() calls above cover)
-        # contains a node_modules location this installer never creates.
-        ancestor_node_modules = unexpected_ancestor_node_modules()
-        if ancestor_node_modules is not None:
+        # review, P1-2 item 4; extended round 43, P1-B): see
+        # unexpected_ancestor_node_modules()'s own docstring -- refuses to
+        # exec at all if Node's own module resolution (the ancestor
+        # node_modules walk, which reaches well outside RELEASE_DIR and
+        # everything the two validate_exec_target() calls above cover,
+        # PLUS the three Module.globalPaths locations node_global_folder_
+        # paths() adds) contains a location this installer never creates.
+        resolution_hit = unexpected_ancestor_node_modules()
+        if resolution_hit is not None:
             return fail(
-                "unexpected node_modules directory on Node's module "
-                "resolution ancestor chain outside the managed release: "
-                f"{{ancestor_node_modules}}"
+                "unexpected item on Node's own module resolution path "
+                f"outside the managed release: {{resolution_hit}}"
             )
         completed = subprocess.run(
             [NODE, CLI, *guarded_arguments(sys.argv[1:])],

@@ -2801,6 +2801,54 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             self.skipTest("no real Node binary available on PATH")
         return node
 
+    def _require_real_openssl_cli(self) -> str:
+        openssl = shutil.which("openssl")
+        if openssl is None:
+            self.skipTest("no real openssl CLI available on PATH")
+        return openssl
+
+    def _generate_self_signed_ca_and_leaf(
+        self, openssl: str, directory: Path
+    ) -> tuple[Path, Path, Path]:
+        # Round 43, P1-A: real CA + leaf certificate pair (via the real
+        # system `openssl` CLI, not a canned/committed fixture) used by
+        # the NODE_TLS_REJECT_UNAUTHORIZED and NODE_EXTRA_CA_CERTS
+        # regression tests below. Returns (ca_cert, leaf_cert, leaf_key).
+        ca_key = directory / "ca-key.pem"
+        ca_cert = directory / "ca-cert.pem"
+        leaf_key = directory / "leaf-key.pem"
+        leaf_csr = directory / "leaf.csr"
+        leaf_cert = directory / "leaf-cert.pem"
+        ext_file = directory / "leaf-ext.cnf"
+        ext_file.write_text(
+            "subjectAltName = DNS:localhost,IP:127.0.0.1\n", encoding="utf-8"
+        )
+        for argv in (
+            [
+                openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", os.fspath(ca_key), "-out", os.fspath(ca_cert),
+                "-days", "2", "-subj", "/CN=Orca Round43 Test CA",
+            ],
+            [
+                openssl, "req", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", os.fspath(leaf_key), "-out", os.fspath(leaf_csr),
+                "-subj", "/CN=localhost",
+            ],
+            [
+                openssl, "x509", "-req", "-in", os.fspath(leaf_csr),
+                "-CA", os.fspath(ca_cert), "-CAkey", os.fspath(ca_key),
+                "-CAcreateserial", "-out", os.fspath(leaf_cert),
+                "-days", "2", "-extfile", os.fspath(ext_file),
+            ],
+        ):
+            result = subprocess.run(
+                argv, capture_output=True, text=True, timeout=30, check=False
+            )
+            self.assertEqual(
+                result.returncode, 0, f"openssl setup failed: {result.stderr}"
+            )
+        return ca_cert, leaf_cert, leaf_key
+
     def test_scrubbed_node_environment_blocks_real_node_options_injection(
         self,
     ) -> None:
@@ -2831,7 +2879,17 @@ class PrimeAgentInstallerTests(unittest.TestCase):
 
             poisoned_env = dict(os.environ)
             poisoned_env["NODE_OPTIONS"] = f"--require={injected}"
-            poisoned_env["KEEP_ME"] = "still-here"
+            # Round 43, P1-A: round 40's scrubbed_node_environment() was a
+            # denylist, so an arbitrary unlisted variable name like
+            # "KEEP_ME" survived untouched (that was the whole point of a
+            # denylist). Now that it is an allowlist, an arbitrary,
+            # unreviewed name is exactly what MUST be dropped -- so this
+            # is now the negative control, not the positive one.
+            poisoned_env["KEEP_ME"] = "arbitrary-unreviewed-name"
+            # Positive control: a genuinely necessary, reviewed name
+            # (terminal detection -- see NODE_ENV_ALLOWED_NAMES) must
+            # still survive.
+            poisoned_env["TERM"] = "xterm-round43-keep-me"
 
             # Ground truth: real Node, run with this environment exactly as
             # inherited (no scrubbing at all), DOES execute the injected
@@ -2851,7 +2909,14 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 scrubbed_env = scrub()
             self.assertNotIn("NODE_OPTIONS", scrubbed_env)
             self.assertNotIn("NODE_PATH", scrubbed_env)
-            self.assertEqual(scrubbed_env.get("KEEP_ME"), "still-here")
+            self.assertNotIn(
+                "KEEP_ME",
+                scrubbed_env,
+                "an arbitrary, unreviewed variable name must NOT survive "
+                "an allowlist -- surviving here would mean this is still "
+                "effectively a denylist",
+            )
+            self.assertEqual(scrubbed_env.get("TERM"), "xterm-round43-keep-me")
 
             scrubbed_result = subprocess.run(
                 [node, os.fspath(cli)],
@@ -2865,6 +2930,437 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 "INJECTED_VIA_NODE_OPTIONS", scrubbed_result.stdout
             )
             self.assertIn("CLI_RAN", scrubbed_result.stdout)
+
+    def test_scrubbed_node_environment_blocks_real_node_tls_reject_unauthorized(
+        self,
+    ) -> None:
+        # Round 43, P1-A. Real, end-to-end reproduction of one of the two
+        # concrete findings round 42 added to round 40's NODE_OPTIONS/
+        # NODE_PATH-only denylist: a real self-signed TLS leaf certificate
+        # (via the real system `openssl` CLI, generated fresh -- not a
+        # canned fixture), a real loopback HTTPS/TLS server (real pinned-
+        # Node-version binary), and a real `tls.connect()` client. First
+        # proves the ground truth (an inherited NODE_TLS_REJECT_UNAUTHORIZED
+        # =0 really does make real Node accept a certificate it would
+        # otherwise refuse), then proves scrubbed_node_environment() closes
+        # it -- the same env dict, scrubbed, no longer honors the override.
+        node = self._require_real_node()
+        openssl = self._require_real_openssl_cli()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _ca_cert, leaf_cert, leaf_key = self._generate_self_signed_ca_and_leaf(
+                openssl, root
+            )
+            server_js = root / "server.js"
+            server_js.write_text(
+                "const https = require('https');\n"
+                "const fs = require('fs');\n"
+                "const server = https.createServer({\n"
+                f"  cert: fs.readFileSync({os.fspath(leaf_cert)!r}),\n"
+                f"  key: fs.readFileSync({os.fspath(leaf_key)!r}),\n"
+                "}, (req, res) => { res.end('OK'); });\n"
+                "server.listen(0, '127.0.0.1', () => {\n"
+                "  process.stdout.write('LISTENING:' + server.address().port + '\\n');\n"
+                "});\n",
+                encoding="utf-8",
+            )
+            client_js = root / "client.js"
+            client_js.write_text(
+                "const tls = require('tls');\n"
+                "const port = Number(process.argv[2]);\n"
+                "const socket = tls.connect({ host: '127.0.0.1', port, servername: 'localhost' }, () => {\n"
+                "  console.log('CLIENT_OK:authorized=' + socket.authorized);\n"
+                "  socket.end();\n"
+                "});\n"
+                "socket.on('error', (e) => console.log('CLIENT_ERR:' + e.code));\n"
+                "setTimeout(() => { console.log('CLIENT_TIMEOUT'); process.exit(1); }, 4000).unref();\n",
+                encoding="utf-8",
+            )
+            source = installer.managed_launch_guard_script(
+                Path(node), client_js, "a" * 64, "b" * 64
+            ).decode("utf-8")
+            namespace: dict[str, object] = {"__name__": "generated_launch_guard"}
+            exec(compile(source, "<generated-launch-guard>", "exec"), namespace)  # noqa: S102
+            scrub = namespace["scrubbed_node_environment"]
+
+            def run_client(env: dict[str, str]) -> str:
+                server = subprocess.Popen(
+                    [node, os.fspath(server_js)],
+                    env=dict(os.environ),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+                try:
+                    listening_line = server.stdout.readline()
+                    self.assertTrue(
+                        listening_line.startswith("LISTENING:"), listening_line
+                    )
+                    port = listening_line.strip().split(":", 1)[1]
+                    client = subprocess.run(
+                        [node, os.fspath(client_js), port],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    return client.stdout
+                finally:
+                    server.terminate()
+                    try:
+                        server.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        server.kill()
+                    if server.stdout is not None:
+                        server.stdout.close()
+
+            # Baseline: an unrelated environment (no override) -- real
+            # Node correctly REFUSES the self-signed leaf.
+            baseline_stdout = run_client(dict(os.environ))
+            self.assertIn("CLIENT_ERR:", baseline_stdout)
+            self.assertNotIn("CLIENT_OK", baseline_stdout)
+
+            poisoned_env = dict(os.environ)
+            poisoned_env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
+
+            # Ground truth: real Node, given this poisoned env exactly as
+            # inherited, DOES accept the untrusted certificate.
+            unscrubbed_stdout = run_client(poisoned_env)
+            self.assertIn("CLIENT_OK:authorized=false", unscrubbed_stdout)
+
+            with mock.patch.dict(os.environ, poisoned_env, clear=True):
+                scrubbed_env = scrub()
+            self.assertNotIn("NODE_TLS_REJECT_UNAUTHORIZED", scrubbed_env)
+
+            # Fix confirmed: real Node, run with the scrubbed environment
+            # (built from the SAME poisoned input), refuses again.
+            scrubbed_stdout = run_client(scrubbed_env)
+            self.assertIn("CLIENT_ERR:", scrubbed_stdout)
+            self.assertNotIn("CLIENT_OK", scrubbed_stdout)
+
+    def test_scrubbed_node_environment_blocks_real_node_extra_ca_certs(
+        self,
+    ) -> None:
+        # Round 43, P1-A. Real, end-to-end reproduction of the second
+        # concrete finding: a real CA cert + a leaf cert it signs (both
+        # via the real system `openssl` CLI), and NODE_EXTRA_CA_CERTS
+        # pointed at the CA -- real Node genuinely trusts the leaf when
+        # this is inherited; scrubbed_node_environment() must remove it.
+        node = self._require_real_node()
+        openssl = self._require_real_openssl_cli()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ca_cert, leaf_cert, leaf_key = self._generate_self_signed_ca_and_leaf(
+                openssl, root
+            )
+            server_js = root / "server.js"
+            server_js.write_text(
+                "const https = require('https');\n"
+                "const fs = require('fs');\n"
+                "const server = https.createServer({\n"
+                f"  cert: fs.readFileSync({os.fspath(leaf_cert)!r}),\n"
+                f"  key: fs.readFileSync({os.fspath(leaf_key)!r}),\n"
+                "}, (req, res) => { res.end('OK'); });\n"
+                "server.listen(0, '127.0.0.1', () => {\n"
+                "  process.stdout.write('LISTENING:' + server.address().port + '\\n');\n"
+                "});\n",
+                encoding="utf-8",
+            )
+            client_js = root / "client.js"
+            client_js.write_text(
+                "const tls = require('tls');\n"
+                "const port = Number(process.argv[2]);\n"
+                "const socket = tls.connect({ host: '127.0.0.1', port, servername: 'localhost' }, () => {\n"
+                "  console.log('CLIENT_OK:authorized=' + socket.authorized);\n"
+                "  socket.end();\n"
+                "});\n"
+                "socket.on('error', (e) => console.log('CLIENT_ERR:' + e.code));\n"
+                "setTimeout(() => { console.log('CLIENT_TIMEOUT'); process.exit(1); }, 4000).unref();\n",
+                encoding="utf-8",
+            )
+            source = installer.managed_launch_guard_script(
+                Path(node), client_js, "a" * 64, "b" * 64
+            ).decode("utf-8")
+            namespace: dict[str, object] = {"__name__": "generated_launch_guard"}
+            exec(compile(source, "<generated-launch-guard>", "exec"), namespace)  # noqa: S102
+            scrub = namespace["scrubbed_node_environment"]
+
+            def run_client(env: dict[str, str]) -> str:
+                server = subprocess.Popen(
+                    [node, os.fspath(server_js)],
+                    env=dict(os.environ),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+                try:
+                    listening_line = server.stdout.readline()
+                    self.assertTrue(
+                        listening_line.startswith("LISTENING:"), listening_line
+                    )
+                    port = listening_line.strip().split(":", 1)[1]
+                    client = subprocess.run(
+                        [node, os.fspath(client_js), port],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    return client.stdout
+                finally:
+                    server.terminate()
+                    try:
+                        server.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        server.kill()
+                    if server.stdout is not None:
+                        server.stdout.close()
+
+            poisoned_env = dict(os.environ)
+            poisoned_env["NODE_EXTRA_CA_CERTS"] = os.fspath(ca_cert)
+
+            # Ground truth: real Node, given this poisoned env exactly as
+            # inherited, trusts the leaf via the injected CA.
+            unscrubbed_stdout = run_client(poisoned_env)
+            self.assertIn("CLIENT_OK:authorized=true", unscrubbed_stdout)
+
+            with mock.patch.dict(os.environ, poisoned_env, clear=True):
+                scrubbed_env = scrub()
+            self.assertNotIn("NODE_EXTRA_CA_CERTS", scrubbed_env)
+
+            # Fix confirmed: real Node, run with the scrubbed environment,
+            # no longer trusts the leaf.
+            scrubbed_stdout = run_client(scrubbed_env)
+            self.assertIn("CLIENT_ERR:", scrubbed_stdout)
+            self.assertNotIn("CLIENT_OK", scrubbed_stdout)
+
+    def test_scrubbed_node_environment_blocks_real_node_compile_cache_write(
+        self,
+    ) -> None:
+        # Round 43, P1-A. NODE_COMPILE_CACHE (https://nodejs.org/api/
+        # module.html#module-compile-cache) was only ever indirectly
+        # blocked, pre-round-43, via this installer's own separate
+        # NODE_DISABLE_COMPILE_CACHE=1 export -- it was never itself in
+        # round 40's five-key denylist. Real, observable reproduction:
+        # setting it to an attacker-chosen directory really does cause
+        # real Node to write real V8 compile-cache files there.
+        node = self._require_real_node()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            cli = root / "cli.js"
+            cli.write_text("console.log('CLI_RAN');\n", encoding="utf-8")
+            source = installer.managed_launch_guard_script(
+                Path(node), cli, "a" * 64, "b" * 64
+            ).decode("utf-8")
+            namespace: dict[str, object] = {"__name__": "generated_launch_guard"}
+            exec(compile(source, "<generated-launch-guard>", "exec"), namespace)  # noqa: S102
+            scrub = namespace["scrubbed_node_environment"]
+
+            attacker_cache_dir = root / "attacker-observed-cache"
+            attacker_cache_dir.mkdir()
+            poisoned_env = dict(os.environ)
+            poisoned_env["NODE_COMPILE_CACHE"] = os.fspath(attacker_cache_dir)
+
+            # Ground truth: real Node, given this poisoned env exactly as
+            # inherited, DOES write cache files into the attacker's
+            # chosen directory.
+            unscrubbed_result = subprocess.run(
+                [node, os.fspath(cli)],
+                env=poisoned_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertIn("CLI_RAN", unscrubbed_result.stdout)
+            self.assertNotEqual(
+                list(attacker_cache_dir.iterdir()),
+                [],
+                "real Node did not write to NODE_COMPILE_CACHE -- test "
+                "assumption invalid for this Node build/version",
+            )
+
+            for entry in attacker_cache_dir.rglob("*"):
+                if entry.is_file():
+                    entry.unlink()
+            for entry in sorted(
+                attacker_cache_dir.rglob("*"), key=lambda p: -len(p.parts)
+            ):
+                if entry.is_dir():
+                    entry.rmdir()
+            self.assertEqual(list(attacker_cache_dir.iterdir()), [])
+
+            with mock.patch.dict(os.environ, poisoned_env, clear=True):
+                scrubbed_env = scrub()
+            self.assertNotIn("NODE_COMPILE_CACHE", scrubbed_env)
+
+            # Fix confirmed: real Node, run with the scrubbed environment
+            # (built from the SAME poisoned input), writes nothing there.
+            scrubbed_result = subprocess.run(
+                [node, os.fspath(cli)],
+                env=scrubbed_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertIn("CLI_RAN", scrubbed_result.stdout)
+            self.assertEqual(list(attacker_cache_dir.iterdir()), [])
+
+    def test_scrubbed_node_environment_excludes_openssl_conf_and_native_loading_vars(
+        self,
+    ) -> None:
+        # Round 43, P1-A. OPENSSL_CONF is Node's own documented
+        # environment variable for exactly the "influences code loading"
+        # category round 42 flagged (https://nodejs.org/api/cli.html --
+        # OpenSSL configuration file). This round built a REAL, compiled,
+        # harmless marker .dylib and a real OpenSSL 3.x `[provider_sect]`
+        # config activating it, and confirmed the underlying MECHANISM is
+        # real: the real system `openssl` CLI (a dynamically-linked
+        # OpenSSL 3.6.x build) genuinely dlopen()'d it and ran its
+        # constructor. Against this installer's exact pinned Node binary
+        # specifically, though, that same config/exec chain did not
+        # reproduce in real testing (this Node build's statically-linked,
+        # non-FIPS OpenSSL did not visibly consult OPENSSL_CONF for
+        # provider auto-activation for a plain script or for
+        # `--openssl-config=<file>`) -- Node's own docs hedge this
+        # variable's effect as being "among other uses... to enable
+        # FIPS-compliant crypto if Node.js is built with ./configure
+        # --openssl-fips", consistent with what was observed
+        # (process.config.variables.openssl_is_fips is false here). This
+        # is exactly the "safer/simpler proxy" this round's dispatch
+        # explicitly allows for a case where a full live-dlopen
+        # reproduction is impractical against the actual pinned binary --
+        # so this test proves the specific env var is genuinely stripped
+        # by the real generated scrubbed_node_environment() (not merely
+        # that some function returns an expected dict shape), while being
+        # honest that end-to-end exploitation was not reproducible
+        # against this exact pinned Node build.
+        node = self._require_real_node()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            cli = root / "cli.js"
+            cli.write_text("console.log('CLI_RAN');\n", encoding="utf-8")
+            source = installer.managed_launch_guard_script(
+                Path(node), cli, "a" * 64, "b" * 64
+            ).decode("utf-8")
+            namespace: dict[str, object] = {"__name__": "generated_launch_guard"}
+            exec(compile(source, "<generated-launch-guard>", "exec"), namespace)  # noqa: S102
+            scrub = namespace["scrubbed_node_environment"]
+
+            poisoned_env = dict(os.environ)
+            poisoned_env["OPENSSL_CONF"] = os.fspath(root / "attacker.cnf")
+            poisoned_env["OPENSSL_MODULES"] = os.fspath(root / "attacker-modules")
+            poisoned_env["OPENSSL_ENGINES"] = os.fspath(root / "attacker-engines")
+            poisoned_env["SSL_CERT_FILE"] = os.fspath(root / "attacker-ca.pem")
+            poisoned_env["SSL_CERT_DIR"] = os.fspath(root / "attacker-ca-dir")
+            poisoned_env["NODE_ICU_DATA"] = os.fspath(root / "attacker-icu")
+            poisoned_env["NODE_REDIRECT_WARNINGS"] = os.fspath(
+                root / "attacker-warnings.log"
+            )
+            poisoned_env["NODE_V8_COVERAGE"] = os.fspath(root / "attacker-coverage")
+            poisoned_env["NODE_REPL_HISTORY"] = os.fspath(
+                root / "attacker-repl-history"
+            )
+            poisoned_env["NAPI_RS_NATIVE_LIBRARY_PATH"] = os.fspath(
+                root / "attacker-native.so"
+            )
+
+            with mock.patch.dict(os.environ, poisoned_env, clear=True):
+                scrubbed_env = scrub()
+            for excluded in (
+                "OPENSSL_CONF", "OPENSSL_MODULES", "OPENSSL_ENGINES",
+                "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_ICU_DATA",
+                "NODE_REDIRECT_WARNINGS", "NODE_V8_COVERAGE",
+                "NODE_REPL_HISTORY", "NAPI_RS_NATIVE_LIBRARY_PATH",
+            ):
+                self.assertNotIn(excluded, scrubbed_env)
+
+            # Sanity: the CLI itself still runs fine with the scrubbed
+            # environment (none of these were ever legitimately needed).
+            result = subprocess.run(
+                [node, os.fspath(cli)],
+                env=scrubbed_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertIn("CLI_RAN", result.stdout)
+
+    def test_scrubbed_node_environment_preserves_necessary_session_and_credential_variables(
+        self,
+    ) -> None:
+        # Round 43, P1-A positive control: converting to an allowlist
+        # must not silently drop variables this installer's own generated
+        # wrapper sets (README.md "For session starts it also:") or that
+        # the real, materialized upstream bundle genuinely reads to
+        # function as a multi-provider AI coding agent (confirmed by
+        # inspecting the real extracted v0.7.2 release tree this round).
+        node = self._require_real_node()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            cli = root / "cli.js"
+            cli.write_text("console.log('CLI_RAN');\n", encoding="utf-8")
+            source = installer.managed_launch_guard_script(
+                Path(node), cli, "a" * 64, "b" * 64
+            ).decode("utf-8")
+            namespace: dict[str, object] = {"__name__": "generated_launch_guard"}
+            exec(compile(source, "<generated-launch-guard>", "exec"), namespace)  # noqa: S102
+            scrub = namespace["scrubbed_node_environment"]
+
+            necessary = {
+                # This installer's own generated env (managed_entrypoint_
+                # script()'s exports).
+                "PRIME_AGENT_CODING_AGENT_DIR": "/managed/state/agent",
+                "PRIME_AGENT_LAUNCHER_PATH": "/managed/bin/prime-agent",
+                "PRIME_AGENT_SESSION_DIR": "/managed/sessions",
+                "PRIME_AGENT_CODING_AGENT_SESSION_DIR": "/managed/sessions",
+                "NODE_DISABLE_COMPILE_CACHE": "1",
+                "DO_NOT_TRACK": "1",
+                "PI_SKIP_VERSION_CHECK": "1",
+                "PRIME_AGENT_TELEMETRY": "0",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "ORCA_PRIME_AGENT_RESOURCE_GUARD": "1",
+                # Session basics.
+                "HOME": "/Users/example",
+                "PATH": "/usr/bin:/bin",
+                "TERM": "xterm-256color",
+                "LANG": "en_US.UTF-8",
+                "LC_ALL": "C",
+                "TMPDIR": "/tmp/example",
+                # Real upstream-bundle-read provider credentials.
+                "ANTHROPIC_API_KEY": "sk-ant-example",
+                "OPENAI_API_KEY": "sk-openai-example",
+                "AWS_ACCESS_KEY_ID": "AKIA-example",
+                "GOOGLE_APPLICATION_CREDENTIALS": "/creds.json",
+            }
+            poisoned_env = dict(os.environ)
+            poisoned_env.update(necessary)
+            with mock.patch.dict(os.environ, poisoned_env, clear=True):
+                scrubbed_env = scrub()
+            for key, value in necessary.items():
+                self.assertEqual(
+                    scrubbed_env.get(key),
+                    value,
+                    f"{key} was dropped by the allowlist but is genuinely needed",
+                )
+
+            # And the tool still functions with this exact scrubbed
+            # environment (the empirical acceptance bar the round-43
+            # dispatch specifically asked for).
+            result = subprocess.run(
+                [node, os.fspath(cli)],
+                env=scrubbed_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("CLI_RAN", result.stdout)
 
     def test_unexpected_ancestor_node_modules_detects_real_node_rce_path(
         self,
@@ -3028,10 +3524,368 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             (tool_root / "node_modules").mkdir(mode=0o700)
             returncode, stderr_output = run_main()
             self.assertNotEqual(returncode, 0)
+            # Round 43: main()'s fail() message was generalized (the same
+            # check now also covers Module.globalPaths locations that are
+            # not literally named "node_modules" -- see the round-43 test
+            # class below) -- this is the exact new wording.
             self.assertIn(
-                "unexpected node_modules directory", stderr_output
+                "unexpected item on Node's own module resolution path",
+                stderr_output,
             )
             self.assertFalse(marker.exists())
+
+    # Round 43, 2026-08-20 (independent Claude opus/max round-42 review,
+    # P1-B): the tests below extend round 40's ancestor-only
+    # unexpected_ancestor_node_modules()/assert_no_unexpected_ancestor_
+    # node_modules() coverage to real Node's Module.globalPaths locations
+    # ($HOME/.node_modules, $HOME/.node_libraries, and
+    # <release>/toolchain/lib/node). All real-HOME-dependent tests use a
+    # temporary directory as HOME (never the real user's home directory).
+
+    def test_node_global_folder_paths_matches_real_node_globalpaths(
+        self,
+    ) -> None:
+        # Ground-truths BOTH independent implementations (the generated
+        # launch guard's node_global_folder_paths() and the real
+        # installer module's own node_global_folder_paths(release_dir))
+        # against real Node's own require('module').globalPaths output,
+        # for both a HOME-set and a HOME-unset scenario.
+        node = self._require_real_node()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "tool/releases/v0.7.2"
+            toolchain_bin = release / "toolchain/bin"
+            toolchain_bin.mkdir(parents=True)
+            node_copy = toolchain_bin / "node"
+            shutil.copy(Path(node).resolve(), node_copy)
+            os.chmod(node_copy, 0o700)
+            fake_home = root / "fake-home"
+            fake_home.mkdir()
+
+            def real_global_paths(env: dict[str, str]) -> list[str]:
+                result = subprocess.run(
+                    [
+                        os.fspath(node_copy), "-e",
+                        "console.log(JSON.stringify(require('module').globalPaths))",
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(result.stdout)
+
+            for env_home in (None, os.fspath(fake_home)):
+                env = {"PATH": os.environ.get("PATH", "")}
+                if env_home is not None:
+                    env["HOME"] = env_home
+                real_paths = real_global_paths(env)
+
+                # Generated launch-guard side (module-level NODE global).
+                source = installer.managed_launch_guard_script(
+                    node_copy, root / "cli.js", "a" * 64, "b" * 64
+                ).decode("utf-8")
+                namespace: dict[str, object] = {"__name__": "generated_launch_guard"}
+                exec(compile(source, "<generated-launch-guard>", "exec"), namespace)  # noqa: S102
+                with mock.patch.dict(os.environ, env, clear=True):
+                    generated_paths = namespace["node_global_folder_paths"]()
+                self.assertEqual(
+                    sorted(generated_paths), sorted(real_paths),
+                    f"generated-side mismatch for HOME={env_home!r}",
+                )
+
+                # Real installer module side (verify()'s own copy).
+                with mock.patch.dict(os.environ, env, clear=True):
+                    installer_paths = installer.node_global_folder_paths(release)
+                self.assertEqual(
+                    sorted(installer_paths), sorted(real_paths),
+                    f"installer-module-side mismatch for HOME={env_home!r}",
+                )
+
+    def test_unexpected_ancestor_node_modules_detects_real_home_global_folders(
+        self,
+    ) -> None:
+        # Real reproduction of the reviewer's exact $HOME/.node_modules
+        # scenario (using a temp HOME), plus its sibling
+        # $HOME/.node_libraries: real Node genuinely loads and executes a
+        # package planted there, and the generated launch guard's
+        # unexpected_ancestor_node_modules() -- extended this round --
+        # detects both.
+        node = self._require_real_node()
+        for global_folder_name, package_name in (
+            (".node_modules", "orca-marker-package"),
+            (".node_libraries", "orca-marker-package"),
+        ):
+            with self.subTest(global_folder_name=global_folder_name):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory).resolve()
+                    release = root / "tool-root/releases/v0.7.2"
+                    bundle_dir = release / "lib/node_modules/prime-agent/dist/bundle"
+                    bundle_dir.mkdir(parents=True)
+                    cli = bundle_dir / "cli.js"
+                    cli.write_text(
+                        f"try {{ require({package_name!r}); }} "
+                        "catch (e) { console.log('NOT_LOADED:' + e.code); }\n",
+                        encoding="utf-8",
+                    )
+                    fake_home = root / "fake-home"
+                    fake_home.mkdir()
+
+                    # Sanity: nothing planted yet.
+                    clean_result = subprocess.run(
+                        [node, os.fspath(cli)],
+                        env={"HOME": os.fspath(fake_home), "PATH": os.environ.get("PATH", "")},
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=False,
+                    )
+                    self.assertIn("NOT_LOADED:MODULE_NOT_FOUND", clean_result.stdout)
+
+                    global_folder = fake_home / global_folder_name
+                    package_dir = global_folder / package_name
+                    package_dir.mkdir(parents=True)
+                    (package_dir / "package.json").write_text(
+                        json.dumps({"name": package_name, "main": "index.js"}),
+                        encoding="utf-8",
+                    )
+                    (package_dir / "index.js").write_text(
+                        "console.log('EXPLOIT_EXECUTED_VIA_' + "
+                        + repr(global_folder_name.upper().lstrip("."))
+                        + ");\n",
+                        encoding="utf-8",
+                    )
+
+                    # Ground truth: real Node, invoked directly (no
+                    # guard), DOES load and execute the planted package.
+                    exploited_result = subprocess.run(
+                        [node, os.fspath(cli)],
+                        env={"HOME": os.fspath(fake_home), "PATH": os.environ.get("PATH", "")},
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=False,
+                    )
+                    self.assertIn(
+                        "EXPLOIT_EXECUTED_VIA_", exploited_result.stdout
+                    )
+
+                    # Confirm the generated launch guard's own check
+                    # detects this identical layout.
+                    with mock.patch.object(installer, "RELEASE_DIR", release):
+                        source = installer.managed_launch_guard_script(
+                            Path(node), cli, "a" * 64, "b" * 64
+                        ).decode("utf-8")
+                    namespace: dict[str, object] = {
+                        "__name__": "generated_launch_guard"
+                    }
+                    exec(compile(source, "<generated-launch-guard>", "exec"), namespace)  # noqa: S102
+                    with mock.patch.dict(
+                        os.environ, {"HOME": os.fspath(fake_home)}, clear=True
+                    ):
+                        detected = namespace["unexpected_ancestor_node_modules"]()
+                    self.assertEqual(detected, os.fspath(global_folder))
+
+    def test_unexpected_ancestor_node_modules_detects_real_toolchain_lib_node_global_folder(
+        self,
+    ) -> None:
+        # Real reproduction of the third Module.globalPaths location:
+        # <node prefix>/lib/node, which on this installer's fixed
+        # toolchain layout is RELEASE_DIR/toolchain/lib/node -- INSIDE
+        # release_dir, not an ancestor, so round 40's ancestor walk alone
+        # never reaches it.
+        node = self._require_real_node()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "tool-root/releases/v0.7.2"
+            toolchain_bin = release / "toolchain/bin"
+            toolchain_bin.mkdir(parents=True)
+            node_copy = toolchain_bin / "node"
+            shutil.copy(Path(node).resolve(), node_copy)
+            os.chmod(node_copy, 0o700)
+            bundle_dir = release / "lib/node_modules/prime-agent/dist/bundle"
+            bundle_dir.mkdir(parents=True)
+            cli = bundle_dir / "cli.js"
+            cli.write_text(
+                "try { require('orca-marker-package'); } "
+                "catch (e) { console.log('NOT_LOADED:' + e.code); }\n",
+                encoding="utf-8",
+            )
+            fake_home = root / "fake-home"
+            fake_home.mkdir()
+            run_env = {"HOME": os.fspath(fake_home), "PATH": os.environ.get("PATH", "")}
+
+            clean_result = subprocess.run(
+                [os.fspath(node_copy), os.fspath(cli)],
+                env=run_env, capture_output=True, text=True, timeout=15, check=False,
+            )
+            self.assertIn("NOT_LOADED:MODULE_NOT_FOUND", clean_result.stdout)
+
+            global_folder = release / "toolchain/lib/node"
+            package_dir = global_folder / "orca-marker-package"
+            package_dir.mkdir(parents=True)
+            (package_dir / "package.json").write_text(
+                json.dumps({"name": "orca-marker-package", "main": "index.js"}),
+                encoding="utf-8",
+            )
+            (package_dir / "index.js").write_text(
+                "console.log('EXPLOIT_EXECUTED_VIA_TOOLCHAIN_LIB_NODE');\n",
+                encoding="utf-8",
+            )
+
+            exploited_result = subprocess.run(
+                [os.fspath(node_copy), os.fspath(cli)],
+                env=run_env, capture_output=True, text=True, timeout=15, check=False,
+            )
+            self.assertIn(
+                "EXPLOIT_EXECUTED_VIA_TOOLCHAIN_LIB_NODE", exploited_result.stdout
+            )
+
+            with mock.patch.object(installer, "RELEASE_DIR", release):
+                source = installer.managed_launch_guard_script(
+                    node_copy, cli, "a" * 64, "b" * 64
+                ).decode("utf-8")
+            namespace: dict[str, object] = {"__name__": "generated_launch_guard"}
+            exec(compile(source, "<generated-launch-guard>", "exec"), namespace)  # noqa: S102
+            with mock.patch.dict(os.environ, run_env, clear=True):
+                detected = namespace["unexpected_ancestor_node_modules"]()
+            self.assertEqual(detected, os.fspath(global_folder))
+
+    def test_launch_guard_main_refuses_before_real_exec_when_home_node_modules_global_folder_present(
+        self,
+    ) -> None:
+        # Full main() wiring, end to end, for the new global-folder check
+        # (mirrors test_launch_guard_main_refuses_before_real_exec_when_
+        # ancestor_node_modules_present above, which covers the plain
+        # ancestor walk) -- uses a temp HOME so real Node's own
+        # Module.globalPaths genuinely includes it.
+        node = self._require_real_node()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            bundle_dir = release / "lib/node_modules/prime-agent/dist/bundle"
+            bundle_dir.mkdir(parents=True, mode=0o700)
+            marker = root / "cli-ran.marker"
+            cli = bundle_dir / "cli.js"
+            cli.write_text(
+                "require('fs').writeFileSync(" + repr(os.fspath(marker)) + ", 'ran');\n",
+                encoding="utf-8",
+            )
+            os.chmod(cli, 0o600)
+            lock = tool_root / "lifecycle.lock"
+            lock.write_bytes(b"")
+            os.chmod(lock, 0o600)
+            for directory_path in (root, tool_root, release.parent, release):
+                os.chmod(directory_path, 0o700)
+            node_copy = root / "node"
+            shutil.copy(Path(node).resolve(), node_copy)
+            os.chmod(node_copy, 0o700)
+            fake_home = root / "fake-home"
+            fake_home.mkdir(mode=0o700)
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+            ):
+                source = installer.managed_launch_guard_script(
+                    node_copy, cli,
+                    installer.sha256_file(node_copy), installer.sha256_file(cli),
+                ).decode("utf-8")
+            namespace: dict[str, object] = {"__name__": "generated_launch_guard"}
+            exec(compile(source, "<generated-launch-guard>", "exec"), namespace)  # noqa: S102
+
+            def run_main() -> tuple[int, str]:
+                buffer = io.StringIO()
+                with (
+                    mock.patch.object(sys, "argv", ["prime-agent-launch-guard.py"]),
+                    mock.patch.dict(
+                        os.environ, {"HOME": os.fspath(fake_home)}, clear=True
+                    ),
+                    contextlib.redirect_stderr(buffer),
+                ):
+                    returncode = namespace["main"]()
+                return returncode, buffer.getvalue()
+
+            # Sanity: clean tree, real Node genuinely runs CLI end to end.
+            returncode, stderr_output = run_main()
+            self.assertEqual(returncode, 0, stderr_output)
+            self.assertTrue(marker.exists())
+            marker.unlink()
+
+            # Plant a package at $HOME/.node_modules -- main() must
+            # refuse BEFORE Node ever runs; the marker must never appear.
+            (fake_home / ".node_modules").mkdir(mode=0o700)
+            returncode, stderr_output = run_main()
+            self.assertNotEqual(returncode, 0)
+            self.assertIn(
+                "unexpected item on Node's own module resolution path",
+                stderr_output,
+            )
+            self.assertFalse(marker.exists())
+
+    def test_assert_no_unexpected_ancestor_node_modules_catches_home_global_folders(
+        self,
+    ) -> None:
+        # verify()-side counterpart -- pure Python logic, no real Node
+        # needed here (the real-Node grounding is established by the
+        # tests above); uses a temp HOME, never the real user's home.
+        for global_folder_name in (".node_modules", ".node_libraries"):
+            with self.subTest(global_folder_name=global_folder_name):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory).resolve()
+                    release = root / "tool/releases/v0.7.2"
+                    release.mkdir(parents=True)
+                    fake_home = root / "fake-home"
+                    (fake_home / global_folder_name).mkdir(parents=True)
+                    with mock.patch.dict(
+                        os.environ, {"HOME": os.fspath(fake_home)}, clear=True
+                    ):
+                        with self.assertRaises(installer.PrimeInstallError):
+                            installer.assert_no_unexpected_ancestor_node_modules(
+                                release
+                            )
+
+    def test_assert_no_unexpected_ancestor_node_modules_catches_toolchain_lib_node(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "tool/releases/v0.7.2"
+            (release / "toolchain/lib/node").mkdir(parents=True)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    r"toolchain/lib/node$",
+                ):
+                    installer.assert_no_unexpected_ancestor_node_modules(release)
+
+    def test_assert_no_unexpected_ancestor_node_modules_ignores_home_globals_when_home_unset_or_empty(
+        self,
+    ) -> None:
+        # Mirrors real Node's own `if (homeDir)` check (see
+        # node_global_folder_paths()'s docstring): an unset OR empty HOME
+        # means the two HOME-based locations are not even considered --
+        # so planting them must NOT cause a false-positive refusal.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "tool/releases/v0.7.2"
+            release.mkdir(parents=True)
+            # A directory OUTSIDE root entirely -- if this function ever
+            # (incorrectly) treated a missing/empty HOME as "" and
+            # resolved ".node_modules" relative to it, this would land
+            # somewhere unrelated; either way this must not raise, since
+            # real Node never adds these paths when HOME is unset/empty.
+            for home_value in (None, ""):
+                environ_override = {} if home_value is None else {"HOME": home_value}
+                with mock.patch.dict(os.environ, environ_override, clear=True):
+                    if home_value is None:
+                        os.environ.pop("HOME", None)
+                    # Must not raise.
+                    installer.assert_no_unexpected_ancestor_node_modules(release)
 
     def test_pending_install_commits_with_command_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
