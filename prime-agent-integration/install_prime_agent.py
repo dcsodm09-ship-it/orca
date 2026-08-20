@@ -3583,6 +3583,61 @@ def assert_materialized_node_modules_matches_lock(
     fix (which structurally closes the same exploitation path a different
     way -- see that function's own docstring): either mechanism alone
     already refuses the same-UID plant this paragraph describes.
+
+    Round 41, 2026-08-20 (independent Codex sol/max round-39 review, P1-C):
+    the round-38 reverse-direction nested check above used to treat "this
+    container's own `container_path` is absent from `materialized_by_container`"
+    as ONE case -- the container's parent package directory was never
+    materialized -- and skip it unconditionally, deferring to the
+    top-level (or an ancestor nested) check to justify the parent's own
+    absence. That conflated two genuinely different situations:
+    `_walk_nested_node_modules_containers()` never queues a nested
+    container's `container_path` at all when its own parent package
+    directory was never materialized (nothing to look inside), but it
+    ALSO never queues one when the parent package directory IS
+    materialized yet simply has no "node_modules" subdirectory of its own
+    -- `_find_nested_node_modules_containers()` finds nothing under it, so
+    zero queue entries are added either way. Both are therefore
+    indistinguishable from `containers`' own shape alone. Reproduced
+    exactly as Codex described: a full installer-orchestration fixture
+    with node_modules/prime-agent materialized and verified, its declared
+    node_modules/prime-agent/node_modules/<child> row present and NOT
+    platform-excluded, but no node_modules/prime-agent/node_modules
+    directory on disk at all -- both this function's structural calls
+    skipped the gap entirely, the pin builder marked the child skipped,
+    the post-move check found no directory to complain about, and
+    tree_digest()'s deny-unknown had no materialized path to even see, so
+    the install reached finalize() with a genuinely missing, declared,
+    non-platform-excluded dependency and nothing anywhere caught it.
+
+    Fixed by disambiguating the two cases below using
+    `materialized_package_lock_paths` -- built from the SAME `containers`
+    list this function already collected via the one real filesystem walk
+    above (no second walk, no new filesystem access): a package is a
+    member of that set if and only if its own containing container was
+    actually walked, i.e. it is genuinely present and already
+    structurally verified by the diff loop earlier in this function. When
+    `container_path` is absent from `materialized_by_container`, its own
+    parent package's lock_path (`container_path` with the trailing
+    "/node_modules" removed -- always well-formed, since
+    declared_nested_node_modules_packages() only ever produces a
+    container_path of the form "<parent_lock_path>/node_modules") is
+    looked up in `materialized_package_lock_paths`: absent means the
+    parent itself was never materialized (the pre-round-41 skip still
+    applies, unchanged, for exactly the same reason given in the comment
+    at that `continue`); present means the parent IS materialized but its
+    own nested node_modules/ container is not, in which case every one of
+    that container's declared children is treated as missing and, unless
+    individually justified by its own row's os/cpu platform exclusion
+    (the identical `lock_row_platform_excludes_current_target()` mechanism
+    the top-level and already-walked-nested cases use), fails this call
+    closed. Because `materialized_package_lock_paths` is assembled from
+    EVERY entry of `containers` (the top level and every container
+    actually reached, at any depth `_walk_nested_node_modules_containers()`
+    walked), this resolves correctly at arbitrary nesting depth -- a
+    doubly-nested child's own container being absent is diagnosed the same
+    way, one level deeper, with no special-casing for exactly one level of
+    nesting.
     """
     node_modules_root = release_dir / "node_modules"
     if node_modules_root.is_symlink() or not node_modules_root.is_dir():
@@ -3631,18 +3686,60 @@ def assert_materialized_node_modules_matches_lock(
     materialized_by_container = {
         container_path: names for container_path, names in containers[1:]
     }
+    # Round 41, 2026-08-20 (P1-C): every package genuinely materialized at
+    # ANY depth this walk actually reached, keyed the same lock_path-style
+    # string convention as `declared_top_level`/`declared_nested`'s own
+    # keys -- built purely from `containers` (already collected above via
+    # the one real filesystem walk this function performs; no second walk
+    # here). Used below to tell "this container's own parent package was
+    # never materialized at all" apart from "the parent IS materialized
+    # but its own nested node_modules/ container is absent" -- see this
+    # function's own round-41 docstring paragraph for why `containers`'
+    # shape alone cannot distinguish the two.
+    materialized_package_lock_paths = {
+        f"{container_path}/{name}"
+        for container_path, names in containers
+        for name in names
+    }
     for container_path, declared_names in declared_nested.items():
         if container_path not in materialized_by_container:
-            # The container itself was never walked because its own parent
-            # package directory was not materialized -- if that parent's
-            # own absence is unjustified, the top-level (or an ancestor
-            # nested) check above already catches IT; nothing here can
-            # independently justify a specific child of a container that
-            # does not exist at all, and treating "parent legitimately
-            # platform-skipped" as implying "every declared child of its
-            # nested node_modules is ALSO individually platform-excluded"
-            # would not generally be true, so this is deliberately skipped
-            # rather than guessed at.
+            # This container's own parent package's lock_path -- always
+            # well-formed here, since declared_nested_node_modules_packages()
+            # only ever produces a container_path of the form
+            # "<parent_lock_path>/node_modules".
+            parent_lock_path = container_path[: -len("/node_modules")]
+            if parent_lock_path not in materialized_package_lock_paths:
+                # The parent package directory itself was never
+                # materialized -- if that parent's own absence is
+                # unjustified, the top-level (or an ancestor nested) check
+                # above already catches IT; nothing here can independently
+                # justify a specific child of a container whose own parent
+                # does not exist, and treating "parent legitimately
+                # platform-skipped" as implying "every declared child of
+                # its nested node_modules is ALSO individually
+                # platform-excluded" would not generally be true, so this
+                # is deliberately skipped rather than guessed at.
+                continue
+            # Round 41 (P1-C): the parent package IS materialized (present
+            # on disk, already verified by the diff loop above) -- its own
+            # nested node_modules/ container is simply absent, even though
+            # the lock declares children for it. None of those declared
+            # children can possibly be materialized (the container holding
+            # them does not exist at all), so every one is treated as
+            # missing here, subject to the identical os/cpu platform-
+            # exclusion justification the already-walked-container branch
+            # below applies.
+            for name in sorted(declared_names):
+                lock_path = f"{container_path}/{name}"
+                row = packages.get(lock_path)
+                if row is not None and not lock_row_platform_excludes_current_target(row):
+                    raise PrimeInstallError(
+                        "declared nested node_modules package's own parent "
+                        "container is absent from the materialized tree "
+                        "even though its parent package is present, and is "
+                        "not justified by an os/cpu platform constraint on "
+                        f"its own lock row: {lock_path}"
+                    )
             continue
         materialized_names = materialized_by_container[container_path]
         missing_nested = sorted(declared_names - materialized_names)

@@ -12774,6 +12774,144 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 },
             )
 
+    def test_assert_materialized_node_modules_matches_lock_reverse_nested_parent_present_container_absent(
+        self,
+    ) -> None:
+        # Round 41 regression (independent Codex sol/max round-39 review,
+        # P1-C): unlike the sibling
+        # ..._reverse_nested_container_absent_is_skipped test above, here
+        # the PARENT package directory genuinely IS materialized on disk
+        # (present, and not platform-excluded -- the top-level reverse
+        # check for it would pass) -- only its own nested node_modules/
+        # container is absent, even though the lock declares a
+        # non-platform-excluded child for that container. Before the
+        # round-41 fix, this went completely unnoticed: `container_path`
+        # not being in `materialized_by_container` was treated identically
+        # to the parent itself being absent. This must now fail closed.
+        with tempfile.TemporaryDirectory() as directory:
+            release_dir = Path(directory).resolve() / "release"
+            parent_pkg = release_dir / "node_modules/parent-pkg"
+            parent_pkg.mkdir(parents=True, mode=0o700)
+            # Deliberately NOT creating parent_pkg/node_modules at all --
+            # the parent package directory exists, but its own nested
+            # container does not.
+            self._chmod_tree_private(release_dir)
+            declared_top_level = frozenset({"node_modules/parent-pkg"})
+            declared_nested = {
+                "node_modules/parent-pkg/node_modules": frozenset({"missing-child"})
+            }
+            with self.assertRaisesRegex(
+                installer.PrimeInstallError,
+                r"declared nested node_modules package's own parent container "
+                r"is absent from the materialized tree.*missing-child",
+            ):
+                installer.assert_materialized_node_modules_matches_lock(
+                    release_dir,
+                    declared_top_level,
+                    declared_nested,
+                    packages={
+                        "node_modules/parent-pkg": {
+                            "name": "parent-pkg",
+                            "version": "1.0.0",
+                        },
+                        "node_modules/parent-pkg/node_modules/missing-child": {
+                            "name": "missing-child",
+                            "version": "1.0.0",
+                        },
+                    },
+                )
+
+    def test_assert_materialized_node_modules_matches_lock_reverse_nested_parent_present_container_absent_platform_justified(
+        self,
+    ) -> None:
+        # Positive control for the round-41 fix immediately above: the
+        # PARENT package directory is materialized, its own nested
+        # node_modules/ container is absent, and the sole declared child
+        # of that container is genuinely platform-excluded (an "os"
+        # constraint that excludes darwin) -- a legitimate,
+        # platform-conditional skip. Confirms the round-41 fix does not
+        # over-tighten: this must NOT raise.
+        with tempfile.TemporaryDirectory() as directory:
+            release_dir = Path(directory).resolve() / "release"
+            parent_pkg = release_dir / "node_modules/parent-pkg"
+            parent_pkg.mkdir(parents=True, mode=0o700)
+            # Deliberately NOT creating parent_pkg/node_modules.
+            self._chmod_tree_private(release_dir)
+            declared_top_level = frozenset({"node_modules/parent-pkg"})
+            declared_nested = {
+                "node_modules/parent-pkg/node_modules": frozenset(
+                    {"platform-excluded-child"}
+                )
+            }
+            # Must not raise.
+            installer.assert_materialized_node_modules_matches_lock(
+                release_dir,
+                declared_top_level,
+                declared_nested,
+                packages={
+                    "node_modules/parent-pkg": {
+                        "name": "parent-pkg",
+                        "version": "1.0.0",
+                    },
+                    "node_modules/parent-pkg/node_modules/platform-excluded-child": {
+                        "name": "platform-excluded-child",
+                        "version": "1.0.0",
+                        "os": ["win32"],
+                        "optional": True,
+                    },
+                },
+            )
+
+    def test_assert_materialized_node_modules_matches_lock_reverse_nested_parent_present_container_absent_deep(
+        self,
+    ) -> None:
+        # Round 41 regression, arbitrary nesting depth: the SAME
+        # parent-present/container-absent gap as the two tests above, but
+        # one level deeper -- "parent-pkg" is materialized at the top
+        # level, its own nested node_modules/ container IS materialized
+        # and contains "mid-pkg", but mid-pkg's OWN nested node_modules/
+        # container is absent even though the lock declares a
+        # non-platform-excluded child for it. Confirms the round-41 fix
+        # generalizes past exactly one level of nesting.
+        with tempfile.TemporaryDirectory() as directory:
+            release_dir = Path(directory).resolve() / "release"
+            mid_pkg = release_dir / "node_modules/parent-pkg/node_modules/mid-pkg"
+            mid_pkg.mkdir(parents=True, mode=0o700)
+            # Deliberately NOT creating
+            # node_modules/parent-pkg/node_modules/mid-pkg/node_modules.
+            self._chmod_tree_private(release_dir)
+            declared_top_level = frozenset({"node_modules/parent-pkg"})
+            declared_nested = {
+                "node_modules/parent-pkg/node_modules": frozenset({"mid-pkg"}),
+                "node_modules/parent-pkg/node_modules/mid-pkg/node_modules": frozenset(
+                    {"deep-missing-child"}
+                ),
+            }
+            with self.assertRaisesRegex(
+                installer.PrimeInstallError,
+                r"declared nested node_modules package's own parent container "
+                r"is absent from the materialized tree.*deep-missing-child",
+            ):
+                installer.assert_materialized_node_modules_matches_lock(
+                    release_dir,
+                    declared_top_level,
+                    declared_nested,
+                    packages={
+                        "node_modules/parent-pkg": {
+                            "name": "parent-pkg",
+                            "version": "1.0.0",
+                        },
+                        "node_modules/parent-pkg/node_modules/mid-pkg": {
+                            "name": "mid-pkg",
+                            "version": "1.0.0",
+                        },
+                        "node_modules/parent-pkg/node_modules/mid-pkg/node_modules/deep-missing-child": {
+                            "name": "deep-missing-child",
+                            "version": "1.0.0",
+                        },
+                    },
+                )
+
     def _chmod_tree_private(self, root: Path) -> None:
         for dirpath, _dirnames, _filenames in os.walk(root):
             os.chmod(dirpath, 0o700)
