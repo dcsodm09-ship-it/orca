@@ -333,9 +333,16 @@ P1**——先用 78 组探针 + 真实 tarball 逐项核算，彻底确认 round
 机制。真实复现两条路径：182 个第三方依赖包只有 4 个被钉住，篡改一个真实被
 `import()` 的依赖（`undici`）能一路存活到 receipt、被真实 `bin/prime-agent --version`
 执行；launch guard 的 python 调用缺 `-I -P`，种一个 `bin/hashlib.py` 能在 guard 自己
-进程里被执行、伪造摘要校验结果。**round 36 已派发**：给 `tree_digest()` 补上拒绝
-未知文件的一半、guard 补 `-I -P`。完整逐轮细节见
-`reports/ORCA-COLLAB-STATE-AND-PRIME-AGENT-2026-08-18.md`。
+进程里被执行、伪造摘要校验结果。**round 36（commit `36a4008c08`）已完成并自验证**：
+没走范围更窄的退路，直接给约 182 个 registry 依赖包建了和四个本地补丁包同等强度的
+逐文件内容钉住机制（基于 npm 自己缓存里 SRI 寻址的 tarball、独立重算 SHA-512 核实）；
+guard 补了 `-I`（不是 `-I -P`——这台机器真实 `/usr/bin/python3` 3.9.6 没有 `-P`，
+加了会直接砸坏每次调用，经验性核实后有理有据地偏离原计划）；搬移后重跑一次
+`node_modules` 结构校验。真实（非 mock）`sandbox_e2e.py` 迭代跑通过程中额外发现并
+修好 3 个真实 npm 打包边界情况的 bug（嵌套 node_modules、DefinitelyTyped 顶层目录
+约定、良性重复路径）。136/136 测试全过、真实回放最终两次 `ok:true`。**round 37
+双复核已派发**（round 35 的 Codex 一路仍在跑，晚到会作为对旧提交的补充记录，不
+阻塞本轮）。完整逐轮细节见 `reports/ORCA-COLLAB-STATE-AND-PRIME-AGENT-2026-08-18.md`。
 `fd6a683a4a` 这个双 GO 时点**已被 8 轮后续真实发现超越，不能再作为"可以安装"的
 依据**——按用户规则，需要在当前 HEAD 上重新拿到一次真正、当下有效的双路 GO。
 

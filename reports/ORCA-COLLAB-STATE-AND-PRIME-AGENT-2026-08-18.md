@@ -1555,6 +1555,73 @@ opus/max 的收尾评价："这个装机时间窗口的安全相关面，对'同
 报告 `ok:true`。round 34 把机制的方向建对了、自己那两处修复也做对了，
 只是复制"模型对照函数"的不变式时只复制了一半。"
 
+### Round 36：把"拒绝未知文件"这一半也补上——这次直接做了完整的 registry 依赖包内容钉住机制（已验证关闭，未独立复核）
+
+**P1-1 修复（选了完整方案，不是缩小范围的退路）**：先做了真实、经验性
+的可行性验证，确认可行之后没有走"只给 `bin/`/`toolchain/` 拒绝未知
+文件"这种范围更窄的退路，而是直接给约 182 个 registry 依赖包也建了
+一套和四个本地补丁包同等强度的逐文件内容钉住机制。新增
+`declared_registry_package_lock_rows()`（任意嵌套深度的每一条
+registry 依赖 lock 记录，排除四个本地补丁包）、
+`verified_registry_package_tarball()`（通过 lock 记录自带的 SRI
+`integrity` 字段解码出路径，在 npm 自己的 `_cacache/content-v2/
+sha512/...` 缓存里定位对应 tarball，再对**实际读到的字节**独立
+重新算一次 SHA-512 核实——不单纯信任"路径即哈希"这个约定，即便同
+UID 攻击者对缓存目录有写权限也伪造不了，因为需要伪造出一个
+SHA-512 第二原像）、`registry_package_content_digests()`（从这些
+已验证的 tarball 字节推导出逐文件 SHA-256 表）。接进
+`_install_locked_within_release_dir()`：每个真实落盘的 registry
+包都会推导出摘要表，复用（不是重写）已有的
+`assert_locally_patched_package_matches_pinned_digests()` 在搬移
+前后各校验一次，再折进 `release_relative_pinned_digests`，让
+`tree_digest()` 已有的零窗口机制自动覆盖到这些包。receipt 新增
+`registry_packages_content_verified` 字段留痕。
+
+**真实（非 mock）`sandbox_e2e.py` 跑起来之后，逐一发现并修好了 3 个
+真 bug**——如果只靠 mock 单测根本测不出来：(a) 真实 npm 为了处理
+版本冲突，会合法地把某些子依赖再嵌套进它自己包的 `node_modules/`
+里，逐包扫描一开始误把这些嵌套包的文件当成"未声明"报错，修法是
+跳过对任何名为 `node_modules` 的子目录继续下钻（那棵子树由它自己
+独立的 lock 记录另外校验）；(b) `@types/mime-types` 真实 tarball
+用的顶层目录是包名本身（DefinitelyTyped 的 `types-publisher` 打包
+惯例），不是从四个本地补丁包那边照搬过来的硬编码 `package/` 约定，
+改成从 tar 里第一个成员动态推导顶层目录、并要求所有成员共用同一个
+顶层目录；(c) `agent-base@7.1.x` 真实 tarball 里同时存在
+`package/./dist/index.js` 和 `package/dist/index.js` 这种因为
+`./` 产生的字节级重复路径（内容完全一致，属于良性打包产物），原来
+的逻辑遇到重复目标路径就直接拒绝，改成只有两条路径解析到同一处、
+**内容还不一样**才真正报错。
+
+**P1-2a 修复（`-I`，不是 `-I -P`，且有理有据地偏离了原始指令）**：
+在 launch guard 的 `/usr/bin/python3 -B <guard>` 调用上加了
+`-I`——但没有照原计划加 `-P`，因为经验性核实发现这台机器真实的
+`/usr/bin/python3` 是 Xcode 命令行工具自带的 3.9.6，根本没实现
+`-P`（Python 3.11 才有），`-B -I -P` 会直接报
+`Unknown option: -P`、退出码 2，等于砸坏每一次托管调用。单独一个
+`-I` 从 Python 3.4 起就会把脚本自己所在目录排除出 `sys.path`——用
+一个独立探针加新增回归测试确认，`-B -I` 在这台机器真实的
+`/usr/bin/python3` 3.9.6 和 Homebrew 3.14.6 上都能完全挡住
+`bin/hashlib.py` 那种遮蔽攻击，而单独 `-B` 挡不住。
+
+**P1-2b 修复**：`assert_materialized_node_modules_matches_lock()`
+现在在 `node_modules` 搬移之后也会再跑一次，和已有的"搬移前后各
+一次"这套模式对齐。
+
+17 条新回归测试（每一条都通过临时单独撤销对应那一处修复来确认"没
+这处修复就是会漏"）：launch guard 遮蔽攻击被真正挡住、搬移后种
+兄弟包被抓到、篡改 registry 依赖文件被抓到（配一条"干净情况不
+误报"的对照测试）、三个新函数各自的单元测试、以及针对上面三个真实
+bug 各自独立的回归测试。136/136 测试（两个解释器各跑两次）全过，
+`py_compile` 干净。round 24-34 的 11 条既有回归测试逐条抽查仍然
+通过。真实生命周期回放这次是一个"真跑→发现真 bug→修好→再真跑"的
+迭代过程，前 3 次真实运行各自撞上一个真 bug（上面说的那三个），修
+好之后第 4、5 次都干净跑通：`ok:true`、26911 个条目、
+`production_lock_sha256` 吻合、`real_user_state_changed:false`，
+两次运行结束后确认真实托管路径均不存在。已提交 `36a4008c08`。
+**已派发 round 37 双复核**（Codex round 35 那一路仍在跑，结果晚到
+时会作为对 `dab6a143d9` 这个已被超越的旧提交的补充数据点单独记录，
+不阻塞本轮推进）。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
