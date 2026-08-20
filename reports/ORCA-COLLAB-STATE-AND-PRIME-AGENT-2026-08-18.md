@@ -2109,6 +2109,62 @@ opus/max 的建议修法：把黑名单换成白名单（或者至少把
 目录检查都扩展到 Node 真正会用的 `_resolveLookupPaths` 完整集合
 （含三个全局文件夹）。
 
+### Round 43：黑名单换白名单 + 全局文件夹补齐（已验证关闭，未独立复核）
+
+**P1-A 修复**：`scrubbed_node_environment()` 从"拿完整环境减几个键"
+的黑名单改成"从零开始、只加已核实安全的键"的混合白名单——
+`NODE_ENV_ALLOWED_PREFIXES`（`LC_` 前缀）+ 一个 103 项的
+`NODE_ENV_ALLOWED_NAMES` 精确名单。名单来源很扎实：会话/系统基础
+变量、locale、终端/TUI 检测变量（prime-agent 本身是个 TUI）、
+代理变量、三个真的核实过安全的 Node 变量（`NODE_ENV`/
+`NODE_DEBUG`/`NODE_DISABLE_COMPILE_CACHE`）、这个安装器自己导出的
+变量、还有 61 个模型供应商凭据/端点变量名——这部分是真的对真实解压
+出来的 v0.7.2 `cli.js` 极其依赖树做了一次 grep 式清点（找到 207 处
+不同的 `process.env.*` 读取），约 150 个调试/构建工具内部/上游功能
+开关类名字刻意排除、宁可排除也不放宽。`OPENSSL_CONF` 等 round 42
+点名的变量全部永久排除在外。
+
+**P1-B 修复**：新增 `node_global_folder_paths()`，两份独立实现（和
+round 40 已有的"生成脚本版 + 真实 Python 版不能共享代码"这套模式
+对齐），把 `unexpected_ancestor_node_modules()`（生成的 launch
+guard）和 `assert_no_unexpected_ancestor_node_modules()`
+（`verify()` 那一侧）都扩展到再检查 `$HOME/.node_modules`、
+`$HOME/.node_libraries`、以 Node 可执行文件自身路径推导出的
+`lib/node` 这三个位置。这次没有凭记忆假设 `Module.globalPaths`
+的算法，而是真的把这个安装器钉住的 `node-v24.19.0-darwin-arm64`
+tarball 解压出来（SHA-256 和 `NODE_ASSET_SHA256` 精确吻合）、用
+`env -i` 控制 `HOME`/`NODE_PATH` 真跑 `require('module').
+globalPaths` 现场核对。
+
+12 条新回归测试，凡是能用真实 Node/openssl 验证的都真的用了（P1-A
+那几条 TLS 相关测试真的构造了一对自签名 CA+叶子证书、起了一个真实
+的本地回环 HTTPS 服务器/客户端；P1-B 那几条真的在新覆盖到的三个
+位置各种一次包，用临时 `HOME`、绝不碰真实用户家目录）。全部用
+"对着 round-42 基线 `294144ba99` 的代码直接新旧对照"验证过：P1-A
+测试的 4 个变量在旧版清空逻辑下全部能泄漏、新版一个都漏不过去；
+P1-B 种在 `$HOME/.node_modules`，旧版检查函数返回 `None`（完全没
+看到）、新版正确返回命中路径，guard 侧和 `verify()` 侧两份实现都
+验证过。181/181 测试（169 条既有 + 12 条新增，两个解释器各跑两次
+加一轮最终确认）全过，`py_compile` 三个相关文件、两个解释器下都
+干净。round 24-41 的既有回归测试逐条抽查仍然通过（只有 2 处既有
+断言的措辞需要更新，不是削弱——一个原来的正控制变量在新的白名单
+语义下正确变成了负控制；一条失败信息的措辞改得更准确，因为现在这
+个检查也会对不叫"node_modules"的位置报错）。真实（非 mock）
+`sandbox_e2e.py` 跑了两次，均 `ok:true`/`exit 0`，零假阳性。
+
+**一处诚实的自我修正，值得记录**：round 42 把它的 `OPENSSL_CONF`
+发现描述成"走完整真实链路端到端复现"。这一轮真的针对这个安装器
+**精确钉住的** Node 二进制做了直接测试，发现它静态编译、非 FIPS
+的 OpenSSL 构建在测试中并没有真的去读 `OPENSSL_CONF` 加载
+provider——真实 `openssl` 命令行工具确实会 `dlopen()` 恶意
+provider，但不是针对这个具体的 Node 构建版本。`OPENSSL_CONF`
+依然被排除在白名单之外（结构上和已确认的那几个变量一样被堵死），
+但这一轮的报告主动纠正了 round 42 那句话的强度，没有悄悄照单全收。
+
+已提交 `76b3a24f36`。**已派发 round 44 双复核**（Claude opus+max 与
+Codex sol+max；round 42 的 Codex 一路仍在跑，结果晚到会作为对
+`294144ba99` 这个已被超越的提交的补充记录）。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max

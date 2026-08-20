@@ -383,9 +383,13 @@ P1**——用 29 条独立探针确认 round 39 那三个发现真的关死了�
 缓解本身还留了两条缝：环境变量清空是黑名单漏了 `OPENSSL_CONF`（真实复现出 Node 启动
 时 `dlopen()` 恶意 OpenSSL provider、早于任何摘要校验就执行）；祖先目录检查建模的是
 Node 解析算法的一半（`_nodeModulePaths`），漏了另一半（`Module.globalPaths`，含
-`$HOME/.node_modules` 等三个全局文件夹，不需要抢时机、重启也不失效）。Codex 一路
-正常派发中，结果待补。**round 43 已派发**：黑名单换白名单、祖先检查扩展到完整
-`_resolveLookupPaths` 集合。完整逐轮细节见
+`$HOME/.node_modules` 等三个全局文件夹，不需要抢时机、重启也不失效）。**round 43
+（commit `76b3a24f36`）已完成并自验证**：环境变量清空从黑名单换成 103 项白名单
+（真的清点了 v0.7.2 `cli.js` 依赖树里 207 处 `process.env.*` 读取）；两处祖先目录
+检查都补上 `Module.globalPaths` 三个全局文件夹（用真实钉住的 Node 二进制现场核对
+算法，不靠记忆）；还主动纠正了 round 42 对 `OPENSSL_CONF` 复现强度的一处过度表述。
+181/181 测试全过、真实回放两次 `ok:true`。round 42 的 Codex 一路仍在跑，结果晚到
+会作为补充记录。**round 44 双复核已派发**。完整逐轮细节见
 `reports/ORCA-COLLAB-STATE-AND-PRIME-AGENT-2026-08-18.md`。
 `fd6a683a4a` 这个双 GO 时点**已被 8 轮后续真实发现超越，不能再作为"可以安装"的
 依据**——按用户规则，需要在当前 HEAD 上重新拿到一次真正、当下有效的双路 GO。
