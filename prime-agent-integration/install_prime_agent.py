@@ -477,16 +477,119 @@ def validate_empty_private_dir(path: Path, label: str) -> Path:
 
 
 def atomic_write(path: Path, raw: bytes, mode: int = 0o600) -> None:
+    """Atomically publish `raw` at `path`, mode `mode`, REPLACING any
+    existing occupant (see atomic_create_private_file() for the sibling
+    create-only, never-clobber discipline used elsewhere in this file).
+
+    Fix (independent Codex sol/max review round 48, reproduced end to end;
+    closed round 49): os.replace(temp_path, path) atomically publishes the
+    new content -- POSIX rename() always replaces the destination's own
+    last path component and never follows a trailing symlink there, so
+    that step alone was always sound. But the function used to then
+    re-resolve `path` BY NAME a second, independent time for
+    os.chmod(path, mode), with no verification afterward that `path` still
+    identified the file just published. A same-UID attacker who won the
+    race between os.replace() returning and os.chmod() running (or at any
+    later point, since nothing here ever re-checked) could swap `path` to
+    a symlink; os.chmod() follows symlinks by default, so it silently
+    chmod'd whatever the symlink pointed at while this function still
+    returned success. Codex's real, isolated reproduction did exactly
+    that; an end-to-end reproduction against quarantine_partial_release()
+    (one of this function's real callers) went further, returning
+    state=quarantined -- meant to signal a safely durable terminal state
+    -- while the actual on-disk manifest was an attacker-controlled
+    symlink containing {"schema":"attacker"}.
+
+    Closed the same way atomic_create_private_file() already closes the
+    equivalent gap for its own publish path: the write descriptor's
+    (st_dev, st_ino) identity is captured BEFORE publishing (while the fd
+    is still open), and after os.replace() the function opens `path` again
+    with O_NOFOLLOW -- so a symlink swap makes this open fail closed with
+    ELOOP instead of following it -- then re-fstats that descriptor and
+    refuses to proceed unless the identity still matches what was
+    published. os.fchmod() is then applied to that freshly opened,
+    identity-verified descriptor -- never os.chmod() by path again -- so
+    the mode change itself is immune to any later path-based swap too.
+
+    Content is also re-read from that same verified descriptor and
+    compared against `raw` byte-for-byte. Identity alone already catches a
+    symlink swap (the common case Codex reproduced), but a same-UID
+    attacker who instead raced a write into the exact published inode
+    (e.g. a lingering open fd to it, opened before this function ever ran)
+    rather than swapping the path would pass an identity check while still
+    corrupting the published bytes; these are small, already-in-memory
+    manifests, so re-reading them in full to rule that out is cheap and
+    matches atomic_create_private_file()'s own rigor.
+
+    Unlike atomic_create_private_file(), this function does not attempt
+    rollback on a failed post-publication check: its callers use it to
+    REPLACE an existing occupant (recovery-manifest status transitions,
+    package.json rewrites), not to create a new file, so there is no prior
+    occupant left to restore -- the temp file that held it is already gone
+    once os.replace() has run. Callers instead get a clear
+    PrimeInstallError and must decide their own recovery; see
+    quarantine_partial_release(), which already treats a failed
+    status-transition write as a hard failure with no durable claim of
+    success, and its own nested rollback-intent write, which already has
+    its own explicit failure handling for exactly this case.
+    """
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temp_path = Path(temporary)
+    published_identity: tuple[int, int] | None = None
     try:
         os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
+            info = os.fstat(handle.fileno())
+            published_identity = (info.st_dev, info.st_ino)
         os.replace(temp_path, path)
-        os.chmod(path, mode)
+        try:
+            # O_NOFOLLOW here is load-bearing, not defense in depth: if a
+            # same-UID racer has swapped `path` to a symlink since
+            # os.replace() returned, this open() must fail closed (ELOOP)
+            # instead of transparently following it the way a plain
+            # os.chmod(path, mode) call would.
+            verified_descriptor = os.open(
+                path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                after = os.fstat(verified_descriptor)
+                if (
+                    published_identity is None
+                    or (after.st_dev, after.st_ino) != published_identity
+                ):
+                    raise PrimeInstallError(
+                        f"managed file identity changed during publication: {path}"
+                    )
+                if after.st_size != len(raw):
+                    raise PrimeInstallError(
+                        f"managed file size changed during publication: {path}"
+                    )
+                chunks: list[bytes] = []
+                remaining = len(raw)
+                while remaining:
+                    chunk = os.read(verified_descriptor, min(65_536, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                if b"".join(chunks) != raw:
+                    raise PrimeInstallError(
+                        f"managed file content changed during publication: {path}"
+                    )
+                # fchmod() on this already-open, already identity-verified
+                # descriptor, NEVER os.chmod(path, mode) by name again --
+                # this is the actual fix: the mode change itself can no
+                # longer be redirected by a later path-based swap either.
+                os.fchmod(verified_descriptor, mode)
+            finally:
+                os.close(verified_descriptor)
+        except OSError as exc:
+            raise PrimeInstallError(
+                f"managed file could not be verified after publication: {path}"
+            ) from exc
         directory_descriptor = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory_descriptor)

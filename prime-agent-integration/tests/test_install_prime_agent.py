@@ -1244,6 +1244,278 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 installer.remove_private_file_durable(large_path, large_raw)
             self.assertFalse(large_path.exists())
 
+    def test_pre_fix_atomic_write_chmod_by_path_would_have_followed_a_symlink_swap(
+        self,
+    ) -> None:
+        # Regression for independent Codex sol/max review round 48,
+        # reproduced end to end (not merely speculated about): atomic_write()
+        # used to publish via os.replace(temp_path, path) -- sound, since
+        # rename() always replaces the destination's own last path
+        # component and never follows a trailing symlink there -- and then
+        # re-resolve `path` BY NAME a second, independent time for
+        # os.chmod(path, mode), with no verification afterward that `path`
+        # still identified the file just published.
+        #
+        # This is a standalone copy of atomic_write()'s pre-round-49 shape
+        # (round 48 HEAD, commit edf8b4086017a2453b3c4084e75f606d276c414f),
+        # used ONLY here to prove the vulnerability genuinely existed --
+        # never called by production code. It is deliberately byte-for-byte
+        # the code quoted in the round-49 fix brief, not a paraphrase.
+        def pre_fix_atomic_write(path: Path, raw: bytes, mode: int = 0o600) -> None:
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=f".{path.name}.", dir=path.parent
+            )
+            temp_path = Path(temporary)
+            try:
+                os.fchmod(descriptor, mode)
+                with os.fdopen(descriptor, "wb", closefd=True) as handle:
+                    handle.write(raw)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp_path, path)
+                os.chmod(path, mode)
+                directory_descriptor = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
+            except BaseException:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+                raise
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            os.chmod(root, 0o700)
+            path = root / "manifest.json"
+            attacker_target = root / "attacker.json"
+            attacker_target.write_bytes(b'{"schema":"attacker"}')
+            os.chmod(attacker_target, 0o644)
+
+            real_replace = os.replace
+            swapped = False
+
+            def swap_after_replace(source: Path, destination: Path) -> None:
+                nonlocal swapped
+                real_replace(source, destination)
+                if not swapped and Path(destination) == path:
+                    swapped = True
+                    Path(destination).unlink()
+                    Path(destination).symlink_to(attacker_target)
+
+            with mock.patch.object(os, "replace", side_effect=swap_after_replace):
+                # THE PROOF: this must NOT raise pre-fix -- the swap is
+                # timed to land exactly between os.replace() returning and
+                # the pre-fix code's own os.chmod(path, mode) call.
+                pre_fix_atomic_write(path, b'{"schema":"legit"}', 0o600)
+
+            self.assertTrue(swapped, "swap hook never fired")
+            self.assertTrue(path.is_symlink())
+            self.assertEqual(os.readlink(path), os.fspath(attacker_target))
+            # The pre-fix os.chmod(path, mode) call really did follow the
+            # symlink through to the attacker's file (not merely that the
+            # function happened to return without raising for some
+            # unrelated reason): the attacker's file was chmod'd to the
+            # private 0o600 mode it never had before.
+            self.assertEqual(
+                stat.S_IMODE(attacker_target.stat().st_mode), 0o600
+            )
+            self.assertEqual(
+                attacker_target.read_bytes(), b'{"schema":"attacker"}'
+            )
+
+    def test_atomic_write_fails_closed_on_symlink_swap_after_replace(self) -> None:
+        # Same injected swap timing as
+        # test_pre_fix_atomic_write_chmod_by_path_would_have_followed_a_
+        # symlink_swap above, run against the real, fixed atomic_write()
+        # itself: the swap must now be caught and reported as a failure,
+        # not silently followed.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            os.chmod(root, 0o700)
+            path = root / "manifest.json"
+            attacker_target = root / "attacker.json"
+            attacker_target.write_bytes(b'{"schema":"attacker"}')
+            os.chmod(attacker_target, 0o644)
+
+            real_replace = os.replace
+            swapped = False
+
+            def swap_after_replace(source: Path, destination: Path) -> None:
+                nonlocal swapped
+                real_replace(source, destination)
+                if not swapped and Path(destination) == path:
+                    swapped = True
+                    Path(destination).unlink()
+                    Path(destination).symlink_to(attacker_target)
+
+            with mock.patch.object(os, "replace", side_effect=swap_after_replace):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "could not be verified after publication",
+                ):
+                    installer.atomic_write(path, b'{"schema":"legit"}', 0o600)
+
+            self.assertTrue(swapped, "swap hook never fired")
+            # Fails closed: the swap is left exactly as the attacker made
+            # it -- the attacker's file must never have been fchmod'd or
+            # otherwise touched via the swapped path, and the function must
+            # not have reported success.
+            self.assertTrue(path.is_symlink())
+            self.assertEqual(os.readlink(path), os.fspath(attacker_target))
+            self.assertEqual(
+                stat.S_IMODE(attacker_target.stat().st_mode), 0o644
+            )
+            self.assertEqual(
+                attacker_target.read_bytes(), b'{"schema":"attacker"}'
+            )
+
+    def test_atomic_write_fails_closed_on_same_inode_content_corruption(
+        self,
+    ) -> None:
+        # The harder case an identity-only check would miss: no path
+        # substitution at all -- a same-UID attacker with a lingering,
+        # already-open descriptor to the SAME published inode overwrites
+        # its bytes in place between os.replace() and the post-publication
+        # check. (st_dev, st_ino) alone would still match, so atomic_write()
+        # must also re-verify content, not merely identity. The corruption
+        # flips a single bit so the corrupted payload is exactly the same
+        # length as the legitimate one -- proving the content check itself
+        # (not just the size check) is load-bearing.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            os.chmod(root, 0o700)
+            path = root / "manifest.json"
+            raw = b'{"schema":"legit-manifest-payload"}'
+            corrupted = raw[:-1] + bytes([raw[-1] ^ 0x01])
+            self.assertEqual(len(raw), len(corrupted))
+            self.assertNotEqual(raw, corrupted)
+
+            real_replace = os.replace
+            corrupted_once = False
+
+            def corrupt_after_replace(source: Path, destination: Path) -> None:
+                nonlocal corrupted_once
+                real_replace(source, destination)
+                if not corrupted_once and Path(destination) == path:
+                    corrupted_once = True
+                    with open(destination, "r+b") as handle:
+                        handle.write(corrupted)
+
+            with mock.patch.object(os, "replace", side_effect=corrupt_after_replace):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "content changed during publication",
+                ):
+                    installer.atomic_write(path, raw, 0o600)
+
+            self.assertTrue(corrupted_once, "corruption hook never fired")
+            # The corrupted bytes are left exactly as the attacker wrote
+            # them -- atomic_write() must not have silently republished or
+            # otherwise "fixed" what it could not verify, only refused to
+            # report success for it.
+            self.assertEqual(path.read_bytes(), corrupted)
+
+    def test_quarantine_partial_release_never_reports_quarantined_for_a_swapped_manifest(
+        self,
+    ) -> None:
+        # Regression for independent Codex sol/max review round 48's
+        # end-to-end reproduction: quarantine_partial_release()'s own
+        # manifest["status"] = "quarantined" transition publishes through
+        # atomic_write() (REPLACING the "moving"-status manifest already on
+        # disk, unlike the initial atomic_create_private_file() publish).
+        # Pre-fix, a same-UID swap of manifest.json to a symlink right
+        # after that publish's os.replace() -- but before its
+        # os.chmod() -- made quarantine_partial_release() still return
+        # state=quarantined (a claimed durable terminal state) while the
+        # real on-disk manifest was an attacker-controlled symlink
+        # containing {"schema":"attacker"}.
+        #
+        # The injected swap re-fires on every os.replace() call that
+        # targets manifest.json (not just the first), matching how a
+        # persistent same-UID racer would behave -- so this also exercises
+        # quarantine_partial_release()'s own rollback-intent write
+        # (atomic_write() called again for status="rolling_back") failing
+        # closed in turn, rather than merely the first status transition.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            release.mkdir(parents=True, mode=0o700)
+            os.chmod(release, 0o700)
+            (release / "partial").write_text("partial", encoding="utf-8")
+            os.chmod(release / "partial", 0o600)
+            state = tool_root / "state"
+            self.create_managed_home(state, session_dir=tool_root / "sessions")
+            user_home = root / "user"
+
+            attacker_target = root / "attacker-manifest.json"
+            attacker_target.write_bytes(b'{"schema":"attacker"}')
+            os.chmod(attacker_target, 0o644)
+
+            real_replace = os.replace
+
+            def swap_manifest_after_replace(source: Path, destination: Path) -> None:
+                real_replace(source, destination)
+                if Path(destination).name == "manifest.json":
+                    Path(destination).unlink()
+                    Path(destination).symlink_to(attacker_target)
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+                mock.patch.object(installer, "STATE_DIR", state),
+                mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home"),
+                mock.patch.object(installer, "STATE_LINK", user_home / ".prime"),
+                mock.patch.object(installer, "USER_HOME", user_home),
+                mock.patch.object(
+                    installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                ),
+                mock.patch.object(
+                    installer, "RECEIPT_PATH", tool_root / "receipt.json"
+                ),
+                mock.patch.object(
+                    installer, "PENDING_PATH", tool_root / "pending.json"
+                ),
+                mock.patch.object(installer, "managed_process_ids", return_value=[]),
+                mock.patch.object(
+                    os, "replace", side_effect=swap_manifest_after_replace
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "cannot publish Prime Agent rollback intent",
+                ):
+                    installer.quarantine_partial_release()
+
+            recovery = next((tool_root / "recovery").iterdir())
+            manifest_path = recovery / "manifest.json"
+            # The manifest path itself must still be exactly the injected
+            # symlink -- quarantine_partial_release() never silently
+            # re-published legitimate content over it -- and the function
+            # never returned a result at all, so it could not have falsely
+            # reported state=quarantined for it.
+            self.assertTrue(manifest_path.is_symlink())
+            self.assertEqual(
+                os.readlink(manifest_path), os.fspath(attacker_target)
+            )
+            # The failure was caught publishing the rollback-intent marker
+            # itself, before any reverse move was attempted -- both moved
+            # items must still be sitting in the recovery destination,
+            # neither silently dropped nor rolled back based on a manifest
+            # transition that was never durably published.
+            self.assertTrue((recovery / "release/partial").is_file())
+            self.assertTrue((recovery / "state/agent/settings.json").is_file())
+            self.assertFalse(release.exists())
+            self.assertFalse(state.exists())
+
     def test_atomic_symlink_never_clobbers_existing_occupant(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
