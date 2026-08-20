@@ -341,8 +341,15 @@ guard 补了 `-I`（不是 `-I -P`——这台机器真实 `/usr/bin/python3` 3.
 `node_modules` 结构校验。真实（非 mock）`sandbox_e2e.py` 迭代跑通过程中额外发现并
 修好 3 个真实 npm 打包边界情况的 bug（嵌套 node_modules、DefinitelyTyped 顶层目录
 约定、良性重复路径）。136/136 测试全过、真实回放最终两次 `ok:true`。**round 37
-双复核已派发**（round 35 的 Codex 一路仍在跑，晚到会作为对旧提交的补充记录，不
-阻塞本轮）。完整逐轮细节见 `reports/ORCA-COLLAB-STATE-AND-PRIME-AGENT-2026-08-18.md`。
+双复核结果**：Claude opus/max **NO_GO，2 个新 P1**——根因精确点名：`tree_digest()`
+只强制了完整性不变式的一半（钉住表里的键必须被观察到），另一半（被观察到的常规
+文件必须在钉住表里）从没做；round 36 的回应是把允许清单撑大（约 1700→24060 条）
+而不是把不变式反过来，留下"registry 探测在攻击者可写文件系统上单一时刻完成"
+（8 条平台条件依赖零竞速可利用）+ "`RELEASE_DIR/node_modules` 搬移后完全不设防、
+且真的在 Node 真实模块解析路径上"两扇门。给出的修法很具体：补"拒绝未知文件"这一半，
+豁免清单从现有常量推导，实测精确 14 个文件。**round 38 已派发**照此实现。round 35
+的 Codex 一路仍在跑，晚到会作为对旧提交的补充记录。完整逐轮细节见
+`reports/ORCA-COLLAB-STATE-AND-PRIME-AGENT-2026-08-18.md`。
 `fd6a683a4a` 这个双 GO 时点**已被 8 轮后续真实发现超越，不能再作为"可以安装"的
 依据**——按用户规则，需要在当前 HEAD 上重新拿到一次真正、当下有效的双路 GO。
 
