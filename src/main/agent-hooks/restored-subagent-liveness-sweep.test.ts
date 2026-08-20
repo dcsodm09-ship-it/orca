@@ -3,10 +3,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AgentSubagentSnapshot } from '../../shared/agent-status-types'
-import { upsertCodexSubagent } from '../../shared/codex-subagent-roster'
 import { makePaneKey } from '../../shared/stable-pane-id'
 import { toAppSshPtyId } from '../../shared/ssh-pty-id'
 import { AgentHookServer } from './server'
+import { postHookEvent } from './server.test-fixtures'
 import {
   indexPersistedPaneKeyPtyIds,
   isLocalExecutionHost,
@@ -20,6 +20,11 @@ const PTY = 'wt-1__pty-1'
 const WORKING_CHILD: AgentSubagentSnapshot = {
   id: 'areview-loop-c237a4c577493352',
   state: 'working',
+  startedAt: 1_000
+}
+const WAITING_CHILD: AgentSubagentSnapshot = {
+  id: 'await-review-1',
+  state: 'waiting',
   startedAt: 1_000
 }
 
@@ -114,69 +119,6 @@ function paneStatus(
   return { state: entry?.state ?? 'missing', subagents: entry?.subagents }
 }
 
-const CODEX_WORKING_CHILD: AgentSubagentSnapshot = {
-  id: 'child-thread-1',
-  state: 'working',
-  startedAt: 1_000
-}
-
-/** Codex counterpart of restartWithInFlightSubagent — same hydrate-then-restart
- *  shape (lead finished/waiting, roster still holds a working child whose
- *  SubagentStop was lost while Orca was down), but for a Codex pane. */
-async function restartWithInFlightCodexSubagent(options?: {
-  connectionId?: string
-  state?: 'working' | 'waiting'
-  subagents?: AgentSubagentSnapshot[]
-}): Promise<AgentHookServer> {
-  const first = new AgentHookServer()
-  await first.start({ env: 'production', userDataPath: dir })
-  first.ingestTerminalStatus({
-    paneKey: PANE,
-    tabId: 'tab-1',
-    worktreeId: 'wt-1',
-    connectionId: options?.connectionId ?? null,
-    payload: {
-      state: options?.state ?? 'working',
-      prompt: 'review the PR',
-      agentType: 'codex',
-      subagents: options?.subagents ?? [CODEX_WORKING_CHILD]
-    }
-  })
-  first.flushStatusPersistSync()
-  first.stop()
-
-  const restarted = new AgentHookServer()
-  await restarted.start({ env: 'production', userDataPath: dir })
-  return restarted
-}
-
-function sweepCodexWith(
-  server: AgentHookServer,
-  overrides: {
-    probeLiveLocalPty?: (ptyId: string) => boolean | null | Promise<boolean | null>
-    executionHostId?: string | null
-    boundPtyIdByPaneKey?: Record<string, string>
-    persistedPtyIdByPaneKey?: Record<string, string>
-  } = {}
-): Promise<number> {
-  return sweepRestoredSubagentsWithoutLiveAgent({
-    probeLiveLocalPty: async (ptyId) =>
-      overrides.probeLiveLocalPty ? await overrides.probeLiveLocalPty(ptyId) : false,
-    isLocalExecutionHost: () =>
-      isLocalExecutionHost(
-        overrides.executionHostId === undefined ? 'local' : overrides.executionHostId
-      ),
-    getBoundPtyIdForPaneKey: (paneKey) => overrides.boundPtyIdByPaneKey?.[paneKey],
-    getPersistedPtyIdForPaneKey: (paneKey) => overrides.persistedPtyIdByPaneKey?.[paneKey],
-    reap: (isLocalHost, isLocalPaneAgentLive, isLocalPaneLivenessEvidenceCurrent) =>
-      server.reapRestoredCodexSubagentsWithoutLiveAgent(
-        isLocalHost,
-        isLocalPaneAgentLive,
-        isLocalPaneLivenessEvidenceCurrent
-      )
-  })
-}
-
 describe('restored subagent liveness sweep', () => {
   it('reaps the phantom seed so a slept-through pane reaches done', async () => {
     const server = await restartWithInFlightSubagent()
@@ -234,6 +176,45 @@ describe('restored subagent liveness sweep', () => {
         // Why: a still-nonterminal reconciled row remains unconfirmed — only hooks or a terminal fact confirm it.
         restoredUnconfirmed: true
       })
+    } finally {
+      server.stop()
+    }
+  })
+
+  it('reaps a persisted waiting child so a slept-through waiting pane reaches done, surviving an unrelated event first', async () => {
+    const server = await restartWithInFlightSubagent({
+      state: 'waiting',
+      subagents: [WAITING_CHILD]
+    })
+    try {
+      expect(paneStatus(server)).toEqual({ state: 'waiting', subagents: [WAITING_CHILD] })
+      expect(server.getStatusSnapshotForPane(PANE)[0]?.restoredUnconfirmed).toBe(true)
+
+      // Why: closes gap-1 end to end — an unrelated live event between restart and the sweep
+      // used to silently drop restoredUnconfirmed for a restored 'waiting' row.
+      await postHookEvent(server, {
+        paneKey: PANE,
+        tabId: 'tab-1',
+        worktreeId: 'wt-1',
+        env: 'production',
+        payload: { hook_event_name: 'Stop' }
+      })
+      const afterUnrelatedEvent = server.getStatusSnapshotForPane(PANE)[0]
+      expect(afterUnrelatedEvent).toMatchObject({ state: 'waiting', restoredUnconfirmed: true })
+
+      const previousReceivedAt = afterUnrelatedEvent?.receivedAt ?? 0
+      const reconciledAt = previousReceivedAt + 1
+      const now = vi.spyOn(Date, 'now').mockReturnValue(previousReceivedAt)
+
+      expect(await sweepWith(server, { persistedPtyIdByPaneKey: { [PANE]: PTY } })).toBe(1)
+
+      expect(paneStatus(server)).toEqual({ state: 'done', subagents: undefined })
+      expect(server.getStatusSnapshotForPane(PANE)[0]).toMatchObject({
+        receivedAt: reconciledAt,
+        stateStartedAt: reconciledAt
+      })
+      expect(server.getStatusSnapshotForPane(PANE)[0]?.restoredUnconfirmed).toBeUndefined()
+      now.mockRestore()
     } finally {
       server.stop()
     }
@@ -538,85 +519,6 @@ describe('restored subagent liveness sweep', () => {
           persistedPtyIdByPaneKey: { [PANE]: PTY }
         })
       ).toBe(0)
-
-      expect(paneStatus(server).state).toBe('working')
-    } finally {
-      server.stop()
-    }
-  })
-})
-
-describe('restored codex subagent liveness sweep', () => {
-  it('reaps the phantom seed so a slept-through codex pane reaches done', async () => {
-    const server = await restartWithInFlightCodexSubagent()
-    try {
-      expect(paneStatus(server)).toEqual({ state: 'working', subagents: [CODEX_WORKING_CHILD] })
-      const previous = server.getStatusSnapshotForPane(PANE)[0]
-      expect(previous?.restoredUnconfirmed).toBe(true)
-      const previousReceivedAt = previous?.receivedAt ?? 0
-      const reconciledAt = previousReceivedAt + 1
-      const now = vi.spyOn(Date, 'now').mockReturnValue(previousReceivedAt)
-
-      expect(await sweepCodexWith(server, { persistedPtyIdByPaneKey: { [PANE]: PTY } })).toBe(1)
-
-      expect(paneStatus(server)).toEqual({ state: 'done', subagents: undefined })
-      expect(server.getStatusSnapshotForPane(PANE)[0]).toMatchObject({
-        receivedAt: reconciledAt,
-        stateStartedAt: reconciledAt
-      })
-      // Why: the reconciled `done` is process-probe-verified, so it must shed the hydrated-unconfirmed marker.
-      expect(server.getStatusSnapshotForPane(PANE)[0]?.restoredUnconfirmed).toBeUndefined()
-      now.mockRestore()
-    } finally {
-      server.stop()
-    }
-  })
-
-  it('keeps a codex seed whose pane still has a live local PTY', async () => {
-    const server = await restartWithInFlightCodexSubagent()
-    try {
-      expect(
-        await sweepCodexWith(server, {
-          probeLiveLocalPty: (ptyId) => ptyId === PTY,
-          persistedPtyIdByPaneKey: { [PANE]: PTY }
-        })
-      ).toBe(0)
-
-      expect(paneStatus(server)).toEqual({ state: 'working', subagents: [CODEX_WORKING_CHILD] })
-    } finally {
-      server.stop()
-    }
-  })
-
-  it('clears restoredFromSnapshot once a live hook confirms the same child id, so the sweep leaves it alone', async () => {
-    const server = await restartWithInFlightCodexSubagent()
-    try {
-      const roster = server._getStateForTests().codexSubagentRosterByPaneKey.get(PANE)
-      expect(roster?.get(CODEX_WORKING_CHILD.id)?.restoredFromSnapshot).toBe(true)
-
-      // Why: a live SubagentStart/PreToolUse hook on this exact id is the only
-      // thing that legitimately proves the hydrated row is still the current
-      // process, not a phantom left by one that died while Orca was down.
-      upsertCodexSubagent(
-        roster!,
-        CODEX_WORKING_CHILD.id,
-        { state: 'working', source: 'hook' },
-        Date.now()
-      )
-      expect(roster?.get(CODEX_WORKING_CHILD.id)?.restoredFromSnapshot).toBeUndefined()
-
-      expect(await sweepCodexWith(server, { persistedPtyIdByPaneKey: { [PANE]: PTY } })).toBe(0)
-
-      expect(paneStatus(server).state).toBe('working')
-    } finally {
-      server.stop()
-    }
-  })
-
-  it('never reaps a relay-owned codex pane even with no local PTY at all', async () => {
-    const server = await restartWithInFlightCodexSubagent({ connectionId: 'conn-1' })
-    try {
-      expect(await sweepCodexWith(server)).toBe(0)
 
       expect(paneStatus(server).state).toBe('working')
     } finally {

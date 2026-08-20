@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  clearClaudeAnsweredQuestionWait,
   clearPaneCacheState,
   createHookListenerState,
   markClaudeLeadTurnInterrupted,
@@ -475,6 +474,38 @@ describe('shared agent-hook-listener', () => {
       expect(stopped?.payload.state).toBe('done')
     })
 
+    it('keeps a restored waiting child eligible for reconciliation across an unrelated event', () => {
+      seedClaudeSubagentRosterFromSnapshots(state, PANE_KEY, [
+        { id: 'await-1', state: 'waiting', startedAt: 1000, agentType: 'general-purpose' }
+      ])
+      const roster = state.claudeSubagentRosterByPaneKey.get(PANE_KEY)
+      expect(roster?.get('await-1')).toMatchObject({ state: 'waiting', restoredFromSnapshot: true })
+
+      // Why: a bare turn-boundary event with no agent_id is exactly the shape that used to
+      // silently drop restoredUnconfirmed for a restored 'waiting' row (gap-1) — must re-arm
+      // the preservation gate the same way it already does for a restored 'working' row.
+      const stop = claudeEvent({ hook_event_name: 'Stop' })
+      expect(stop?.payload.state).toBe('waiting')
+      expect(stop?.restoredUnconfirmed).toBe(true)
+      expect(roster?.get('await-1')?.restoredFromSnapshot).toBe(true)
+    })
+
+    it('does not mark a genuinely live wait as an unconfirmed restored one', () => {
+      claudeEvent({ hook_event_name: 'UserPromptSubmit', prompt: 'go' })
+      claudeEvent({
+        hook_event_name: 'PermissionRequest',
+        agent_id: 'a-live-1',
+        tool_name: 'Bash',
+        tool_input: { command: 'sleep 999' }
+      })
+      const stop = claudeEvent({ hook_event_name: 'Stop' })
+      expect(stop?.payload.state).toBe('waiting')
+      // Why: claudeRosterHasRuntimeWaitingSubagent must see this row as live (not
+      // restoredFromSnapshot), so the gate must NOT fire — a genuinely live wait needs no
+      // 'unconfirmed restored' preservation and marking it so would be actively wrong.
+      expect(stop?.restoredUnconfirmed).toBeUndefined()
+    })
+
     it('removes a snapshot-seeded child missing from a present background_tasks list', () => {
       seedClaudeSubagentRosterFromSnapshots(state, PANE_KEY, [
         { id: 'a77', state: 'working', startedAt: 1000, agentType: 'general-purpose' }
@@ -621,6 +652,35 @@ describe('shared agent-hook-listener', () => {
       expect(stop?.payload.subagents).toBeUndefined()
     })
 
+    it('restores a persisted waiting child snapshot with a fresh waitingConfirmedAt', () => {
+      vi.useFakeTimers()
+      try {
+        vi.setSystemTime(5_000)
+        seedClaudeSubagentRosterFromSnapshots(state, PANE_KEY, [
+          { id: 'await-2', state: 'waiting', startedAt: 1000, agentType: 'general-purpose' }
+        ])
+        const roster = state.claudeSubagentRosterByPaneKey.get(PANE_KEY)
+        expect(roster?.get('await-2')).toMatchObject({
+          state: 'waiting',
+          startedAt: 1000,
+          restoredFromSnapshot: true,
+          waitingConfirmedAt: 5000
+        })
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('still skips a restored idle/blocked snapshot', () => {
+      seedClaudeSubagentRosterFromSnapshots(state, PANE_KEY, [
+        { id: 'a-idle', state: 'idle', startedAt: 1000 },
+        { id: 'a-blocked', state: 'blocked', startedAt: 1000 }
+      ])
+      // Why: getOrCreateClaudeSubagentRoster always creates a Map entry, even when every
+      // snapshot is skipped — an empty roster, not an absent one, is the correct outcome.
+      expect(state.claudeSubagentRosterByPaneKey.get(PANE_KEY)?.size).toBe(0)
+    })
+
     it('rebuilds a running one-shot subagent from background_tasks after restart', () => {
       // Why: fresh listener state (post-restart) has no roster; a Stop that
       // reports a running non-teammate task must resurrect the child row and
@@ -642,285 +702,6 @@ describe('shared agent-hook-listener', () => {
       expect(stop?.payload.subagents).toEqual([
         expect.objectContaining({ id: 'a77', state: 'working', description: 'long build' })
       ])
-    })
-  })
-
-  describe('clearClaudeAnsweredQuestionWait', () => {
-    const claudeEvent = (
-      payload: Record<string, unknown>
-    ): ReturnType<typeof normalizeHookPayload> =>
-      normalizeHookPayload(state, 'claude', { paneKey: PANE_KEY, payload }, 'production')
-
-    it('restores working for an answered lead question and drops the card', () => {
-      claudeEvent({ hook_event_name: 'UserPromptSubmit', prompt: 'pick a color' })
-      const wait = claudeEvent({
-        hook_event_name: 'PreToolUse',
-        tool_name: 'AskUserQuestion',
-        tool_input: { questions: [{ question: 'Red or Blue?' }] }
-      })
-      expect(wait?.payload.state).toBe('waiting')
-      expect(wait?.payload.interactivePrompt).toBeDefined()
-
-      expect(clearClaudeAnsweredQuestionWait(state, PANE_KEY)).toEqual({ state: 'working' })
-
-      // Why: a child-driven refresh re-emits the cached lead state; the linger
-      // bug would come back if it could resurrect the dismissed question.
-      const childDriven = claudeEvent({
-        hook_event_name: 'SubagentStart',
-        agent_id: 'a1',
-        agent_type: 'probe'
-      })
-      expect(childDriven?.payload.state).toBe('working')
-      expect(childDriven?.payload.toolName).toBeUndefined()
-      expect(childDriven?.payload.interactivePrompt).toBeUndefined()
-    })
-
-    it('restores the stashed lead state for an answered child question', () => {
-      claudeEvent({ hook_event_name: 'UserPromptSubmit', prompt: 'go' })
-      claudeEvent({ hook_event_name: 'SubagentStart', agent_id: 'a1', agent_type: 'probe' })
-      claudeEvent({ hook_event_name: 'Stop' })
-      const wait = claudeEvent({
-        hook_event_name: 'PreToolUse',
-        tool_name: 'AskUserQuestion',
-        agent_id: 'a1',
-        tool_input: { questions: [{ question: 'Continue?' }] }
-      })
-      expect(wait?.payload.state).toBe('waiting')
-
-      // Why: the lead already finished; the answer resumes the child, so the
-      // emitted state is gated up to working only while that child still runs.
-      expect(clearClaudeAnsweredQuestionWait(state, PANE_KEY)).toEqual({
-        state: 'working',
-        turnCompletedAt: expect.any(Number)
-      })
-      expect(state.claudeLeadStateByPaneKey.get(PANE_KEY)).toEqual({
-        state: 'done',
-        turnCompletedAt: expect.any(Number)
-      })
-
-      const drained = claudeEvent({ hook_event_name: 'SubagentStop', agent_id: 'a1' })
-      expect(drained?.payload.state).toBe('done')
-    })
-
-    it('falls back to working when no lead record exists', () => {
-      expect(clearClaudeAnsweredQuestionWait(state, PANE_KEY)).toEqual({ state: 'working' })
-    })
-
-    it('resolves an answered child question even after an unrelated lead event overwrote the cached lead record', () => {
-      // Why: normalizeClaudeEvent unconditionally overwrites claudeLeadStateByPaneKey on every
-      // event, including one wholly unrelated to any child — this reproduces exactly that: a
-      // plain lead PreToolUse fires after the child's wait starts, and the answer must still
-      // resolve the child's roster row instead of being silently dropped forever (#P1).
-      claudeEvent({ hook_event_name: 'UserPromptSubmit', prompt: 'go' })
-      claudeEvent({ hook_event_name: 'SubagentStart', agent_id: 'a1', agent_type: 'probe' })
-      const wait = claudeEvent({
-        hook_event_name: 'PreToolUse',
-        tool_name: 'AskUserQuestion',
-        agent_id: 'a1',
-        tool_input: { questions: [{ question: 'Continue?' }] }
-      })
-      expect(wait?.payload.state).toBe('waiting')
-
-      // Unrelated lead activity — no agent_id, so it doesn't touch child a1's own wait, but it
-      // DOES overwrite the internal lead-turn cache away from 'waiting'/waitingAgentId.
-      const unrelated = claudeEvent({ hook_event_name: 'PreToolUse', tool_name: 'Bash' })
-      expect(unrelated?.payload.state).toBe('waiting')
-      expect(state.claudeLeadStateByPaneKey.get(PANE_KEY)?.state).not.toBe('waiting')
-
-      expect(clearClaudeAnsweredQuestionWait(state, PANE_KEY)).toEqual({ state: 'working' })
-      expect(state.claudeSubagentRosterByPaneKey.get(PANE_KEY)?.get('a1')?.state).toBe('working')
-
-      const drained = claudeEvent({ hook_event_name: 'SubagentStop', agent_id: 'a1' })
-      expect(drained?.payload.state).toBe('working')
-    })
-
-    it('does not resolve a genuinely-blocked child when the LEAD itself asked the question', () => {
-      // Why: a lead-owned AskUserQuestion (no agent_id) never sets waitingAgentId — answering it
-      // must not accidentally resolve a DIFFERENT child's still-genuinely-pending
-      // PermissionRequest just because a bare roster scan would otherwise find it first (#P1,
-      // found reviewing an earlier version of this fix that used a bare scan with no fallback
-      // restriction).
-      claudeEvent({ hook_event_name: 'UserPromptSubmit', prompt: 'go' })
-      claudeEvent({ hook_event_name: 'SubagentStart', agent_id: 'a1', agent_type: 'probe' })
-      const blocked = claudeEvent({
-        hook_event_name: 'PermissionRequest',
-        agent_id: 'a1',
-        tool_name: 'Bash',
-        tool_input: { command: 'rm -rf build' }
-      })
-      expect(blocked?.payload.state).toBe('waiting')
-
-      // The lead's OWN question — no agent_id, so it can't and doesn't touch a1's wait, but it
-      // does overwrite the shared lead-turn cache's own state/waitingAgentId.
-      const leadWait = claudeEvent({
-        hook_event_name: 'PreToolUse',
-        tool_name: 'AskUserQuestion',
-        tool_input: { questions: [{ question: 'Proceed?' }] }
-      })
-      expect(leadWait?.payload.state).toBe('waiting')
-
-      expect(clearClaudeAnsweredQuestionWait(state, PANE_KEY)).toEqual({
-        state: 'waiting'
-      })
-      // a1's real, still-pending Bash approval must survive untouched.
-      expect(state.claudeSubagentRosterByPaneKey.get(PANE_KEY)?.get('a1')?.state).toBe('waiting')
-      // Why: the STATE alone being correct isn't enough — a reader of lastToolByPaneKey must
-      // still see a1's real card (not an empty one) immediately, not just once some later,
-      // unrelated hook event happens to re-derive it (#P2, found reviewing an earlier version
-      // of this fix that only repinned the tool snapshot inside the answeredChild branch, so a
-      // lead-owned answer with a still-blocked child wiped the card instead of repinning it).
-      expect(state.lastToolByPaneKey.get(PANE_KEY)).toMatchObject({
-        toolName: 'Bash',
-        toolInput: expect.stringContaining('rm -rf build')
-      })
-    })
-
-    it('resolves the correct child when two are waiting at once', () => {
-      // Why: answering the SECOND child's question must flip a2, not silently consume a1's
-      // unrelated, still-pending permission request just because a1 was inserted first (#P1).
-      claudeEvent({ hook_event_name: 'UserPromptSubmit', prompt: 'go' })
-      claudeEvent({ hook_event_name: 'SubagentStart', agent_id: 'a1', agent_type: 'probe' })
-      claudeEvent({ hook_event_name: 'SubagentStart', agent_id: 'a2', agent_type: 'probe' })
-      const a1Blocked = claudeEvent({
-        hook_event_name: 'PermissionRequest',
-        agent_id: 'a1',
-        tool_name: 'Bash',
-        tool_input: { command: 'rm -rf build' }
-      })
-      expect(a1Blocked?.payload.state).toBe('waiting')
-      const a2Wait = claudeEvent({
-        hook_event_name: 'PreToolUse',
-        tool_name: 'AskUserQuestion',
-        agent_id: 'a2',
-        tool_input: { questions: [{ question: 'Continue?' }] }
-      })
-      expect(a2Wait?.payload.state).toBe('waiting')
-
-      expect(clearClaudeAnsweredQuestionWait(state, PANE_KEY)).toEqual({ state: 'waiting' })
-      const roster = state.claudeSubagentRosterByPaneKey.get(PANE_KEY)
-      expect(roster?.get('a2')?.state).toBe('working')
-      expect(roster?.get('a1')?.state).toBe('waiting')
-      // Why: the repoint must record waitingOwner:'child' too, not just waitingAgentId — a
-      // missing owner here forces a LATER answer for this same sibling through the less direct
-      // fallback-scan path instead of the reliable pointer (found reviewing an earlier version
-      // of this fix that set waitingAgentId but omitted waitingOwner on this exact write).
-      expect(state.claudeLeadStateByPaneKey.get(PANE_KEY)).toMatchObject({
-        waitingAgentId: 'a1',
-        waitingOwner: 'child'
-      })
-    })
-
-    it('uses the pointer, not roster insertion order, when both children wait on their own AskUserQuestion', () => {
-      // Why: this specifically pins the waitingOwner==='child' pointer branch — a1 (inserted
-      // first) and a2 (inserted second, pointer names it) are BOTH AskUserQuestion-shaped, so
-      // the isAskUserQuestionTool filter alone can't distinguish them; only the pointer can.
-      // Deleting the pointer branch and falling straight to the fallback scan would wrongly
-      // resolve a1 (first match) instead of a2 (the one the pointer, and the user, actually
-      // answered) — this test fails in that case, unlike the earlier two-children test where
-      // the non-question sibling gets filtered out regardless of whether the pointer runs.
-      claudeEvent({ hook_event_name: 'UserPromptSubmit', prompt: 'go' })
-      claudeEvent({ hook_event_name: 'SubagentStart', agent_id: 'a1', agent_type: 'probe' })
-      claudeEvent({ hook_event_name: 'SubagentStart', agent_id: 'a2', agent_type: 'probe' })
-      claudeEvent({
-        hook_event_name: 'PreToolUse',
-        tool_name: 'AskUserQuestion',
-        agent_id: 'a1',
-        tool_use_id: 'tu-a1',
-        tool_input: { questions: [{ question: 'From a1?' }] }
-      })
-      claudeEvent({
-        hook_event_name: 'PreToolUse',
-        tool_name: 'AskUserQuestion',
-        agent_id: 'a2',
-        tool_use_id: 'tu-a2',
-        tool_input: { questions: [{ question: 'From a2?' }] }
-      })
-      expect(state.claudeLeadStateByPaneKey.get(PANE_KEY)).toMatchObject({
-        waitingOwner: 'child',
-        waitingAgentId: 'a2'
-      })
-
-      expect(clearClaudeAnsweredQuestionWait(state, PANE_KEY)).toEqual({ state: 'waiting' })
-      const roster = state.claudeSubagentRosterByPaneKey.get(PANE_KEY)
-      expect(roster?.get('a2')?.state).toBe('working')
-      expect(roster?.get('a1')?.state).toBe('waiting')
-    })
-
-    it('does not resolve a child genuinely waiting on its OWN AskUserQuestion when the lead asks a separate one', () => {
-      // Why: waitingOwner:'lead' must short-circuit before ever considering a child row, even
-      // when that child's own wait is itself an AskUserQuestion (the isAskUserQuestionTool
-      // filter alone can't distinguish this from the lead's own question — both look identical
-      // as "a waiting row with an AskUserQuestion tool name") (#P1).
-      claudeEvent({ hook_event_name: 'UserPromptSubmit', prompt: 'go' })
-      claudeEvent({ hook_event_name: 'SubagentStart', agent_id: 'a1', agent_type: 'probe' })
-      const childWait = claudeEvent({
-        hook_event_name: 'PreToolUse',
-        tool_name: 'AskUserQuestion',
-        agent_id: 'a1',
-        tool_input: { questions: [{ question: 'Child question?' }] }
-      })
-      expect(childWait?.payload.state).toBe('waiting')
-
-      // The lead's OWN question — no agent_id.
-      const leadWait = claudeEvent({
-        hook_event_name: 'PreToolUse',
-        tool_name: 'AskUserQuestion',
-        tool_input: { questions: [{ question: 'Lead question?' }] }
-      })
-      expect(leadWait?.payload.state).toBe('waiting')
-      expect(state.claudeLeadStateByPaneKey.get(PANE_KEY)?.waitingOwner).toBe('lead')
-
-      expect(clearClaudeAnsweredQuestionWait(state, PANE_KEY)).toEqual({ state: 'waiting' })
-      // a1's real, still-pending question must survive untouched — the lead's own question was
-      // what got answered, and there is no child row to flip for it.
-      expect(state.claudeSubagentRosterByPaneKey.get(PANE_KEY)?.get('a1')?.state).toBe('waiting')
-    })
-
-    it('resolves whichever waiting question is currently displayed when the pointer is lost with two candidates', () => {
-      // Why: once an unrelated event wipes waitingOwner/waitingAgentId, the fallback can no
-      // longer identify "the one just answered" by insertion order alone when two children are
-      // each waiting on their own AskUserQuestion — it must instead match whichever one's card
-      // is actually still on screen (lastToolByPaneKey's waitingToolUseId), which the
-      // unrelated-event handling itself keeps pinned to a real roster row throughout.
-      claudeEvent({ hook_event_name: 'UserPromptSubmit', prompt: 'go' })
-      claudeEvent({ hook_event_name: 'SubagentStart', agent_id: 'a1', agent_type: 'probe' })
-      claudeEvent({ hook_event_name: 'SubagentStart', agent_id: 'a2', agent_type: 'probe' })
-      claudeEvent({
-        hook_event_name: 'PreToolUse',
-        tool_name: 'AskUserQuestion',
-        agent_id: 'a1',
-        tool_use_id: 'tu-a1',
-        tool_input: { questions: [{ question: 'From a1?' }] }
-      })
-      claudeEvent({
-        hook_event_name: 'PreToolUse',
-        tool_name: 'AskUserQuestion',
-        agent_id: 'a2',
-        tool_use_id: 'tu-a2',
-        tool_input: { questions: [{ question: 'From a2?' }] }
-      })
-      expect(state.claudeLeadStateByPaneKey.get(PANE_KEY)?.waitingAgentId).toBe('a2')
-
-      // Unrelated lead activity wipes waitingOwner/waitingAgentId — falls back to a roster scan.
-      claudeEvent({ hook_event_name: 'PostToolUse', tool_name: 'Read' })
-      expect(state.claudeLeadStateByPaneKey.get(PANE_KEY)?.waitingOwner).toBeUndefined()
-
-      // Why NOT rely on the real re-derivation here: claudeRosterFindWaitingSubagent (used by
-      // both the unrelated-event handler AND, degenerately, the fallback's "first match" path)
-      // always agrees with plain insertion order — so a naturally-occurring sequence can never
-      // prove the discriminator does real work, only that it doesn't get in the way. Force a
-      // genuine mismatch directly: pretend the currently-displayed card is a2's, even though a1
-      // is first in the roster, and confirm the discriminator — not insertion order — wins.
-      state.lastToolByPaneKey.set(PANE_KEY, {
-        toolName: 'AskUserQuestion',
-        waitingToolUseId: 'tu-a2'
-      })
-
-      expect(clearClaudeAnsweredQuestionWait(state, PANE_KEY)).toEqual({ state: 'waiting' })
-      const roster = state.claudeSubagentRosterByPaneKey.get(PANE_KEY)
-      // Resolves whichever is actually displayed (a2), not a1 merely because it's first.
-      expect(roster?.get('a2')?.state).toBe('working')
-      expect(roster?.get('a1')?.state).toBe('waiting')
     })
   })
 })

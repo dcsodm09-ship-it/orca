@@ -57,6 +57,8 @@ import {
 } from '../../shared/claude-subagent-roster'
 import {
   codexRosterHasRestoredSnapshotSubagent,
+  codexRosterHasRuntimeConfirmedSubagent,
+  codexRosterHasWaitingSubagent,
   codexRosterHasWorkingSubagent,
   codexRosterToSnapshots
 } from '../../shared/codex-subagent-roster'
@@ -1037,6 +1039,26 @@ export class AgentHookServer {
     }
     // Why: sync the listener's lead-turn record too, or a later child event re-emits the stale waiting state and resurrects the card.
     const restored = clearClaudeAnsweredQuestionWait(this.state, existing.paneKey)
+    // Why: clearClaudeAnsweredQuestionWait already wrote the post-repoint tool snapshot (or
+    // cleared it) into state.lastToolByPaneKey as a side effect when it ran — read it back
+    // directly rather than widening that function's return type, mirroring this file's own
+    // established direct this.state.lastToolByPaneKey access elsewhere
+    // (dropStatusEntriesByTabPrefix). Gated to restored.state==='waiting': that is the only
+    // branch where clearClaudeAnsweredQuestionWait repoints instead of clearing the snapshot,
+    // so it is the only case with real toolName/toolInput/interactivePrompt to publish.
+    const repointedTool =
+      restored.state === 'waiting' ? this.state.lastToolByPaneKey.get(existing.paneKey) : undefined
+    // Why: payload.subagents is a pre-answer snapshot — the roster may have just changed (the
+    // answered child flipped 'waiting'→'working', or a sibling was repointed); recompute fresh,
+    // mirroring the identical recompute-after-roster-mutation pattern already used by the
+    // dead-pane reap sweep (claudeRosterToSnapshots(this.state.claudeSubagentRosterByPaneKey...)).
+    // Falls back to the pre-answer payload.subagents when the local roster is empty (a
+    // relayed/remote Claude pane never populates claudeSubagentRosterByPaneKey locally — only
+    // Codex has a reconcileRemoteCodexState equivalent) so answering doesn't blank child rows
+    // applyNormalizedStatus would otherwise drop for lacking a subagents key.
+    const currentSubagents =
+      claudeRosterToSnapshots(this.state.claudeSubagentRosterByPaneKey.get(existing.paneKey)) ??
+      payload.subagents
     const inferred = this.applyNormalizedStatus({
       paneKey: existing.paneKey,
       tabId: existing.tabId,
@@ -1051,7 +1073,12 @@ export class AgentHookServer {
         ...(restored.turnCompletedAt !== undefined
           ? { turnCompletedAt: restored.turnCompletedAt }
           : {}),
-        ...(payload.subagents ? { subagents: payload.subagents } : {})
+        ...(repointedTool?.toolName !== undefined ? { toolName: repointedTool.toolName } : {}),
+        ...(repointedTool?.toolInput !== undefined ? { toolInput: repointedTool.toolInput } : {}),
+        ...(repointedTool?.interactivePrompt !== undefined
+          ? { interactivePrompt: repointedTool.interactivePrompt }
+          : {}),
+        ...(currentSubagents ? { subagents: currentSubagents } : {})
       }
     })
     console.debug('[agent-hooks] inferred resolved question status', {
@@ -2911,6 +2938,16 @@ export class AgentHookServer {
     const candidates: { paneKey: string; entry: EnrichedAgentHookEventPayload }[] = []
     for (const [paneKey, entry] of this.state.lastStatusByPaneKey) {
       const enriched = entry as EnrichedAgentHookEventPayload
+      // Why: deliberately checks codexRosterHasRuntimeConfirmedSubagent on THIS roster, not the
+      // shared runtimeObservedStatusPaneKeys the Claude reap above uses — that set is set/cleared
+      // by ANY hook event for the pane regardless of which roster row it touches, and restricting
+      // Codex candidacy to it made a genuinely-alive Codex pane with one unrelated unreaped ghost
+      // (this exact sweep spares a ghost whose pane liveness probe finds the process alive) look
+      // "unconfirmed" to every OTHER consumer of restoredUnconfirmed for as long as the ghost
+      // survives (dual review, 2026-08-20 — mobile agent rows vanished, remote AskUserQuestion
+      // became unanswerable, attention suppressed). This roster-scoped check answers exactly what
+      // this sweep needs — is there still a specific unconfirmed row to reap — without publishing
+      // that fact onto the pane's general status for six unrelated consumers to also read.
       if (
         enriched.payload.agentType === 'codex' &&
         enriched.connectionId === null &&
@@ -2918,7 +2955,9 @@ export class AgentHookServer {
         codexRosterHasRestoredSnapshotSubagent(
           this.state.codexSubagentRosterByPaneKey.get(paneKey)
         ) &&
-        !this.runtimeObservedStatusPaneKeys.has(paneKey)
+        !codexRosterHasRuntimeConfirmedSubagent(
+          this.state.codexSubagentRosterByPaneKey.get(paneKey)
+        )
       ) {
         candidates.push({ paneKey, entry: enriched })
       }
@@ -2939,22 +2978,38 @@ export class AgentHookServer {
         liveness[index] ||
         !isLocalPaneLivenessEvidenceCurrent(paneKey) ||
         this.state.lastStatusByPaneKey.get(paneKey) !== enriched ||
-        this.runtimeObservedStatusPaneKeys.has(paneKey) ||
+        codexRosterHasRuntimeConfirmedSubagent(
+          this.state.codexSubagentRosterByPaneKey.get(paneKey)
+        ) ||
         !isLocalExecutionHost(enriched.worktreeId)
       ) {
         continue
       }
+      // Why: captured BEFORE the reap below — mirrors hadWaitingSubagentBeforeReap in
+      // reapRestoredClaudeSubagentsWithoutLiveAgent. Codex has a lead-owned 'waiting' state
+      // independent of the roster too (a plain, no-agent_id PermissionRequest sets
+      // codexLeadStateByPaneKey directly, and codexRosterEffectiveState falls back to it
+      // whenever the roster has no waiting row) — reaping an unrelated dead restored child
+      // must never resolve that separate, lead-owned wait.
+      const hadWaitingSubagentBeforeReap = codexRosterHasWaitingSubagent(
+        this.state.codexSubagentRosterByPaneKey.get(paneKey)
+      )
       if (!reapRestoredCodexSubagentsForDeadPane(this.state, paneKey)) {
         continue
       }
       changedPanes += 1
       const roster = this.state.codexSubagentRosterByPaneKey.get(paneKey)
       const subagents = codexRosterToSnapshots(roster)
-      // Why: mirrors the Claude reap's completion inference — a persisted
-      // 'working' pane with no working roster row left is a finished lead a
-      // dead child was pinning open.
+      // Why: mirrors the Claude reap's completion inference — a persisted 'working' or
+      // 'waiting' pane with no working/waiting roster row left is a finished lead a dead
+      // child was pinning open (restore-parity gap #1: Codex's roster has always accepted
+      // restored 'waiting' snapshots, so this reap needed the same dual-condition Claude's
+      // got in round 2, gated by hadWaitingSubagentBeforeReap above).
       const state =
-        enriched.payload.state === 'working' && !codexRosterHasWorkingSubagent(roster)
+        (enriched.payload.state === 'working' && !codexRosterHasWorkingSubagent(roster)) ||
+        (enriched.payload.state === 'waiting' &&
+          hadWaitingSubagentBeforeReap &&
+          !codexRosterHasWaitingSubagent(roster))
           ? 'done'
           : enriched.payload.state
       const stateChanged = state !== enriched.payload.state

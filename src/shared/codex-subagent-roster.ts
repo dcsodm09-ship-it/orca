@@ -235,6 +235,25 @@ export function codexRosterHasWorkingSubagent(roster: CodexSubagentRoster | unde
   return false
 }
 
+/** Whether any row is still blocked on its own PermissionRequest/AskUserQuestion — mirrors
+ *  claudeRosterHasWaitingSubagent. Lets the dead-pane reap tell a child-owned 'waiting'
+ *  apart from a lead-owned one (codexLeadStateForHookEvent maps a plain, no-agent_id
+ *  PermissionRequest straight to codexLeadStateByPaneKey; codexRosterEffectiveState
+ *  returns that lead state verbatim whenever the roster has no waiting row), so reaping
+ *  an unrelated dead restored child can never resolve a lead-owned wait it had nothing
+ *  to do with (restore-parity gap #1's Codex-side dead-pane reap fix). */
+export function codexRosterHasWaitingSubagent(roster: CodexSubagentRoster | undefined): boolean {
+  if (!roster) {
+    return false
+  }
+  for (const tracked of roster.values()) {
+    if (tracked.state === 'waiting') {
+      return true
+    }
+  }
+  return false
+}
+
 export function codexRosterToSnapshots(
   roster: CodexSubagentRoster | undefined
 ): AgentSubagentSnapshot[] | undefined {
@@ -292,6 +311,34 @@ export function isHookConfirmedCodexSubagent(
   id: string
 ): boolean {
   return roster?.get(id)?.source === 'hook'
+}
+
+/** Whether any row's hook-confirmed status comes from LIVE activity this runtime, not merely a
+ *  restored disk snapshot. seedCodexSubagentRoster deliberately stamps a restored row
+ *  source:'hook' too (so a reconnect can't make an already-known child newly fragile against the
+ *  next lead Stop, see that function's comment) — but that means hasHookConfirmedCodexSubagent
+ *  alone can't tell "a child is genuinely still running" apart from "a restored row nothing has
+ *  reconfirmed happens to still be sitting there." Used directly by
+ *  reapRestoredCodexSubagentsWithoutLiveAgent's candidate filter (agent-hooks/server.ts) to find
+ *  a pane whose roster still holds an unconfirmed restored row — scoped to the roster itself
+ *  rather than the pane's general status, so this signal never reaches the ~6 unrelated
+ *  consumers that read the pane's restoredUnconfirmed field (dual review, 2026-08-20: an earlier
+ *  version routed this through that shared field and made an otherwise-alive Codex pane with one
+ *  unrelated unreaped ghost look "unconfirmed" everywhere for up to 30 minutes). Mirrors
+ *  claudeRosterHasRuntimeWorkingSubagent/claudeRosterHasRuntimeWaitingSubagent's
+ *  restoredFromSnapshot discrimination on the Claude side. */
+export function codexRosterHasRuntimeConfirmedSubagent(
+  roster: CodexSubagentRoster | undefined
+): boolean {
+  if (!roster) {
+    return false
+  }
+  for (const tracked of roster.values()) {
+    if (tracked.source === 'hook' && tracked.restoredFromSnapshot !== true) {
+      return true
+    }
+  }
+  return false
 }
 
 // Why: reuses the same generous, already-established convention as AGENT_STATUS_STALE_AFTER_MS

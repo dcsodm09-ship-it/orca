@@ -6,6 +6,7 @@ import {
   AGENT_TYPE_MAX_LENGTH
 } from './agent-status-types'
 import {
+  codexRosterHasWaitingSubagent,
   codexRosterToSnapshots,
   finishCodexSubagent,
   hasHookConfirmedCodexSubagent,
@@ -205,6 +206,39 @@ describe('Codex subagent roster', () => {
       expect(isHookConfirmedCodexSubagent(roster, 'transcript-child')).toBe(false)
       expect(isHookConfirmedCodexSubagent(roster, 'missing-child')).toBe(false)
       expect(isHookConfirmedCodexSubagent(undefined, 'hook-child')).toBe(false)
+    })
+  })
+
+  describe('codexRosterHasWaitingSubagent', () => {
+    it('returns false for an undefined roster', () => {
+      expect(codexRosterHasWaitingSubagent(undefined)).toBe(false)
+    })
+
+    it('returns false for an empty roster', () => {
+      expect(codexRosterHasWaitingSubagent(new Map())).toBe(false)
+    })
+
+    it('returns true when any row is waiting, hook-confirmed or not', () => {
+      const roster: CodexSubagentRoster = new Map()
+      upsertCodexSubagent(roster, 'child-1', { state: 'waiting', source: 'transcript' }, 10)
+      expect(codexRosterHasWaitingSubagent(roster)).toBe(true)
+    })
+
+    it('returns true for a restored-from-snapshot waiting row too', () => {
+      const roster: CodexSubagentRoster = new Map()
+      upsertCodexSubagent(
+        roster,
+        'child-1',
+        { state: 'waiting', source: 'hook', restoredFromSnapshot: true },
+        10
+      )
+      expect(codexRosterHasWaitingSubagent(roster)).toBe(true)
+    })
+
+    it('returns false when the roster has only working rows', () => {
+      const roster: CodexSubagentRoster = new Map()
+      upsertCodexSubagent(roster, 'child-1', { state: 'working', source: 'hook' }, 10)
+      expect(codexRosterHasWaitingSubagent(roster)).toBe(false)
     })
   })
 })

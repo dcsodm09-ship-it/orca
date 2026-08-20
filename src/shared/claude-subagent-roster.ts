@@ -38,6 +38,20 @@ export type TrackedClaudeSubagent = {
   waitingToolName?: string
   waitingToolInput?: string
   waitingToolUseId?: string
+  /** Full JSON of the AskUserQuestion tool input (or the PermissionRequest approval
+   *  envelope) — mirrors ToolSnapshot.interactivePrompt (agent-hook-listener.ts), captured
+   *  once at wait-start alongside waitingToolName/waitingToolInput/waitingToolUseId. Without
+   *  this, a later repoint onto this row (clearClaudePendingWaitForAgent,
+   *  clearClaudeAnsweredQuestionWait, or the unrelated-event re-derivation) could restore
+   *  which TOOL a sibling is blocked on but never the actual question text/options — the
+   *  card content would be permanently empty once the lead's own live event that originally
+   *  derived it had passed. Cleared everywhere the three fields above are cleared:
+   *  upsertWorkingClaudeSubagent, stopClaudeSubagent, idleClaudeTeammateByName. NOT cleared
+   *  in foldClaudeBackgroundTasksIntoRoster's listed-authoritative branch — that branch is
+   *  gated `if (existing.state !== 'waiting')` before ever setting state:'working', so it
+   *  structurally cannot transition a row OUT of 'waiting' and never needs to (same reason
+   *  waitingToolName/waitingToolInput/waitingToolUseId are untouched there today). */
+  interactivePrompt?: string
   /** A TeammateIdle matched this id by name — proof it is a persistent
    *  in-process teammate, not a workflow lane that merely reuses the
    *  `a<name>-<hex>` id shape. Never cleared: identity can't change mid-life.
@@ -114,6 +128,7 @@ export function upsertWorkingClaudeSubagent(
     existing.waitingToolName = undefined
     existing.waitingToolInput = undefined
     existing.waitingToolUseId = undefined
+    existing.interactivePrompt = undefined
     // Why: live activity proves the lifecycle stream owns this id again;
     // background_tasks omission must stop reaping it (teammate-shaped ids
     // never appear there). The fold re-tags its own recreations after this.
@@ -150,6 +165,7 @@ export function upsertWaitingClaudeSubagent(
     toolName?: string
     toolInput?: string
     toolUseId?: string
+    interactivePrompt?: string
   },
   now: number
 ): void {
@@ -164,6 +180,7 @@ export function upsertWaitingClaudeSubagent(
     existing.waitingToolName = fields.toolName
     existing.waitingToolInput = fields.toolInput
     existing.waitingToolUseId = fields.toolUseId
+    existing.interactivePrompt = fields.interactivePrompt
     existing.backgroundTasksAuthoritative = undefined
     existing.restoredFromSnapshot = undefined
     // Why: a live PermissionRequest/AskUserQuestion is fresh proof this child is
@@ -182,6 +199,7 @@ export function upsertWaitingClaudeSubagent(
     waitingToolName: fields.toolName,
     waitingToolInput: fields.toolInput,
     waitingToolUseId: fields.toolUseId,
+    interactivePrompt: fields.interactivePrompt,
     waitingConfirmedAt: now
   })
 }
@@ -221,6 +239,7 @@ export function stopClaudeSubagent(roster: ClaudeSubagentRoster, id: string): vo
   tracked.waitingToolName = undefined
   tracked.waitingToolInput = undefined
   tracked.waitingToolUseId = undefined
+  tracked.interactivePrompt = undefined
   tracked.waitingConfirmedAt = undefined
   tracked.state = 'idle'
 }
@@ -279,6 +298,7 @@ export function idleClaudeTeammateByName(roster: ClaudeSubagentRoster, name: str
       tracked.waitingToolName = undefined
       tracked.waitingToolInput = undefined
       tracked.waitingToolUseId = undefined
+      tracked.interactivePrompt = undefined
       tracked.waitingConfirmedAt = undefined
       tracked.state = 'idle'
       tracked.confirmedTeammate = true
@@ -312,19 +332,36 @@ export function claudeRosterHasWaitingSubagent(roster: ClaudeSubagentRoster | un
 
 /** First roster entry still blocked on its own PermissionRequest/AskUserQuestion, if
  *  any — used to repoint the pane's single-slot wait pointer/tool-snapshot cache at a
- *  still-pending sibling when another child's wait resolves. */
+ *  still-pending sibling when another child's wait resolves.
+ *
+ *  A restored-from-snapshot 'waiting' row carries no waitingToolName/interactivePrompt
+ *  (AgentSubagentSnapshot never persisted them) and upsertWaitingClaudeSubagent always
+ *  clears restoredFromSnapshot the moment a live event gives a row real content — so a
+ *  row still flagged restoredFromSnapshot is reliably content-empty. Prefer any live,
+ *  content-bearing 'waiting' row over such a ghost, or a restored ghost that is merely
+ *  first in Map insertion order silently hijacks the pane's one display slot from a
+ *  genuinely-waiting live sibling, blanking its card content while pane state still
+ *  (correctly) reads 'waiting' — a fake-stuck-pane regression found in dual review of
+ *  the restore-parity fix this function's ghost rows exist to support. Fall back to a
+ *  content-empty ghost only when it's the sole waiting row, so a restored-only pane
+ *  still reports 'waiting' rather than losing the row entirely. */
 export function claudeRosterFindWaitingSubagent(
   roster: ClaudeSubagentRoster | undefined
 ): [id: string, tracked: TrackedClaudeSubagent] | undefined {
   if (!roster) {
     return undefined
   }
+  let ghost: [id: string, tracked: TrackedClaudeSubagent] | undefined
   for (const entry of roster) {
-    if (entry[1].state === 'waiting') {
+    if (entry[1].state !== 'waiting') {
+      continue
+    }
+    if (entry[1].restoredFromSnapshot !== true) {
       return entry
     }
+    ghost ??= entry
   }
-  return undefined
+  return ghost
 }
 
 /** A working child observed in this listener runtime, not merely restored from disk. */
@@ -336,6 +373,28 @@ export function claudeRosterHasRuntimeWorkingSubagent(
   }
   for (const tracked of roster.values()) {
     if (tracked.state === 'working' && tracked.restoredFromSnapshot !== true) {
+      return true
+    }
+  }
+  return false
+}
+
+/** A waiting child observed in this listener runtime, not merely restored from disk —
+ *  mirrors claudeRosterHasRuntimeWorkingSubagent exactly. Used by normalizeClaudeEvent's
+ *  unconfirmed-restored-status preservation gate to tell 'this pane reads waiting only
+ *  because of a restored/unconfirmed row' apart from 'a live child is genuinely waiting'
+ *  (Claude/Codex restore-parity gap #1: a restored 'waiting' row needs the identical
+ *  preservation treatment a restored 'working' row already gets, or it loses its
+ *  unconfirmed marker on the very next unrelated event and becomes permanently
+ *  ineligible for the dead-pane liveness sweep). */
+export function claudeRosterHasRuntimeWaitingSubagent(
+  roster: ClaudeSubagentRoster | undefined
+): boolean {
+  if (!roster) {
+    return false
+  }
+  for (const tracked of roster.values()) {
+    if (tracked.state === 'waiting' && tracked.restoredFromSnapshot !== true) {
       return true
     }
   }

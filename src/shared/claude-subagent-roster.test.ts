@@ -4,6 +4,8 @@ import { readClaudeBackgroundAgentTasks } from './claude-background-task-invento
 import { foldClaudeBackgroundTasksIntoRoster } from './claude-subagent-background-task-fold'
 import {
   CLAUDE_WAITING_SUBAGENT_STALE_MS,
+  claudeRosterFindWaitingSubagent,
+  claudeRosterHasRuntimeWaitingSubagent,
   claudeRosterHasRuntimeWorkingSubagent,
   claudeRosterHasWorkingSubagent,
   claudeRosterToSnapshots,
@@ -589,6 +591,74 @@ describe('claude-subagent-roster', () => {
   })
 })
 
+describe('TrackedClaudeSubagent.interactivePrompt', () => {
+  it('lands the field on both a freshly created row and an existing-row update', () => {
+    const roster: ClaudeSubagentRoster = new Map()
+    // Why: proves upsertWaitingClaudeSubagent's new-row create branch actually
+    // threads interactivePrompt through, not just the type declaration.
+    upsertWaitingClaudeSubagent(
+      roster,
+      'a1',
+      { toolName: 'AskUserQuestion', interactivePrompt: '{"questions":[{"question":"Pick one"}]}' },
+      100
+    )
+    expect(roster.get('a1')).toMatchObject({
+      state: 'waiting',
+      interactivePrompt: '{"questions":[{"question":"Pick one"}]}'
+    })
+
+    // Why: a second call on the same id exercises the existing-row branch, which is a
+    // separate code path from the create branch above.
+    upsertWaitingClaudeSubagent(
+      roster,
+      'a1',
+      { toolName: 'AskUserQuestion', interactivePrompt: '{"questions":[{"question":"Pick two"}]}' },
+      200
+    )
+    expect(roster.get('a1')).toMatchObject({
+      state: 'waiting',
+      interactivePrompt: '{"questions":[{"question":"Pick two"}]}'
+    })
+  })
+
+  it('is cleared by upsertWorkingClaudeSubagent so a stale question cannot leak into a later wait', () => {
+    const roster: ClaudeSubagentRoster = new Map()
+    upsertWaitingClaudeSubagent(
+      roster,
+      'a1',
+      { toolName: 'AskUserQuestion', interactivePrompt: '{"questions":[{"question":"Pick one"}]}' },
+      100
+    )
+    upsertWorkingClaudeSubagent(roster, 'a1', {}, 200)
+    expect(roster.get('a1')?.interactivePrompt).toBeUndefined()
+  })
+
+  it('is cleared by stopClaudeSubagent so a stale question cannot leak into a later wait', () => {
+    const roster: ClaudeSubagentRoster = new Map()
+    // Why: a teammate-shaped id parks idle (not deleted) on stop, so the clear is observable.
+    upsertWaitingClaudeSubagent(
+      roster,
+      'aprobe1-6d3cb5b5',
+      { toolName: 'AskUserQuestion', interactivePrompt: '{"questions":[{"question":"Pick one"}]}' },
+      100
+    )
+    stopClaudeSubagent(roster, 'aprobe1-6d3cb5b5')
+    expect(roster.get('aprobe1-6d3cb5b5')?.interactivePrompt).toBeUndefined()
+  })
+
+  it('is cleared by idleClaudeTeammateByName so a stale question cannot leak into a later wait', () => {
+    const roster: ClaudeSubagentRoster = new Map()
+    upsertWaitingClaudeSubagent(
+      roster,
+      'aprobe1-6d3cb5b5',
+      { toolName: 'AskUserQuestion', interactivePrompt: '{"questions":[{"question":"Pick one"}]}' },
+      100
+    )
+    idleClaudeTeammateByName(roster, 'probe1')
+    expect(roster.get('aprobe1-6d3cb5b5')?.interactivePrompt).toBeUndefined()
+  })
+})
+
 describe('restored-row liveness reap', () => {
   const restored = (id: string): ClaudeSubagentRoster =>
     new Map([
@@ -636,5 +706,68 @@ describe('restored-row liveness reap', () => {
     const roster = restored('aprobe1-6d3cb5b5')
     foldClaudeBackgroundTasksIntoRoster(roster, [task({ id: 'other', teammate: true })], 200)
     expect(roster.has('aprobe1-6d3cb5b5')).toBe(false)
+  })
+})
+
+describe('claudeRosterHasRuntimeWaitingSubagent', () => {
+  it('returns false for an undefined roster', () => {
+    expect(claudeRosterHasRuntimeWaitingSubagent(undefined)).toBe(false)
+  })
+
+  it('returns false for an empty roster', () => {
+    expect(claudeRosterHasRuntimeWaitingSubagent(new Map())).toBe(false)
+  })
+
+  it('returns false when the only waiting row is restored from a snapshot', () => {
+    const roster: ClaudeSubagentRoster = new Map([
+      ['a1', { state: 'waiting', startedAt: 100, restoredFromSnapshot: true }]
+    ])
+    expect(claudeRosterHasRuntimeWaitingSubagent(roster)).toBe(false)
+  })
+
+  it('returns true for a waiting row confirmed by a live upsert', () => {
+    const roster: ClaudeSubagentRoster = new Map()
+    upsertWaitingClaudeSubagent(roster, 'a1', {}, 100)
+    expect(claudeRosterHasRuntimeWaitingSubagent(roster)).toBe(true)
+  })
+
+  it('returns false when the roster has only a working row', () => {
+    const roster: ClaudeSubagentRoster = new Map()
+    upsertWorkingClaudeSubagent(roster, 'a1', {}, 100)
+    expect(claudeRosterHasRuntimeWaitingSubagent(roster)).toBe(false)
+  })
+})
+
+describe('claudeRosterFindWaitingSubagent — restored ghost must not hijack a live sibling', () => {
+  it('returns the live, content-bearing row over a content-empty restored ghost that is first in Map order', () => {
+    const roster: ClaudeSubagentRoster = new Map([
+      ['a1-restored-ghost', { state: 'waiting', startedAt: 50, restoredFromSnapshot: true }]
+    ])
+    upsertWaitingClaudeSubagent(
+      roster,
+      'a2-live',
+      { toolName: 'AskUserQuestion', interactivePrompt: 'Ship to prod?' },
+      100
+    )
+    const found = claudeRosterFindWaitingSubagent(roster)
+    expect(found?.[0]).toBe('a2-live')
+    expect(found?.[1].waitingToolName).toBe('AskUserQuestion')
+    expect(found?.[1].interactivePrompt).toBe('Ship to prod?')
+  })
+
+  it('still falls back to a content-empty restored ghost when it is the only waiting row', () => {
+    const roster: ClaudeSubagentRoster = new Map([
+      ['a1-restored-ghost', { state: 'waiting', startedAt: 50, restoredFromSnapshot: true }]
+    ])
+    const found = claudeRosterFindWaitingSubagent(roster)
+    expect(found?.[0]).toBe('a1-restored-ghost')
+  })
+
+  it('prefers the live row even when the ghost is inserted after it', () => {
+    const roster: ClaudeSubagentRoster = new Map()
+    upsertWaitingClaudeSubagent(roster, 'a1-live', { toolName: 'AskUserQuestion' }, 100)
+    roster.set('a2-restored-ghost', { state: 'waiting', startedAt: 50, restoredFromSnapshot: true })
+    const found = claudeRosterFindWaitingSubagent(roster)
+    expect(found?.[0]).toBe('a1-live')
   })
 })

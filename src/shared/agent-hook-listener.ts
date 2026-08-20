@@ -29,6 +29,7 @@ import { isAskUserQuestionTool } from './agent-question-answered-intent'
 import {
   claudeRosterFindWaitingSubagent,
   claudeRosterHasRestoredSnapshotSubagent,
+  claudeRosterHasRuntimeWaitingSubagent,
   claudeRosterHasRuntimeWorkingSubagent,
   claudeRosterHasWaitingSubagent,
   claudeRosterHasWorkingSubagent,
@@ -2786,7 +2787,9 @@ export function markClaudeLeadTurnInterrupted(state: HookListenerState, paneKey:
   state.claudeActiveSessionCronPaneKeys.delete(paneKey)
 }
 
-/** Rebuild a pane's working roster from a persisted snapshot; live activity confirms a seed, a complete task inventory may reap an unconfirmed one whose finish hook arrived while Orca was offline. */
+/** Rebuild a pane's working/waiting roster from a persisted snapshot; live activity confirms a
+ *  seed, a complete task inventory may reap an unconfirmed one whose finish hook arrived while
+ *  Orca was offline. */
 export function seedClaudeSubagentRosterFromSnapshots(
   state: HookListenerState,
   paneKey: string,
@@ -2796,31 +2799,36 @@ export function seedClaudeSubagentRosterFromSnapshots(
     return
   }
   const roster = getOrCreateClaudeSubagentRoster(state, paneKey)
+  // Why: real wall-clock restore time, not the snapshot's own (possibly long-stale)
+  // startedAt — mirrors upsertCodexSubagent's confirmedAt (Date.now(), not the caller's
+  // `now`) for the identical reason: anchoring a restored 'waiting' row's bounded
+  // fold-protection window (waitingConfirmedAt, see claudeSubagentSurvivesUnlistedFold)
+  // to the ORIGINAL wait-start risks an immediate reap on the first background_tasks Stop
+  // after restart, before a live reconfirmation or the dead-pane liveness sweep can run.
+  const restoredAt = Date.now()
   for (const snapshot of snapshots) {
-    // Why: idle-teammate liveness can't be proven across a restart (its TeammateIdle confirmation
-    // is gone); only working seeds restore, and a live teammate re-earns its row via SubagentStart.
-    // A 'waiting' seed is deliberately NOT restored either, despite being a real Claude/Codex
-    // parity gap (Codex's seedCodexSubagentRoster does accept it) — a restored 'waiting' row was
-    // tried and reverted: resolveClaudePaneState's unconditional "any waiting child wins" rule
-    // forces the pane 'waiting' on the very next event, and the restoredUnconfirmed safety net at
-    // the bottom of normalizeClaudeEvent only covers 'working', so the row silently loses its
-    // unconfirmed marker and, with it, all eligibility for the dead-pane liveness sweep — a
-    // self-perpetuating fake 'waiting' with no recovery path in the general case (verified
-    // end-to-end against a real AgentHookServer + hook HTTP flow). Fixing this properly needs the
-    // unconfirmed-preservation gate extended to a restoredFromSnapshot-driven 'waiting' too, which
-    // is real design work, not a quick patch — not attempted this round.
-    if (snapshot.state !== 'working') {
+    // Why: idle-teammate liveness can't be proven across a restart (its TeammateIdle
+    // confirmation is gone); a live teammate re-earns its row via SubagentStart. A
+    // 'waiting' seed DOES restore (Claude/Codex restore-parity gap #1, closed) — the
+    // unconfirmed-preservation gate in normalizeClaudeEvent now covers 'waiting' the same
+    // way it covers 'working' (see claudeRosterHasRuntimeWaitingSubagent), so this can no
+    // longer strand the pane in a self-perpetuating fake 'waiting' with no recovery path.
+    if (snapshot.state !== 'working' && snapshot.state !== 'waiting') {
       continue
     }
     roster.set(snapshot.id, {
-      state: 'working',
+      state: snapshot.state,
       startedAt: snapshot.startedAt,
       agentType: snapshot.agentType,
       description: snapshot.description,
-      // Why: the seed can be a phantom (child finished while Orca was down, SubagentStop lost); let a PRESENT background_tasks list omitting the id remove it, not gate the pane 'working' forever.
+      // Why: the seed can be a phantom (child finished while Orca was down, its finish hook
+      // lost); let a PRESENT background_tasks list omitting the id remove it, not gate the
+      // pane forever.
       backgroundTasksAuthoritative: true,
-      // Why: an idle parent never emits that list, so the inventory reap alone can strand the seed; mark it for the liveness reap below.
-      restoredFromSnapshot: true
+      // Why: an idle parent never emits that list, so the inventory reap alone can strand
+      // the seed; mark it for the liveness reap below.
+      restoredFromSnapshot: true,
+      ...(snapshot.state === 'waiting' ? { waitingConfirmedAt: restoredAt } : {})
     })
   }
 }
@@ -2914,6 +2922,7 @@ function clearClaudePendingWaitForAgent(
       toolName: tracked.waitingToolName,
       toolInput: tracked.waitingToolInput,
       waitingToolUseId: tracked.waitingToolUseId,
+      interactivePrompt: tracked.interactivePrompt,
       lastAssistantMessage: previousTool?.lastAssistantMessage
     })
     return
@@ -3034,6 +3043,7 @@ export function clearClaudeAnsweredQuestionWait(
       toolName: tracked.waitingToolName,
       toolInput: tracked.waitingToolInput,
       waitingToolUseId: tracked.waitingToolUseId,
+      interactivePrompt: tracked.interactivePrompt,
       lastAssistantMessage: previousTool?.lastAssistantMessage
     })
     return { state: 'waiting' }
@@ -3247,7 +3257,20 @@ function normalizeClaudeEvent(
           // waitingToolUseId (see below) — keep the frozen per-child copy in
           // parity so a repoint can't newly engage the parallel-tool-use guard
           // for a plain permission wait that never used it before.
-          toolUseId: isAskUserQuestionWait ? eventToolUseId : undefined
+          toolUseId: isAskUserQuestionWait ? eventToolUseId : undefined,
+          // Why: freeze the actual question/options (or approval envelope) on this
+          // child's own row at wait-start, mirroring every other deriveInteractivePrompt
+          // call site — without it a later repoint (clearClaudePendingWaitForAgent,
+          // clearClaudeAnsweredQuestionWait, or the unrelated-event re-derivation) has
+          // nowhere to read the card's actual content from once this live event has
+          // passed. Called unconditionally, matching deriveInteractivePrompt's own
+          // established contract: it internally branches on isAskUserQuestionTool vs.
+          // eventName==='PermissionRequest' and returns undefined for anything else.
+          interactivePrompt: deriveInteractivePrompt(
+            eventToolName,
+            hookPayload.tool_input,
+            eventName
+          )
         },
         Date.now()
       )
@@ -3296,6 +3319,7 @@ function normalizeClaudeEvent(
         toolName: tracked.waitingToolName,
         toolInput: tracked.waitingToolInput,
         waitingToolUseId: tracked.waitingToolUseId,
+        interactivePrompt: tracked.interactivePrompt,
         lastAssistantMessage: state.lastToolByPaneKey.get(paneKey)?.lastAssistantMessage
       })
       return buildClaudeStatusPayload(state, eventName, promptText, paneKey, hookPayload, {
@@ -3391,12 +3415,27 @@ function normalizeClaudeEvent(
   })
 
   const effectiveRoster = state.claudeSubagentRosterByPaneKey.get(paneKey)
+  // Why: a restored-only 'waiting' pane state must get the identical preservation
+  // treatment a restored-only 'working' state already gets — resolveClaudePaneState's
+  // unconditional "any waiting child wins" rule (claudeRosterHasWaitingSubagent) forces
+  // effectiveState 'waiting' for a restored waiting child exactly as it forces 'working'
+  // for a restored working one. Without this, the row silently loses its
+  // claudeUnconfirmedRestoredStatusPaneKeys marker on the very next unrelated event and,
+  // with it, all eligibility for the dead-pane liveness sweep in server.ts's
+  // reapRestoredClaudeSubagentsWithoutLiveAgent (via runtimeObservedStatusPaneKeys) — a
+  // self-perpetuating fake 'waiting' pane with no recovery path (restore-parity gap #1).
+  const restoredRosterAloneDrivesEffectiveState =
+    effectiveState === 'working'
+      ? claudeRosterHasRestoredSnapshotSubagent(effectiveRoster) &&
+        !claudeRosterHasRuntimeWorkingSubagent(effectiveRoster)
+      : effectiveState === 'waiting'
+        ? claudeRosterHasRestoredSnapshotSubagent(effectiveRoster) &&
+          !claudeRosterHasRuntimeWaitingSubagent(effectiveRoster)
+        : false
   if (
     isTurnBoundary &&
     eventAgentId === undefined &&
-    effectiveState === 'working' &&
-    claudeRosterHasRestoredSnapshotSubagent(effectiveRoster) &&
-    !claudeRosterHasRuntimeWorkingSubagent(effectiveRoster) &&
+    restoredRosterAloneDrivesEffectiveState &&
     !state.claudeRunningNonAgentTaskPaneKeys.has(paneKey) &&
     !state.claudeActiveSessionCronPaneKeys.has(paneKey)
   ) {
@@ -3417,6 +3456,7 @@ function normalizeClaudeEvent(
       toolName: tracked.waitingToolName,
       toolInput: tracked.waitingToolInput,
       waitingToolUseId: tracked.waitingToolUseId,
+      interactivePrompt: tracked.interactivePrompt,
       lastAssistantMessage: state.lastToolByPaneKey.get(paneKey)?.lastAssistantMessage
     })
     return buildClaudeStatusPayload(state, eventName, promptText, paneKey, hookPayload, {
@@ -4897,6 +4937,16 @@ export function normalizeHookPayload(
     (providerSessionOnly
       ? normalizeAgentStatusPayload({ state: 'done', prompt: '', agentType: source })
       : null)
+  // Why: Codex deliberately does NOT get a restoredUnconfirmed marker here (dual review,
+  // 2026-08-20 — two attempts tried: a Stop-only marker Set, then a live per-event roster
+  // computation; both made an otherwise-genuinely-alive Codex pane with one unrelated,
+  // not-yet-reaped restored child read "unconfirmed" to every consumer of this field, not just
+  // the reap sweep — mobile agent rows vanished, remote AskUserQuestion became unanswerable,
+  // attention suppression broke, for as long as that unrelated ghost survived, up to 30 minutes).
+  // The reap sweep's own actual need — "does this pane's roster still hold a restored row
+  // nothing has runtime-confirmed" — is answered directly inside
+  // reapRestoredCodexSubagentsWithoutLiveAgent via codexRosterHasRuntimeConfirmedSubagent against
+  // the roster itself, without publishing that fact onto the pane's general status.
   const restoredUnconfirmed =
     source === 'claude' && state.claudeUnconfirmedRestoredStatusPaneKeys.delete(paneKey)
   return transportPayload
