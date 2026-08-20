@@ -5945,7 +5945,7 @@ def guarded_arguments(arguments: list[str]) -> list[str]:
     return [*prefix, *RESOURCE_GUARDS, *remaining]
 
 
-def validate_exec_target(path: str, root: str, expected_sha256: str) -> str | None:
+def validate_exec_target(path: str, root: str, expected_sha256: str) -> tuple[str | None, int]:
     # Round 13/14, 2026-08-18 (independent review, P2): NODE and CLI are the
     # two paths that matter MOST in this whole script -- they are what
     # actually gets exec'd -- yet, unlike LOCK just above (~15 lines of
@@ -5959,11 +5959,11 @@ def validate_exec_target(path: str, root: str, expected_sha256: str) -> str | No
     # current-uid-owned file with no group/other permission bits -- matching
     # the exact mode extract_node_toolchain()/safe_extract_main_asset()
     # themselves always write (0o700 for the executable NODE, 0o600 or
-    # 0o700 for CLI/its own dependencies). Returns an error message on
-    # failure, or None when `path` is safe to exec -- mirroring this
-    # script's own fail()-based idiom (a plain return value, not an
-    # exception type this standalone generated script never defines)
-    # rather than introducing a new error-handling convention.
+    # 0o700 for CLI/its own dependencies). Returns (error_message, fd) --
+    # fd is -1 whenever error_message is not None, mirroring this script's
+    # own fail()-based idiom (a plain return value, not an exception type
+    # this standalone generated script never defines) rather than
+    # introducing a new error-handling convention.
     #
     # Round 23, 2026-08-19 (independent Codex sol/max review, P1-1/P1-2):
     # these structural checks alone never verified CONTENT -- only that
@@ -5982,38 +5982,114 @@ def validate_exec_target(path: str, root: str, expected_sha256: str) -> str | No
     # used to re-confirm the leaf identity (not a second, independent
     # lexical open), and refuses unless its digest matches exactly.
     #
-    # This still leaves the same small, structural residual gap LOCK's own
-    # descriptor-bound flock() does NOT have, now applied to content as well
-    # as identity: subprocess.run() ultimately re-resolves `path` by name a
-    # second time to exec it, so a same-UID racer that wins the narrow
-    # window between this check returning and that later, independent exec
-    # could still swap the target underneath it. Fully closing that would
-    # mean exec'ing through an already-open, already-validated file
-    # descriptor (e.g. Darwin's /dev/fd/<n>) instead of a path at all -- a
-    # larger structural change than this P1-scoped addition, documented
-    # here rather than silently left unmentioned.
+    # Round 47, 2026-08-20 (independent Codex sol/terra round-46 review,
+    # P1): this function used to close its own descriptor before
+    # returning, so `main()` validated NODE/CLI's identity+content through
+    # one open()/read()/close() cycle and then handed the SAME path
+    # strings to `subprocess.run([NODE, CLI, ...])`, which re-resolves
+    # both by pathname a SECOND, entirely independent time to actually
+    # exec them -- a same-UID racer who won the (previously unbounded)
+    # window between this function returning and that later, separate
+    # exec could still swap the target underneath it, with the hash check
+    # having validated content that was never what actually ran.
+    #
+    # The intended fix (this round's original brief) was to bind the real
+    # exec target to THIS SAME already-open, already-validated descriptor
+    # via Darwin's /dev/fd/<n> instead of ever re-resolving by path again
+    # -- so this function now returns the open descriptor on success
+    # instead of closing it, letting the caller decide how to use it.
+    #
+    # That full fd-binding turned out to be empirically infeasible for
+    # BOTH NODE and CLI on this exact platform/toolchain -- confirmed by
+    # real, non-mocked tests (subprocess.run AND a raw os.fork()+
+    # os.execve() that bypasses Python's subprocess machinery entirely),
+    # not assumed from documentation, before writing any of the code
+    # below:
+    #
+    #   NODE (the OS-level exec target itself): Darwin's /dev/fd entries
+    #   report permission bits derived from the ORIGINAL open()'s access
+    #   mode, not the underlying file's real mode -- os.fstat() on the raw
+    #   descriptor shows the true 0700, but os.stat("/dev/fd/<n>") on that
+    #   SAME descriptor shows an access-mode-filtered 0444 for an
+    #   O_RDONLY open, or 0111 for an O_EXEC open -- and os.O_RDONLY and
+    #   the BSD os.O_EXEC access modes are mutually exclusive per open
+    #   file description on this platform: an O_EXEC descriptor cannot be
+    #   read() (confirmed: Errno 9, EBADF) and an O_RDONLY descriptor
+    #   cannot be exec'd via /dev/fd (confirmed: Errno 13, EPERM, both via
+    #   subprocess.run(executable="/dev/fd/<n>", pass_fds=(...)) AND via a
+    #   raw os.fork()+os.execve("/dev/fd/<n>", ...)) -- a real macOS
+    #   restriction on executing through the fdesc pseudo-filesystem, not
+    #   a Python/subprocess limitation, and not fixable by combining open
+    #   flags: os.O_RDONLY | os.O_EXEC behaves exactly like plain
+    #   os.O_EXEC (exec-shaped, unreadable). Darwin has no
+    #   fexecve(2)-equivalent syscall reachable from Python at all.
+    #
+    #   CLI (the script argument NODE itself loads): reading CLI's
+    #   content via /dev/fd/<n> DOES work -- a real Node process loads and
+    #   runs a script referenced this way correctly, confirmed end to
+    #   end. But doing so sets __dirname/__filename to
+    #   "/dev/fd"/"/dev/fd/<n>" instead of CLI's real directory, confirmed
+    #   with a real Node process running a script that does
+    #   require(path.join(__dirname, 'sibling.js')): it throws "Cannot
+    #   find module '/dev/fd/sibling.js'" instead of loading the sibling.
+    #   The real, pinned dist/bundle/cli.js this installer ships is
+    #   already documented elsewhere in this file (see the
+    #   patched_content_digests comment in
+    #   _install_locked_within_release_dir()) as statically AND
+    #   dynamically importing the rest of prime-agent's own dist/bundle/
+    #   directory unconditionally -- this is not a hypothetical edge case,
+    #   it is confirmed to be exactly the shape of the real shipped
+    #   entrypoint, so launching it via /dev/fd/<n> would silently break
+    #   those imports at runtime rather than merely failing an abstract
+    #   test script.
+    #
+    # Given both halves of the intended fd-binding fix are genuinely
+    # blocked -- not skipped for convenience -- the actual mitigation
+    # applied instead is reassert_exec_target_identity() below: main()
+    # keeps BOTH validated descriptors this function returns open, purely
+    # as an immutable identity ANCHOR (once opened, an fd's own (st_dev,
+    # st_ino) can never be changed by anything done to the path
+    # afterward), and re-checks, as literally the last two statements
+    # before subprocess.run(), that NODE/CLI's paths still resolve to
+    # those exact anchored inodes. This shrinks the exploitable window
+    # from "the entire remainder of main() after this function first
+    # returns" (lock reassertion, the sibling validate_exec_target() call,
+    # the ancestor-node_modules walk, argument/environment construction)
+    # down to "the gap between that final cheap lstat-based check and
+    # subprocess.run()'s own internal, unavoidable path-based exec" -- the
+    # smallest window expressible without OS support this platform does
+    # not have. It does NOT reach zero: subprocess.run() still ultimately
+    # re-resolves NODE/CLI by path string to actually exec/open them, so a
+    # racer who wins that last, now much narrower gap (or who can mutate
+    # the SAME already-validated inode's bytes in place, which no
+    # content-hash-then-later-use scheme fully closes against a same-UID
+    # adversary who already has write access to begin with) is still not
+    # caught. Documented here with the same honesty this comment used to
+    # describe the residual with before this round, rather than silently
+    # claiming a full close that real testing disproved.
     if os.path.realpath(path) != os.path.abspath(path):
-        return f"managed exec target contains a symlink: {{path}}"
+        return f"managed exec target contains a symlink: {{path}}", -1
     if os.path.commonpath((root, os.path.realpath(path))) != root:
-        return f"managed exec target escaped the Extreme SSD: {{path}}"
+        return f"managed exec target escaped the Extreme SSD: {{path}}", -1
     try:
         info = os.lstat(path)
     except OSError:
-        return f"managed exec target is missing: {{path}}"
+        return f"managed exec target is missing: {{path}}", -1
     if (
         not stat.S_ISREG(info.st_mode)
         or info.st_uid != os.getuid()
         or info.st_mode & 0o077
     ):
-        return f"managed exec target is unsafe: {{path}}"
+        return f"managed exec target is unsafe: {{path}}", -1
     if info.st_size > MAX_EXEC_TARGET_BYTES:
-        return f"managed exec target exceeds the approved size: {{path}}"
+        return f"managed exec target exceeds the approved size: {{path}}", -1
     descriptor = -1
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         opened = os.fstat(descriptor)
         if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
-            return f"managed exec target identity changed before verification: {{path}}"
+            os.close(descriptor)
+            return f"managed exec target identity changed before verification: {{path}}", -1
         digest = hashlib.sha256()
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
@@ -6021,17 +6097,52 @@ def validate_exec_target(path: str, root: str, expected_sha256: str) -> str | No
                 break
             digest.update(chunk)
     except OSError:
-        return f"managed exec target became unreadable: {{path}}"
-    finally:
         if descriptor >= 0:
             os.close(descriptor)
+        return f"managed exec target became unreadable: {{path}}", -1
     if digest.hexdigest() != expected_sha256:
-        return f"managed exec target content changed: {{path}}"
+        os.close(descriptor)
+        return f"managed exec target content changed: {{path}}", -1
+    return None, descriptor
+
+
+def reassert_exec_target_identity(path: str, anchor_descriptor: int) -> str | None:
+    # Round 47, 2026-08-20 (independent Codex sol/terra round-46 review,
+    # P1): the best achievable mitigation for the gap validate_exec_
+    # target()'s own docstring documents in full -- see it for why full
+    # descriptor-bound exec was empirically infeasible on this platform
+    # for both NODE and CLI. Re-checks, via a fresh os.lstat() of `path`
+    # (a NEW path-based lookup, deliberately -- this is exactly the
+    # lookup subprocess.run() is about to perform a moment later to
+    # actually exec/open the target) that the path STILL resolves to the
+    # exact same inode `anchor_descriptor` was opened against and fully
+    # content-validated by validate_exec_target(). `anchor_descriptor`
+    # stays open the whole time specifically so this comparison is
+    # against an immutable reference (an already-open file descriptor's
+    # own identity can never be changed by anything done to the path
+    # afterward) rather than against a second, equally racy, path-based
+    # lstat() -- mirrors main()'s own pre-existing post-flock LOCK
+    # identity reassertion above, applied here to NODE/CLI. Called as the
+    # LAST statement before subprocess.run() so the remaining window is
+    # as small as this platform allows -- see validate_exec_target() for
+    # exactly what that window still leaves open.
+    try:
+        anchor = os.fstat(anchor_descriptor)
+    except OSError:
+        return f"managed exec target descriptor became invalid: {{path}}"
+    try:
+        current = os.lstat(path)
+    except OSError:
+        return f"managed exec target is missing: {{path}}"
+    if (current.st_dev, current.st_ino) != (anchor.st_dev, anchor.st_ino):
+        return f"managed exec target identity changed immediately before exec: {{path}}"
     return None
 
 
 def main() -> int:
     descriptor = -1
+    node_descriptor = -1
+    cli_descriptor = -1
     try:
         if os.path.realpath(LOCK) != os.path.abspath(LOCK):
             return fail("managed lifecycle lock path contains a symlink")
@@ -6066,10 +6177,10 @@ def main() -> int:
         after_flock = os.lstat(LOCK)
         if (after_flock.st_dev, after_flock.st_ino) != (opened.st_dev, opened.st_ino):
             return fail("managed lifecycle lock identity changed while held")
-        node_error = validate_exec_target(NODE, root, NODE_SHA256)
+        node_error, node_descriptor = validate_exec_target(NODE, root, NODE_SHA256)
         if node_error is not None:
             return fail(node_error)
-        cli_error = validate_exec_target(CLI, root, CLI_SHA256)
+        cli_error, cli_descriptor = validate_exec_target(CLI, root, CLI_SHA256)
         if cli_error is not None:
             return fail(cli_error)
         # Round 40, 2026-08-20 (independent Claude opus/max round-39
@@ -6086,12 +6197,28 @@ def main() -> int:
                 "unexpected item on Node's own module resolution path "
                 f"outside the managed release: {{resolution_hit}}"
             )
+        arguments = guarded_arguments(sys.argv[1:])
+        # Round 40, 2026-08-20 (P1-2 item 1): see
+        # scrubbed_node_environment()'s own docstring.
+        environment = scrubbed_node_environment()
+        # Round 47, 2026-08-20 (independent Codex sol/terra round-46
+        # review, P1): reassert NODE/CLI identity through the SAME
+        # already-open descriptors validate_exec_target() returned above,
+        # as literally the last two statements before the actual exec --
+        # see reassert_exec_target_identity()'s own docstring, and
+        # validate_exec_target()'s, for the full reasoning and the
+        # empirically-confirmed platform constraints that make this a
+        # window-shrink rather than a full close.
+        node_reassert_error = reassert_exec_target_identity(NODE, node_descriptor)
+        if node_reassert_error is not None:
+            return fail(node_reassert_error)
+        cli_reassert_error = reassert_exec_target_identity(CLI, cli_descriptor)
+        if cli_reassert_error is not None:
+            return fail(cli_reassert_error)
         completed = subprocess.run(
-            [NODE, CLI, *guarded_arguments(sys.argv[1:])],
+            [NODE, CLI, *arguments],
             check=False,
-            # Round 40, 2026-08-20 (P1-2 item 1): see
-            # scrubbed_node_environment()'s own docstring.
-            env=scrubbed_node_environment(),
+            env=environment,
         )
         return completed.returncode
     except (OSError, subprocess.SubprocessError) as exc:
@@ -6099,6 +6226,10 @@ def main() -> int:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+        if node_descriptor >= 0:
+            os.close(node_descriptor)
+        if cli_descriptor >= 0:
+            os.close(cli_descriptor)
 
 
 if __name__ == "__main__":

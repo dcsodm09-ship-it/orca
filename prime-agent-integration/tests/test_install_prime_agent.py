@@ -471,11 +471,26 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             guard,
         )
         self.assertIn("def guarded_arguments", guard)
-        self.assertIn("[NODE, CLI, *guarded_arguments", guard)
+        # Round 47, 2026-08-20: guarded_arguments()'s result is now bound to
+        # a local (`arguments`) before the exec call, rather than spliced
+        # inline, so the final reassert_exec_target_identity() calls can run
+        # after it with nothing else left to compute before subprocess.run()
+        # -- see reassert_exec_target_identity()'s own docstring.
+        self.assertIn("arguments = guarded_arguments(sys.argv[1:])", guard)
+        self.assertIn("[NODE, CLI, *arguments]", guard)
         self.assertIn(f"NODE_SHA256 = {'0' * 64!r}", guard)
         self.assertIn(f"CLI_SHA256 = {'0' * 64!r}", guard)
-        self.assertIn("validate_exec_target(NODE, root, NODE_SHA256)", guard)
-        self.assertIn("validate_exec_target(CLI, root, CLI_SHA256)", guard)
+        self.assertIn(
+            "node_error, node_descriptor = validate_exec_target(NODE, root, NODE_SHA256)",
+            guard,
+        )
+        self.assertIn(
+            "cli_error, cli_descriptor = validate_exec_target(CLI, root, CLI_SHA256)",
+            guard,
+        )
+        self.assertIn("def reassert_exec_target_identity", guard)
+        self.assertIn("reassert_exec_target_identity(NODE, node_descriptor)", guard)
+        self.assertIn("reassert_exec_target_identity(CLI, cli_descriptor)", guard)
         self.assertIn("import hashlib", guard)
 
     def test_version_probe_accepts_one_exact_stderr_line(self) -> None:
@@ -2782,6 +2797,236 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             # NODE must never have been reached -- the re-assertion must
             # fire strictly before subprocess.run([NODE, CLI, ...]).
             self.assertNotIn("should-not-run", buffer.getvalue())
+
+    def test_reassert_exec_target_identity_blocks_post_validation_cli_swap(
+        self,
+    ) -> None:
+        # Regression for independent Codex sol/terra round-46 review, P1:
+        # validate_exec_target() opens NODE/CLI via O_NOFOLLOW, hash-
+        # validates their content through that open descriptor, then used
+        # to close it -- but main()'s subsequent subprocess.run([NODE,
+        # CLI, ...]) re-resolved both by path string a SECOND, independent
+        # time to actually exec them. A same-UID racer who won the window
+        # between validation returning and that later, separate exec could
+        # swap the target underneath it -- the hash check had validated
+        # content that was never what actually ran.
+        #
+        # Round 47's fix attempted full descriptor-bound exec (Darwin's
+        # /dev/fd/<n>) first, per the dispatch brief, and found it
+        # genuinely infeasible for BOTH halves on this real platform/
+        # toolchain (see validate_exec_target()'s own docstring for the
+        # full empirical writeup: NODE cannot be exec'd via /dev/fd at all
+        # -- confirmed EPERM via real subprocess.run AND a raw
+        # os.fork()+os.execve() bypassing Python's subprocess machinery
+        # entirely -- and CLI loaded via /dev/fd breaks the real, pinned
+        # dist/bundle/cli.js's own __dirname-relative sibling imports,
+        # confirmed with a real Node process). The actual fix instead is
+        # reassert_exec_target_identity(): the SAME already-open,
+        # already-content-validated descriptor is kept open by main() and
+        # used as an immutable anchor for one final, cheap identity
+        # re-check immediately before subprocess.run() -- shrinking the
+        # window from "the rest of main()'s runtime" down to "the gap
+        # between that final lstat() and subprocess.run()'s own internal
+        # exec", the smallest expressible on this platform.
+        #
+        # This test injects the EXACT race the original P1 described --
+        # a swap landing in the narrow window right after
+        # validate_exec_target(CLI, ...) succeeds -- against the REAL
+        # generated guard script's REAL main() (exec'd into a namespace,
+        # no mocking of the checks under test, matching this file's
+        # established convention -- see test_launch_guard_reasserts_lock_
+        # identity_after_flock just above) and confirms the swap is now
+        # caught: main() fails closed with the new "identity changed
+        # immediately before exec" message, and -- proven the same way
+        # test_launch_guard_refuses_to_exec_a_symlinked_cli proves it, via
+        # a real marker file a real fake NODE would have written had it
+        # actually run -- NODE never executes at all. Compare against
+        # test_pre_fix_single_open_then_path_based_exec_would_have_
+        # picked_up_the_swap below, which proves the identical race WAS
+        # silently exec'd by the mechanism this function replaces.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            tool_root.mkdir(mode=0o700)
+            lock = tool_root / "lifecycle.lock"
+            lock.write_bytes(b"")
+            os.chmod(lock, 0o600)
+
+            marker = root / "node-actually-ran"
+            observed = root / "cli-content-node-received"
+            node = root / "node"
+            node.write_text(
+                "#!/bin/sh\n"
+                f': > {shlex.quote(os.fspath(marker))}\n'
+                f'cp "$1" {shlex.quote(os.fspath(observed))}\n',
+                encoding="utf-8",
+            )
+            os.chmod(node, 0o700)
+
+            cli = root / "cli.js"
+            original_content = b"// legitimate, hash-pinned CLI content\n"
+            cli.write_bytes(original_content)
+            os.chmod(cli, 0o600)
+
+            swapped_content = b"// attacker-substituted CLI content\n"
+            self.assertNotEqual(original_content, swapped_content)
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+            ):
+                source = installer.managed_launch_guard_script(
+                    node, cli, installer.sha256_file(node), installer.sha256_file(cli)
+                ).decode("utf-8")
+
+            namespace: dict[str, object] = {
+                "__name__": "generated_launch_guard_race_test"
+            }
+            exec(compile(source, "<generated-launch-guard>", "exec"), namespace)  # noqa: S102
+
+            real_validate_exec_target = namespace["validate_exec_target"]
+            cli_path_str = os.fspath(cli)
+
+            def racing_validate_exec_target(path, root_arg, expected_sha256):
+                result = real_validate_exec_target(path, root_arg, expected_sha256)
+                if path == cli_path_str:
+                    # Simulate a same-UID racer who wins the window
+                    # between THIS validation call returning and the
+                    # later, separate subprocess.run()-driven exec --
+                    # rename-swap (a fresh inode), exactly the class of
+                    # attack round 46 flagged. Deterministic injection at
+                    # the real program point, not a mock of the check
+                    # under test itself -- matches this file's own
+                    # "deterministic stand-in for winning the race"
+                    # convention (see e.g. test_make_patched_asset_
+                    # detects_content_swap_before_archiving).
+                    swap_path = root / ".swap-cli.js"
+                    swap_path.write_bytes(swapped_content)
+                    os.chmod(swap_path, 0o600)
+                    os.replace(swap_path, cli)
+                return result
+
+            namespace["validate_exec_target"] = racing_validate_exec_target
+
+            buffer = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["prime-agent-launch-guard.py"]),
+                contextlib.redirect_stderr(buffer),
+            ):
+                returncode = namespace["main"]()
+
+            self.assertEqual(returncode, 78, buffer.getvalue())
+            self.assertIn(
+                "identity changed immediately before exec", buffer.getvalue()
+            )
+            self.assertFalse(
+                marker.exists(),
+                "NODE must never actually run once the post-validation "
+                "swap is detected",
+            )
+            self.assertFalse(observed.exists())
+            # Confirm the file ON DISK really does hold the swapped bytes
+            # -- i.e. the guard's refusal is because it correctly detected
+            # a real swap, not because the swap silently failed for some
+            # unrelated reason.
+            self.assertEqual(cli.read_bytes(), swapped_content)
+
+    def test_pre_fix_single_open_then_path_based_exec_would_have_picked_up_the_swap(
+        self,
+    ) -> None:
+        # Standalone minimal fixture isolating just the mechanism round 47
+        # replaced (per this file's own established convention for a
+        # pre-fix/post-fix comparison when the vulnerable code no longer
+        # exists in install_prime_agent.py to invoke directly): a single
+        # open()/hash/close validation -- exactly validate_exec_target()'s
+        # own behavior before round 47, faithfully reproduced here rather
+        # than invoking any part of the current installer -- followed by a
+        # SEPARATE, independent, path-string-based subprocess.run(),
+        # exactly what main() used to do immediately afterward with no
+        # reassertion in between. Injects the IDENTICAL race, at the
+        # identical timing (immediately after validation returns, before
+        # the separate exec), against the identical real-Node-shaped fake
+        # used in test_reassert_exec_target_identity_blocks_post_
+        # validation_cli_swap above, and confirms this pre-fix mechanism
+        # DOES silently exec the swapped content -- the exact gap round 47
+        # closes.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+
+            marker = root / "node-actually-ran"
+            observed = root / "cli-content-node-received"
+            node = root / "node"
+            node.write_text(
+                "#!/bin/sh\n"
+                f': > {shlex.quote(os.fspath(marker))}\n'
+                f'cp "$1" {shlex.quote(os.fspath(observed))}\n',
+                encoding="utf-8",
+            )
+            os.chmod(node, 0o700)
+
+            cli = root / "cli.js"
+            original_content = b"// legitimate, hash-pinned CLI content\n"
+            cli.write_bytes(original_content)
+            os.chmod(cli, 0o600)
+            expected_sha256 = hashlib.sha256(original_content).hexdigest()
+
+            swapped_content = b"// attacker-substituted CLI content\n"
+
+            def pre_fix_validate(path: str, expected: str) -> str | None:
+                # Faithful reproduction of validate_exec_target() exactly
+                # as it existed before round 47: opens once (O_NOFOLLOW),
+                # hashes the FULL content through that same descriptor,
+                # closes it, and returns pass/fail -- WITHOUT keeping the
+                # descriptor open and WITHOUT any later reassertion.
+                descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    digest = hashlib.sha256()
+                    while True:
+                        chunk = os.read(descriptor, 1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                finally:
+                    os.close(descriptor)
+                if digest.hexdigest() != expected:
+                    return "content changed"
+                return None
+
+            # Validation succeeds against the ORIGINAL content...
+            self.assertIsNone(pre_fix_validate(os.fspath(cli), expected_sha256))
+
+            # ...then, WITHOUT re-running validation (exactly the race
+            # round 46 flagged), a same-UID racer swaps CLI's content at
+            # the same path.
+            swap_path = root / ".swap-cli.js"
+            swap_path.write_bytes(swapped_content)
+            os.chmod(swap_path, 0o600)
+            os.replace(swap_path, cli)
+
+            # Pre-fix main() would now go straight to
+            # subprocess.run([NODE, CLI, ...]) using the PATH STRINGS -- a
+            # second, independent lookup -- with no further check at all
+            # in between.
+            result = subprocess.run(
+                [os.fspath(node), os.fspath(cli)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(
+                marker.exists(), "pre-fix pattern must have actually run NODE"
+            )
+            self.assertTrue(observed.exists())
+            # THE PROOF: the pre-fix mechanism exec'd the SWAPPED content,
+            # not the originally validated content -- exactly the gap
+            # round 47 closes (compare against
+            # test_reassert_exec_target_identity_blocks_post_validation_
+            # cli_swap above, where the identical race against the FIXED
+            # guard is caught instead).
+            self.assertEqual(observed.read_bytes(), swapped_content)
+            self.assertNotEqual(observed.read_bytes(), original_content)
 
     # Round 40, 2026-08-20 (independent Claude opus/max round-39 review,
     # P1-2): the three tests below all use a REAL Node binary (located on
