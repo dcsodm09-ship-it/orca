@@ -1745,6 +1745,47 @@ P1 加一个 P2 一个 P3，而且不再依赖"有没有把每一个攻击者可
 缺失检查、`upstream-package-lock.json` 补上下载摘要复核、
 `RELEASE_DIR` 补上隔离恢复后的拒绝门。
 
+### Round 38：不变式真正反过来了（已验证关闭，未独立复核）
+
+**主修复**：新增 `allowed_unpinned_release_files()`，从
+`ASSETS`/`WORKSPACE_ASSETS`/`MAIN_PATCHED_ASSET`/`NODE_ASSET` 这些
+既有常量再加 5 个字面量记账路径推导出来——真实安装实测精确 14 项，
+和 opus/max 数的一样。`tree_digest()` 现在会记录扫描过程中遇到的
+每一个常规文件，当调用方传了完整钉住表时，只要"被观察到的常规文件
+− 钉住表 − 允许豁免清单"不是空集就报错。确认了这个新检查只有
+`write_pending_install()` 的两次调用会触发（这是唯二真正传了完整
+钉住表的调用点）；`finalize_pending_install()`/`verify()` 本来就
+不传钉住表、不受影响——这一处改动同时关掉 P1-1、P1-2、P2-2 里
+`RELEASE_DIR` 那道门、以及 `.bin/` 那条 P3（只覆盖误种的常规文件，
+符号链接内容仍靠原有机制约束，opus/max 报告里也明确点出了这个
+边界）。
+
+**三处配套修复**：registry 探测那个 `continue` 换成
+`skipped_registry_lock_paths` 记账 + 搬移后完整性断言（任何被跳过
+的 lock 路径搬移后如果真的落盘了就报错——不再只信任搬移前那一次
+探测）；`assert_materialized_node_modules_matches_lock()` 新增可选
+反方向检查（`packages` 参数，只作用于 registry 行），缺失的声明行
+必须用它自己的 `os`/`cpu` 字段真正证明"这条在当前平台本来就不该
+存在"；`upstream-package-lock.json` 补上和 `extract_node_toolchain()`
+/`safe_extract_main_asset()` 同款的读回摘要复核；`_install_locked()`
+现在如果隔离恢复之后 `RELEASE_DIR` 还在就直接拒绝，和
+`STATE_DIR`/`PROBE_HOME`/session 目录已有的门对齐。
+
+16 条新回归测试（10 条直接/全流程 + 6 条针对反方向检查），覆盖
+`RELEASE_DIR` 根目录/`bin/`/`toolchain/`/`node_modules/` 形状的路径
+上各自的拒绝未知场景、豁免清单的推导本身、round 37 的零竞速变体和
+P1-2 端到端复现、上游 lock 篡改、`RELEASE_DIR` 隔离门、
+os/cpu 证明逻辑单独测试。全部通过对 round-37 基线
+`36a4008c08` 独立导入代码的隔离脚本确认可复现、修复后关闭。
+152/152 测试（两个解释器各跑两次，4/4 干净）全过，`py_compile`
+在两个解释器下对三个相关文件都干净。round 21/24/25/27/29/32/34/
+35/36 共 8 条既有回归测试逐条抽查仍然通过。真实（非 mock）
+`sandbox_e2e.py` 跑了三次：2 次完整跑通 `ok:true`/`exit 0`、新检查
+零假阳性；1 次 `install()` 本身成功，但在下游一个 `--version` 探测
+子进程上撞到一个 15 秒超时，很可能和当时机器 8 核负载 27-33 有关，
+和这次改动本身无关（如实记录，未淡化处理）。已提交 `8160356b9a`。
+**已派发 round 39 双复核**（针对当前提交重新派一次 Codex 一路）。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
