@@ -2165,6 +2165,100 @@ provider，但不是针对这个具体的 Node 构建版本。`OPENSSL_CONF`
 Codex sol+max；round 42 的 Codex 一路仍在跑，结果晚到会作为对
 `294144ba99` 这个已被超越的提交的补充记录）。
 
+### Round 44：环境变量这一类真的关死了，但 `Module.globalPaths` 修法本身有一处词法归一化偏差——一个很窄的修法（已派发 round 45）
+
+**Claude opus/max：NO_GO，0 P0、1 P1、0 P2、7 P3**——先做了大量正面
+独立验证：重新从 GitHub 下载了全部四个 release tarball、逐字节核对
+和钉住的摘要一致；自己重新对真实解压出来的 v0.7.2 树清点了 142 个
+不同的 `process.env.*` 名字（比 round 43 报告的 207 处读取对应的
+distinct 名字略少，属于统计口径差异），确认真正危险的名字全部被
+排除在白名单外——还额外发现了一个有力的佐证：bundle 里真的有 Google
+"可执行文件来源凭据"这条认证路径（`GOOGLE_EXTERNAL_ACCOUNT_ALLOW_
+EXECUTABLES` 网关），这个变量没进白名单、门槛正确地失败关闭——但
+round 40 原来那个只有 5 个键的黑名单**从没提过这个变量名**，如果
+还是黑名单方案，这条路径会直接放行、把已经在名单里的
+`GOOGLE_APPLICATION_CREDENTIALS`/`CLOUDSDK_CONFIG` 变成任意命令
+执行。这是"白名单是正确架构选择"的一条具体证据，不是纸面论证。
+`LC_` 前缀确认没有任何 Node/OpenSSL/npm 变量会利用它做危险的事；
+`Module.globalPaths` 用真实 Node v24.19.0 核对确认三个位置确实是
+完整集合；确认 ESM 解析没有独立的"全局路径"概念（`cli.js` 确认是
+`"type": "module"`，`PACKAGE_RESOLVE` 只走祖先 `node_modules`
+遍历，CJS 那套集合是严格超集）；`run_npm()`/`exact_tool_version()`/
+`run_version_probe()` 本来就用完整替换的环境字典、比白名单更严格，
+这个结论在 round 43 之后重新推导过依然成立；launch guard 自己的
+进程本身也逐项核实过（`DYLD_INSERT_LIBRARIES` 被系统完整性保护
+清空、`/bin/sh` 非交互模式不会读取 `BASH_ENV`、Node 参数注入无法
+通过 `guarded_arguments()` 达成）。
+
+**但挖出一个真实、可复现的新 P1**——这次范围很窄，只是同一处修法
+自身实现的一个小偏差：round 43 新加的两处 `Module.globalPaths`
+检查（生成脚本版 + `verify()` 那一侧的真实 Python 版）在拼路径时
+用的是 `os.path.join`（不做归一化）+ `os.path.lexists()`（必须
+真的物理存在才算数），而真实 Node 构造这两个位置时用的是
+`path.resolve(homeDir, '.node_modules')`——**纯词法层面**归一化
+`..`、`.`、重复分隔符，完全不碰文件系统。真实复现：`HOME` 里带一段
+经过一个真实不存在的中间组件的 `..`（比如
+`<真实目录>/../does-not-exist/..`），Node 词法解析后落回攻击者
+真实控制的那个目录、把它加进 `Module.globalPaths`；但这个安装器的
+检查函数按字面路径去 `stat`，在那个不存在的中间组件上直接
+`ENOENT`、判定"这里什么都没有"，于是不拒绝。走完整真实链路
+（生成的 `/bin/sh` wrapper → `/usr/bin/python3 -B -I` → 生成的
+launch guard → 真实钉住的 Node v24.19.0）复现：对照组（`HOME` 不带
+`..`）guard 正确拒绝、攻击者标记文件没写入；攻击组
+（带那段 `..`）guard 判定"没有异常"、真实 Node 的
+`Module.globalPaths` 真的解析到了攻击者目录、guard 退出码 0、
+攻击者代码真的执行了。`HOME` 本身在白名单里、而且没法清空（应用
+本身就需要它），同 UID 环境变量投毒、零用户交互——和 round 40 的
+`NODE_OPTIONS` 那次是同一个威胁模型。
+
+给出的修法很直接：两处都改成
+`os.path.abspath(os.path.join(home, ...))`，opus/max 已经用
+`/a/nonexistent/../b`、`/a/./b/../c`、`/tmp/x/..`、`~`、相对路径
+`HOME` 等多组用例验证过和 Node 的 `path.resolve` 结果一致，只留了
+一个还需核实但影响很小的细节（`HOME='//tmp//x//'` 这种双斜杠开头
+的写法，POSIX/Python 会保留开头的 `//`、Node 会把它折叠掉，但在
+Darwin 上是良性的）。
+
+7 条 P3（供后续记录，不阻断）：`RELEASE_DIR` 内部自己的
+`node_modules` 影子问题——opus/max 自己也复现了，但同意这确实该
+继续留作已记录的残留，并且补上了应该写进文档的具体理由：launch
+guard **自己**的内容在执行路径上根本没有任何摘要校验机会（`/bin/sh`
+wrapper 直接 `exec ... <guard>`，无从校验），所以一旦攻击者能写
+`RELEASE_DIR`，游戏已经结束——从 `RELEASE_DIR` 的**父目录**开始
+祖先遍历不是随意选的边界，是有道理的边界；`install-home` 那个
+`HOME`（`managed_npm_environment()` 设的，给 `run_npm()` 这些用）
+自己的全局文件夹从未建模，和已经做内容校验的 `PROBE_HOME` 不对称，
+但插桩了 `npm --version`/`npm install --package-lock-only`/
+`npm ci` 全过程确认零 `MODULE_NOT_FOUND`，是加固缺口、不是已证实
+的攻击路径；`unexpected_ancestor_node_modules()` 和真正 exec 之间
+还有一个和 `validate_exec_target()` 已经承认的同一类 TOCTOU，只是
+这处没写进文档；`EDITOR`/`VISUAL` 在白名单里被归进"会话/系统基础
+变量"、但实际上 bundle 真的会 `spawnSync` 这两个变量指向的程序，
+分类注释应该说明这一点；`NODE_ENV_ALLOWED_PREFIXES` 里的 `LC_`
+本身是无界通配符，目前无害但值得记一笔；
+`ORCA_PRIME_AGENT_RESOURCE_GUARD` 在白名单里但根本是个"死条目"——
+`guarded_arguments()` 早就无条件把它从环境里 `pop()` 掉了，正控制
+测试验证的是这个函数本身、不是真实执行路径会看到的行为。
+
+181/181 测试（两个解释器各跑两次）全过，`py_compile` 干净；12 条
+round 43 新增测试里 10 条对着 round-42 基线 `294144ba99` 真的会
+失败、修复后通过，另外 2 条是明确标注的正/负控制、两边都该通过——
+确认全是真回归测试。真实 `sandbox_e2e.py` 跑了三次全部
+`exit 0`/`ok:true`。
+
+opus/max 的收尾判断："环境变量这一类，从证据上看真的关死了——我
+直接拿真实 bundle 攻击白名单、没打穿，还额外证实了一条黑名单方案
+本来会漏掉的真实路径（Google 可执行凭据）。模块解析边界这一类
+**还没关**：round 43 建模对了三个位置，但用 `os.path.join` 去
+复现 Node 的 `path.resolve`，一个走过不存在中间组件的 `..` 就能
+同时穿过 guard 侧和 `verify()` 侧两处检查、真的执行代码。修法很小
+很局部，round 45 应该收得很窄。"
+
+**已派发 round 45**：把两处 `Module.globalPaths` 拼路径都换成
+`os.path.abspath(os.path.join(home, ...))`，顺带核实一下双斜杠
+开头这种边缘写法。round 42 的 Codex 一路仍在跑（超过 4 小时，本轮
+要求了"格外仔细"，结果晚到会作为补充记录）。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max

@@ -388,8 +388,14 @@ Node 解析算法的一半（`_nodeModulePaths`），漏了另一半（`Module.g
 （真的清点了 v0.7.2 `cli.js` 依赖树里 207 处 `process.env.*` 读取）；两处祖先目录
 检查都补上 `Module.globalPaths` 三个全局文件夹（用真实钉住的 Node 二进制现场核对
 算法，不靠记忆）；还主动纠正了 round 42 对 `OPENSSL_CONF` 复现强度的一处过度表述。
-181/181 测试全过、真实回放两次 `ok:true`。round 42 的 Codex 一路仍在跑，结果晚到
-会作为补充记录。**round 44 双复核已派发**。完整逐轮细节见
+181/181 测试全过、真实回放两次 `ok:true`。**round 44 双复核结果**：Claude opus/max
+**NO_GO，1 个很窄的新 P1**——环境变量白名单这一类确认真的关死了（还额外证实白名单
+比黑名单方案多堵了一条真实的 Google 可执行凭据路径），但 `Module.globalPaths` 修法
+本身拼路径用 `os.path.join`+`lexists`、和 Node 真正用的词法归一化 `path.resolve`
+不一致——`HOME` 里带一段走过不存在中间组件的 `..` 能同时穿过 guard 侧和 `verify()`
+侧两处检查、真实执行代码。修法很直接（换成 `os.path.abspath(os.path.join(...))`）。
+round 42 的 Codex 一路仍在跑（超过 4 小时），结果晚到会作为补充记录。**round 45
+已派发**（很窄的修法）。完整逐轮细节见
 `reports/ORCA-COLLAB-STATE-AND-PRIME-AGENT-2026-08-18.md`。
 `fd6a683a4a` 这个双 GO 时点**已被 8 轮后续真实发现超越，不能再作为"可以安装"的
 依据**——按用户规则，需要在当前 HEAD 上重新拿到一次真正、当下有效的双路 GO。
