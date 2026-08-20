@@ -8,6 +8,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 import tarfile
@@ -2781,6 +2782,256 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             # NODE must never have been reached -- the re-assertion must
             # fire strictly before subprocess.run([NODE, CLI, ...]).
             self.assertNotIn("should-not-run", buffer.getvalue())
+
+    # Round 40, 2026-08-20 (independent Claude opus/max round-39 review,
+    # P1-2): the three tests below all use a REAL Node binary (located on
+    # PATH -- `shutil.which("node")` -- rather than the pinned tarball this
+    # installer downloads, since these tests target Node's own documented
+    # CLI/module-resolution BEHAVIOR, which is stable core Node.js
+    # semantics, not something specific to the exact pinned patch version;
+    # skipped entirely, rather than mocked around, when no real Node is
+    # available at all) instead of mocked assertions, per this file's own
+    # established convention that a finding this specific to real Node's
+    # actual behavior needs a real Node to prove -- see e.g.
+    # test_install_locked_detects_undeclared_package_in_subdirectory_anchored_nested_node_modules's
+    # own "Verified with real Node" precedent above.
+    def _require_real_node(self) -> str:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("no real Node binary available on PATH")
+        return node
+
+    def test_scrubbed_node_environment_blocks_real_node_options_injection(
+        self,
+    ) -> None:
+        # Round 40, P1-2 item 1. Grounds BOTH halves in real Node: first
+        # confirms real Node actually honors an inherited NODE_OPTIONS
+        # (the real vulnerability -- pre-round-40, `subprocess.run([NODE,
+        # CLI, ...])` in the generated launch guard's main() passed no
+        # `env=` at all, so this was inherited completely unscrubbed), then
+        # confirms scrubbed_node_environment() -- the exact function
+        # main() now calls -- removes it while leaving an unrelated
+        # variable untouched, and that real Node run with THAT environment
+        # no longer honors the injection.
+        node = self._require_real_node()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            cli = root / "cli.js"
+            cli.write_text("console.log('CLI_RAN');\n", encoding="utf-8")
+            injected = root / "injected.js"
+            injected.write_text(
+                "console.log('INJECTED_VIA_NODE_OPTIONS');\n", encoding="utf-8"
+            )
+            source = installer.managed_launch_guard_script(
+                Path(node), cli, "a" * 64, "b" * 64
+            ).decode("utf-8")
+            namespace: dict[str, object] = {"__name__": "generated_launch_guard"}
+            exec(compile(source, "<generated-launch-guard>", "exec"), namespace)  # noqa: S102
+            scrub = namespace["scrubbed_node_environment"]
+
+            poisoned_env = dict(os.environ)
+            poisoned_env["NODE_OPTIONS"] = f"--require={injected}"
+            poisoned_env["KEEP_ME"] = "still-here"
+
+            # Ground truth: real Node, run with this environment exactly as
+            # inherited (no scrubbing at all), DOES execute the injected
+            # module -- proving this is a real vulnerability, not a
+            # theoretical one.
+            unscrubbed_result = subprocess.run(
+                [node, os.fspath(cli)],
+                env=poisoned_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertIn("INJECTED_VIA_NODE_OPTIONS", unscrubbed_result.stdout)
+
+            with mock.patch.dict(os.environ, poisoned_env, clear=True):
+                scrubbed_env = scrub()
+            self.assertNotIn("NODE_OPTIONS", scrubbed_env)
+            self.assertNotIn("NODE_PATH", scrubbed_env)
+            self.assertEqual(scrubbed_env.get("KEEP_ME"), "still-here")
+
+            scrubbed_result = subprocess.run(
+                [node, os.fspath(cli)],
+                env=scrubbed_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertNotIn(
+                "INJECTED_VIA_NODE_OPTIONS", scrubbed_result.stdout
+            )
+            self.assertIn("CLI_RAN", scrubbed_result.stdout)
+
+    def test_unexpected_ancestor_node_modules_detects_real_node_rce_path(
+        self,
+    ) -> None:
+        # Round 40, P1-2 item 4. Reproduces the reviewer's exact finding
+        # with real Node: a package planted at an ancestor node_modules
+        # location OUTSIDE RELEASE_DIR (two levels above it here, modeling
+        # TOOL_ROOT/node_modules) is loaded and executed by real Node's own
+        # module resolution when a bare specifier isn't found inside
+        # RELEASE_DIR -- proving the resolution chain genuinely reaches
+        # there before this test ever asserts anything about this
+        # installer's own mitigation. Then confirms
+        # unexpected_ancestor_node_modules() -- the exact function the
+        # generated launch guard's main() now calls before ever exec'ing
+        # NODE -- detects that identical layout.
+        node = self._require_real_node()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "tool-root/releases/v0.7.2"
+            bundle_dir = release / "lib/node_modules/prime-agent/dist/bundle"
+            bundle_dir.mkdir(parents=True)
+            cli = bundle_dir / "cli.js"
+            cli.write_text(
+                "try { require('bufferutil'); } "
+                "catch (e) { console.log('NOT_LOADED:' + e.code); }\n",
+                encoding="utf-8",
+            )
+            # Sanity: nothing planted yet -- real Node fails to resolve the
+            # bare specifier cleanly (MODULE_NOT_FOUND), proving the CLI
+            # script itself is not somehow satisfying the require() some
+            # other way.
+            clean_result = subprocess.run(
+                [node, os.fspath(cli)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertIn("NOT_LOADED:MODULE_NOT_FOUND", clean_result.stdout)
+
+            # Plant the malicious package two levels above RELEASE_DIR
+            # (TOOL_ROOT/node_modules -- release.parent.parent/"node_modules"
+            # -- release.parent is TOOL_ROOT/releases).
+            ancestor_node_modules = release.parent.parent / "node_modules"
+            ancestor_pkg = ancestor_node_modules / "bufferutil"
+            ancestor_pkg.mkdir(parents=True)
+            (ancestor_pkg / "package.json").write_text(
+                '{"name": "bufferutil", "main": "index.js"}\n', encoding="utf-8"
+            )
+            (ancestor_pkg / "index.js").write_text(
+                "console.log('EXPLOIT_EXECUTED_VIA_ANCESTOR_NODE_MODULES');\n",
+                encoding="utf-8",
+            )
+
+            # Ground truth: real Node, invoked directly (modeling this
+            # installer's own pre-round-40 subprocess.run() call shape --
+            # no ancestor guard, whatever RELEASE_DIR-external content
+            # exists is exactly as reachable to Node as anything inside
+            # it), DOES load and execute the planted ancestor package.
+            exploited_result = subprocess.run(
+                [node, os.fspath(cli)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertIn(
+                "EXPLOIT_EXECUTED_VIA_ANCESTOR_NODE_MODULES",
+                exploited_result.stdout,
+            )
+
+            # Now confirm the real generated launch guard's own check --
+            # unexpected_ancestor_node_modules(), called from main() before
+            # NODE is ever exec'd -- detects this identical layout.
+            with mock.patch.object(installer, "RELEASE_DIR", release):
+                source = installer.managed_launch_guard_script(
+                    Path(node), cli, "a" * 64, "b" * 64
+                ).decode("utf-8")
+            namespace: dict[str, object] = {"__name__": "generated_launch_guard"}
+            exec(compile(source, "<generated-launch-guard>", "exec"), namespace)  # noqa: S102
+            detected = namespace["unexpected_ancestor_node_modules"]()
+            self.assertEqual(detected, os.fspath(ancestor_node_modules))
+
+    def test_launch_guard_main_refuses_before_real_exec_when_ancestor_node_modules_present(
+        self,
+    ) -> None:
+        # Round 40, P1-2 items 1 and 4, wired-in end to end: runs the
+        # REAL, complete generated launch guard main() (same in-process
+        # exec-into-namespace technique as
+        # test_main_refuses_when_lock_identity_changes_after_flock above),
+        # with a REAL Node binary as NODE and a REAL cli.js as CLI, through
+        # BOTH scenarios -- proving the new checks are actually wired into
+        # main()'s real control flow, not merely correct as standalone
+        # functions (the two tests above), AND that a genuinely clean tree
+        # is not falsely blocked.
+        node = self._require_real_node()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            bundle_dir = release / "lib/node_modules/prime-agent/dist/bundle"
+            bundle_dir.mkdir(parents=True, mode=0o700)
+            marker = root / "cli-ran.marker"
+            cli = bundle_dir / "cli.js"
+            cli.write_text(
+                "require('fs').writeFileSync(" + repr(os.fspath(marker)) + ", 'ran');\n",
+                encoding="utf-8",
+            )
+            os.chmod(cli, 0o600)
+            lock = tool_root / "lifecycle.lock"
+            lock.write_bytes(b"")
+            os.chmod(lock, 0o600)
+            for directory_path in (root, tool_root, release.parent, release):
+                os.chmod(directory_path, 0o700)
+            # NODE must itself pass validate_exec_target()'s own SSD_ROOT-
+            # containment/private-ownership/content-digest checks -- copy
+            # the real Node binary inside this sandboxed root so it is
+            # both a private, current-uid-owned regular file AND inside
+            # the mocked SSD_ROOT this test uses, then pin its digest to
+            # this exact copy.
+            node_copy = root / "node"
+            shutil.copy(Path(node).resolve(), node_copy)
+            os.chmod(node_copy, 0o700)
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+            ):
+                source = installer.managed_launch_guard_script(
+                    node_copy,
+                    cli,
+                    installer.sha256_file(node_copy),
+                    installer.sha256_file(cli),
+                ).decode("utf-8")
+            namespace: dict[str, object] = {"__name__": "generated_launch_guard"}
+            exec(compile(source, "<generated-launch-guard>", "exec"), namespace)  # noqa: S102
+
+            def run_main() -> tuple[int, str]:
+                buffer = io.StringIO()
+                with (
+                    mock.patch.object(sys, "argv", ["prime-agent-launch-guard.py"]),
+                    contextlib.redirect_stderr(buffer),
+                ):
+                    returncode = namespace["main"]()
+                return returncode, buffer.getvalue()
+
+            # Sanity: clean tree -- real Node genuinely runs CLI end to
+            # end, through main()'s own real subprocess.run() call
+            # (including its new env=scrubbed_node_environment()
+            # argument), and the marker file it writes actually appears.
+            returncode, stderr_output = run_main()
+            self.assertEqual(returncode, 0, stderr_output)
+            self.assertTrue(marker.exists())
+            marker.unlink()
+
+            # Plant an ancestor node_modules directory (TOOL_ROOT/
+            # node_modules -- one level above RELEASE_DIR/.. i.e.
+            # release.parent.parent) -- main() must refuse BEFORE Node
+            # ever runs; the marker file must never appear.
+            (tool_root / "node_modules").mkdir(mode=0o700)
+            returncode, stderr_output = run_main()
+            self.assertNotEqual(returncode, 0)
+            self.assertIn(
+                "unexpected node_modules directory", stderr_output
+            )
+            self.assertFalse(marker.exists())
 
     def test_pending_install_commits_with_command_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -12647,12 +12898,231 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     root, pinned_relative_digests=pinned_relative_digests
                 )
 
+    def _round40_symlink_deny_unknown_tree_digest_harness(
+        self, *, plant_relative_dir: str | None, plant_relative_symlink: str
+    ) -> None:
+        """Shared harness for the round-40 tree_digest() symlink deny-unknown
+        regression tests below: builds a minimal tree with ONE genuinely
+        pinned regular file and ONE unpinned-but-exempt file named LICENSE
+        (a real allowed_unpinned_release_files() member -- present in every
+        genuine release tree, verified once at download time, but
+        deliberately never a key of `pinned_relative_digests`; see that
+        function's own docstring), plants a SYMLINK at
+        `plant_relative_symlink` (creating `plant_relative_dir` first, if
+        given) pointing at LICENSE, and confirms tree_digest() now refuses
+        the call -- exercising round 40's symlink half of the completeness
+        invariant directly, isolated from the full install() pipeline.
+
+        Mirrors the independent round-39 review's own real, non-mocked Node
+        reproduction: planting a symlink at a node_modules-package-shaped
+        path pointing at LICENSE, confirming real Node's own extensionless-
+        symlink-target loader fallback loads LICENSE's content and executes
+        it as JavaScript (empirically re-confirmed against a real pinned
+        Node binary while implementing this fix -- see this round's own
+        dispatch notes for the exact transcript).
+
+        Verified to FAIL against pre-fix HEAD (commit 8160356b9a) via a
+        standalone scratch script importing that commit's tree_digest()
+        directly: for every location this harness is used against below,
+        tree_digest() returned a digest/count pair successfully, silently
+        folding the symlink into the recorded baseline with zero comparison
+        against anything -- round 38's regular-file-only deny-unknown check
+        never populates anything from the `S_ISLNK` branch at all, so it is
+        structurally incapable of ever comparing a symlink against
+        anything.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            pinned_content = b"genuine pinned content\n"
+            pinned_path = root / "pinned-file.js"
+            pinned_path.write_bytes(pinned_content)
+            pinned_digest = installer.sha256_bytes(pinned_content)
+            exempt_content = b"console.log('EXPLOIT_EXECUTED_VIA_SYMLINK');\n"
+            exempt_path = root / "LICENSE"
+            exempt_path.write_bytes(exempt_content)
+            self.assertIn("LICENSE", installer.allowed_unpinned_release_files())
+            if plant_relative_dir is not None:
+                (root / plant_relative_dir).mkdir(parents=True, mode=0o700)
+            symlink_path = root / plant_relative_symlink
+            symlink_path.symlink_to(
+                Path(os.path.relpath(exempt_path, symlink_path.parent))
+            )
+            self._chmod_tree_private(root)
+            os.chmod(pinned_path, 0o600)
+            os.chmod(exempt_path, 0o600)
+            pinned_relative_digests = {"pinned-file.js": pinned_digest}
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                with self.assertRaises(installer.PrimeInstallError) as cm:
+                    installer.tree_digest(
+                        root, pinned_relative_digests=pinned_relative_digests
+                    )
+            message = str(cm.exception)
+            self.assertIn(
+                "neither a package's own .bin/ entry nor resolved to a "
+                "pinned, digest-verified regular file",
+                message,
+            )
+            self.assertIn(plant_relative_symlink, message)
+
+    def test_tree_digest_deny_unknown_catches_symlink_to_license_at_node_modules_top_level(
+        self,
+    ) -> None:
+        # The reviewer's exact reproduction shape: a symlink directly under
+        # node_modules/, named like a real optional native dependency the
+        # pinned bundle unconditionally require()s (bufferutil).
+        self._round40_symlink_deny_unknown_tree_digest_harness(
+            plant_relative_dir="node_modules",
+            plant_relative_symlink="node_modules/bufferutil",
+        )
+
+    def test_tree_digest_deny_unknown_catches_symlink_to_license_at_scoped_package_path(
+        self,
+    ) -> None:
+        self._round40_symlink_deny_unknown_tree_digest_harness(
+            plant_relative_dir="node_modules/@mariozechner",
+            plant_relative_symlink="node_modules/@mariozechner/clipboard-win32",
+        )
+
+    def test_tree_digest_deny_unknown_catches_symlink_to_license_under_bin(
+        self,
+    ) -> None:
+        self._round40_symlink_deny_unknown_tree_digest_harness(
+            plant_relative_dir="bin",
+            plant_relative_symlink="bin/evil-binary",
+        )
+
+    def test_tree_digest_deny_unknown_catches_symlink_to_license_under_toolchain(
+        self,
+    ) -> None:
+        self._round40_symlink_deny_unknown_tree_digest_harness(
+            plant_relative_dir="toolchain/bin",
+            plant_relative_symlink="toolchain/bin/evil-node",
+        )
+
+    def test_tree_digest_deny_unknown_catches_symlink_to_license_inside_dot_bin(
+        self,
+    ) -> None:
+        # The sneaky variant: the symlink DOES sit inside a `.bin/`
+        # directory (the one structural property genuine npm-produced
+        # symlinks share), but its target -- LICENSE -- is not a pinned,
+        # digest-verified regular file. Proves the check requires BOTH
+        # conditions, not just the `.bin/` placement alone (which would
+        # have silently reopened the identical hole one level up: an
+        # attacker who also gets to choose the parent directory name could
+        # simply name it ".bin").
+        self._round40_symlink_deny_unknown_tree_digest_harness(
+            plant_relative_dir="node_modules/.bin",
+            plant_relative_symlink="node_modules/.bin/evil",
+        )
+
+    def test_tree_digest_deny_unknown_accepts_genuine_bin_symlink_to_pinned_target(
+        self,
+    ) -> None:
+        # Positive counterpart to the five rejection tests above (and to
+        # test_tree_digest_deny_unknown_accepts_allowed_unpinned_release_files
+        # for the regular-file half): a symlink that IS what a genuine `npm
+        # ci` actually produces -- directly inside a `.bin/` directory,
+        # resolving to a target that IS a pinned, digest-verified regular
+        # file -- is accepted normally. Proves round 40's new symlink check
+        # genuinely discriminates between the real shape and the reviewer's
+        # attack shape, rather than merely rejecting every symlink
+        # unconditionally (which would make a genuine, clean install fail
+        # closed on its own legitimate `.bin/` entries).
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            pinned_content = b"genuine pinned content\n"
+            pinned_path = root / "node_modules/some-package/bin/cli.js"
+            pinned_path.parent.mkdir(parents=True, mode=0o700)
+            pinned_path.write_bytes(pinned_content)
+            pinned_digest = installer.sha256_bytes(pinned_content)
+            bin_dir = root / "node_modules/.bin"
+            bin_dir.mkdir(mode=0o700)
+            symlink_path = bin_dir / "some-package"
+            symlink_path.symlink_to(Path(os.path.relpath(pinned_path, bin_dir)))
+            self._chmod_tree_private(root)
+            os.chmod(pinned_path, 0o600)
+            pinned_relative_digests = {
+                "node_modules/some-package/bin/cli.js": pinned_digest
+            }
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                # Must not raise.
+                installer.tree_digest(
+                    root, pinned_relative_digests=pinned_relative_digests
+                )
+
+    def test_assert_no_unexpected_ancestor_node_modules_accepts_clean_chain(
+        self,
+    ) -> None:
+        # verify()'s counterpart to the generated launch guard's
+        # unexpected_ancestor_node_modules() -- see
+        # test_unexpected_ancestor_node_modules_detects_real_node_rce_path
+        # above for the real-Node grounding of the underlying finding this
+        # closes (independent Claude opus/max round-39 review, P1-2). Pure
+        # Python logic, so no real Node needed here; the shared invariant
+        # (Node's ancestor node_modules walk reaches outside RELEASE_DIR)
+        # is what the real-Node tests above already establish.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "tool/releases/v0.7.2"
+            release.mkdir(parents=True)
+            # Must not raise.
+            installer.assert_no_unexpected_ancestor_node_modules(release)
+
+    def test_assert_no_unexpected_ancestor_node_modules_catches_directory_two_levels_up(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "tool/releases/v0.7.2"
+            release.mkdir(parents=True)
+            (root / "tool/node_modules").mkdir()
+            with self.assertRaisesRegex(
+                installer.PrimeInstallError,
+                r"unexpected node_modules directory.*tool/node_modules$",
+            ):
+                installer.assert_no_unexpected_ancestor_node_modules(release)
+
+    def test_assert_no_unexpected_ancestor_node_modules_catches_dangling_symlink(
+        self,
+    ) -> None:
+        # os.path.lexists (not os.path.exists) is what this function uses,
+        # specifically so a dangling symlink -- which os.path.exists()
+        # alone would silently treat as absent -- is still caught.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "tool/releases/v0.7.2"
+            release.mkdir(parents=True)
+            bad = root / "tool/releases/node_modules"
+            os.symlink("nonexistent-target", bad)
+            self.assertFalse(os.path.exists(bad))
+            self.assertTrue(os.path.lexists(bad))
+            with self.assertRaises(installer.PrimeInstallError):
+                installer.assert_no_unexpected_ancestor_node_modules(release)
+
+    def test_assert_no_unexpected_ancestor_node_modules_ignores_locations_inside_release_dir(
+        self,
+    ) -> None:
+        # Negative counterpart: a node_modules directory INSIDE release_dir
+        # itself (the legitimate one, plus any legitimately nested ones)
+        # is not this function's concern at all -- it only walks STRICTLY
+        # ABOVE release_dir. Those in-tree locations are covered by
+        # tree_digest()'s own completeness invariant instead (see
+        # tree_digest()'s docstring).
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "tool/releases/v0.7.2"
+            (release / "lib/node_modules").mkdir(parents=True)
+            (release / "node_modules").mkdir()
+            # Must not raise -- both are inside release_dir.
+            installer.assert_no_unexpected_ancestor_node_modules(release)
+
     def _round38_full_install_stray_harness(
         self,
         *,
         extra_registry_lock_path: str | None = None,
         plant_relative_path: str,
         expected_message_fragment: str,
+        plant_as_symlink: bool = False,
     ) -> None:
         """Shared harness for the round-38 end-to-end regression tests
         below: runs the REAL, unmocked `_install_locked_within_release_dir()`
@@ -12819,8 +13289,28 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 if path == launch_guard_path and not planted["done"]:
                     target = release / plant_relative_path
                     target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-                    target.write_bytes(b"attacker-controlled\n")
-                    os.chmod(target, 0o600)
+                    if plant_as_symlink:
+                        # Round 40, 2026-08-20: a symlink-shaped
+                        # materialization (rather than a regular file) at
+                        # the previously-skipped registry package's own
+                        # path -- see the round-40 fix to the post-move
+                        # `skipped_registry_lock_paths` assertion in
+                        # `_install_locked_within_release_dir()`, which
+                        # used to check `is_dir() and not is_symlink()`
+                        # (False, i.e. "still absent", for exactly this
+                        # shape). Points at `launch_guard_path`'s own
+                        # parent directory (guaranteed to exist by this
+                        # point, since the launch guard was just written)
+                        # so `post_move_dir.is_dir()` would ALSO have been
+                        # True pre-fix, following the symlink -- proving
+                        # this is caught by the "is a symlink at all" half
+                        # of the fix, not merely by "is not a directory".
+                        target.symlink_to(
+                            Path(os.path.relpath(launch_guard_path.parent, target.parent))
+                        )
+                    else:
+                        target.write_bytes(b"attacker-controlled\n")
+                        os.chmod(target, 0o600)
                     for dirpath, _dirnames, _filenames in os.walk(target.parent):
                         os.chmod(dirpath, 0o700)
                     planted["done"] = True
@@ -12967,6 +13457,34 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             extra_registry_lock_path="node_modules/@mariozechner/clipboard-win32",
             plant_relative_path="lib/node_modules/@mariozechner/clipboard-win32/index.js",
             expected_message_fragment="@mariozechner/clipboard-win32",
+        )
+
+    def test_install_locked_detects_symlink_materialized_at_always_skipped_registry_row(
+        self,
+    ) -> None:
+        # Round 40, 2026-08-20 (independent Claude opus/max round-39
+        # review, P1-1): the SAME scenario as the test just above, but the
+        # post-move materialization is a SYMLINK (to an existing, real
+        # directory elsewhere in the release tree) rather than a regular
+        # file inside a freshly created directory. Pre-fix (commit
+        # 8160356b9a), the post-move `skipped_registry_lock_paths`
+        # assertion checked `post_move_dir.is_dir() and not
+        # post_move_dir.is_symlink()` -- which evaluates False (i.e. "not
+        # materialized, still fine") for exactly this shape, since
+        # `is_dir()` on a symlink-to-directory follows the link and
+        # returns True, and `not is_symlink()` then makes the whole
+        # conjunction False. Verified via a standalone scratch script
+        # exercising that pre-fix condition directly against the plant
+        # this test performs: it evaluates False, so pre-fix HEAD would
+        # have silently accepted this plant and install() would have
+        # completed with a clean receipt. Post-fix, `post_move_dir.exists()
+        # or post_move_dir.is_symlink()` catches it -- `exists()` follows
+        # the symlink to the real directory it points at and returns True.
+        self._round38_full_install_stray_harness(
+            extra_registry_lock_path="node_modules/@mariozechner/clipboard-win32",
+            plant_relative_path="lib/node_modules/@mariozechner/clipboard-win32",
+            expected_message_fragment="@mariozechner/clipboard-win32",
+            plant_as_symlink=True,
         )
 
     def test_install_locked_detects_content_planted_at_pre_move_node_modules_path_after_move(

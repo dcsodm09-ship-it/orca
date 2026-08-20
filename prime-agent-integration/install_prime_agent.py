@@ -4078,6 +4078,58 @@ def tree_digest(
     member of allowed_unpinned_release_files() also fails this call
     closed -- see the round-38 paragraph below.
 
+    Round 40, 2026-08-20 (independent Claude opus/max round-39 review,
+    P1-1): round 38's deny-unknown completeness check, directly below,
+    populated `observed_regular_relative_paths` -- and therefore only ever
+    compared anything -- inside the `elif stat.S_ISREG(...)` branch. The
+    `if stat.S_ISLNK(...)` branch above it never contributed to any
+    completeness set at all, so a symlink at ANY relative path, pointing
+    anywhere `is_relative_to(resolved_root)` already permits, was accepted
+    into the permanent trust baseline with ZERO comparison against
+    anything -- structurally unable to ever be caught by the round-38 fix,
+    which only ever looked at regular files. Reproduced with real Node:
+    planting a symlink at a node_modules-package-shaped path (mimicking a
+    package the pinned bundle unconditionally `require()`s, e.g.
+    "lib/node_modules/bufferutil") pointing at RELEASE_DIR/LICENSE -- one
+    of the 14 allowed_unpinned_release_files() exemptions, since its
+    content is verified once at download time but never individually
+    pinned into `pinned_relative_digests` the way every node_modules
+    package member is -- was accepted here, and Node's own
+    extensionless-symlink-target loader fallback then loaded LICENSE's
+    text and executed it as JavaScript on every future managed invocation.
+    The identical blind spot independently defeated a second, separate
+    piece of round-38's own new code: `_install_locked_within_release_dir()`'s
+    post-move assertion that a previously-skipped registry package had not
+    since materialized used to check `is_dir() and not is_symlink()`,
+    which evaluates False -- i.e. "not materialized, still fine" -- for a
+    symlink-to-directory; fixed there, the same round, to fail closed on
+    ANY post-move presence (file, symlink, or directory), not only a
+    directory (see that assertion's own comment for detail).
+
+    Fixed the same structural way as round 38 itself: `observed_symlink_
+    relative_paths`, tracked alongside `observed_regular_relative_paths`
+    below (same `pinned_relative_digests is not None` gate), records every
+    symlink's relative path together with its already-resolved,
+    already-containment-checked target's OWN relative path. After the
+    walk, any observed symlink that is NOT both (a) directly inside a
+    `.bin/` directory and (b) resolved to a target that is itself a key of
+    `pinned_relative_digests` (i.e. a digest-verified, individually pinned
+    regular file) fails this call closed. `.bin/` symlinks are the ONLY
+    symlinks a genuine install ever produces under RELEASE_DIR: every
+    OTHER source this tree's content can come from -- the four release
+    tarballs (safe_extract_main_asset()) and the Node.js tarball
+    (extract_node_toolchain()) -- already refuses any symlink outright via
+    assert_tree_has_no_symlinks() before that content is ever published
+    here, so `npm ci`'s own node_modules/.bin/ generation (one symlink per
+    package with a declared "bin" entry, pointing at that same package's
+    own, already-pinned script file) is the only legitimate source left.
+    Requiring the target to be a pinned key -- rather than merely
+    re-running the existing containment check -- is what directly closes
+    the LICENSE reproduction above: LICENSE is deliberately NOT a key of
+    `pinned_relative_digests` (see allowed_unpinned_release_files()), so a
+    symlink pointing at it is refused regardless of where the symlink
+    itself sits.
+
     Round 38, 2026-08-20 (independent Claude opus/max round-37 review,
     P1-1/P1-2): through round 37, this function enforced only ONE
     direction of what is actually a completeness invariant with two
@@ -4217,6 +4269,16 @@ def tree_digest(
     # compare against an already-recorded baseline -- see this function's
     # own docstring for why that is correct, not an oversight.
     observed_regular_relative_paths: set[str] = set()
+    # Round 40, 2026-08-20 (P1-1): the symlink counterpart of `observed_
+    # regular_relative_paths` just above -- maps every observed symlink's
+    # `root`-relative path to its own already-resolved, already-containment-
+    # checked target's `root`-relative path. Same population gate
+    # (`pinned_relative_digests is not None`) and same purpose: the deny-
+    # unknown completeness check after the loop uses this to refuse any
+    # symlink that is not a genuine npm `.bin/` entry pointing at a pinned,
+    # digest-verified regular file -- see this function's own docstring for
+    # the full finding this closes.
+    observed_symlink_relative_paths: dict[str, str] = {}
     for path in sorted(root.rglob("*"), key=lambda item: os.fspath(item.relative_to(root))):
         relative = os.fspath(path.relative_to(root))
         info = path.lstat()
@@ -4232,6 +4294,10 @@ def tree_digest(
                 raise PrimeInstallError(f"broken runtime symlink: {relative}") from exc
             if Path(target_text).is_absolute() or not is_relative_to(target, resolved_root):
                 raise PrimeInstallError(f"runtime symlink escaped release: {relative}")
+            if pinned_relative_digests is not None:
+                observed_symlink_relative_paths[relative] = os.fspath(
+                    target.relative_to(resolved_root)
+                )
             payload = b"L\0" + relative.encode() + b"\0" + target_text.encode()
         elif stat.S_ISREG(info.st_mode):
             content_sha256 = sha256_file_verified(path)
@@ -4305,7 +4371,81 @@ def tree_digest(
                 "nor an accepted unpinned exemption -- refusing to adopt into "
                 f"the trusted baseline: {unknown_regular_relative_paths}"
             )
+        # Round 40, 2026-08-20 (independent Claude opus/max round-39 review,
+        # P1-1): the symlink counterpart of the regular-file deny-unknown
+        # check just above -- see this function's own docstring for the full
+        # finding this closes. A symlink is accepted into the trusted
+        # baseline only when BOTH (a) it sits directly inside a `.bin/`
+        # directory -- the only shape a genuine `npm ci` ever produces under
+        # RELEASE_DIR, since every other content source is already required
+        # to be symlink-free by assert_tree_has_no_symlinks() before
+        # publication -- AND (b) its already-containment-checked target is
+        # itself a key of `pinned_relative_digests`, i.e. a digest-verified,
+        # individually pinned regular file, not merely something structurally
+        # contained within RELEASE_DIR. Condition (b) is what directly closes
+        # the LICENSE reproduction: LICENSE is a deliberate
+        # allowed_unpinned_release_files() exemption, never a key of
+        # `pinned_relative_digests`, so a symlink pointing at it is refused
+        # regardless of where the symlink itself is placed.
+        unknown_symlink_relative_paths = sorted(
+            relative
+            for relative, target_relative in observed_symlink_relative_paths.items()
+            if PurePosixPath(relative).parent.name != ".bin"
+            or target_relative not in pinned_relative_digests
+        )
+        if unknown_symlink_relative_paths:
+            raise PrimeInstallError(
+                "release tree contains symlink(s) that are neither a package's "
+                "own .bin/ entry nor resolved to a pinned, digest-verified "
+                "regular file -- refusing to adopt into the trusted baseline: "
+                f"{unknown_symlink_relative_paths}"
+            )
     return digest.hexdigest(), count
+
+
+def assert_no_unexpected_ancestor_node_modules(release_dir: Path) -> None:
+    """Real Node's own CommonJS module resolution (`Module._nodeModulePaths`)
+    walks from wherever it is resolving a bare specifier upward through
+    EVERY ancestor directory, appending "node_modules" at each level, all
+    the way to the real filesystem root -- confirmed empirically against
+    this installer's exact pinned Node version (real
+    `Module._nodeModulePaths(...)` output, real ancestor walk, real
+    termination at "/"). Every location that walk reaches STRICTLY ABOVE
+    `release_dir` is something this installer never legitimately creates --
+    every write it performs during a real install stays within
+    `release_dir` itself, or within sibling, dot-prefixed per-tool home
+    directories under LOCAL_HOMES that are never named "node_modules" -- and
+    was, through round 39, not considered by anything in this file's trust
+    model at all (independent Claude opus/max round-39 review, P1-2).
+
+    Round 40, 2026-08-20: this is verify()'s counterpart to
+    managed_launch_guard_script()'s own, independently generated
+    `unexpected_ancestor_node_modules()` check (the two cannot literally
+    share code -- the launch guard is a standalone script with no import of
+    this module -- but enforce the identical invariant). Mirrors this file's
+    existing pattern of defense-in-depth checks that verify() performs even
+    though verify() itself never execs NODE/CLI directly (see the
+    node_sha256/npm_cli_sha256/entrypoint_sha256/launch_guard_sha256/
+    command_wrapper_sha256 loop in verify() for the established precedent).
+    Refuses on ANY presence at all (file, symlink -- dangling or not -- or
+    directory) rather than comparing against a recorded baseline, for the
+    same reason `unexpected_ancestor_node_modules()` does: none of these
+    locations should ever exist, so there is nothing to legitimately
+    distinguish between "existed at install time" and "appeared later" --
+    both are equally wrong.
+    """
+    current = os.fspath(release_dir)
+    while True:
+        parent = os.path.dirname(current)
+        if parent == current:
+            return
+        current = parent
+        candidate = os.path.join(current, "node_modules")
+        if os.path.lexists(candidate):
+            raise PrimeInstallError(
+                "unexpected node_modules directory on Node's module "
+                f"resolution ancestor chain outside the managed release: {candidate}"
+            )
 
 
 def write_pending_install(
@@ -4784,9 +4924,46 @@ def managed_launch_guard_script(
     Codex sol/max round-23 review, 2026-08-19, P1-1/P1-2: "...launch
     guard's baked-in NODE= points at the attacker binary, verify()
     passes").
+
+    Round 40, 2026-08-20 (independent Claude opus/max round-39 review,
+    P1-2): everything above -- and everything validate_exec_target() below
+    checks -- verifies NODE and CLI themselves. Nothing here, through round
+    39, considered two entirely different things real Node itself does once
+    it actually starts running CLI: (1) it reads NODE_OPTIONS/NODE_PATH/
+    NODE_PRESERVE_SYMLINKS(_MAIN) from whatever process environment this
+    script happens to inherit -- there was no `env=` argument to the
+    `subprocess.run([NODE, CLI, ...])` call below at all before this round,
+    so the FULL parent environment passed through unscrubbed, and
+    NODE_OPTIONS in particular can inject `--require`/`--loader`/`--import`
+    and run attacker code before CLI's own first line ever executes,
+    independent of anything this script's own path/content checks cover;
+    (2) its own CommonJS module resolution (`Module._nodeModulePaths`)
+    walks from CLI's directory upward through EVERY ancestor directory,
+    appending "node_modules" at each level, all the way to the real
+    filesystem root -- confirmed empirically against this exact pinned
+    Node version (real `Module._nodeModulePaths(...)` output, real
+    ancestor walk, real termination at "/") -- reaching well outside
+    RELEASE_DIR, which is the only tree tree_digest() (and therefore this
+    installer's entire verification model) ever looks at. On this actual
+    machine the walk crosses five same-UID-writable ancestor locations
+    before reaching SSD_ROOT itself, which this round separately confirmed
+    (real `stat`/`diskutil info`) is root:wheel-owned with no other-write
+    bit on a real, Owners-enabled APFS volume -- so the practical exposure
+    is bounded, not unbounded, but those five locations are real and were
+    entirely unconsidered by anything in this file. `scrubbed_node_
+    environment()` and `unexpected_ancestor_node_modules()` below close (1)
+    and mitigate (2) respectively -- see each function's own docstring, and
+    this installer's round-40 dispatch notes, for the exact scope closed
+    and the residual this leaves (the RELEASE_DIR-internal ancestor
+    locations, items already covered at install time by tree_digest()'s own
+    completeness invariant but not re-checked on every single launch, is a
+    separate, pre-existing, already-documented residual -- see
+    validate_exec_target()'s own docstring below for that one -- not new to
+    this round).
     """
     lock = lifecycle_lock_path()
     ssd_root = SSD_ROOT
+    release_dir = RELEASE_DIR
     source = f'''#!/usr/bin/python3
 from __future__ import annotations
 
@@ -4799,6 +4976,7 @@ import sys
 
 LOCK = {os.fspath(lock)!r}
 SSD_ROOT = {os.fspath(ssd_root)!r}
+RELEASE_DIR = {os.fspath(release_dir)!r}
 NODE = {os.fspath(node)!r}
 CLI = {os.fspath(cli)!r}
 NODE_SHA256 = {node_sha256!r}
@@ -4918,6 +5096,103 @@ RUNTIME_NO_GUARD_COMMANDS = frozenset(
         "stop",
     )
 )
+# Round 40, 2026-08-20 (independent Claude opus/max round-39 review, P1-2
+# item 1): every one of these directly influences, or (NODE_OPTIONS) can
+# inject arbitrary code into, Node's own startup and module resolution --
+# https://nodejs.org/api/cli.html#node_optionsoptions,
+# https://nodejs.org/api/cli.html#node_pathpath,
+# https://nodejs.org/api/cli.html#node_preserve_symlinks1,
+# https://nodejs.org/api/cli.html#node_preserve_symlinks_main1,
+# https://nodejs.org/api/repl.html#repl_node_repl_external_module --
+# independent of anything validate_exec_target() below checks (that only
+# ever inspects NODE/CLI themselves, never the environment they run in).
+# See scrubbed_node_environment()'s own docstring for why these are
+# explicitly removed from a COPY of the real environment rather than this
+# script exec'ing NODE/CLI with a wholesale-replaced, minimal one the way
+# managed_npm_environment() does for install-time npm invocations: this is
+# the user's real interactive session, and CLI legitimately needs whatever
+# else that session provides (credentials, PATH, TERM, ...).
+NODE_ENV_SCRUB_KEYS = (
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NODE_PRESERVE_SYMLINKS",
+    "NODE_PRESERVE_SYMLINKS_MAIN",
+    "NODE_REPL_EXTERNAL_MODULE",
+)
+
+
+def scrubbed_node_environment() -> dict[str, str]:
+    """A copy of this process's real environment with every key in
+    NODE_ENV_SCRUB_KEYS removed, for the SOLE subprocess this script ever
+    execs: `NODE CLI ...`. Round 40, 2026-08-20 (independent Claude
+    opus/max round-39 review, P1-2 item 1): before this round,
+    `subprocess.run([NODE, CLI, ...])` in main() below passed no `env=`
+    argument at all, so the child inherited this process's FULL
+    environment unscrubbed -- a same-UID actor who set NODE_OPTIONS (e.g.
+    to "--require=/path/to/attacker.js") anywhere upstream of this exec
+    (the calling shell's own exported environment, a wrapper script, an
+    inherited launchd/tmux/orchestration environment) had that flag
+    consumed by Node BEFORE CLI's own first line ever ran, and every check
+    this script performs above (LOCK identity, NODE/CLI structural and
+    content validation) reports success regardless, because none of them
+    inspects the process environment at all. NODE_PATH is the equally
+    direct analogue for module resolution rather than code injection: it
+    adds arbitrary, attacker-named directories to Node's own search path,
+    unconditionally, ahead of (or interleaved with) the ancestor
+    node_modules walk unexpected_ancestor_node_modules() below separately
+    addresses. NODE_PRESERVE_SYMLINKS(_MAIN) is scrubbed for the same
+    "never let the environment silently change how modules resolve"
+    reasoning, even though this installer's own symlink handling (see
+    tree_digest()'s round-40 fix) does not depend on Node's own
+    preserve-symlinks setting one way or the other.
+    """
+    environment = dict(os.environ)
+    for key in NODE_ENV_SCRUB_KEYS:
+        environment.pop(key, None)
+    return environment
+
+
+def unexpected_ancestor_node_modules() -> str | None:
+    """Round 40, 2026-08-20 (independent Claude opus/max round-39 review,
+    P1-2 item 4): real Node's own CommonJS module resolution
+    (`Module._nodeModulePaths`) walks from CLI's directory upward through
+    EVERY ancestor directory, appending "node_modules" at each level, all
+    the way to the real filesystem root -- confirmed empirically against
+    this exact pinned Node version, independent of anything RELEASE_DIR-
+    scoped this installer's own tree_digest() walk ever considers. Every
+    ancestor node_modules location STRICTLY ABOVE RELEASE_DIR is something
+    this installer never legitimately creates -- every write this
+    installer performs during a real install stays within RELEASE_DIR
+    itself, or within sibling, dot-prefixed per-tool home directories
+    under LOCAL_HOMES that are never named "node_modules" (empirically
+    confirmed absent on this real managed prefix's real ancestor chain at
+    the time this round was implemented) -- so this refuses outright on
+    ANY presence at all (file, symlink, or directory; `os.path.lexists`
+    does not follow the final symlink component, so a dangling symlink is
+    still caught) rather than trying to compare against some previously
+    recorded baseline, which would need a place to durably store that
+    baseline and a mechanism to keep it from itself becoming stale. Walks
+    to the real filesystem root ("/") rather than stopping at SSD_ROOT: on
+    this actual machine SSD_ROOT itself is root:wheel-owned with no
+    other-write bit (confirmed via `stat`/`diskutil info` on a real,
+    Owners-enabled APFS volume, so genuinely not same-UID-writable here),
+    but this script does not assume that permission state holds forever
+    (a remount, a different machine, a future ownership change) -- the
+    extra ~2-3 stat calls this costs are negligible, and checking
+    unconditionally is strictly more robust than trusting an assumption
+    about current filesystem permissions. Returns the first offending
+    "<ancestor>/node_modules" path found, or None if the whole chain is
+    clean.
+    """
+    current = RELEASE_DIR
+    while True:
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+        candidate = os.path.join(current, "node_modules")
+        if os.path.lexists(candidate):
+            return candidate
 
 
 def fail(message: str) -> int:
@@ -5410,8 +5685,25 @@ def main() -> int:
         cli_error = validate_exec_target(CLI, root, CLI_SHA256)
         if cli_error is not None:
             return fail(cli_error)
+        # Round 40, 2026-08-20 (independent Claude opus/max round-39
+        # review, P1-2 item 4): see unexpected_ancestor_node_modules()'s
+        # own docstring -- refuses to exec at all if Node's own module
+        # resolution ancestor chain (which reaches well outside RELEASE_DIR
+        # and everything the two validate_exec_target() calls above cover)
+        # contains a node_modules location this installer never creates.
+        ancestor_node_modules = unexpected_ancestor_node_modules()
+        if ancestor_node_modules is not None:
+            return fail(
+                "unexpected node_modules directory on Node's module "
+                "resolution ancestor chain outside the managed release: "
+                f"{{ancestor_node_modules}}"
+            )
         completed = subprocess.run(
-            [NODE, CLI, *guarded_arguments(sys.argv[1:])], check=False
+            [NODE, CLI, *guarded_arguments(sys.argv[1:])],
+            check=False,
+            # Round 40, 2026-08-20 (P1-2 item 1): see
+            # scrubbed_node_environment()'s own docstring.
+            env=scrubbed_node_environment(),
         )
         return completed.returncode
     except (OSError, subprocess.SubprocessError) as exc:
@@ -7447,13 +7739,31 @@ def _install_locked_within_release_dir(
     # (which independently closes the identical exploitation path; see its
     # docstring -- this is deliberate defense in depth, not the sole
     # mechanism either check alone is required to be).
+    #
+    # Round 40, 2026-08-20 (independent Claude opus/max round-39 review,
+    # P1-1): this check originally read `post_move_dir.is_dir() and not
+    # post_move_dir.is_symlink()` -- which evaluates False, i.e. "still
+    # absent, still fine", for a SYMLINK planted at `post_move_dir` (a
+    # symlink is never `is_dir() is True` in the sense this condition
+    # intended; `is_dir()` on a symlink-to-directory follows the link and
+    # returns True, but `not is_symlink()` then makes the whole conjunction
+    # False for exactly that case) -- the identical blind spot that
+    # independently defeated tree_digest()'s own round-38 fix a different
+    # way (see this file's tree_digest() docstring, round 40 paragraph, for
+    # the full LICENSE-target reproduction). Fixed to fail closed on ANY
+    # post-move materialization at all -- file, symlink (dangling or not),
+    # or directory -- using the same `path.exists() or path.is_symlink()`
+    # idiom already used everywhere else in this file to detect "something
+    # is now here, of any kind" without silently following a symlink into a
+    # False negative.
     for lock_path in skipped_registry_lock_paths:
         post_move_dir = global_root.parent / lock_path
-        if post_move_dir.is_dir() and not post_move_dir.is_symlink():
+        if post_move_dir.exists() or post_move_dir.is_symlink():
             raise PrimeInstallError(
-                "registry package directory is materialized but was absent "
-                "(or a symlink) at the pre-npm-ci-completion presence probe -- "
-                f"refusing to trust unverified content: {lock_path}"
+                "registry package path is materialized (file, symlink, or "
+                "directory) but was absent (or a symlink) at the "
+                "pre-npm-ci-completion presence probe -- refusing to trust "
+                f"unverified content: {lock_path}"
             )
     release_relative_pinned_digests: dict[str, str] = {
         os.fspath(node.relative_to(RELEASE_DIR)): node_sha256,
@@ -7879,6 +8189,11 @@ def verify(expected_lock_identity: tuple[int, int] | None = None) -> dict[str, A
         # and always passes None here, unchanged from before this fix.
         assert_lifecycle_lock_path_identity(lifecycle_lock_path(), expected_lock_identity)
     release = verify_private_ssd_dir(Path(receipt["release_dir"]))
+    # Round 40, 2026-08-20 (independent Claude opus/max round-39 review,
+    # P1-2): defense in depth alongside managed_launch_guard_script()'s own
+    # equivalent, independently generated check -- see
+    # assert_no_unexpected_ancestor_node_modules()'s own docstring.
+    assert_no_unexpected_ancestor_node_modules(release)
     state = validate_runtime_state(Path(receipt["state_dir"]))
     validate_pristine_managed_home(Path(receipt["probe_home"]), "Prime Agent probe home")
     session_dir = verify_private_ssd_dir(Path(receipt["session_dir"]))
