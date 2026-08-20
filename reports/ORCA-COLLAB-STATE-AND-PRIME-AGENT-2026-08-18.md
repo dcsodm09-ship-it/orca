@@ -1860,6 +1860,57 @@ lock 在这一步之前就已经被闭包哈希钉死，`os`/`cpu` 数组不可�
 架构问题——具体怎么做（清空环境变量/拒绝祖先目录可写/搬迁 release
 根目录）留给下一轮实际调研之后再定。
 
+**round 39 的 Codex 一路（`task_71cb7ad4b0c5`）这次真的完整跑完了**
+（07:25 派发、08:09 完成，约 44 分钟真实工作，遇到 hooks 界面时
+Monitor 自动处理，中途手动补发一次 Enter 后开始真正干活）——**独立
+得出 NO-GO，和 opus/max 的两个 P1 高度吻合，还多找到一个新的第三
+问题**：
+
+- **P1-A（对应 opus/max 的 P1-1）**：独立复现——种一个指向 `LICENSE`
+  的符号链接在 `node_modules/bufferutil/index.js`，`tree_digest`
+  接受，真实 Node v24.19.0 把 `LICENSE` 当 JavaScript 执行，打印
+  `LICENSE_EXECUTED_AS_JS`、退出码 0。另外确认了"指向另一个已钉住
+  文件的符号链接"同样会被接受。
+- **P1-B（对应 opus/max 的 P1-2）**：独立复现——真实 Node 解析路径
+  链确实会走出 `RELEASE_DIR`，到 `TOOL_ROOT/releases/node_modules`、
+  `TOOL_ROOT/node_modules` 等祖先目录，在这些位置放一个文件会被
+  真实加载执行、打印 `OUTSIDE_MODULE_EXECUTED`——判定是"持久、零
+  竞速的装机后可种植面"，另外指出继承的 `NODE_PATH`/`NODE_OPTIONS`
+  是一个独立的、未加限制的额外输入面。
+- **P1-C（全新发现，opus/max 没找到）**：
+  `assert_materialized_node_modules_matches_lock()` 把"嵌套
+  `node_modules` 容器缺失"和"父包本身缺失"同等对待、直接跳过——
+  但如果父包目录**真实存在**、只是它自己的嵌套依赖容器不存在，
+  而这个嵌套容器里声明过一个非平台排除的子依赖，这种情况下父包
+  本身没有被判定为"缺失"，检查也就不会走到"要求这个缺失必须用
+  `os`/`cpu` 字段证明"的分支——子依赖的缺失就这样被完全放过了。
+  真实跑通完整安装流水线复现：`node_modules/prime-agent` 目录
+  存在，它要求的 `node_modules/missing-child` 缺失，搬移前后两处
+  结构检查、钉住表构建、拒绝未知检查全部对这个缺口视而不见。
+  round 38 新加的反方向测试只覆盖了"父包本身缺失"这一种情况，没
+  覆盖"父包存在、子容器缺失"这种。
+
+也如实指出几条信息性问题：README 里的测试数还停在 99（实际已经
+152）；`tree_digest` 文档里对同一处豁免的措辞前后不一致（一处说
+"五个记账文件"、另一处说"这四个都不算"）；空的非 registry 目录
+完全不进摘要，目录拓扑本身算不算基线的一部分需要明确决定；
+`lock_row_platform_excludes` 没有覆盖 npm 平台字段的全部写法
+（比如 `"any"`、`libc`），当前生产闭包用不到但以后 lock 变了
+值得补个夹具；确认了 `sandbox_e2e.py` 用的是真正的 `assert`、
+`python -O` 优化模式下不会被跳过（早前几轮的顾虑已经解决）。
+
+真实测试证据：152/152 测试（两个解释器各跑两次）全过、
+`py_compile` 两个解释器都干净、16 条命名回归测试单独按全限定名
+跑通、真实（非 mock）`sandbox_e2e.py` 跑了三次全部 `exit 0`/
+`ok:true`（第一次因为机器负载高明显更慢，但没有超时或重试）、
+独立构造的常规文件边界测试（点文件、244 字符文件名、冗余分隔符、
+含反斜杠文件名）全部正确拒绝，符号链接/硬链接/FIFO/零字节文件的
+完整矩阵测试也和 opus/max 的结论一致——符号链接是唯一能绕过的
+文件形态。
+
+**已把 P1-C 并入 round 41 的修复范围**（round 40 已经在专门处理
+P1-1/P1-2，不打断它正在进行的工作）。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
