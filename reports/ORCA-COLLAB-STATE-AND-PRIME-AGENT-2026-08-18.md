@@ -2777,6 +2777,14 @@ expected d6da1eea7d0f2d0a7c14251dde34e31d799edad6c78bea6c08cf33294727ee32"}
 **已派发 round 50 双复核**（Claude opus+max 与 Codex sol+max，对
 `b00e9a6f81`）。
 
+Codex 一路派发过程出现了一个此前没见过的新失败模式：`gpt-5.6-sol` 在
+这次绑定到的账号下直接报 `400 invalid_request_error`——"The 'gpt-5.6-sol'
+model is not supported when using Codex with a ChatGPT account."（不是
+hooks 竞态、也不是 Trusted Access，是这个账号的认证方式不支持这个模型）。
+直接改用 `gpt-5.6-terra/high` 重新派发（沿用本轮已经反复验证过的替代
+方案），派发过程又撞了一次已知的 `hooks.json` 信任竞态，同样手法恢复
+后确认真实在跑。opus/max 一路也已并行派出。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
