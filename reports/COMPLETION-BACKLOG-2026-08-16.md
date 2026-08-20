@@ -325,8 +325,16 @@ opus/max 给出了具体、廉价的最小修法。**round 30（commit `035ef5da
 没钉、round 32 说"不执行"的残留说明被证伪。**round 34（commit `dab6a143d9`）已完成
 并自验证**：加了一个统一的完整性断言堵住符号链接/目录/删除三种绕法，把整个工具链树
 （含 `lib/cli.js`）也钉进去。120/120 测试全过、真实 `sandbox_e2e.py` 跑两次 `ok:true`
-零假阳性（首次钉住全工具链树）。**round 35 双复核已派发**，尚未独立确认——这次 Codex
-若再卡在 hooks 提示会更及时处理，不会再放置数小时。完整逐轮细节见
+零假阳性（首次钉住全工具链树）。**round 35 双复核结果**：Codex 一路正常派发中（设了
+主动响应 hooks 提示的 Monitor，未再放置数小时）；Claude opus/max **NO_GO，2 个新
+P1**——先用 78 组探针 + 真实 tarball 逐项核算，彻底确认 round 34 那两处修复本身完全
+正确、完整；但挖出根因：round 34 引用的"模型对照函数"其实有两条不变式（缺失文件+
+未声明文件），round 34 只做了"缺失"这一半，`tree_digest()` 完全没有拒绝未知文件的
+机制。真实复现两条路径：182 个第三方依赖包只有 4 个被钉住，篡改一个真实被
+`import()` 的依赖（`undici`）能一路存活到 receipt、被真实 `bin/prime-agent --version`
+执行；launch guard 的 python 调用缺 `-I -P`，种一个 `bin/hashlib.py` 能在 guard 自己
+进程里被执行、伪造摘要校验结果。**round 36 已派发**：给 `tree_digest()` 补上拒绝
+未知文件的一半、guard 补 `-I -P`。完整逐轮细节见
 `reports/ORCA-COLLAB-STATE-AND-PRIME-AGENT-2026-08-18.md`。
 `fd6a683a4a` 这个双 GO 时点**已被 8 轮后续真实发现超越，不能再作为"可以安装"的
 依据**——按用户规则，需要在当前 HEAD 上重新拿到一次真正、当下有效的双路 GO。

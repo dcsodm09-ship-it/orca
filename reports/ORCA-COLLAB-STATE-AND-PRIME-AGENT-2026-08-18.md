@@ -1478,6 +1478,83 @@ round 24-32 的 7 条既有回归测试逐条抽查仍然通过。真实（非 m
 平台特定文件选择产生和 tarball 流式摘要对不上的内容）。已提交
 `dab6a143d9`。**已派发 round 35 双复核。**
 
+### Round 35：round 34 那两处修复本身完全正确；但只做了"模型对照函数"里一半的不变式——挖出 2 个新 P1
+
+**Codex 这一路**（`task_cbfadb497314`）这次设了主动响应 hooks 提示的
+Monitor，正常派发中，结果尚未到（不再放置数小时不管）。
+
+**Claude opus/max：NO_GO，0 P0、2 P1、2 P2、8 P3**——先做了非常彻底的
+反向验证，明确判定 round 34 自己的两处修复**都是对的、都完整**：
+针对完整性断言，用 9 个不同钉住路径（工具链、补丁包、入口文件、
+guard、wrapper）× 7 种绕过手法（含 round 34 自己没测过的"父目录被
+换掉导致子路径整个不可达"变体、大小写重命名、FIFO 替换、幽灵钉住键
+等）做了 78 组探针，78/78 全部被正确拒绝、两个解释器四次运行结果
+一致；针对工具链钉住，直接从真实 tarball 算出精确数字核对
+（5779 个成员 = 1068 目录 + 4708 常规文件 + 3 个符号链接，逐一确认
+这 3 个符号链接在解压阶段就被跳过、完整性断言正确地没有要求给它们
+配摘要）、真实安装里钉住键数量 `6449 = 4708 + 1739 + 2` 分毫不差、
+真实 e2e 两次 `ok:true` 零假阳性。
+
+**但往深一层挖，找到了真正的根因**：`assert_locally_patched_package_
+matches_pinned_digests()`（round 34 自己引用的"模型对照函数"）其实
+强制了**两条**不变式——"没有钉住的文件缺失" **和** "没有未声明的
+文件出现"——round 34 的注释说自己实现的是"和它一样的不变式"，但
+实际上**只做了"缺失"这一半**。`tree_digest()` 完全没有"拒绝未知
+文件"这一半的对应机制：任何一个没被钉住的文件，只要出现在
+`RELEASE_DIR` 底下，都会被原样折进永久信任的基线里。
+
+由此复现出 2 个真实、可利用的新 P1：
+
+- **P1-1**：真实 `cli.js` 会无条件 `import("undici")`，但被钉住的
+  只有四个本地补丁包，安装的 182 个第三方依赖包里**只有 4 个**被
+  钉住，剩下 **176 个包、17611 个常规文件完全不设防**。真实复现：
+  在 npm ci 运行期间篡改 `node_modules/undici/index.js`，
+  `install()` 完整成功、篡改字节成为基线、`verify()` 报告
+  `ok:true`，攻击者代码不仅在 `verify()` 自己的版本探测里跑了，
+  在真实 `bin/prime-agent --version`（退出码 0、版本号正确）里也
+  真的执行了。round 34 写的那句"每一条会被执行的路径现在全部在
+  `release_relative_pinned_digests` 里"经这次复现证实是错的。
+- **P1-2**（两个变体，各自独立复现两次）：
+  - **(a) launch guard 自己被 stdlib 遮蔽**：wrapper 执行
+    `/usr/bin/python3 -B <guard>` 时没有加 `-I`/`-P`，导致
+    `sys.path[0]` 就是 `RELEASE_DIR/bin`。装机窗口内种一个
+    `bin/hashlib.py`：install 完整成功（26912 个条目）、这个文件
+    没被钉住、`verify()` 报告 `ok:true`，而且这份伪造的
+    `hashlib.py` **真的在 launch guard 自己的进程里被执行了**——
+    在 `import hashlib` 那一刻，早于 `validate_exec_target()` 真正
+    跑起来之前。真实攻击载荷可以伪造 `sha256().hexdigest()`，从
+    guard 内部把 round 23/24/29/32 辛苦建起来的 NODE/CLI 内容钉住
+    机制直接废掉。
+  - **(b) 搬移之后种兄弟模块**：
+    `assert_materialized_node_modules_matches_lock()` 只在搬移
+    **之前**跑一次，搬移之后再也不会重新检查。搬移完之后种
+    `bufferutil`/`utf-8-validate` 这两个包，两者都能存活进最终提交
+    的基线、`verify()` 报告 `ok:true`——而这个函数自己的文档字符串
+    明确宣称"新增一个包会被抓到"，所以这**不是**一个早就被接受的
+    残留，是真被绕过了。
+
+opus/max 给出的修法方向：给 `tree_digest()` 补上"内容已完全确定的
+目录（`bin/`、`toolchain/`）拒绝未知文件"这一半；对第三方 registry
+依赖包，npm 自己的缓存里留着 377 个按 SRI 寻址的 tarball，逐文件
+摘要**其实是可以在 npm ci 之前就推导出来的**——这和早前几轮"不现实
+去做"的理由是矛盾的，值得重新评估；guard 的 python 调用补上
+`-I -P`。另有 2 条 P2（未独立复现，标记为线索：
+`resume_incomplete_quarantine()` 缺少 `quarantine_partial_release()`
+已有的激活态校验；`config`/`package` 完全没有 `RESOURCE_GUARDS`、
+只靠 `settings.json` 这一道门）+ 8 条 P3（`os.replace` 之后多余的
+按路径 `chmod`、`mkdir(parents=True)` 留下 0755 中间目录、一处已被
+`fdopen` 关闭的 fd 又被关了一次等，逐一记录但均判定低危）。opus/max
+特别明确否决了自己排查过程中一度出现的"receipt 本身没有签名认证"
+这一条 P1 级怀疑——指出同 UID 攻击者能同时改产物又改基线的话，任何
+无密钥的完整性方案都挡不住，这是架构边界问题不是缺陷，降级为 P3/
+信息性。
+
+opus/max 的收尾评价："这个装机时间窗口的安全相关面，对'同 UID 攻击者
+在这个威胁模型下'来说，还没有真正关上——通过三条已复现的路径，攻击者
+控制的代码依然能一路留存到每一次未来的托管调用，且 `verify()` 永远
+报告 `ok:true`。round 34 把机制的方向建对了、自己那两处修复也做对了，
+只是复制"模型对照函数"的不变式时只复制了一半。"
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
