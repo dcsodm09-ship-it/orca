@@ -1439,6 +1439,45 @@ opus/max 明确指出：round 32 自己的改动没有缺陷，问题出在"往�
 残留说明对 npm 库文件的事实陈述是错的——同一种"对覆盖到的部分讲得
 很精确、对没覆盖到的部分给出错误断言"的模式，又往下一层重演了一次。
 
+### Round 34：一个结构性完整性断言 + 把整个工具链树也钉进去（已验证关闭，未独立复核）
+
+**P1-1 修复**：新增 `consumed_pinned_relative_paths`，只有当一个钉住
+路径真的通过"是常规文件"这个分支、内容和钉住值吻合时才会被记进这个
+集合。整棵树扫完之后，钉住表里任何一个键**没有**出现在这个集合
+里——不管是因为被观察成符号链接、被观察成目录、还是压根没被观察到
+（已删除）——都会让 `PrimeInstallError` 报错并点名具体是哪个路径。
+这是一个统一的结构性完整性断言，不是只针对符号链接的窄修法（round
+33 明确要求"删除"和"换成目录"两种同样能绕过、需要一种机制一起堵
+住），写法上和 `assert_locally_patched_package_matches_pinned_
+digests()` 已有的"observed/missing"记账方式保持一致。
+
+**P1-2 修复**：`extract_node_toolchain()` 现在返回一个五元组，多出
+的 `toolchain_content_digests` 就是这个函数内部本来就算好、之前只
+挑两个条目用、其余全部丢弃的完整逐文件摘要表。
+`_install_locked_within_release_dir()` 把这张表以
+`"toolchain/<相对路径>"` 为键整个塞进
+`release_relative_pinned_digests`——现在 `toolchain/` 目录下每一个
+常规文件（包括真正被 `npm-cli.js` 转发壳 `require()` 的
+`lib/node_modules/npm/lib/cli.js`）都和四个本地补丁包、入口文件、
+launch guard、wrapper 一样，享有同一套零窗口保证。残留说明相应
+更新，去掉了被证伪的"工具链其余文件不会被执行"这句话，改成明确
+陈述"整个工具链现在已全部钉住"。
+
+4 条新回归测试（P1-1 三个场景：钉住路径被换成符号链接、被换成目录、
+被整个删掉；P1-2：篡改未钉住的 `npm` 库文件 `lib/cli.js`），全部
+确认对 round-33 基线 `a3430db740` 可复现（旧代码要么静默接受、要么
+装完成功并写下"干净"的 receipt）、对修复后的代码正确报错拒绝。共享
+测试夹具 `fake_extract_node_toolchain` 顺带升级成新的五元组契约、
+并且模拟了 npm 真实的"转发壳/库文件"两层结构，约 19 条既有集成测试
+因此自动开始真正验证新契约。120/120 测试（116 条既有 + 4 条新增）
+在两个解释器下各跑两次全过，`py_compile` 在三条解释器路径下都干净。
+round 24-32 的 7 条既有回归测试逐条抽查仍然通过。真实（非 mock）
+`sandbox_e2e.py` 生命周期回放跑了两次，均 `exit 0`/`ok:true`、26911
+个条目、`real_user_state_changed:false`——**第一次把整个工具链树都
+钉住之后，零假阳性**（没有任何 npm 侧的安装后步骤、权限归一化、或
+平台特定文件选择产生和 tarball 流式摘要对不上的内容）。已提交
+`dab6a143d9`。**已派发 round 35 双复核。**
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
