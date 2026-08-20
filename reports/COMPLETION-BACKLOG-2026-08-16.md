@@ -422,6 +422,18 @@ Darwin `/dev/fd/<n>` + `pass_fds=`/`executable=`），彻底消掉第二次按�
 `fd6a683a4a` 这个双 GO 时点**已被 8 轮后续真实发现超越，不能再作为"可以安装"的
 依据**——按用户规则，需要在当前 HEAD 上重新拿到一次真正、当下有效的双路 GO。
 
+**round 47 结果（已提交 `8ec03e28fd`）**：完整描述符绑定 exec 被真实验证为在这台
+机器上两边都走不通——NODE 侧因为 Darwin 上 `O_RDONLY`/`O_EXEC` 互斥（读不了就
+exec 不了，exec 得了就读不了，没有 `fexecve` 等价物）；CLI 侧因为 `/dev/fd/<n>`
+会让 `__dirname` 变成 `/dev/fd/<n>`，破坏真实 `cli.js` 依赖的兄弟文件 `require`。
+两边都不是猜测，是写了独立验证脚本（`tests/smoke_dev_fd_exec.py`）真跑出来的。
+改用任务允许的兜底方案：保留已校验描述符做身份锚点，在真正 `subprocess.run()`
+前的最后一刻重新核对路径仍指向同一个 inode，把可利用窗口压缩到"最后一次
+`lstat()` 到 `subprocess.run()` 自己再次按路径 exec"之间——不是归零，文档如实
+写明残留。187/187 测试双解释器 OK（提交前独立复核过一遍，不只采信 agent 说法），
+3 次真实 `sandbox_e2e.py` 全 `ok:true`，`production_lock_sha256` 未变。**已派发
+round 48 双复核。**
+
 ## 8. 桌面 / 浏览器（2 项）
 
 `desktop-mcp`、`ego-capability-fixture`：均 `BLOCKED_HUMAN_DECISION`（peer 认证机制未设计 / ship-or-discard 未决策）。

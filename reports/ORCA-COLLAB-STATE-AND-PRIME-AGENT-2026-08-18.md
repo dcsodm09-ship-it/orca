@@ -2473,6 +2473,63 @@ Python `subprocess` 的 `pass_fds=` 保持描述符跨 fork 存活、`executable
 真实、可复现的回归测试证明"校验通过后、exec 之前"这个窗口内替换目标
 文件不再能让 guard 执行到被替换的内容。
 
+### Round 47 结果：完整描述符绑定 exec 在这台机器上被真实验证为不可行（NODE 和 CLI 两边各有独立原因），改用"把可利用窗口压缩到最小"的兜底方案，已提交 `8ec03e28fd`
+
+修复 agent 没有直接假设 `/dev/fd/<n>` 方案可行就动手改代码，而是先写了一个
+独立的现场验证脚本（`tests/smoke_dev_fd_exec.py`，已保留）用真 Node 子进程和
+一次绕过 Python `subprocess` 机制的裸 `os.fork()+os.execve()` 分别测试，
+拿到了两个各自独立、都是真 OS 限制而非 Python 限制的否定结果：
+
+- **NODE 侧打不通**：Darwin 上 `os.O_RDONLY` 和 BSD 的 `os.O_EXEC` 这两种
+  打开方式在同一个 open file description 上互斥——`O_EXEC` 打开的描述符
+  不能 `read()`（`EBADF`）、`O_RDONLY` 打开的描述符不能通过 `/dev/fd` 被
+  exec（`EPERM`），两种组合方式都试过，都被拒绝；Darwin 也没有 Python 能
+  调用到的 `fexecve(2)` 等价物。也就是说"用同一个描述符既校验内容又拿去
+  exec"这件事本身在这台机器的操作系统层面就做不到，不是权限或写法问题。
+- **CLI 侧能读但会破坏真实功能**：通过 `/dev/fd/<n>` 传给 Node 确实能被
+  正确加载执行，但会把 `__dirname`/`__filename` 变成 `/dev/fd/<n>` 而不是
+  CLI 真实所在目录，导致 `require(path.join(__dirname, ...))` 找不到同目录
+  的兄弟文件——用真实 Node 进程复现确认过；而这个安装器实际钉住、真正会
+  分发的 `dist/bundle/cli.js` 本身就在无条件做这类兄弟文件导入（本文件
+  别处关于 `patched_content_digests` 的注释已经记录过这一点），不是理论
+  上才会踩到的边缘情形。
+
+两边都被真实验证为此平台上走不通之后，采用了任务里明确允许的兜底方案：
+`validate_exec_target()` 现在不再在返回前关闭自己打开的描述符，而是把
+这个"已校验、已打开"的描述符原样返回给调用者，作为一个"身份不可能被
+篡改"的锚点（描述符一旦打开，它自己的 `(st_dev, st_ino)` 不会因为之后对
+路径本身做了什么而改变）；新增的 `reassert_exec_target_identity()` 在
+`main()` 里紧贴着真正 `subprocess.run()` 之前——是调用它之前的最后两条
+语句——重新核对 `NODE`/`CLI` 的路径此刻是否仍然解析到这个锚点描述符对应
+的同一个 inode。这把可被利用的窗口从"`validate_exec_target()` 返回之后
+`main()` 剩下的全部执行时间"压缩到了"这最后一次 `lstat()` 和
+`subprocess.run()` 自己内部再次按路径 exec 之间的这一小段"——在这台机器
+不提供更强 OS 原语的前提下，这是能表达出的最小窗口，**但没有归零**，
+文档里也没有夸大成"已彻底关闭"：`subprocess.run()` 终究还是要按路径字符串
+再解析一次去 exec，赢下这个更窄窗口的同 UID 攻击者、或者干脆原地改写
+已校验 inode 内容字节的攻击者，仍然不会被这套机制拦下——这个残留和之前
+每一轮一样，如实写进了函数自己的文档字符串里。
+
+新增两条回归测试：一条在 `validate_exec_target(CLI, ...)` 刚返回后的确定
+时刻注入替换，确认修复后的真实 `main()` 会 fail-closed（退出码 78，NODE
+从未被真正跑起来）；另一条是修复前代码形状的独立复现（打开→校验哈希→
+关闭→之后再按路径 exec），用同样的替换时机证明**修复前**这个替换确实会
+被悄悄执行——一次真正的修复前/修复后对照，不是只验证修复后这一侧。
+
+187/187 测试全过（两个解释器各两次，修复 agent 自己跑了 4 次，提交前我
+自己又独立跑了一遍完整确认，不是只采信 agent 的说法），`py_compile` 三个
+改动文件、两个解释器全干净。真实（非 mock）`sandbox_e2e.py` 跑了 3 次，
+全部 `ok:true`、`real_user_state_changed:false`，`production_lock_sha256`
+和修复前完全一致（这次改动完全没碰钉定/校验逻辑本身，只改了校验通过之后
+到真正 exec 之间这一段）；每次运行里的 `wrapper --version` 都真实走过了
+修复后的完整 exec 路径（两次 `validate_exec_target()`、两次新增的
+`reassert_exec_target_identity()`、真正 `subprocess.run()` 执行真正的
+NODE 加载真正的 CLI）并返回了正确的钉定版本号。
+
+已提交 `8ec03e28fd`。**已派发 round 48 双复核**（Claude opus+max 与 Codex
+sol+max）——按用户规则，任一路 P0/P1 都阻断，修复后必须对新候选重新走
+两路独立复核。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
