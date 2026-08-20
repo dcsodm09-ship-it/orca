@@ -1948,8 +1948,9 @@ def safe_extract_main_asset(
 
 def extract_node_toolchain(
     asset: Path, destination: Path, expected_sha256: str
-) -> tuple[Path, Path, str, str]:
-    """Returns (node, npm_cli, node_sha256, npm_cli_sha256).
+) -> tuple[Path, Path, str, str, dict[Path, str]]:
+    """Returns (node, npm_cli, node_sha256, npm_cli_sha256,
+    toolchain_content_digests).
 
     node_sha256/npm_cli_sha256 are SHA-256 content digests of `node`/
     `npm_cli`'s own bytes, captured WHILE those exact bytes are streamed
@@ -1977,6 +1978,31 @@ def extract_node_toolchain(
     guard only proves the DIRECTORY was not swapped, not that every file
     reachable through it still holds the content this function itself
     wrote.
+
+    `toolchain_content_digests` is the SAME per-file digest map the write
+    loop below already builds for every regular file it extracts (keyed by
+    `destination`-relative Path, e.g. Path("bin/node")) -- round 34,
+    2026-08-20 (independent Claude opus/max round-33 review, P1-2): before
+    this round, this map was built in full but then discarded, with only
+    its node_relative/npm_cli_relative entries ever pulled out (as
+    node_sha256/npm_cli_sha256 below). `exact_tool_version()`'s npm-version
+    probe execs `node lib/node_modules/npm/bin/npm-cli.js --version`, and
+    real npm's own npm-cli.js is a two-line forwarding stub
+    (`require('../lib/cli.js')`) -- the actual npm library code that
+    subprocess loads and runs is lib/cli.js and everything it requires,
+    none of which was ever pinned. Reproduced: tampering the unpinned
+    lib/cli.js while leaving the pinned npm-cli.js stub untouched let the
+    tampered code execute inside every exact_tool_version() npm-version
+    call (at install time and, via verify()'s own re-probe, on every
+    future invocation), with `node npm-cli.js --version` still reporting
+    the correct version string throughout, since npm-cli.js itself was
+    never touched. `_install_locked_within_release_dir()` now folds this
+    entire map into `release_relative_pinned_digests` (keyed
+    "toolchain/<relative>") the same way the four locally patched
+    packages' own full file trees already are (round 27/28) -- so
+    tree_digest()'s pinned-digest comparison, plus this round's P1-1
+    completeness assertion, cover every regular file under toolchain/, not
+    only the two entry-point files.
     """
     expected_root = f"node-v{NODE_VERSION}-darwin-arm64"
     # Must be freshly created, never a pre-existing directory: see
@@ -2121,7 +2147,12 @@ def extract_node_toolchain(
         raise PrimeInstallError(
             "pinned Node.js runtime digest capture is incomplete"
         ) from exc
-    return node, npm_cli, node_sha256, npm_cli_sha256
+    # Round 34, 2026-08-20 (P1-2): return the COMPLETE per-file digest map
+    # captured above -- not merely the two entries just pulled out for
+    # node_sha256/npm_cli_sha256 -- so the caller can pin every regular
+    # file under the extracted toolchain tree, not only its two entry
+    # points. See this function's own docstring for why.
+    return node, npm_cli, node_sha256, npm_cli_sha256, content_digests
 
 
 def managed_npm_environment(
@@ -3349,14 +3380,56 @@ def tree_digest(
     "lib/node_modules/prime-agent/dist/bundle/cli.js") to a SHA-256 digest
     already known, independently, to be correct -- captured strictly
     BEFORE any external `npm` subprocess this installer does not control
-    ever ran (see extract_node_toolchain()'s node_sha256/npm_cli_sha256 and
-    make_patched_asset()'s per-file content_digests maps). For any regular
-    file whose `root`-relative path is a key in this map, the content
-    digest this walk computes below is compared against the pinned value
-    RIGHT HERE, in the SAME pass that is about to fold that digest into the
-    tree's overall hash -- and this function fails closed on a mismatch --
-    INSTEAD OF unconditionally recording whatever happens to be on disk as
-    the permanently-trusted baseline with no comparison against anything.
+    ever ran (see extract_node_toolchain()'s node_sha256/npm_cli_sha256/
+    toolchain_content_digests and make_patched_asset()'s per-file
+    content_digests maps). For any regular file whose `root`-relative path
+    is a key in this map, the content digest this walk computes below is
+    compared against the pinned value RIGHT HERE, in the SAME pass that is
+    about to fold that digest into the tree's overall hash -- and this
+    function fails closed on a mismatch -- INSTEAD OF unconditionally
+    recording whatever happens to be on disk as the permanently-trusted
+    baseline with no comparison against anything. EVERY key present in
+    `pinned_relative_digests` is additionally required to have been
+    observed and matched as a regular file during this same walk -- see
+    the round-34 paragraph below for why, and for what this closes.
+
+    Round 34, 2026-08-20 (independent Claude opus/max round-33 review,
+    P1-1): the content comparison above only ever fired inside this
+    function's `elif stat.S_ISREG(...)` branch -- the `if stat.S_ISLNK(...)`
+    branch and the `elif stat.S_ISDIR(...)` branch below never consulted
+    `pinned_relative_digests` at all, and nothing anywhere in this function
+    checked that every key of `pinned_relative_digests` was actually
+    observed during the walk. A same-UID racer who, in the same install-time
+    window this parameter already exists to close, replaced a pinned
+    path's regular file with a SYMLINK, replaced it with a DIRECTORY, or
+    simply DELETED it outright had that substitution (or omission) fold
+    into the recorded baseline with zero comparison -- whatever the racer
+    left in its place (or didn't leave at all) was accepted unconditionally,
+    exactly as if `pinned_relative_digests` had never been passed for that
+    one path. Reproduced end-to-end through the real install(): symlink-
+    substituting a file that IS a key of `release_relative_pinned_digests`
+    (built in _install_locked_within_release_dir()) but is NOT one of
+    verify()'s five receipt-checked exec targets let install() complete and
+    verify() report ok:true, while the attacker's symlink target executed on
+    every managed invocation.
+
+    Fixed with a completeness invariant, not a narrow symlink-only patch
+    (round-33 review explicitly found deletion and directory-substitution
+    equally exploitable, and asked for one mechanism that closes all
+    three): `consumed_pinned_relative_paths`, tracked below, records every
+    `pinned_relative_digests` key that was actually matched against a
+    regular file (i.e. reached the `elif stat.S_ISREG(...)` branch AND had
+    a pinned entry AND passed the content comparison). After the walk
+    completes, ANY key of `pinned_relative_digests` that is not also in
+    `consumed_pinned_relative_paths` -- because the walk observed it as a
+    symlink, observed it as a directory, or never observed it at all
+    (deleted, or never created) -- fails this call closed. This is
+    structurally the same missing-file bookkeeping
+    assert_locally_patched_package_matches_pinned_digests() already
+    performs for the four locally patched packages' own trees (its own
+    `observed`/`missing` pair, just above this function); this walk now
+    enforces the identical invariant for every `pinned_relative_digests`
+    key, regardless of which caller supplied the map.
 
     Round 29, 2026-08-19 (independent Claude opus/max round-29 review,
     P1-1): before this parameter existed, tree_digest() was purely a
@@ -3390,6 +3463,11 @@ def tree_digest(
     digest = hashlib.sha256()
     digest.update(b"R\0" + str(stat.S_IMODE(root_info.st_mode)).encode() + b"\n")
     count = 1
+    # Round 34, 2026-08-20 (P1-1): every `pinned_relative_digests` key that
+    # this walk actually matched against a regular file whose content
+    # equalled the pinned value -- see the completeness assertion after the
+    # loop, and this function's own docstring for what this closes.
+    consumed_pinned_relative_paths: set[str] = set()
     for path in sorted(root.rglob("*"), key=lambda item: os.fspath(item.relative_to(root))):
         relative = os.fspath(path.relative_to(root))
         info = path.lstat()
@@ -3410,11 +3488,13 @@ def tree_digest(
             content_sha256 = sha256_file_verified(path)
             if pinned_relative_digests is not None:
                 expected = pinned_relative_digests.get(relative)
-                if expected is not None and content_sha256 != expected:
-                    raise PrimeInstallError(
-                        "release tree content does not match its digest-verified "
-                        f"pre-npm-ci pinned baseline: {relative}"
-                    )
+                if expected is not None:
+                    if content_sha256 != expected:
+                        raise PrimeInstallError(
+                            "release tree content does not match its digest-verified "
+                            f"pre-npm-ci pinned baseline: {relative}"
+                        )
+                    consumed_pinned_relative_paths.add(relative)
             payload = (
                 b"F\0"
                 + relative.encode()
@@ -3434,6 +3514,23 @@ def tree_digest(
             raise PrimeInstallError(f"unexpected runtime file type: {relative}")
         digest.update(payload + b"\n")
         count += 1
+    if pinned_relative_digests is not None:
+        # Round 34, 2026-08-20 (P1-1): fail closed if ANY pinned path was
+        # not observed and matched as a regular file above -- covers a
+        # pinned path replaced with a symlink (observed, but never added to
+        # `consumed_pinned_relative_paths` because only the S_ISREG branch
+        # ever adds to it), replaced with a directory (same reason), or
+        # deleted outright (never observed by the walk at all) with the
+        # exact same check, rather than three separate narrow patches.
+        unconsumed_pinned_relative_paths = sorted(
+            set(pinned_relative_digests) - consumed_pinned_relative_paths
+        )
+        if unconsumed_pinned_relative_paths:
+            raise PrimeInstallError(
+                "release tree is missing pinned path(s), or a pinned path is no "
+                "longer a plain regular file (replaced with a symlink, replaced "
+                f"with a directory, or deleted): {unconsumed_pinned_relative_paths}"
+            )
     return digest.hexdigest(), count
 
 
@@ -5510,8 +5607,23 @@ def _install_locked_within_release_dir(
         NODE_ASSET_SHA256,
         max_bytes=MAX_NODE_DOWNLOAD_BYTES,
     )
-    node, npm_cli, node_sha256, npm_cli_sha256 = extract_node_toolchain(
-        assets_dir / NODE_ASSET, RELEASE_DIR / "toolchain", NODE_ASSET_SHA256
+    # `toolchain_content_digests` (round 34, 2026-08-20, P1-2) is the
+    # COMPLETE per-file digest map for every regular file extract_node_
+    # toolchain() wrote under RELEASE_DIR/toolchain/, captured directly
+    # from the digest-verified Node.js tarball's bytes as they were
+    # streamed to disk -- not merely node_sha256/npm_cli_sha256's two
+    # entry-point entries. Threaded into `release_relative_pinned_digests`
+    # below, alongside `patched_content_digests`, so the ENTIRE toolchain
+    # tree gets the same zero-window install-time pinning the four locally
+    # patched packages' own full trees already have (round 27/28) -- see
+    # extract_node_toolchain()'s own docstring for the reproduced finding
+    # this closes (real npm library code under toolchain/lib/node_modules/
+    # npm/lib/ was previously unpinned and ran, unverified, inside every
+    # exact_tool_version() npm-version probe).
+    node, npm_cli, node_sha256, npm_cli_sha256, toolchain_content_digests = (
+        extract_node_toolchain(
+            assets_dir / NODE_ASSET, RELEASE_DIR / "toolchain", NODE_ASSET_SHA256
+        )
     )
     # Round 24, 2026-08-19 (independent Codex sol/max round-23 review,
     # P1-1): node_sha256/npm_cli_sha256, captured by extract_node_toolchain()
@@ -6227,28 +6339,78 @@ def _install_locked_within_release_dir(
     # with zero window, and verify()'s pre-exec digest loop independently
     # re-checks all five on every future invocation as defense in depth.
     #
+    # Round 34, 2026-08-20 (independent Claude opus/max round-33 review,
+    # P1-1/P1-2): two fixes to the pinning mechanism itself, both closed
+    # together this round:
+    #
+    #   P1-1: tree_digest()'s pinned-digest comparison only ever fired for
+    #   a pinned path that was still a REGULAR FILE at walk time -- a
+    #   pinned path replaced with a symlink, replaced with a directory, or
+    #   deleted outright skipped the comparison entirely and got folded
+    #   into (or silently omitted from) the baseline with no check at all.
+    #   tree_digest() now asserts, after its walk, that every key of
+    #   whatever `pinned_relative_digests` map it was given was actually
+    #   observed and content-matched as a regular file -- see that
+    #   function's own docstring for the full finding and fix.
+    #
+    #   P1-2: `release_relative_pinned_digests` previously pinned only TWO
+    #   files under toolchain/ -- bin/node and lib/node_modules/npm/bin/
+    #   npm-cli.js -- even though real npm-cli.js is a two-line forwarding
+    #   stub (`require('../lib/cli.js')`) whose actual library code (lib/
+    #   cli.js and everything it requires) was never pinned, despite
+    #   exact_tool_version()'s npm-version probe genuinely executing it on
+    #   every install and every verify(). `toolchain_content_digests`
+    #   (extract_node_toolchain()'s now-complete return value; see its own
+    #   docstring) is folded into `release_relative_pinned_digests` below
+    #   for every regular file under toolchain/, not merely the two entry
+    #   points -- the exact same full-tree pinning pattern the four locally
+    #   patched packages already had since round 27/28, now applied to the
+    #   toolchain too.
+    #
+    # What is FULLY pinned as of this round, matching the four locally
+    # patched packages' own treatment: node, npm-cli, EVERY OTHER regular
+    # file under toolchain/ (npm's full library tree, its own nested
+    # dependencies, docs -- everything extract_node_toolchain() extracted),
+    # the entrypoint (dist/bundle/cli.js) and the rest of the four locally
+    # patched packages' own trees, the launch guard, and the command
+    # wrapper. tree_digest()'s pinned-digest comparison plus this round's
+    # P1-1 completeness assertion cover all of it with zero install-time
+    # window, and verify()'s pre-exec digest loop separately re-checks the
+    # five actually-exec'd files (node, npm-cli, entrypoint, launch guard,
+    # command wrapper) on every future invocation as defense in depth --
+    # unchanged this round, since the newly-pinned toolchain files beyond
+    # node/npm-cli are not individually exec'd by anything, only reachable
+    # through npm-cli.js's own `require()` chain, which IS exec'd (that is
+    # the P1-2 finding this fix closes).
+    #
     # The genuinely narrower residual that remains, accepted and
-    # deliberately not fixed this round: files under RELEASE_DIR that are
-    # recorded in tree_digest()'s overall release_tree_sha256 (so tampering
-    # them still shows up as detected "release tree drifted" DRIFT) but are
-    # NOT individually pinned and NOT ever exec'd post-install --
-    # package.json, package-lock.json, LICENSE, upstream-package-lock.json,
-    # and the toolchain's own non-node/npm-cli files (npm's other library
-    # sources, docs, etc.). A same-UID racer who tampers one of these in
-    # the same install-time window has that tampered content silently
-    # adopted as part of the recorded tree_digest() baseline, exactly as
-    # the pinned paths' pre-round-29 behavior was -- but, unlike the five
-    # pinned/exec'd paths above, nothing in this installer or its generated
-    # scripts ever reads or executes any of these files' content again
-    # after install, so the practical consequence of winning that race is
-    # inert recorded drift (a receipt field that silently reflects
-    # attacker-chosen bytes nothing acts on), not code execution. Closing
-    # this residual too is straightforward given the mechanism now built
-    # (add each path's already-known-correct digest -- e.g. LICENSE_SHA256,
-    # the generated lock's own hash -- to the same map) but is intentionally
-    # out of THIS round's required scope; the one genuinely irreducible
-    # residual for every path that IS pinned (including the five exec'd
-    # ones) is the same class this file already accepts elsewhere (see e.g.
+    # deliberately not fixed this round because it is NOT code that this
+    # installer or its generated scripts ever execute: files under
+    # RELEASE_DIR that are recorded in tree_digest()'s overall
+    # release_tree_sha256 (so tampering them still shows up as detected
+    # "release tree drifted" DRIFT) but are NOT individually pinned --
+    # package.json, package-lock.json, LICENSE, and
+    # upstream-package-lock.json. A same-UID racer who tampers one of
+    # these in the same install-time window has that tampered content
+    # silently adopted as part of the recorded tree_digest() baseline,
+    # exactly as the pinned paths' pre-round-29 behavior was -- but nothing
+    # in this installer or its generated scripts ever reads or executes
+    # any of these four files' content again after install, so the
+    # practical consequence of winning that race is inert recorded drift
+    # (a receipt field that silently reflects attacker-chosen bytes
+    # nothing acts on), not code execution. Closing this residual too is
+    # straightforward given the mechanism now built (add each path's
+    # already-known-correct digest -- e.g. LICENSE_SHA256, the generated
+    # lock's own hash -- to the same map) but is intentionally out of THIS
+    # round's required scope. Separately, and NOT newly introduced by this
+    # round: the ~196 third-party registry dependency packages' own file
+    # content remains unpinned by this mechanism -- see
+    # assert_materialized_node_modules_matches_lock()'s own docstring for
+    # the precise, previously-established statement of that scope.
+    #
+    # The one genuinely irreducible residual for every path that IS
+    # pinned (including the toolchain's now-complete tree) is the same
+    # class this file already accepts elsewhere (see e.g.
     # create_fresh_private_dir()'s own docstring): the microsecond-scale,
     # in-process gap inside a single sha256_file_verified() call between
     # its own lstat() and O_NOFOLLOW open() -- not something an external
@@ -6285,6 +6447,24 @@ def _install_locked_within_release_dir(
             release_relative_pinned_digests[
                 f"{package_relative}/{member_relative.as_posix()}"
             ] = member_sha256
+    # Round 34, 2026-08-20 (independent Claude opus/max round-33 review,
+    # P1-2): fold the COMPLETE toolchain digest map into the same pinned
+    # baseline, keyed the same way `node`/`npm_cli`'s own two explicit
+    # entries above already are ("toolchain/" + the destination-relative
+    # path extract_node_toolchain() extracted it to) -- both of those
+    # explicit entries are themselves keys of `toolchain_content_digests`
+    # (it is the SAME map node_sha256/npm_cli_sha256 were pulled from), so
+    # this loop harmlessly re-assigns them to the identical value already
+    # set above rather than diverging from it. This is the toolchain's
+    # full-tree counterpart to the locally patched packages' loop just
+    # above -- see extract_node_toolchain()'s own docstring for the
+    # reproduced finding this closes (real npm library code under
+    # toolchain/lib/node_modules/npm/lib/ executing, unpinned, inside
+    # every exact_tool_version() npm-version probe).
+    for member_relative, member_sha256 in toolchain_content_digests.items():
+        release_relative_pinned_digests[
+            f"toolchain/{member_relative.as_posix()}"
+        ] = member_sha256
     write_pending_install(
         receipt, pinned_relative_digests=release_relative_pinned_digests
     )

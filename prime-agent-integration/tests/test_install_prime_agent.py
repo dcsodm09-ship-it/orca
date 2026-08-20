@@ -26,7 +26,7 @@ import install_prime_agent as installer
 class PrimeAgentInstallerTests(unittest.TestCase):
     def fake_extract_node_toolchain(
         self, asset: Path, destination: Path, expected_sha256: str
-    ) -> tuple[Path, Path, str, str]:
+    ) -> tuple[Path, Path, str, str, dict[Path, str]]:
         """Shared `extract_node_toolchain` fake for the full-`_install_locked()`
         integration tests below (round 24, 2026-08-19): unlike the real
         function, this never touches the network or a real Node.js tarball,
@@ -38,20 +38,45 @@ class PrimeAgentInstallerTests(unittest.TestCase):
         bare, non-existent Paths (this fixture's pre-round-24 shape) now
         fails those checks before ever reaching whatever each individual
         test actually means to exercise.
+
+        Round 34, 2026-08-20 (P1-2): also writes a THIRD toolchain file,
+        lib/node_modules/npm/lib/cli.js -- modeling real npm's own layout,
+        where lib/node_modules/npm/bin/npm-cli.js is a two-line forwarding
+        stub and lib/node_modules/npm/lib/cli.js is the actual library code
+        that runs -- and returns a `toolchain_content_digests` map (the
+        function's now 5th return value) covering all three files, exactly
+        as the real extract_node_toolchain() returns a digest for every
+        regular file it extracts, not merely node/npm-cli.js. Every caller
+        that unpacks this fake's return value already expects a 5-tuple to
+        match the real function's current signature.
         """
         node_path = destination / "bin/node"
         npm_cli_path = destination / "lib/node_modules/npm/bin/npm-cli.js"
+        npm_lib_cli_path = destination / "lib/node_modules/npm/lib/cli.js"
         node_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         node_path.write_bytes(b"#!/bin/sh\necho fake-node\n")
         os.chmod(node_path, 0o700)
         npm_cli_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-        npm_cli_path.write_bytes(b"// fake npm cli\n")
+        npm_cli_path.write_bytes(b"#!/usr/bin/env node\nrequire('../lib/cli.js')\n")
         os.chmod(npm_cli_path, 0o600)
+        npm_lib_cli_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        npm_lib_cli_path.write_bytes(b"// fake npm lib/cli.js (the real npm library code)\n")
+        os.chmod(npm_lib_cli_path, 0o600)
+        toolchain_content_digests = {
+            Path("bin/node"): installer.sha256_file(node_path),
+            Path("lib/node_modules/npm/bin/npm-cli.js"): installer.sha256_file(
+                npm_cli_path
+            ),
+            Path("lib/node_modules/npm/lib/cli.js"): installer.sha256_file(
+                npm_lib_cli_path
+            ),
+        }
         return (
             node_path,
             npm_cli_path,
-            installer.sha256_file(node_path),
-            installer.sha256_file(npm_cli_path),
+            toolchain_content_digests[Path("bin/node")],
+            toolchain_content_digests[Path("lib/node_modules/npm/bin/npm-cli.js")],
+            toolchain_content_digests,
         )
 
     def create_managed_home(
@@ -10700,6 +10725,442 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             self.assertEqual(
                 installer.sha256_bytes(target_path.read_bytes()),
                 pinned_digests[Path("pinned-file.js")],
+            )
+
+    def _round34_p1_1_completeness_harness(
+        self, *, tamper, error_regex: str
+    ) -> None:
+        """Shared harness for the three round-34 P1-1 regression tests just
+        below.
+
+        Regression for independent Claude opus/max round-33 review,
+        2026-08-19, P1-1: "tree_digest()'s pinned-digest comparison only
+        fires inside the `elif stat.S_ISREG(...)` branch. The `if
+        stat.S_ISLNK(...)` branch and the `elif stat.S_ISDIR(...)` branch
+        never consult pinned_relative_digests, and the function never
+        verifies that every key in pinned_relative_digests was actually
+        observed as a regular file during the walk. So a pinned path that
+        gets replaced with a symlink, replaced with a directory, or simply
+        deleted silently skips the comparison entirely -- whatever's there
+        (or isn't) gets folded into the permanent baseline with zero
+        check."
+
+        Calls the real tree_digest() twice against a real temp directory:
+        once while the pinned path is still the genuine regular file (a
+        sanity check that the pinned map is otherwise accepted), then again
+        after `tamper` has replaced/removed it, with the exact same
+        `pinned_relative_digests` map both times -- isolating the
+        completeness assertion as the ONLY thing that can still catch it
+        (there is no separate sweep function for a bare tree_digest()
+        caller the way the four locally patched packages have
+        assert_locally_patched_package_matches_pinned_digests()).
+
+        A content-identical decoy file, elsewhere in the same directory, is
+        available to `tamper` for the symlink scenario specifically -- so a
+        symlink substitution whose target happens to match the pinned
+        digest byte-for-byte is still caught, proving this is a TYPE
+        (regular-file) check, not merely a weaker content check that would
+        have been fooled by matching bytes.
+
+        Verified against pre-fix HEAD (commit a3430db740) via a standalone
+        scratch script exercising the same three scenarios directly against
+        that commit's tree_digest(): all three completed with `NO_RAISE`
+        (tree_digest() returned a digest/count pair successfully, silently
+        folding the tampered/omitted path into the baseline with no
+        comparison at all) pre-fix, and all three raise the completeness
+        error below post-fix.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            genuine_content = b"genuine, pinned content\n"
+            pinned_path = root / "pinned-file.js"
+            pinned_path.write_bytes(genuine_content)
+            os.chmod(pinned_path, 0o600)
+            pinned_digest = installer.sha256_bytes(genuine_content)
+            # Same content as the pinned file, but a DIFFERENT path -- only
+            # used by the symlink scenario, to prove the catch is type-based
+            # rather than incidentally a content mismatch.
+            decoy_path = root / "decoy-same-content.js"
+            decoy_path.write_bytes(genuine_content)
+            os.chmod(decoy_path, 0o600)
+            pinned_relative_digests = {"pinned-file.js": pinned_digest}
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                # Sanity: while the pinned path is still the genuine regular
+                # file, tree_digest() accepts the pinned map normally.
+                installer.tree_digest(
+                    root, pinned_relative_digests=pinned_relative_digests
+                )
+                tamper(pinned_path, decoy_path)
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, error_regex
+                ):
+                    installer.tree_digest(
+                        root, pinned_relative_digests=pinned_relative_digests
+                    )
+
+    def test_tree_digest_completeness_catches_pinned_path_replaced_with_symlink(
+        self,
+    ) -> None:
+        # See _round34_p1_1_completeness_harness()'s own docstring for the
+        # full finding. This scenario: the pinned regular file is deleted
+        # and replaced, in its exact place, with a RELATIVE symlink to a
+        # content-identical decoy elsewhere in the same tree -- so if this
+        # were caught only by a content mismatch (as the pre-round-34 code
+        # would have computed one, had it even tried), it would NOT be
+        # caught; the only thing that can catch it is the completeness
+        # assertion refusing a pinned path that is no longer a regular file
+        # at all. tree_digest()'s own separate escaped-symlink check
+        # (`runtime symlink escaped release`) does not fire either, since
+        # the decoy is a relative symlink target that stays inside the same
+        # release tree -- isolating this test to the completeness
+        # assertion specifically, not the unrelated escape check.
+        #
+        # Verified to FAIL against pre-fix HEAD (commit a3430db740) via a
+        # standalone scratch script: tree_digest() returned a digest/count
+        # pair successfully, silently folding the symlink in as if
+        # `pinned_relative_digests` had never named this path at all.
+        def tamper(pinned_path: Path, decoy_path: Path) -> None:
+            pinned_path.unlink()
+            pinned_path.symlink_to(Path(decoy_path.name))
+
+        self._round34_p1_1_completeness_harness(
+            tamper=tamper,
+            error_regex=(
+                r"release tree is missing pinned path\(s\), or a pinned "
+                r"path is no longer a plain regular file.*pinned-file\.js"
+            ),
+        )
+
+    def test_tree_digest_completeness_catches_pinned_path_replaced_with_directory(
+        self,
+    ) -> None:
+        # See _round34_p1_1_completeness_harness()'s own docstring for the
+        # full finding. This scenario: the pinned regular file is deleted
+        # and a DIRECTORY (containing an attacker-controlled file) is
+        # created in its exact place -- the `elif stat.S_ISDIR(...)` branch
+        # never consulted `pinned_relative_digests` before this round's fix,
+        # so this substitution was folded into the baseline with zero check
+        # either.
+        #
+        # Verified to FAIL against pre-fix HEAD (commit a3430db740) via a
+        # standalone scratch script: tree_digest() returned a digest/count
+        # pair successfully, silently recording the substituted directory
+        # (and its attacker-controlled member) as part of the baseline.
+        def tamper(pinned_path: Path, decoy_path: Path) -> None:
+            del decoy_path
+            pinned_path.unlink()
+            pinned_path.mkdir(mode=0o700)
+            (pinned_path / "attacker-payload.js").write_bytes(b"attacker payload\n")
+            os.chmod(pinned_path / "attacker-payload.js", 0o600)
+
+        self._round34_p1_1_completeness_harness(
+            tamper=tamper,
+            error_regex=(
+                r"release tree is missing pinned path\(s\), or a pinned "
+                r"path is no longer a plain regular file.*pinned-file\.js"
+            ),
+        )
+
+    def test_tree_digest_completeness_catches_pinned_path_deleted_entirely(
+        self,
+    ) -> None:
+        # See _round34_p1_1_completeness_harness()'s own docstring for the
+        # full finding. This scenario: the pinned regular file is simply
+        # DELETED, with nothing put in its place -- the walk never observes
+        # this relative path at all, so pre-round-34 there was no check of
+        # any kind (not even a wrong-type one) that could have noticed it
+        # was gone; tree_digest() unconditionally recorded a baseline that
+        # simply omits it.
+        #
+        # Verified to FAIL against pre-fix HEAD (commit a3430db740) via a
+        # standalone scratch script: tree_digest() returned a digest/count
+        # pair successfully, with the deleted path silently absent from the
+        # recorded baseline instead of being refused.
+        def tamper(pinned_path: Path, decoy_path: Path) -> None:
+            del decoy_path
+            pinned_path.unlink()
+
+        self._round34_p1_1_completeness_harness(
+            tamper=tamper,
+            error_regex=(
+                r"release tree is missing pinned path\(s\), or a pinned "
+                r"path is no longer a plain regular file.*pinned-file\.js"
+            ),
+        )
+
+    def test_install_locked_detects_unpinned_toolchain_npm_lib_cli_tamper(
+        self,
+    ) -> None:
+        # Regression for independent Claude opus/max round-33 review,
+        # 2026-08-19, P1-2: "release_relative_pinned_digests only pins
+        # toolchain/bin/node and toolchain/lib/node_modules/npm/bin/
+        # npm-cli.js -- but the real npm-cli.js is a 2-line forwarding stub
+        # (`require('../lib/cli.js')`), and the actual npm library code
+        # that runs is in toolchain/lib/node_modules/npm/lib/cli.js and its
+        # dependencies, which are NOT pinned. verify() itself executes this
+        # via exact_tool_version(), which real npm CLI code confirmed to
+        # actually run. ... tampering the unpinned lib/cli.js while leaving
+        # the pinned npm-cli.js stub untouched still results in the
+        # tampered code executing inside verify(), with node npm-cli.js
+        # --version still returning the correct version string (since
+        # npm-cli.js itself, the only pinned file, is unchanged)."
+        #
+        # This wraps `self.fake_extract_node_toolchain` (which already
+        # writes a THIRD toolchain file, lib/node_modules/npm/lib/cli.js,
+        # modeling real npm's stub/library split -- see that fake's own
+        # docstring) with a side effect that, immediately after the fake
+        # returns genuine content and a genuine, tarball-derived digest map
+        # for all three files, overwrites lib/cli.js's on-disk bytes IN
+        # PLACE -- leaving npm-cli.js (the pinned stub) and its own digest
+        # completely untouched -- exactly modeling a same-UID racer who
+        # wins the window between extraction and write_pending_install()'s
+        # later tree_digest() call, without any of this installer's own
+        # node/npm-cli-specific re-verification calls (all of which only
+        # ever touch the two entry-point files) having any way to observe
+        # it.
+        #
+        # Verified to FAIL against pre-fix HEAD (commit a3430db740) via a
+        # standalone scratch script using an arity-matched (4-tuple)
+        # extract_node_toolchain fake, exercising the same real install()
+        # path: installer.install() completed successfully (no exception),
+        # with the tampered lib/cli.js content and a clean receipt both
+        # left on disk -- because pre-fix, `release_relative_pinned_
+        # digests` never contained a "toolchain/lib/node_modules/npm/lib/
+        # cli.js" key at all, so tree_digest() had nothing to compare that
+        # path against and simply recorded the tampered bytes as part of
+        # the trusted baseline.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            user_home = root / "user"
+            user_home.mkdir(mode=0o700)
+
+            local_assets = {
+                "prime-agent": installer.MAIN_PATCHED_ASSET,
+                **installer.WORKSPACE_ASSETS,
+            }
+            generated = {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {
+                        "name": "orca-managed-prime-agent",
+                        "version": installer.VERSION,
+                        "dependencies": {
+                            "prime-agent": f"file:assets/{installer.MAIN_PATCHED_ASSET}"
+                        },
+                    },
+                    **{
+                        f"node_modules/local-{index}": {
+                            "name": name,
+                            "version": installer.VERSION,
+                            "resolved": f"file:assets/{asset_name}",
+                            "integrity": "sha512-dGVzdA==",
+                        }
+                        for index, (name, asset_name) in enumerate(local_assets.items())
+                    },
+                },
+            }
+            with mock.patch.object(installer, "RELEASE_DIR", release):
+                expected_lock_sha256 = installer.sha256_bytes(
+                    installer.normalized_production_lock(generated)
+                )
+            generated_lock_raw = installer.canonical_json(generated)
+
+            GENUINE_CLI_CONTENT = b"// genuine, tarball-pinned cli.js\n"
+            ATTACKER_NPM_LIB_CLI_CONTENT = (
+                b"// ATTACKER npm lib/cli.js, planted AFTER extract_node_"
+                b"toolchain() returned genuine content -- the pinned "
+                b"npm-cli.js stub itself is left completely untouched.\n"
+            )
+
+            def fake_run_npm(
+                npm_path, node_path, args, cwd, cache, install_home, install_tmp,
+                timeout=300, child_umask=None, release_dir_fd=None,
+            ):
+                cwd = Path(cwd)
+                if args and args[0] == "install":
+                    lock_path = cwd / "package-lock.json"
+                    lock_path.write_bytes(generated_lock_raw)
+                    os.chmod(lock_path, 0o600)
+                elif args and args[0] == "ci":
+                    bundle = cwd / "node_modules/prime-agent/dist/bundle"
+                    bundle.mkdir(parents=True, mode=0o700)
+                    for ancestor in (
+                        cwd / "node_modules",
+                        cwd / "node_modules/prime-agent",
+                        cwd / "node_modules/prime-agent/dist",
+                        bundle,
+                    ):
+                        os.chmod(ancestor, 0o700)
+                    cli = bundle / "cli.js"
+                    cli.write_bytes(GENUINE_CLI_CONTENT)
+                    os.chmod(cli, 0o600)
+
+            def fake_make_patched_asset(
+                original_asset,
+                original_sha256,
+                upstream_lock,
+                assets_dir,
+                *,
+                expected_name,
+                managed_name,
+                output_name,
+            ):
+                patched = assets_dir / output_name
+                installer.atomic_create_private_file(patched, b"stub-asset", 0o600)
+                published_stat = patched.lstat()
+                content_digests = (
+                    {Path("dist/bundle/cli.js"): installer.sha256_bytes(GENUINE_CLI_CONTENT)}
+                    if managed_name == "prime-agent"
+                    else {}
+                )
+                return (
+                    patched,
+                    installer.sha256_bytes(b"stub-asset"),
+                    {"name": managed_name, "version": installer.VERSION},
+                    (published_stat.st_dev, published_stat.st_ino),
+                    content_digests,
+                )
+
+            def fake_safe_download(url, destination, expected_sha256, *, max_bytes=None):
+                if destination.name == "upstream-package-lock.json":
+                    payload = installer.canonical_json(
+                        {"lockfileVersion": 3, "packages": {}}
+                    )
+                else:
+                    payload = b"stub-download"
+                installer.atomic_create_private_file(destination, payload, 0o600)
+
+            fake_evidence = {
+                "volume_uuid": "TEST-UUID",
+                "node_version": installer.NODE_VERSION,
+                "npm_version": installer.NPM_VERSION,
+                "orca_support": {"test": "support"},
+            }
+
+            real_fake_extract_node_toolchain = self.fake_extract_node_toolchain
+            tamper_fired = {"done": False}
+
+            def extract_then_tamper_npm_lib_cli(asset, destination, expected_sha256):
+                result = real_fake_extract_node_toolchain(
+                    asset, destination, expected_sha256
+                )
+                if not tamper_fired["done"]:
+                    npm_lib_cli_path = destination / "lib/node_modules/npm/lib/cli.js"
+                    npm_cli_path = destination / "lib/node_modules/npm/bin/npm-cli.js"
+                    before_npm_cli_bytes = npm_cli_path.read_bytes()
+                    with open(npm_lib_cli_path, "r+b") as handle:
+                        handle.seek(0)
+                        handle.write(ATTACKER_NPM_LIB_CLI_CONTENT)
+                        handle.truncate()
+                    # The pinned stub itself must be completely untouched by
+                    # this tamper -- otherwise this test would not isolate
+                    # the P1-2 finding (an UNPINNED sibling file executing)
+                    # from the already-fixed round-29 finding (the PINNED
+                    # npm-cli.js itself being swapped).
+                    assert npm_cli_path.read_bytes() == before_npm_cli_bytes
+                    tamper_fired["done"] = True
+                # The returned digest map is the ORIGINAL, genuine,
+                # tarball-derived one from the fake -- exactly modeling a
+                # same-UID racer whose on-disk swap this installer's own
+                # extraction-time bookkeeping never observes.
+                return result
+
+            with contextlib.ExitStack() as stack:
+                enter = stack.enter_context
+                enter(mock.patch.object(installer, "SSD_ROOT", root))
+                enter(mock.patch.object(installer, "TOOL_ROOT", tool_root))
+                enter(mock.patch.object(installer, "RELEASE_DIR", release))
+                enter(mock.patch.object(installer, "STATE_DIR", tool_root / "state"))
+                enter(
+                    mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home")
+                )
+                enter(mock.patch.object(installer, "USER_HOME", user_home))
+                enter(mock.patch.object(installer, "STATE_LINK", user_home / ".prime"))
+                enter(
+                    mock.patch.object(
+                        installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "RECEIPT_PATH",
+                        tool_root / "receipts" / f"v{installer.VERSION}.json",
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "PENDING_PATH", tool_root / "pending-install.json"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_SHA256", expected_lock_sha256
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_PACKAGE_COUNT", len(local_assets)
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "volume_uuid", return_value="TEST-UUID")
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "verify_orca_support",
+                        return_value={"test": "support"},
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "prime_agent_command_candidates", return_value=[]
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "preflight", return_value=fake_evidence)
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "extract_node_toolchain",
+                        side_effect=extract_then_tamper_npm_lib_cli,
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "exact_tool_version", return_value="stub"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "make_patched_asset",
+                        side_effect=fake_make_patched_asset,
+                    )
+                )
+                enter(mock.patch.object(installer, "run_npm", side_effect=fake_run_npm))
+
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    r"release tree content does not match its digest-verified "
+                    r"pre-npm-ci pinned baseline: "
+                    r"toolchain/lib/node_modules/npm/lib/cli\.js",
+                ):
+                    installer.install()
+
+            self.assertTrue(tamper_fired["done"])
+            self.assertFalse((tool_root / "pending-install.json").exists())
+            self.assertFalse(
+                (tool_root / "receipts" / f"v{installer.VERSION}.json").exists()
             )
 
 
