@@ -2392,6 +2392,87 @@ opus/max 的收尾判断："46 轮走到这里，'没找到东西'只有在搜�
 还不能宣布候选完成**——需要用户对这个持续性基础设施阻断做一个
 决定。
 
+### Round 46 补记：改用 `gpt-5.6-terra`/`high` 重跑这一路后，真正跑完了——结论 NO-GO，发现一个真实 P1（`main()` 的 exec 仍按路径而非已校验描述符二次解析，构成同 UID TOCTOU 窗口）
+
+用户在被问到"第 4 次撞上 Trusted Access 墙怎么办"时选择"换成
+`gpt-5.6-terra/high` 重试这一路"（沿用 `install_bridge.py` 那条独立复核
+线索之前已验证过的同款替代方案）。新一路（`task_30441d2ff9f6` /
+dispatch `ctx_4697b09684c8`）派发后立刻撞上另一个、性质完全不同的
+基础设施问题——共享 `hooks.json` 信任凭据缺口触发的
+`codex-hooks-review-prompt` 竞态，Orca 自动 `agent_readiness` 检查在
+~2 秒内把 Task/Dispatch 判定为 failed，但底层终端其实还活着。按发
+"3"+Enter 恢复终端后，用"新建 task-create + `worker-start --terminal
+<已恢复终端句柄>`"这个本轮已验证过的做法重新挂载到 Orca 真实追踪下
+（不是回退到未追踪的裸终端），确认 `state: ready` 且真实在推进（心跳
+先后经过 investigating → reviewing → waiting 三个阶段）。
+
+**任务本体在 2026-08-20 12:51:30Z 真正跑完，dispatch 状态 `completed`：**
+
+- `python3 -m unittest discover`：`/usr/bin/python3` 两次都是
+  `Ran 185 tests` + `OK`（30.281s、29.716s）；`/opt/homebrew/bin/python3`
+  两次同样 `Ran 185 tests` + `OK`（28.693s、27.628s）。
+- 两个解释器 `py_compile` 都干净。
+- round 45 新增的 4 条 HOME 测试单独跑全部通过。
+- 独立构造的真实 Node fixture 复核了 round 45 的修复本身：
+  `pre_fix_lexists=false`、`node_includes_normalized=true`、
+  `installer_caught=true`——round 45 的归一化修法本身没有问题。
+- 真实（非 mock）`sandbox_e2e.py` 生命周期回放跑了 3 次，全部
+  `exit 0`、`ok:true`、`real_user_state_changed:false`、
+  `release_tree_entries:26911`，`production_lock_sha256` 三次一致为
+  `d6da1eea7d0f2d0a7c14251dde34e31d799edad6c78bea6c08cf33294727ee32`
+  （`release_tree_sha256` 三次不同，是沙箱临时路径带来的预期差异，
+  不是问题）。
+
+**但整体结论是 NO-GO，理由是一个真实的 P1**：Codex 在"这轮要求
+格外广"的要求下，读到了 `validate_exec_target()`（`install_prime_agent.py`
+约 5995-6030 行）与 `main()`（约 6069-6095 行）之间的一处结构性
+TOCTOU——`validate_exec_target()` 本身没问题：它用 `O_NOFOLLOW` 打开
+NODE/CLI、通过这个已打开的描述符校验身份和内容哈希、然后关闭描述符，
+返回"校验通过"。**但 `main()` 紧接着调用
+`subprocess.run([NODE, CLI, *guarded_arguments(...)], ...)`，这会让
+子进程 exec 时按路径字符串重新解析 NODE 和 CLI 一次**——这是独立于
+前面校验的第二次、按名字的查找。一个同 UID 攻击者如果能在
+"`validate_exec_target()` 返回通过"和"`subprocess.run()` 真正 exec"
+之间这段很窄的时间窗口里，把路径指向的文件换成别的内容，校验完全
+形同虚设：guard 会正确报告"校验通过"，但实际执行的是被换过的文件。
+
+值得如实记录的是：**这个缺口本来就不是 Codex 凭空发现的隐藏 bug——
+`validate_exec_target()` 函数正上方（第 5985-5994 行）的注释里，
+早前某一轮就已经明确写出了这个残留缺口的存在**（"`subprocess.run()`
+ultimately re-resolves `path` by name a second time to exec it, so
+a same-UID racer... could still swap the target underneath it. Fully
+closing that would mean exec'ing through an already-open,
+already-validated file descriptor... instead of a path at all -- a
+larger structural change than this P1-scoped addition"）——也就是说
+早前那一轮的判断是"这个结构性改动范围比当轮 P1 大，值得记录但不必
+当轮堵死"。**round 46 的 Claude opus/max 一路显然也读到了这段注释和
+这两处代码**（它的读通读明确提到"receipt and recovery paths sound"、
+"uninstall/enable/command dispatch"等相邻区域都覆盖到了），但没有把
+这个已经写明的残留缺口重新升级成阻断项——而 Codex sol/terra 一路
+在被要求"这轮要格外广"之后，明确把它判定为**发布前必须堵住的 P1**，
+不接受"已经写在注释里"作为足够的缓解。**这是两路复核在同一个已知
+缺口上出现了真实的严重度判断分歧，不是一路发现另一路完全没看到的
+东西**——但按用户自己 CLAUDE.md 的规则，"任一路存在可复现 P0/P1 都
+不得完成"，不区分"是不是双方都看到了这个点"，所以这仍然是一个
+阻断项，**round 46 不构成双 GO**，需要真正把这个缺口堵死（描述符
+绑定 exec，而不是"文档记录 + 接受残留风险"）后，对新候选重新走一次
+双路复核。
+
+Codex 这一路的其余读通结论：receipt/journal 恢复路径仍然 fail-closed；
+uninstall 唯一暴露的是一个安全的进程标题伪装 DoS（不构成安全绕过）；
+CLI 用固定 `argparse` `choices=` 元组，没有注入面；静态搜索没有找到
+第二处"外部输入 + 词法归一化不一致"的实例（round 44/45 那类 bug没有
+在别处复现）。
+
+**已派发 round 47 修复**：把 `NODE`/`CLI` 的 exec 目标从"路径字符串"
+换成"已校验、已打开的文件描述符"本身，彻底消掉 `validate_exec_target()`
+和真正 exec 之间的第二次按名字解析——具体做法交给修复 agent 用真实
+Node 子进程反复验证后确定（候选方向：Darwin 的 `/dev/fd/<n>` 配合
+Python `subprocess` 的 `pass_fds=` 保持描述符跨 fork 存活、`executable=`
+参数把真正的 exec 目标和 argv[0] 显示名分离），要求修复后必须有一条
+真实、可复现的回归测试证明"校验通过后、exec 之前"这个窗口内替换目标
+文件不再能让 guard 执行到被替换的内容。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
