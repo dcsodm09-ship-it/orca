@@ -2651,6 +2651,65 @@ cybersecurity 内容策略"。
 反应应该是先检查任务书措辞是不是过于"漏洞复现"口吻，而不是默认归因于
 模型档位或账号状态。
 
+### Round 48 Codex 第三次尝试结果：**`atomic_write()` 的发现被真实复现确认——这是一个真实 P1，round 48 不构成双 GO，已派发 round 49**
+
+`task_cd2bb634bd24` 真正跑完了，`atomic_write()`/recovery-manifest 这条
+线索被**真实复现确认**，不是猜测：
+
+> `atomic_write()` 用 `os.replace(temp_path, path)` 发布内容后，紧接着
+> 用 `os.chmod(path, mode)` **按路径名重新解析一次** `path` 去改权限，
+> 全程没有对最终发布结果做任何身份/内容校验。在一次独立隔离的真实执行
+> 里，在这个 `chmod` 的确切窗口把 `manifest.json` 换成符号链接，
+> `atomic_write()` 仍然正常返回成功，而此刻 `path` 已经是一个指向攻击者
+> 内容的符号链接（`final_is_symlink=True`）。端到端复现进一步确认：对
+> `quarantine_partial_release()` 做同样的注入，返回的是
+> `state=quarantined`——一个本该代表"已经安全落盘、可信"的终态——但它的
+> manifest 此刻其实是一个内容为 `{"schema":"attacker"}` 的攻击者符号
+> 链接。因为目标 mode 是 `0600`，后续按正常路径去读它会 fail-closed，
+> 但 `atomic_write()`/`quarantine_partial_release()` 这两层本身**已经
+> 谎报了一次"已完成的持久化事务"**，其对外承诺的 manifest 不变量并不
+> 成立。
+
+同一份代码里其实已经有一个做对了这件事的姊妹函数可以直接参考——
+`atomic_create_private_file()`：它在发布前就先记下临时文件描述符的
+`(st_dev, st_ino)` 身份，`rename` 之后重新 `lstat` 目标、比对身份**并
+重新读取内容核对字节一致**，任何一项不符都视为发布失败并触发回滚。
+`atomic_write()` 缺的正是这套"发布后身份/内容核验"，Codex 这一路的原话
+是："`atomic_create_private_file` has after-publication identity/content
+checks whereas `atomic_write` lacks equivalent protection。"
+
+这一路其余结论：187/187 测试 5 次全过（双解释器各两次，外加复现后又
+多跑一次确认）；`py_compile` 三个改动文件双解释器全干净；广度读通了
+uninstall/disable（mutation 前正确重申锁身份、进程扫描/禁用态校验失败
+时会精确恢复原链接）和命令行 parser dispatch（固定 6 个合法动作，无
+注入面），未发现新阻断项；对 opus/max 提出的 CLI 侧描述符绑定思路给出
+了独立第二意见——技术方向认可（"technically sound... only if it reads
+the already validated/re-wound CLI fd and compiles it with the canonical
+real filename plus `Module._nodeModulePaths(real dirname)`"），但明确
+指出这应该是**在 `require.main`/`process.argv`/module cache 都补齐测试
+覆盖之后**的后续改进项，不能替代 NODE 侧的按路径重新解析；3 次真实
+`sandbox_e2e.py` 全部 `exit 0`、`ok:true`，`production_lock_sha256` 与
+钉定值一致。
+
+这一路的最终结论原话："do not merge/consider install-ready until
+atomic_write final-path publication is made descriptor/identity bound
+or post-publication verified and the recovery transition
+regression-tested."——**明确的 NO-GO**。
+
+**综合两路**：Claude opus/max 是 GO（0 P0/P1，2 个关于 exec 残留窗口
+准确性的 P2）；Codex sol/max 是 **NO-GO**，且这个 P1 是**真实复现**的、
+不是理论推测——按用户规则，任一路存在可复现 P0/P1 都不得完成，**round
+48 不构成双 GO**。已经用真实代码定位了确切缺口（`install_prime_agent.py`
+第 479-504 行 `atomic_write()`，第 488-489 行 `os.replace` 之后紧跟
+按路径 `os.chmod` 这两行是缺口所在）并核对了同文件里 `atomic_create_
+private_file()`（第 1213 行起）已经验证过的正确模式可以直接套用，**已
+派发 round 49 修复**：给 `atomic_write()` 补上和 `atomic_create_
+private_file()` 同等级别的发布后身份核验（保留写入描述符做锚点、
+`os.replace` 之后用 `O_NOFOLLOW` 重新打开目标核对身份、改用
+`os.fchmod` 而不是按路径 `os.chmod`），要求真实复现 pre-fix/post-fix
+对照回归测试。opus/max 提出的 CLI 侧描述符绑定改进，作为可选、非阻断
+的后续项一并写进 round 49 任务书，不强制本轮完成。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max

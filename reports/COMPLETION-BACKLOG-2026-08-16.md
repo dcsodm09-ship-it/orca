@@ -434,6 +434,20 @@ exec 不了，exec 得了就读不了，没有 `fexecve` 等价物）；CLI 侧�
 3 次真实 `sandbox_e2e.py` 全 `ok:true`，`production_lock_sha256` 未变。**已派发
 round 48 双复核。**
 
+**round 48 结果：不构成双 GO，已派发 round 49。** Claude opus/max 是 GO（0 P0/P1，
+2 个关于 CLI 侧 exec 残留窗口准确性的 P2，其中一条还挖出一个此前被误判"做不到"、
+实际可行的关闭路径）。Codex sol/max 一路连撞 2 次 Trusted Access 墙（这次不是模型
+档位问题——是任务书措辞太像"漏洞复现"，换成中性措辞、同一个模型不换、不重新请示，
+第 3 次真的跑起来了），**真实复现确认了一个独立的真实 P1**：`atomic_write()`
+（`install_prime_agent.py:479-504`，manifest.json 状态转换在用）`os.replace()`
+发布后紧跟按路径 `os.chmod()`，全程没有发布后身份/内容核验——真实注入证明能在
+这个窗口把 manifest 换成攻击者符号链接，`atomic_write()`/`quarantine_partial_
+release()` 仍然报告成功，谎报一次"已完成的持久化事务"。同文件里 `atomic_create_
+private_file()`（1213 行起）已经验证过正确模式（发布前记身份、发布后核对身份+
+内容）可以直接套用。按用户规则任一路可复现 P1 都阻断，**已派发 round 49**：给
+`atomic_write()` 补齐同等级别核验；opus/max 的 CLI 描述符绑定改进作为可选非阻断
+项一并带上，不强制本轮完成。
+
 ## 8. 桌面 / 浏览器（2 项）
 
 `desktop-mcp`、`ego-capability-fixture`：均 `BLOCKED_HUMAN_DECISION`（peer 认证机制未设计 / ship-or-discard 未决策）。
