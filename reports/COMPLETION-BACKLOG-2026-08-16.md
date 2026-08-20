@@ -448,6 +448,23 @@ private_file()`（1213 行起）已经验证过正确模式（发布前记身份
 `atomic_write()` 补齐同等级别核验；opus/max 的 CLI 描述符绑定改进作为可选非阻断
 项一并带上，不强制本轮完成。
 
+**round 49 结果（已提交 `b00e9a6f81`）**：`atomic_write()` 缺口这次彻底关闭了，
+不是压缩窗口——照 `atomic_create_private_file()` 已验证的模式办：发布前记描述符
+身份、`os.replace()` 后用 `O_NOFOLLOW` 重新打开核对身份（符号链接替换会直接
+`ELOOP` 失败）、额外重读内容比对（防同 inode 原地篡改）、`os.fchmod` 只对已核验
+描述符做，不再按路径 `os.chmod`。额外发现 `safe_extract_main_asset()`/
+`extract_node_toolchain()` 里有两处结构相同但未调用 `atomic_write()` 的同形状
+写法，如实标注留给后续轮次，本轮未处理。4 条新回归测试（含 pre-fix/post-fix
+对照、同 inode 内容篡改、`quarantine_partial_release()` 端到端复现）。191/191
+测试双解释器独立复核 OK，`py_compile` 干净。**`sandbox_e2e.py` 重新确认了一个
+独立、正在恶化的问题**：修复后首次真实运行 `ok:true`，但后续运行稳定复现
+`production lock hash mismatch`——查证是钉定依赖 `@smithy/core@3.33.3` 在真实
+npm registry 上已经不存在了（上游发布事件，不是本机问题；修复 agent 用隔离
+worktree 对照修复前提交跑出了完全相同的哈希，证明与本轮改动无关）。这正是本
+候选从第 1 轮起就独立标注的"上游锁定哈希漂移"问题，现在从"哈希对不上"恶化成
+了"钉定版本在 registry 上已不存在"，仍然是独立于代码安全复核之外、需要人工
+判断的信任决定，本轮未处理。**已派发 round 50 双复核。**
+
 ## 8. 桌面 / 浏览器（2 项）
 
 `desktop-mcp`、`ego-capability-fixture`：均 `BLOCKED_HUMAN_DECISION`（peer 认证机制未设计 / ship-or-discard 未决策）。

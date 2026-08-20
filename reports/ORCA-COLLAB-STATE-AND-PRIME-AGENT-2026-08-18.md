@@ -2710,6 +2710,73 @@ private_file()` 同等级别的发布后身份核验（保留写入描述符做�
 对照回归测试。opus/max 提出的 CLI 侧描述符绑定改进，作为可选、非阻断
 的后续项一并写进 round 49 任务书，不强制本轮完成。
 
+### Round 49 结果：`atomic_write()` 缺口已彻底关闭（不是压缩窗口，这次没有 round 47 那种操作系统层面的限制）——已提交 `b00e9a6f81`，同时重新确认了一个独立存在、正在恶化的上游锁定哈希漂移问题
+
+修复完全照着同文件里 `atomic_create_private_file()` 已经验证过的模式：
+发布前（描述符还开着的时候）先记下 `(st_dev, st_ino)` 身份；
+`os.replace()` 之后不再按路径 `os.chmod()`，而是用 `O_NOFOLLOW` 重新打开
+`path`（这一步是真正关键——如果这时候 `path` 已经被换成符号链接，
+`O_NOFOLLOW` 会让这次 `open()` 直接以 `ELOOP` 失败，而不是像原来的
+`os.chmod()` 那样透明地跟随符号链接过去）；重新 `fstat` 这个新描述符，
+身份不符就拒绝；**还额外做了内容重读比对**——这一步比 Codex 复现出的
+"符号链接替换"场景要求更严格：身份检查本身防不住"同 UID 攻击者不换路径、
+直接原地改写已发布 inode 的字节"这种情形（比如一个更早就打开着的、
+指向同一个 inode 的描述符），额外把内容读出来逐字节比对能同时防住这
+一类。真正的权限修改这次也改成了对着这个已核验描述符 `os.fchmod()`，
+不再有任何一次按路径名的 `os.chmod()`。和 `atomic_create_private_file()`
+不同的是没有照搬它的回滚逻辑——`atomic_write()` 的调用方用它来**替换**
+已有内容（recovery-manifest 状态转换、package.json 重写），不是新建，
+发布失败时已经没有"原来的占用者"可以恢复，调用方直接拿到明确的
+`PrimeInstallError` 自己决定怎么处理。
+
+修复过程中额外发现（**如实标注为本轮不处理、留给后续轮次**）：
+`safe_extract_main_asset()`（第 1994 行附近）和 `extract_node_toolchain()`
+（第 2203 行附近）里各自独立存在结构相同的"`os.replace()` 之后按路径
+`os.chmod()`"写法——这两处都不是调用 `atomic_write()`，本轮修复范围没
+覆盖到，但携带同一种 TOCTOU 形状，值得单独记一笔。
+
+新增 4 条回归测试：一条独立复现修复前代码形状、证明符号链接替换在旧代码
+下确实会得逞；一条用同样的注入时机打真正修复后的 `atomic_write()`，证明
+现在会 fail-closed；一条是同 inode、单比特内容篡改（身份和大小都不变），
+专门证明"内容重读"这一步不是摆设、确实在拦截身份检查本身拦不住的情形；
+一条是对 `quarantine_partial_release()` 的端到端复现，manifest 每次
+`os.replace()` 都被替换，证明它不再对被替换的 manifest 谎报
+`state=quarantined`。
+
+**独立复核（提交前）**：191/191 测试双解释器（`/usr/bin/python3` 和
+`/opt/homebrew/bin/python3`）各自单独重新跑过，都是 OK；`py_compile`
+两个文件双解释器都干净；diff 逐行读过，确认 `except BaseException` 那层
+外层清理逻辑完全未受影响、新增的 `verified_descriptor` 在
+`os.open()` 失败时不会有描述符泄漏（成功才会走到 `try/finally`）。
+
+**`sandbox_e2e.py` 真实运行确认了一个独立存在、正在恶化的问题——不是这次
+修复引入的，但必须如实记录**：修复后第一次真实运行是 `ok:true`，
+`production_lock_sha256` 和修复前完全一致。但后续运行（修复 agent 自己
+的、以及我提交前独立又跑的一次）都稳定复现同一个失败：
+
+```
+{"error": "generated production lock hash mismatch: observed
+fe4402ae740cc0d2f326baf58f80543ecf8e9668e22f6434f0941bed43c732f5,
+expected d6da1eea7d0f2d0a7c14251dde34e31d799edad6c78bea6c08cf33294727ee32"}
+```
+
+修复 agent 没有想当然地归咎给自己的改动，而是专门做了隔离对照：把
+**修复前**的提交（`edf8b40860`）check out 到一个独立 worktree，在同一个
+真实（未 mock）registry 状态下跑了一遍 `sandbox_e2e.py`，得到的是**完全
+相同**的 `fe4402ae74...` 哈希——证明这个漂移在修复前、修复后代码上表现
+完全一致，和本轮改动无关。进一步查证是 `@smithy/core@3.33.3`（钉定依赖
+闭包里的一个版本）在真实 npm registry 上已经不存在了（当前最新是
+`3.33.2`）——这是一次真实的上游发布事件，不是本机架构问题。**这正是这条
+复核线索从第 1 轮起就一直独立标注的"上游锁定哈希漂移"问题**（2026-08-14
+采集的证据和当时/后续 registry 实际状态不一致），现在确认它依然存在，
+而且从"哈希对不上"恶化成了"钉定的具体依赖版本在 registry 上已经不存在"，
+这意味着即便安全复核彻底收敛，`GENERATED_LOCK_SHA256` 也需要人工对照
+最新上游证据重新采集、核对、钉一次，这本身是一次独立于代码安全复核的
+信任判断，本轮仍未擅自处理。
+
+**已派发 round 50 双复核**（Claude opus+max 与 Codex sol+max，对
+`b00e9a6f81`）。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
