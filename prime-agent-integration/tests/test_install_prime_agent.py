@@ -3887,6 +3887,230 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     # Must not raise.
                     installer.assert_no_unexpected_ancestor_node_modules(release)
 
+    # Round 45, 2026-08-20 (independent Claude opus/max round-44 review):
+    # node_global_folder_paths()'s two HOME-relative entries previously
+    # used a bare os.path.join() (no lexical normalization), while real
+    # Node builds the same entries with path.resolve() (pure lexical
+    # normalization of ".."/"."/duplicate separators, no filesystem
+    # access). A HOME containing ".." through a path component that does
+    # not physically exist made the un-normalized candidate string ENOENT
+    # under os.path.lexists() even though real Node's own lexical
+    # resolution landed on a real, existing directory it actually loads
+    # code from. The following tests reproduce that exact scenario end to
+    # end (real generated launch guard, real pinned Node) for both
+    # independent implementations, plus the leading-double-slash edge
+    # case the round-44 review flagged as needing real-Node verification.
+
+    def test_node_global_folder_paths_dotdot_traversal_through_nonexistent_component_mechanism(
+        self,
+    ) -> None:
+        # Isolates the exact mechanism (no Node needed): a HOME value
+        # that lexically normalizes back to a real, existing directory,
+        # but only by passing through an intermediate component that
+        # does not exist on disk. The bare os.path.join() candidate must
+        # miss it (ENOENT on the nonexistent intermediate component); the
+        # os.path.abspath()-normalized candidate this round's fix
+        # produces must find it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            fake_home = root / "fake-home"
+            (fake_home / ".node_modules").mkdir(parents=True)
+            home_value = os.fspath(fake_home) + "/nonexistent-decoy/.."
+
+            pre_fix_candidate = os.path.join(home_value, ".node_modules")
+            self.assertFalse(
+                os.path.lexists(pre_fix_candidate),
+                "un-normalized candidate unexpectedly exists -- test setup invalid",
+            )
+
+            post_fix_candidate = os.path.abspath(pre_fix_candidate)
+            self.assertEqual(
+                post_fix_candidate, os.fspath(fake_home / ".node_modules")
+            )
+            self.assertTrue(os.path.lexists(post_fix_candidate))
+
+    def test_launch_guard_main_refuses_home_dotdot_traversal_through_nonexistent_component(
+        self,
+    ) -> None:
+        # Full real reproduction of round 44's finding: real Node
+        # (invoked directly, no guard) genuinely resolves and loads a
+        # package planted at the attacker's target via a HOME value that
+        # traverses ".." through a nonexistent decoy component; the
+        # generated launch guard's main(), with this round's fix, refuses
+        # BEFORE that real exec ever happens.
+        node = self._require_real_node()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            bundle_dir = release / "lib/node_modules/prime-agent/dist/bundle"
+            bundle_dir.mkdir(parents=True, mode=0o700)
+            marker = root / "cli-ran.marker"
+            cli = bundle_dir / "cli.js"
+            cli.write_text(
+                "require('fs').writeFileSync(" + repr(os.fspath(marker)) + ", 'ran');\n",
+                encoding="utf-8",
+            )
+            os.chmod(cli, 0o600)
+            lock = tool_root / "lifecycle.lock"
+            lock.write_bytes(b"")
+            os.chmod(lock, 0o600)
+            for directory_path in (root, tool_root, release.parent, release):
+                os.chmod(directory_path, 0o700)
+            node_copy = root / "node"
+            shutil.copy(Path(node).resolve(), node_copy)
+            os.chmod(node_copy, 0o700)
+            fake_home = root / "fake-home"
+            fake_home.mkdir(mode=0o700)
+            # Traverses ".." through "nonexistent-decoy", which is never
+            # created -- lexically normalizes straight back to fake_home.
+            home_value = os.fspath(fake_home) + "/nonexistent-decoy/.."
+
+            # Ground truth: real Node's own Module.globalPaths, given
+            # this exact traversal HOME, genuinely includes fake_home's
+            # real .node_modules -- confirming real Node performs the
+            # same pure-lexical normalization this fix now matches.
+            global_paths_result = subprocess.run(
+                [
+                    os.fspath(node_copy), "-e",
+                    "console.log(JSON.stringify(require('module').globalPaths))",
+                ],
+                env={"HOME": home_value, "PATH": os.environ.get("PATH", "")},
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            self.assertEqual(global_paths_result.returncode, 0, global_paths_result.stderr)
+            real_global_paths = json.loads(global_paths_result.stdout)
+            self.assertIn(
+                os.fspath(fake_home / ".node_modules"), real_global_paths
+            )
+
+            # Ground truth exploit: real Node, invoked directly (no
+            # guard) with this traversal HOME, DOES load and execute a
+            # package planted at fake_home/.node_modules.
+            package_dir = fake_home / ".node_modules" / "orca-marker-package"
+            package_dir.mkdir(parents=True)
+            (package_dir / "package.json").write_text(
+                json.dumps({"name": "orca-marker-package", "main": "index.js"}),
+                encoding="utf-8",
+            )
+            (package_dir / "index.js").write_text(
+                "console.log('EXPLOIT_EXECUTED_VIA_DOTDOT_TRAVERSAL');\n",
+                encoding="utf-8",
+            )
+            exploit_cli = root / "exploit-cli.js"
+            exploit_cli.write_text(
+                "try { require('orca-marker-package'); } "
+                "catch (e) { console.log('NOT_LOADED:' + e.code); }\n",
+                encoding="utf-8",
+            )
+            exploited_result = subprocess.run(
+                [os.fspath(node_copy), os.fspath(exploit_cli)],
+                env={"HOME": home_value, "PATH": os.environ.get("PATH", "")},
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            self.assertIn("EXPLOIT_EXECUTED_VIA_DOTDOT_TRAVERSAL", exploited_result.stdout)
+
+            # The fix, closed: the generated launch guard's main(), with
+            # this exact traversal HOME, refuses BEFORE Node ever runs
+            # CLI -- the marker must never appear.
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "RELEASE_DIR", release),
+            ):
+                source = installer.managed_launch_guard_script(
+                    node_copy, cli,
+                    installer.sha256_file(node_copy), installer.sha256_file(cli),
+                ).decode("utf-8")
+            namespace: dict[str, object] = {"__name__": "generated_launch_guard"}
+            exec(compile(source, "<generated-launch-guard>", "exec"), namespace)  # noqa: S102
+
+            buffer = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["prime-agent-launch-guard.py"]),
+                mock.patch.dict(os.environ, {"HOME": home_value}, clear=True),
+                contextlib.redirect_stderr(buffer),
+            ):
+                returncode = namespace["main"]()
+            self.assertNotEqual(returncode, 0)
+            self.assertIn(
+                "unexpected item on Node's own module resolution path",
+                buffer.getvalue(),
+            )
+            self.assertFalse(marker.exists())
+
+    def test_assert_no_unexpected_ancestor_node_modules_catches_home_dotdot_traversal_through_nonexistent_component(
+        self,
+    ) -> None:
+        # verify()-side counterpart of the test above -- pure Python
+        # logic (the real-Node grounding for this exact traversal shape
+        # is established by the launch-guard test above).
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "tool/releases/v0.7.2"
+            release.mkdir(parents=True)
+            fake_home = root / "fake-home"
+            (fake_home / ".node_libraries").mkdir(parents=True)
+            home_value = os.fspath(fake_home) + "/nonexistent-decoy/.."
+
+            with mock.patch.dict(os.environ, {"HOME": home_value}, clear=True):
+                self.assertIn(
+                    os.fspath(fake_home / ".node_libraries"),
+                    installer.node_global_folder_paths(release),
+                )
+                with self.assertRaises(installer.PrimeInstallError):
+                    installer.assert_no_unexpected_ancestor_node_modules(release)
+
+    def test_node_global_folder_paths_leading_double_slash_diverges_textually_but_same_inode(
+        self,
+    ) -> None:
+        # Round-44-flagged edge case: Python's os.path specially
+        # preserves exactly two leading slashes (a POSIX-permitted
+        # convention -- see os.path.normpath's documented behavior),
+        # while real Node's path.resolve()/path.normalize() collapse a
+        # leading "//" to a single "/". Confirms the two implementations
+        # genuinely diverge TEXTUALLY, but that this platform's own
+        # filesystem path resolution treats both forms as the identical
+        # inode, so the presence check this function feeds is unaffected
+        # in practice.
+        node = self._require_real_node()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "tool/releases/v0.7.2"
+            release.mkdir(parents=True)
+            (root / ".node_modules").mkdir()
+            home_value = "/" + os.fspath(root)  # doubles the leading slash
+            self.assertTrue(home_value.startswith("//"))
+
+            python_path = os.path.abspath(os.path.join(home_value, ".node_modules"))
+            self.assertTrue(python_path.startswith("//"))
+
+            node_result = subprocess.run(
+                [
+                    node, "-e",
+                    "console.log(require('path').resolve(process.env.HOME, '.node_modules'))",
+                ],
+                env={"HOME": home_value, "PATH": os.environ.get("PATH", "")},
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            self.assertEqual(node_result.returncode, 0, node_result.stderr)
+            node_path = node_result.stdout.strip()
+            self.assertFalse(node_path.startswith("//"))
+
+            # Textual divergence, confirmed.
+            self.assertNotEqual(python_path, node_path)
+
+            # Same real file regardless, confirmed.
+            self.assertTrue(os.path.lexists(python_path))
+            self.assertTrue(os.path.lexists(node_path))
+            self.assertEqual(os.stat(python_path).st_ino, os.stat(node_path).st_ino)
+
+            # And the function under test still correctly detects
+            # presence despite the textual divergence.
+            with mock.patch.dict(os.environ, {"HOME": home_value}, clear=True):
+                with self.assertRaises(installer.PrimeInstallError):
+                    installer.assert_no_unexpected_ancestor_node_modules(release)
+
     def test_pending_install_commits_with_command_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

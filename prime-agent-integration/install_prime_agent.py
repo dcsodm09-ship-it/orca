@@ -4593,12 +4593,38 @@ def node_global_folder_paths(release_dir: Path) -> list[str]:
     launch guard's own independent copy -- has no validated, symlink-free
     NODE path available to it (verify() calls this before it resolves
     `node` from the receipt at all).
+
+    Round 45, 2026-08-20 (independent Claude opus/max round-44 review):
+    the two HOME-relative entries are wrapped in `os.path.abspath()`
+    (pure lexical normalization, no filesystem access) rather than left
+    as a bare `os.path.join()`. Real Node builds these with
+    `path.resolve(homeDir, '.node_modules')`, which normalizes `..`/`.`/
+    duplicate separators PURELY LEXICALLY. A bare `os.path.join()` does
+    not normalize at all, so a HOME containing a `..` segment that routes
+    through a path component that does not exist on disk previously made
+    the un-normalized candidate string fail the `os.path.lexists()` check
+    below with ENOENT even though real Node's own lexical resolution
+    landed on a real, existing, attacker-controlled directory -- letting
+    real Node load and execute code from a location this check believed
+    was empty. `os.path.abspath()` normalizes the same way `path.resolve()`
+    does without requiring any intermediate component to exist, closing
+    that gap. Verified empirically against the real pinned Node binary
+    across `..` through a nonexistent component, `.` segments, duplicate
+    separators, a bare `~` (neither side tilde-expands), a relative HOME,
+    and a leading `//` HOME. Only the last diverges textually: Python's
+    `os.path` specially preserves exactly two leading slashes (a POSIX-
+    permitted convention) while Node's `path.resolve()` collapses them to
+    one. Confirmed benign on this platform -- Darwin's (and Linux's)
+    kernel path resolution does not implement that POSIX allowance, so
+    `//x` and `/x` name the identical inode and `os.path.lexists()` sees
+    the same file either way; see
+    test_node_global_folder_paths_leading_double_slash_diverges_textually_but_same_inode.
     """
     paths: list[str] = []
     home = os.environ.get("HOME")
     if home:
-        paths.append(os.path.join(home, ".node_modules"))
-        paths.append(os.path.join(home, ".node_libraries"))
+        paths.append(os.path.abspath(os.path.join(home, ".node_modules")))
+        paths.append(os.path.abspath(os.path.join(home, ".node_libraries")))
     paths.append(os.path.join(os.fspath(release_dir), "toolchain", "lib", "node"))
     return paths
 
@@ -5529,12 +5555,29 @@ def node_global_folder_paths() -> list[str]:
     unconditionally removed by scrubbed_node_environment() before this
     exact exec, so real Node will see no NODE_PATH at all for this
     invocation and contributes no such entries to its own globalPaths.
+
+    Round 45, 2026-08-20 (independent Claude opus/max round-44 review):
+    the two HOME-relative entries are wrapped in os.path.abspath() (pure
+    lexical normalization, no filesystem access) instead of a bare
+    os.path.join(), matching real Node's path.resolve(homeDir, name)
+    which normalizes .. / . / duplicate separators purely lexically. A
+    bare os.path.join() left a HOME containing ".." through a nonexistent
+    path component un-normalized, so the lexists() check below hit ENOENT
+    on the un-normalized string and refused to flag a directory real Node
+    itself resolves to and actually loads code from -- see
+    node_global_folder_paths()'s verify()-side sibling docstring, just
+    above managed_launch_guard_script() in this same file, for the full
+    empirical verification (including the one confirmed-benign textual
+    divergence: a leading double-slash HOME, where os.path.abspath()
+    keeps two leading slashes but real Node collapses to one -- harmless
+    here because this platform's own filesystem resolution treats both
+    forms as the identical inode).
     """
     paths: list[str] = []
     home = os.environ.get("HOME")
     if home:
-        paths.append(os.path.join(home, ".node_modules"))
-        paths.append(os.path.join(home, ".node_libraries"))
+        paths.append(os.path.abspath(os.path.join(home, ".node_modules")))
+        paths.append(os.path.abspath(os.path.join(home, ".node_libraries")))
     paths.append(os.path.join(os.path.dirname(os.path.dirname(NODE)), "lib", "node"))
     return paths
 
