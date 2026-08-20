@@ -2259,6 +2259,49 @@ opus/max 的收尾判断："环境变量这一类，从证据上看真的关死�
 开头这种边缘写法。round 42 的 Codex 一路仍在跑（超过 4 小时，本轮
 要求了"格外仔细"，结果晚到会作为补充记录）。
 
+**round 42 的 Codex 一路最终结局**：跑到约 6 小时时检查发现终端
+停在同一个 OpenAI 自己的"Trusted Access for Cyber"内容策略墙上
+（`lastOutputAt` 时间戳早已不再变化）——和 round 35 那次一样，是
+这条复核线索之前就记录过的、跨轮次表现不稳定的独立阻断，不是
+hooks.json 问题，本次也没有真正开始过干活。已停止、清理、如实
+记录；反正它审查的是 `294144ba99`（round 40+41 合并状态），此后已
+被 round 42-45 接连超越，不再有意义去等它。round 46 会为当前提交
+重新派发一次全新的 Codex 一路。
+
+### Round 45：`Module.globalPaths` 路径归一化问题修好，很窄的一次改动（已验证关闭，未独立复核）
+
+两处 `node_global_folder_paths()` 实现（`verify()` 侧真实 Python
+版 + 生成的 launch guard 版）里，`$HOME/.node_modules`、
+`$HOME/.node_libraries` 这两个位置的拼接都从裸的 `os.path.join`
+换成了 `os.path.abspath(os.path.join(home, ...))`——纯词法层面
+归一化（内部走 `os.path.normpath()`），不碰文件系统，和 Node 的
+`path.resolve()` 对齐。这次没有直接采信 round 44 给的修法就完事，
+而是自己又独立核实了一遍：拿真实钉住的 Node 跑 `path.resolve()`，
+对 10 种情况（原始那个"走过不存在中间组件的 `..`"、`.` 片段、重复
+分隔符、裸 `~`、相对路径 `HOME`、开头双斜杠、结尾斜杠、多段 `..`
+跳跃、开头三斜杠）逐一比对，9 种完全吻合，唯独"开头双斜杠"这一种
+真的有偏差——Python 的 `os.path` 会保留正好两个开头斜杠（POSIX
+允许的一种特殊行为），Node 的 `path.resolve()` 会把它们折叠成一个；
+用 `os.stat().st_ino` 现场确认这台 Darwin 文件系统上 `//x` 和 `/x`
+其实是同一个 inode，所以这个偏差只在字符串层面存在、不影响实际的
+存在性判断——本轮没有把这个残留藏起来，专门写了一条测试记录下来、
+也补进了两个函数自己的文档字符串。
+
+4 条新回归测试（机制隔离测试、走完整真实链路的 launch guard 端到端
+复现、`verify()` 侧的对应版本、开头双斜杠这个偏差本身的记录性测试）
+都用 `git stash` 真的把代码还原到 round-44 基线 `76b3a24f36`、确认
+两条核心测试确实会失败（guard 不拒绝、
+`assert_no_unexpected_ancestor_node_modules` 不报错），恢复修复后
+再确认通过。185/185 测试（181 条既有 + 4 条新增，两个解释器各跑
+两次）全过，`py_compile` 干净。round 24-43 的既有回归测试逐条抽查
+（9 条，覆盖 `Module.globalPaths`、祖先遍历、home 全局文件夹、
+`toolchain/lib/node`）仍然通过。真实（非 mock）`sandbox_e2e.py`
+跑了两次，均 `ok:true`/`exit 0`/`real_user_state_changed:false`。
+这一轮的改动确实收得很窄，如计划：两个文件共 51/+224 行，只动了
+那两处路径拼接加测试。已提交 `f152c108d9`。**已派发 round 46**：
+针对当前提交派发全新的 Codex QA 一路，同时派 Claude opus+max
+双复核。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max

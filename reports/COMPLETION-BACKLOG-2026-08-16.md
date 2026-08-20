@@ -394,8 +394,13 @@ Node 解析算法的一半（`_nodeModulePaths`），漏了另一半（`Module.g
 本身拼路径用 `os.path.join`+`lexists`、和 Node 真正用的词法归一化 `path.resolve`
 不一致——`HOME` 里带一段走过不存在中间组件的 `..` 能同时穿过 guard 侧和 `verify()`
 侧两处检查、真实执行代码。修法很直接（换成 `os.path.abspath(os.path.join(...))`）。
-round 42 的 Codex 一路仍在跑（超过 4 小时），结果晚到会作为补充记录。**round 45
-已派发**（很窄的修法）。完整逐轮细节见
+round 42 的 Codex 一路最终查明卡在同一个 OpenAI Trusted Access 内容策略墙上（约 6
+小时从未真正干活），已停止清理——反正它审的是已被超越两轮的旧提交。**round 45
+（commit `f152c108d9`）已完成并自验证**：两处路径归一化都换成
+`os.path.abspath(...)`，还额外独立核实出一个开头双斜杠的边缘偏差（字符串层面
+存在、这台机器上不影响实际存在性判断，已如实记录而非隐藏）。185/185 测试全过、
+真实回放两次 `ok:true`，改动本身确实收得很窄。**round 46 双复核已派发**（含针对
+当前提交全新派发的 Codex 一路）。完整逐轮细节见
 `reports/ORCA-COLLAB-STATE-AND-PRIME-AGENT-2026-08-18.md`。
 `fd6a683a4a` 这个双 GO 时点**已被 8 轮后续真实发现超越，不能再作为"可以安装"的
 依据**——按用户规则，需要在当前 HEAD 上重新拿到一次真正、当下有效的双路 GO。
