@@ -3340,10 +3340,72 @@ def _walk_nested_node_modules_containers(
     return results
 
 
+# npm's own lockfileVersion 3 "packages" rows spell the platform/architecture
+# an "os"/"cpu" constraint restricts a row to using Node's own
+# process.platform / process.arch strings -- "darwin" / "arm64" for this
+# installer's only supported target (preflight() already refuses to run at
+# all on anything else). Named constants, not inlined string literals in
+# _lock_row_platform_excludes_current_target() below, so both this file's
+# own single supported-platform check (preflight()) and the lock-row
+# constraint check stay obviously in sync if a future round ever needs to
+# read them side by side.
+NPM_LOCK_CURRENT_OS = "darwin"
+NPM_LOCK_CURRENT_CPU = "arm64"
+
+
+def _npm_lock_platform_list_excludes(values: Any, current: str) -> bool:
+    """Whether a single "os" or "cpu" array from a package-lock.json row
+    (npm's own convention: bare entries are an allow-list, "!"-prefixed
+    entries are a block-list, and the two forms are not mixed in a single
+    well-formed array) excludes `current` -- mirrors npm's own
+    checkPlatform()/checkCpu() semantics closely enough for this
+    installer's one purpose (justifying an otherwise-unexplained absence
+    from the materialized tree; see
+    assert_materialized_node_modules_matches_lock()'s own round-38
+    paragraph), without needing to reproduce npm's full validation of the
+    array's own well-formedness -- a malformed array here simply excludes
+    nothing, which fails this installer CLOSED (the row's absence stays
+    unjustified) rather than open.
+    """
+    if not isinstance(values, list) or not values:
+        return False
+    allowed = [
+        value for value in values if isinstance(value, str) and value and value[0] != "!"
+    ]
+    blocked = [
+        value[1:]
+        for value in values
+        if isinstance(value, str) and len(value) > 1 and value[0] == "!"
+    ]
+    if allowed and current not in allowed:
+        return True
+    return current in blocked
+
+
+def lock_row_platform_excludes_current_target(row: Any) -> bool:
+    """Whether `row` (a package-lock.json "packages" map entry) declares an
+    "os" or "cpu" constraint that excludes this installer's one supported
+    target (darwin/arm64) -- i.e. whether `npm ci` was SUPPOSED to skip
+    materializing this row here, as opposed to silently failing to install
+    something it should have. Used by
+    assert_materialized_node_modules_matches_lock()'s round-38
+    reverse-direction check (below) to distinguish a legitimately
+    platform-skipped declared row from a genuinely missing one; see that
+    function's own docstring for the full finding this closes.
+    """
+    if not isinstance(row, dict):
+        return False
+    return _npm_lock_platform_list_excludes(
+        row.get("os"), NPM_LOCK_CURRENT_OS
+    ) or _npm_lock_platform_list_excludes(row.get("cpu"), NPM_LOCK_CURRENT_CPU)
+
+
 def assert_materialized_node_modules_matches_lock(
     release_dir: Path,
     declared_top_level: frozenset[str],
     declared_nested: dict[str, frozenset[str]],
+    *,
+    packages: dict[str, Any] | None = None,
 ) -> None:
     """Round 25, 2026-08-19 (independent Claude opus/max round-25 review,
     P1-B): `npm ci`'s own runtime is an external subprocess window this
@@ -3479,6 +3541,48 @@ def assert_materialized_node_modules_matches_lock(
     therefore has no content on disk to tamper in the first place) and the
     same microsecond-scale, in-process open/lstat gap already accepted for
     every OTHER pinned path in this file.
+
+    Round 38, 2026-08-20 (independent Claude opus/max round-37 review,
+    part of the P1-1 fix): the paragraph above says a declared registry
+    row this platform's `npm ci` never downloads "has no content on disk
+    to tamper in the first place" -- true only as long as nothing else
+    ever plants content at that exact declared-but-never-materialized
+    path. Round 37 found that untrue in practice: the walk above only
+    ever checks the MATERIALIZED-but-undeclared direction (a directory
+    present on disk with no matching declared row); it never checked the
+    converse (a declared row absent from the materialized tree), so a
+    same-UID racer planting a directory at one of those never-materialized
+    declared paths went completely unnoticed by this function -- and,
+    before this round's separate tree_digest() deny-unknown fix, by
+    anything else either. `packages`, when given, enables that converse
+    check: for every declared top-level or nested entry NOT found in the
+    materialized tree, look up its row in `packages` by lock_path and, if
+    found, require its OWN "os"/"cpu" constraints (see
+    lock_row_platform_excludes_current_target()) to justify the absence as
+    a genuine, expected platform skip -- an absence with no such
+    justification fails this call closed instead of being silently
+    tolerated the way every prior round tolerated it. `packages` is NOT
+    the full generated package-lock.json "packages" map -- callers must
+    scope it to REGISTRY rows only (declared_registry_package_lock_rows()'s
+    return value; both real call sites in
+    `_install_locked_within_release_dir()`, pre- and post-move, pass
+    exactly that), excluding the four locally patched/workspace packages
+    on purpose: those are never platform-conditional, are already governed
+    by their own separate, unconditional presence checks elsewhere in this
+    file, and -- for a synthetic test lock -- may legitimately use a
+    lock_path that does not match this function's own name-based
+    resolution (see package_name_from_lock_path()'s own docstring for the
+    one real-world case they can genuinely diverge in). A lock_path this
+    function looks up that is absent from `packages` (a local/workspace
+    asset, or any row the caller did not choose to scope this check to) is
+    therefore treated as nothing to verify here, not as an unjustified
+    absence. `packages` defaults to None so this check is opt-in entirely:
+    every existing caller/test that does not supply it is unaffected. This
+    is independent, narrower defense-in-depth alongside tree_digest()'s
+    own round-38 deny-unknown
+    fix (which structurally closes the same exploitation path a different
+    way -- see that function's own docstring): either mechanism alone
+    already refuses the same-UID plant this paragraph describes.
     """
     node_modules_root = release_dir / "node_modules"
     if node_modules_root.is_symlink() or not node_modules_root.is_dir():
@@ -3500,6 +3604,57 @@ def assert_materialized_node_modules_matches_lock(
                 "npm materialized undeclared nested node_modules package(s) not "
                 f"present in the verified lock inside {container_path}: {unexpected_nested}"
             )
+    if packages is None:
+        return
+    # Round 38, 2026-08-20 (P1-1, reverse direction): every declared entry
+    # in `packages` not found in the materialized set above must be
+    # justified by its own lock row's os/cpu platform constraints -- see
+    # this function's own round-38 docstring paragraph. `packages` is
+    # deliberately scoped by the caller to REGISTRY rows only (see that
+    # paragraph for why) -- `row = packages.get(lock_path)` returning None
+    # therefore means "not a row this check tracks" (a local/workspace
+    # asset, governed by its own separate, unconditional presence checks
+    # elsewhere in this file, or a row this function's own name resolution
+    # cannot map back to `packages`'s literal keys) and is treated as
+    # nothing to verify here, NOT as an unjustified absence -- only a row
+    # this dict actually contains, that is both absent from the
+    # materialized tree AND not platform-excluded, fails closed.
+    missing_top = sorted(declared_top_level - materialized_top_level)
+    for lock_path in missing_top:
+        row = packages.get(lock_path)
+        if row is not None and not lock_row_platform_excludes_current_target(row):
+            raise PrimeInstallError(
+                "declared node_modules package is missing from the materialized "
+                "tree and is not justified by an os/cpu platform constraint on "
+                f"its own lock row: {lock_path}"
+            )
+    materialized_by_container = {
+        container_path: names for container_path, names in containers[1:]
+    }
+    for container_path, declared_names in declared_nested.items():
+        if container_path not in materialized_by_container:
+            # The container itself was never walked because its own parent
+            # package directory was not materialized -- if that parent's
+            # own absence is unjustified, the top-level (or an ancestor
+            # nested) check above already catches IT; nothing here can
+            # independently justify a specific child of a container that
+            # does not exist at all, and treating "parent legitimately
+            # platform-skipped" as implying "every declared child of its
+            # nested node_modules is ALSO individually platform-excluded"
+            # would not generally be true, so this is deliberately skipped
+            # rather than guessed at.
+            continue
+        materialized_names = materialized_by_container[container_path]
+        missing_nested = sorted(declared_names - materialized_names)
+        for name in missing_nested:
+            lock_path = f"{container_path}/{name}"
+            row = packages.get(lock_path)
+            if row is not None and not lock_row_platform_excludes_current_target(row):
+                raise PrimeInstallError(
+                    "declared nested node_modules package is missing from the "
+                    "materialized tree and is not justified by an os/cpu "
+                    f"platform constraint on its own lock row: {lock_path}"
+                )
 
 
 def assert_locally_patched_package_matches_pinned_digests(
@@ -3817,6 +3972,81 @@ def run_npm(
         raise PrimeInstallError(f"npm failed with exit {result.returncode}: {tail}")
 
 
+def allowed_unpinned_release_files() -> frozenset[str]:
+    """The complete set of RELEASE_DIR-relative regular-file paths that a
+    genuine install legitimately leaves OUTSIDE `release_relative_pinned_
+    digests` (see _install_locked_within_release_dir()'s construction of
+    that map) -- files tree_digest()'s round-38 deny-unknown check (below)
+    must NOT reject even though they have no pinned entry.
+
+    Round 38, 2026-08-20 (independent Claude opus/max round-37 review,
+    P1-1/P1-2): every regular file under RELEASE_DIR that is NOT a key of
+    `pinned_relative_digests` and NOT named here is now refused outright by
+    tree_digest() -- this is the "deny-unknown" half of the completeness
+    invariant round 34 only ever enforced one direction of (see that
+    function's own docstring). Getting this exemption set exactly right
+    matters as much as the check itself: too narrow, and a genuine clean
+    install fails closed on its own legitimate files; too broad, and it
+    silently reopens the exact hole this round closes. So every entry here
+    is derived from an EXISTING constant, never hardcoded as a bare
+    literal, so this set self-corrects if any of those constants ever
+    change:
+
+      * Five bookkeeping files this installer downloads, generates, or
+        copies at the top of RELEASE_DIR / inside lib/node_modules/, whose
+        content is either independently digest-verified at the moment it
+        is written (LICENSE, upstream-package-lock.json -- see
+        safe_download() and, as of this same round, the re-verified read
+        in _install_locked_within_release_dir()) or re-derivable/re-
+        validated by other means (package.json is a literal this
+        installer's own root_manifest constructs and immediately re-reads
+        via verify_unchanged_private_ssd_file(); package-lock.json is
+        validated in full by validate_generated_lock() against
+        GENERATED_LOCK_SHA256 before `npm ci` ever runs;
+        lib/node_modules/.package-lock.json is `npm ci`'s own hidden
+        top-level bookkeeping marker -- see
+        KNOWN_NON_DIRECTORY_NODE_MODULES_ENTRIES's own comment for the
+        empirical confirmation that this is the ONE non-package entry a
+        real install ever materializes there) -- none of these four is
+        individually pinned (an accepted, long-documented residual; see
+        the comment above `release_relative_pinned_digests`'s own
+        construction), and none is ever read or executed again by this
+        installer or its generated scripts after install.
+      * Every file this installer downloads into RELEASE_DIR/assets/ --
+        the four official release tarballs (ASSETS), the Node.js tarball
+        (NODE_ASSET), and the four locally-patched tarballs this installer
+        itself builds from them (MAIN_PATCHED_ASSET, WORKSPACE_ASSETS) --
+        each already digest-verified at download/build time (safe_download()'s
+        own in-memory check, make_patched_asset()'s own published-then-
+        reread comparison) and never the source of anything this installer
+        or its generated scripts execute directly (only their EXTRACTED,
+        individually-pinned contents under lib/node_modules/ and
+        toolchain/ are ever executed).
+
+    Deliberately a plain function, not a module-level constant computed at
+    import time: keeping it a function makes the "derived from existing
+    constants, not hardcoded" property directly testable (a test can call
+    it and assert its value tracks ASSETS/WORKSPACE_ASSETS/
+    MAIN_PATCHED_ASSET/NODE_ASSET if any of them are ever mutated in a
+    future round) without relying on import-order side effects.
+    """
+    literal_bookkeeping_files = frozenset(
+        {
+            "LICENSE",
+            "package.json",
+            "package-lock.json",
+            "upstream-package-lock.json",
+            "lib/node_modules/.package-lock.json",
+        }
+    )
+    asset_file_names = frozenset(
+        {*ASSETS, NODE_ASSET, MAIN_PATCHED_ASSET, *WORKSPACE_ASSETS.values()}
+    )
+    return literal_bookkeeping_files | frozenset(
+        f"assets/{name}" for name in asset_file_names
+    )
+
+
 def tree_digest(
     root: Path, *, pinned_relative_digests: dict[str, str] | None = None
 ) -> tuple[str, int]:
@@ -3842,7 +4072,63 @@ def tree_digest(
     baseline with no comparison against anything. EVERY key present in
     `pinned_relative_digests` is additionally required to have been
     observed and matched as a regular file during this same walk -- see
-    the round-34 paragraph below for why, and for what this closes.
+    the round-34 paragraph below for why, and for what this closes. As of
+    round 38, the CONVERSE is also enforced: every regular file this walk
+    observes that is NEITHER a key of `pinned_relative_digests` NOR a
+    member of allowed_unpinned_release_files() also fails this call
+    closed -- see the round-38 paragraph below.
+
+    Round 38, 2026-08-20 (independent Claude opus/max round-37 review,
+    P1-1/P1-2): through round 37, this function enforced only ONE
+    direction of what is actually a completeness invariant with two
+    halves: "every pinned key must be observed as a regular file" (round
+    34, below). The other half -- "every regular file observed during the
+    walk must be pinned (or an accepted, explicitly-named exemption)" --
+    was never implemented, so ANY regular file anywhere under `root` that
+    was not one of `pinned_relative_digests`'s own keys was unconditionally
+    folded into the recorded baseline with zero comparison, exactly as if
+    `pinned_relative_digests` had never been passed at all. Round 36
+    responded to round 35's "no deny-unknown half" finding by growing the
+    allow-list (`release_relative_pinned_digests` went from ~1,700 to a
+    measured 24,060 entries -- covering the toolchain, both locally
+    patched and registry-derived node_modules content, the launch guard,
+    and the command wrapper) rather than inverting the invariant, leaving
+    every OTHER location under RELEASE_DIR -- most concretely, any
+    declared registry package row this platform's `npm ci` happens not to
+    materialize (see declared_registry_package_lock_rows()'s own docstring
+    for exactly which rows those are) -- open for a same-UID racer to
+    plant an entirely new, never-pinned file that becomes part of the
+    permanently-trusted baseline. Reproduced two ways against pre-fix HEAD
+    36a4008c08: (a) hide a genuinely-materialized registry package during
+    the pre-move presence probe below (see the P1-1 comment at
+    `_install_locked_within_release_dir()`'s registry-pinning loop), then
+    restore a tampered copy after the probe passed it by; (b) a zero-race
+    variant needing no timing at all -- several of this exact closure's
+    declared registry rows are unconditionally skipped by `npm ci` on this
+    platform (a real, always-true platform/architecture mismatch, not a
+    race), so a same-UID actor can plant content at one of those
+    declared-but-never-materialized paths at ANY point during the install
+    with nothing to out-race.
+
+    Fixed the same way round 34 fixed the missing-pinned-key half: track
+    every regular file's `root`-relative path observed during the walk
+    (`observed_regular_relative_paths`, alongside the existing
+    `consumed_pinned_relative_paths`), and after the walk, when
+    `pinned_relative_digests is not None`, additionally refuse if
+    `observed_regular_relative_paths - set(pinned_relative_digests) -
+    allowed_unpinned_release_files()` is non-empty. This closes the
+    exploitation path structurally -- independent of whether any given
+    caller (`_install_locked_within_release_dir()`'s registry-pinning
+    loop, `assert_materialized_node_modules_matches_lock()`) also happens
+    to catch a given same-UID plant through its own, narrower mechanism --
+    because it is enforced in the SAME pass that establishes the
+    permanently-trusted `release_tree_sha256` baseline, the same way the
+    round-34/round-29 fixes already are. See allowed_unpinned_release_files()
+    for the complete, derived-from-existing-constants exemption set this
+    requires (measured, on a real install, at exactly 14 files), and
+    _install_locked_within_release_dir()'s registry-pinning loop and
+    assert_materialized_node_modules_matches_lock() for the independent,
+    narrower defense-in-depth checks added the same round.
 
     Round 34, 2026-08-20 (independent Claude opus/max round-33 review,
     P1-1): the content comparison above only ever fired inside this
@@ -3919,6 +4205,18 @@ def tree_digest(
     # equalled the pinned value -- see the completeness assertion after the
     # loop, and this function's own docstring for what this closes.
     consumed_pinned_relative_paths: set[str] = set()
+    # Round 38, 2026-08-20 (P1-1/P1-2): every regular file's `root`-relative
+    # path observed during this walk, regardless of whether it has a pinned
+    # entry -- the deny-unknown completeness check after the loop below
+    # uses this to refuse any regular file that is neither pinned nor an
+    # accepted exemption. Only populated (via the same `pinned_relative_
+    # digests is not None` guard already used for the content comparison
+    # below) when a caller actually supplied a pinned map to check against;
+    # left empty and unused for the two callers (finalize_pending_install(),
+    # verify()) that intentionally call this function without one, to
+    # compare against an already-recorded baseline -- see this function's
+    # own docstring for why that is correct, not an oversight.
+    observed_regular_relative_paths: set[str] = set()
     for path in sorted(root.rglob("*"), key=lambda item: os.fspath(item.relative_to(root))):
         relative = os.fspath(path.relative_to(root))
         info = path.lstat()
@@ -3938,6 +4236,7 @@ def tree_digest(
         elif stat.S_ISREG(info.st_mode):
             content_sha256 = sha256_file_verified(path)
             if pinned_relative_digests is not None:
+                observed_regular_relative_paths.add(relative)
                 expected = pinned_relative_digests.get(relative)
                 if expected is not None:
                     if content_sha256 != expected:
@@ -3981,6 +4280,30 @@ def tree_digest(
                 "release tree is missing pinned path(s), or a pinned path is no "
                 "longer a plain regular file (replaced with a symlink, replaced "
                 f"with a directory, or deleted): {unconsumed_pinned_relative_paths}"
+            )
+        # Round 38, 2026-08-20 (independent Claude opus/max round-37 review,
+        # P1-1/P1-2): the converse of the completeness check just above --
+        # fail closed if this walk observed any regular file that is
+        # neither a key of `pinned_relative_digests` NOR one of the
+        # explicitly-named, derived-from-constants exemptions
+        # allowed_unpinned_release_files() returns. See this function's own
+        # docstring for the full finding this closes: without this half of
+        # the invariant, ANY regular file under `root` with no pinned entry
+        # -- most concretely, a declared registry package row this
+        # platform's `npm ci` never materializes, or content planted while
+        # a legitimately-pinned package directory was transiently absent --
+        # was unconditionally folded into the permanently-trusted baseline
+        # with zero comparison against anything.
+        unknown_regular_relative_paths = sorted(
+            observed_regular_relative_paths
+            - set(pinned_relative_digests)
+            - allowed_unpinned_release_files()
+        )
+        if unknown_regular_relative_paths:
+            raise PrimeInstallError(
+                "release tree contains regular file(s) that are neither pinned "
+                "nor an accepted unpinned exemption -- refusing to adopt into "
+                f"the trusted baseline: {unknown_regular_relative_paths}"
             )
     return digest.hexdigest(), count
 
@@ -5985,6 +6308,27 @@ def _install_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
         raise PrimeInstallError("managed Prime Agent path already exists; run verify or inspect before retry")
     if STATE_LINK.exists() or STATE_LINK.is_symlink():
         raise PrimeInstallError("~/.prime already exists; refusing to merge state")
+    # Round 38, 2026-08-20 (independent Claude opus/max round-37 review,
+    # P2-2): STATE_DIR, PROBE_HOME, and the session directory each already
+    # get a "still present after the quarantine attempt above -> refuse"
+    # gate, immediately below -- RELEASE_DIR was the one managed root
+    # missing the identical gate. quarantine_partial_release() relocates
+    # any leftover RELEASE_DIR it finds (see its own docstring), so a
+    # genuinely successful quarantine never legitimately leaves one behind
+    # -- but ensure_private_dir() (used to create/open RELEASE_DIR just
+    # below), unlike create_fresh_private_dir(), ACCEPTS a pre-existing
+    # same-UID 0700 directory rather than refusing one outright, which is
+    # exactly the right behavior for TOOL_ROOT/the npm cache/scratch dirs
+    # this file also uses it for, but was silently wrong here: if
+    # quarantine_partial_release() above raised before completing (e.g.
+    # "still in use" for a live process) or a same-UID racer recreated
+    # RELEASE_DIR in the narrow window between that call returning and this
+    # check, `ensure_private_dir(RELEASE_DIR)` would silently REUSE
+    # whatever was already there instead of refusing -- the same
+    # reuse-instead-of-refuse gap STATE_DIR/PROBE_HOME/the session
+    # directory already close for themselves, applied here too.
+    if RELEASE_DIR.exists() or RELEASE_DIR.is_symlink():
+        raise PrimeInstallError("managed Prime Agent release already exists; refusing to reuse it")
     if STATE_DIR.exists() or STATE_DIR.is_symlink():
         raise PrimeInstallError("managed Prime Agent state already exists; refusing to reuse it")
     if PROBE_HOME.exists() or PROBE_HOME.is_symlink():
@@ -6090,7 +6434,29 @@ def _install_locked_within_release_dir(
     ensure_private_dir(managed_session_dir())
     safe_download(LOCK_URL, RELEASE_DIR / "upstream-package-lock.json", LOCK_SHA256)
     safe_download(LICENSE_URL, RELEASE_DIR / "LICENSE", LICENSE_SHA256)
-    upstream_lock = strict_json((RELEASE_DIR / "upstream-package-lock.json").read_bytes())
+    # Round 38, 2026-08-20 (independent Claude opus/max round-37 review,
+    # P2-1): safe_download() verifies downloaded bytes IN MEMORY against
+    # LOCK_SHA256 and then writes them to disk -- this call used to re-open
+    # that same file from disk by PATH via a bare `.read_bytes()` immediately
+    # afterward, with no digest re-check at all, mirroring the exact TOCTOU
+    # gap round 13/14 already closed for the Node.js toolchain tarball
+    # (extract_node_toolchain()) and the four locally patched packages'
+    # source tarballs (safe_extract_main_asset()) -- see either of those
+    # functions' own comments for the full finding. Bounded by the
+    # closure-hash gate below and by `--ignore-scripts` (a tampered
+    # upstream lock cannot itself execute anything), but this file's own
+    # established convention is to close a TOCTOU window it already has the
+    # mechanism for rather than leave it merely bounded elsewhere -- mirror
+    # that same read_private_file()-then-re-hash pattern exactly, rather
+    # than a second, independently raceable open-by-path.
+    upstream_lock_raw = read_private_file(
+        RELEASE_DIR / "upstream-package-lock.json", max_bytes=MAX_DOWNLOAD_BYTES
+    )
+    if sha256_bytes(upstream_lock_raw) != LOCK_SHA256:
+        raise PrimeInstallError(
+            "upstream package lock changed on disk before use"
+        )
+    upstream_lock = strict_json(upstream_lock_raw)
     if not isinstance(upstream_lock, dict) or upstream_lock.get("lockfileVersion") != 3:
         raise PrimeInstallError("unexpected upstream lock identity")
     for name, digest in ASSETS.items():
@@ -6433,7 +6799,10 @@ def _install_locked_within_release_dir(
     # raise for it. See assert_materialized_node_modules_matches_lock()'s
     # own docstring for exactly what this check does and does not cover.
     assert_materialized_node_modules_matches_lock(
-        RELEASE_DIR, declared_top_level_packages, declared_nested_packages
+        RELEASE_DIR,
+        declared_top_level_packages,
+        declared_nested_packages,
+        packages=declared_registry_rows,
     )
     # Round 27, 2026-08-19 (independent Claude opus/max round-27 review,
     # P1): the check above is purely STRUCTURAL -- directory presence and
@@ -6469,9 +6838,22 @@ def _install_locked_within_release_dir(
     # fold further below, so each package's cached tarball is only read
     # and decompressed once, not once per sweep.
     registry_pinned_digests: dict[str, dict[Path, str]] = {}
+    # Round 38, 2026-08-20 (independent Claude opus/max round-37 review,
+    # P1-1): every lock_path this ONE, attacker-writable-filesystem
+    # presence probe below finds absent (or symlinked) at this exact
+    # instant -- kept so the post-move completeness assertion further down
+    # (after the node_modules -> lib/node_modules move) can confirm that
+    # absence still holds against the POST-MOVE tree, rather than trusting
+    # this single pre-move snapshot as the last word. See that assertion's
+    # own comment for the full finding this closes; tree_digest()'s own
+    # round-38 deny-unknown fix independently closes the same exploitation
+    # path a different way (see its docstring), so this is defense in
+    # depth, not the only mechanism this now relies on.
+    skipped_registry_lock_paths: list[str] = []
     for lock_path in sorted(declared_registry_rows):
         package_dir = RELEASE_DIR / lock_path
         if package_dir.is_symlink() or not package_dir.is_dir():
+            skipped_registry_lock_paths.append(lock_path)
             continue
         pinned_digests = registry_package_content_digests(
             verified_registry_package_tarball(
@@ -7024,7 +7406,10 @@ def _install_locked_within_release_dir(
     # just below is already re-run a second time post-move -- closing this
     # the same way round 29/30 already established for that sweep.
     assert_materialized_node_modules_matches_lock(
-        global_root.parent, declared_top_level_packages, declared_nested_packages
+        global_root.parent,
+        declared_top_level_packages,
+        declared_nested_packages,
+        packages=declared_registry_rows,
     )
     for locally_patched_name, pinned_digests in patched_content_digests.items():
         assert_locally_patched_package_matches_pinned_digests(
@@ -7042,6 +7427,34 @@ def _install_locked_within_release_dir(
         assert_locally_patched_package_matches_pinned_digests(
             global_root.parent / lock_path, pinned_digests, lock_path
         )
+    # Round 38, 2026-08-20 (independent Claude opus/max round-37 review,
+    # P1-1): the pre-move presence probe that built `registry_pinned_
+    # digests` above is a SINGLE snapshot on a filesystem the same-UID
+    # attacker this file's whole threat model assumes can also write to --
+    # a package directory it found absent (or symlinked) is permanently
+    # excluded from that map, and every check that consults the map (the
+    # sweep just above, the pinning fold further below) is structurally
+    # blind to whatever was excluded. Re-derive completeness from the
+    # POST-MOVE tree instead of trusting that one snapshot: any lock_path
+    # the probe skipped that is NOW a real, materialized directory --
+    # whether because a same-UID racer planted it in the window between
+    # the probe and this point, or because it is one of the declared rows
+    # this platform's `npm ci` unconditionally skips every single install
+    # (round 37's own "zero-race" reproduction: no timing needed at all,
+    # since nothing legitimate ever contends for that exact path) -- fails
+    # closed here, with a specific, early error, rather than only being
+    # caught downstream by tree_digest()'s own round-38 deny-unknown check
+    # (which independently closes the identical exploitation path; see its
+    # docstring -- this is deliberate defense in depth, not the sole
+    # mechanism either check alone is required to be).
+    for lock_path in skipped_registry_lock_paths:
+        post_move_dir = global_root.parent / lock_path
+        if post_move_dir.is_dir() and not post_move_dir.is_symlink():
+            raise PrimeInstallError(
+                "registry package directory is materialized but was absent "
+                "(or a symlink) at the pre-npm-ci-completion presence probe -- "
+                f"refusing to trust unverified content: {lock_path}"
+            )
     release_relative_pinned_digests: dict[str, str] = {
         os.fspath(node.relative_to(RELEASE_DIR)): node_sha256,
         os.fspath(npm_cli.relative_to(RELEASE_DIR)): npm_cli_sha256,

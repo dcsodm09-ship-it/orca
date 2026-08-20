@@ -24,6 +24,27 @@ sys.path.insert(0, os.fspath(Path(__file__).resolve().parents[1]))
 
 import install_prime_agent as installer
 
+# Round 38, 2026-08-20: the SHA-256 of the generic stub upstream lock every
+# `fake_safe_download()` closure across the full-`install()` regression
+# tests below writes for "upstream-package-lock.json"
+# (`{"lockfileVersion": 3, "packages": {}}`) -- every one of those closures
+# is byte-for-byte identical in what it writes for this file, so this is
+# computed once, here, rather than 19 separate times. Round 38 added a
+# digest re-check in `_install_locked_within_release_dir()` (mirroring the
+# existing round-13/14 pattern already used for the Node.js toolchain
+# tarball and the four locally patched packages' own source tarballs)
+# comparing the freshly re-read on-disk bytes against the real
+# `installer.LOCK_SHA256` module constant -- which a synthetic test lock
+# can never match. Every one of those 19 tests patches `installer.
+# LOCK_SHA256` to this value, alongside its existing `safe_download` patch,
+# so that new re-check compares against the SAME stub content the test's
+# own `fake_safe_download` actually wrote, exactly the way
+# `GENERATED_LOCK_SHA256` is already independently patched to match each
+# test's own synthetic generated lock.
+STUB_UPSTREAM_LOCK_SHA256 = installer.sha256_bytes(
+    installer.canonical_json({"lockfileVersion": 3, "packages": {}})
+)
+
 
 class PrimeAgentInstallerTests(unittest.TestCase):
     def fake_extract_node_toolchain(
@@ -6094,6 +6115,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 )
                 enter(
                     mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
+                    )
+                )
+                enter(
+                    mock.patch.object(
                         installer,
                         "extract_node_toolchain",
                         side_effect=self.fake_extract_node_toolchain,
@@ -6334,6 +6360,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 )
                 enter(
                     mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
+                    )
+                )
+                enter(
+                    mock.patch.object(
                         installer,
                         "extract_node_toolchain",
                         side_effect=self.fake_extract_node_toolchain,
@@ -6524,6 +6555,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 enter(
                     mock.patch.object(
                         installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
                     )
                 )
                 enter(
@@ -6762,6 +6798,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 enter(
                     mock.patch.object(
                         installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
                     )
                 )
                 enter(
@@ -7578,6 +7619,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 )
                 enter(
                     mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
+                    )
+                )
+                enter(
+                    mock.patch.object(
                         installer,
                         "extract_node_toolchain",
                         side_effect=self.fake_extract_node_toolchain,
@@ -7839,6 +7885,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 )
                 enter(
                     mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
+                    )
+                )
+                enter(
+                    mock.patch.object(
                         installer,
                         "extract_node_toolchain",
                         side_effect=self.fake_extract_node_toolchain,
@@ -8096,6 +8147,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 enter(
                     mock.patch.object(
                         installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
                     )
                 )
                 enter(
@@ -8388,6 +8444,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 )
                 enter(
                     mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
+                    )
+                )
+                enter(
+                    mock.patch.object(
                         installer,
                         "extract_node_toolchain",
                         side_effect=self.fake_extract_node_toolchain,
@@ -8647,6 +8708,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 enter(
                     mock.patch.object(
                         installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
                     )
                 )
                 enter(
@@ -8912,6 +8978,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 )
                 enter(
                     mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
+                    )
+                )
+                enter(
+                    mock.patch.object(
                         installer,
                         "extract_node_toolchain",
                         side_effect=self.fake_extract_node_toolchain,
@@ -9148,6 +9219,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 enter(
                     mock.patch.object(
                         installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
                     )
                 )
                 enter(
@@ -9428,6 +9504,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 enter(
                     mock.patch.object(
                         installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
                     )
                 )
                 enter(
@@ -9730,6 +9811,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 )
                 enter(
                     mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
+                    )
+                )
+                enter(
+                    mock.patch.object(
                         installer,
                         "extract_node_toolchain",
                         side_effect=self.fake_extract_node_toolchain,
@@ -10016,6 +10102,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 enter(
                     mock.patch.object(
                         installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
                     )
                 )
                 enter(
@@ -10323,6 +10414,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 )
                 enter(
                     mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
+                    )
+                )
+                enter(
+                    mock.patch.object(
                         installer,
                         "extract_node_toolchain",
                         side_effect=self.fake_extract_node_toolchain,
@@ -10594,6 +10690,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 )
                 enter(
                     mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
+                    )
+                )
+                enter(
+                    mock.patch.object(
                         installer,
                         "extract_node_toolchain",
                         side_effect=self.fake_extract_node_toolchain,
@@ -10785,7 +10886,16 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             decoy_path = root / "decoy-same-content.js"
             decoy_path.write_bytes(genuine_content)
             os.chmod(decoy_path, 0o600)
-            pinned_relative_digests = {"pinned-file.js": pinned_digest}
+            # Round 38: also pinned (to the same, genuinely-matching digest,
+            # since `tamper` never touches `decoy_path` itself in any of the
+            # three scenarios below) so tree_digest()'s new deny-unknown
+            # check has nothing to say about it -- this harness isolates the
+            # round-34 completeness assertion specifically, not the
+            # unrelated round-38 deny-unknown check.
+            pinned_relative_digests = {
+                "pinned-file.js": pinned_digest,
+                "decoy-same-content.js": pinned_digest,
+            }
             with mock.patch.object(installer, "SSD_ROOT", root):
                 # Sanity: while the pinned path is still the genuine regular
                 # file, tree_digest() accepts the pinned map normally.
@@ -11128,6 +11238,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 enter(
                     mock.patch.object(
                         installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
                     )
                 )
                 enter(
@@ -11735,6 +11850,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 )
                 enter(
                     mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
+                    )
+                )
+                enter(
+                    mock.patch.object(
                         installer,
                         "extract_node_toolchain",
                         side_effect=self.fake_extract_node_toolchain,
@@ -11998,6 +12118,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 )
                 enter(
                     mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
+                    )
+                )
+                enter(
+                    mock.patch.object(
                         installer,
                         "extract_node_toolchain",
                         side_effect=self.fake_extract_node_toolchain,
@@ -12160,6 +12285,967 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             wrapper,
         )
         self.assertNotIn(" -P", wrapper)
+
+    # ------------------------------------------------------------------
+    # Round 38, 2026-08-20 (independent Claude opus/max round-37 review):
+    # regression tests for the tree_digest() deny-unknown fix (P1-1/P1-2),
+    # the registry-pinning post-move completeness assertion and
+    # assert_materialized_node_modules_matches_lock() reverse-direction
+    # check (P1-1, secondary), the upstream-package-lock.json download
+    # digest re-check (P2-1), and the RELEASE_DIR post-quarantine refusal
+    # gate (P2-2).
+    # ------------------------------------------------------------------
+
+    def test_allowed_unpinned_release_files_is_derived_from_current_constants(
+        self,
+    ) -> None:
+        # Round 37's own reproduction, against a real install, measured
+        # this exemption set at exactly 14 entries: 5 bookkeeping literals
+        # plus 9 "assets/<name>" entries. Assert the CURRENT, real value
+        # matches that count and content exactly, AND assert the function
+        # actually tracks ASSETS/WORKSPACE_ASSETS/MAIN_PATCHED_ASSET/
+        # NODE_ASSET rather than being a hardcoded literal that happens to
+        # match today -- mutating those constants must change the
+        # function's return value with no other code change.
+        exempt = installer.allowed_unpinned_release_files()
+        self.assertEqual(
+            exempt,
+            frozenset(
+                {
+                    "LICENSE",
+                    "package.json",
+                    "package-lock.json",
+                    "upstream-package-lock.json",
+                    "lib/node_modules/.package-lock.json",
+                    *(f"assets/{name}" for name in installer.ASSETS),
+                    f"assets/{installer.NODE_ASSET}",
+                    f"assets/{installer.MAIN_PATCHED_ASSET}",
+                    *(
+                        f"assets/{name}"
+                        for name in installer.WORKSPACE_ASSETS.values()
+                    ),
+                }
+            ),
+        )
+        self.assertEqual(len(exempt), 14)
+        # Every entry is genuinely derived from a constant, not hardcoded:
+        # mutating ASSETS to add a new download must add a new
+        # "assets/<name>" exemption with no other change.
+        with mock.patch.object(
+            installer,
+            "ASSETS",
+            {**installer.ASSETS, "extra-fake-asset.tgz": "0" * 64},
+        ):
+            grown = installer.allowed_unpinned_release_files()
+        self.assertIn("assets/extra-fake-asset.tgz", grown)
+        self.assertEqual(len(grown), 15)
+
+    def test_lock_row_platform_excludes_current_target(self) -> None:
+        excludes = installer.lock_row_platform_excludes_current_target
+        # No constraint at all -- never excludes.
+        self.assertFalse(excludes({"name": "x", "version": "1.0.0"}))
+        # Allow-list form: current platform absent -> excludes.
+        self.assertTrue(excludes({"os": ["win32"]}))
+        self.assertTrue(excludes({"cpu": ["x64"]}))
+        # Allow-list form: current platform present -> does not exclude.
+        self.assertFalse(excludes({"os": ["darwin"]}))
+        self.assertFalse(excludes({"cpu": ["arm64"]}))
+        # Block-list ("!") form: current platform named -> excludes.
+        self.assertTrue(excludes({"os": ["!darwin"]}))
+        self.assertTrue(excludes({"cpu": ["!arm64"]}))
+        # Block-list form: current platform NOT named -> does not exclude.
+        self.assertFalse(excludes({"os": ["!win32"]}))
+        # Either field alone is sufficient.
+        self.assertTrue(excludes({"os": ["darwin"], "cpu": ["x64"]}))
+        # Malformed/empty inputs fail closed (never excuse an absence).
+        self.assertFalse(excludes({"os": []}))
+        self.assertFalse(excludes({"os": "darwin"}))
+        self.assertFalse(excludes("not-a-dict"))
+        self.assertFalse(excludes(None))
+
+    def test_assert_materialized_node_modules_matches_lock_reverse_top_level(
+        self,
+    ) -> None:
+        # Round 38 reverse-direction regression, top-level: a declared
+        # top-level row absent from the materialized tree, with no os/cpu
+        # justification on its own lock row, fails closed when `packages`
+        # is supplied and contains that row.
+        with tempfile.TemporaryDirectory() as directory:
+            release_dir = Path(directory).resolve() / "release"
+            node_modules = release_dir / "node_modules/prime-agent"
+            node_modules.mkdir(parents=True, mode=0o700)
+            self._chmod_tree_private(release_dir)
+            declared_top_level = frozenset(
+                {"node_modules/prime-agent", "node_modules/missing-pkg"}
+            )
+            with self.assertRaisesRegex(
+                installer.PrimeInstallError,
+                r"declared node_modules package is missing from the materialized "
+                r"tree and is not justified.*missing-pkg",
+            ):
+                installer.assert_materialized_node_modules_matches_lock(
+                    release_dir,
+                    declared_top_level,
+                    {},
+                    packages={
+                        "node_modules/missing-pkg": {
+                            "name": "missing-pkg",
+                            "version": "1.0.0",
+                        }
+                    },
+                )
+
+    def test_assert_materialized_node_modules_matches_lock_reverse_top_level_platform_justified(
+        self,
+    ) -> None:
+        # Same absence as above, but this time the row's own "os"
+        # constraint genuinely excludes darwin -- a legitimate,
+        # platform-conditional skip, so this must NOT raise.
+        with tempfile.TemporaryDirectory() as directory:
+            release_dir = Path(directory).resolve() / "release"
+            node_modules = release_dir / "node_modules/prime-agent"
+            node_modules.mkdir(parents=True, mode=0o700)
+            self._chmod_tree_private(release_dir)
+            declared_top_level = frozenset(
+                {"node_modules/prime-agent", "node_modules/missing-pkg"}
+            )
+            # Must not raise.
+            installer.assert_materialized_node_modules_matches_lock(
+                release_dir,
+                declared_top_level,
+                {},
+                packages={
+                    "node_modules/missing-pkg": {
+                        "name": "missing-pkg",
+                        "version": "1.0.0",
+                        "os": ["win32"],
+                        "optional": True,
+                    }
+                },
+            )
+
+    def test_assert_materialized_node_modules_matches_lock_reverse_top_level_row_not_in_packages(
+        self,
+    ) -> None:
+        # A declared top-level absence whose lock_path is not a key of
+        # `packages` at all (the scoping convention real call sites use to
+        # exclude the four locally patched/workspace packages -- see
+        # assert_materialized_node_modules_matches_lock()'s own round-38
+        # docstring paragraph) is treated as nothing to verify here, not
+        # as an unjustified absence.
+        with tempfile.TemporaryDirectory() as directory:
+            release_dir = Path(directory).resolve() / "release"
+            node_modules = release_dir / "node_modules/prime-agent"
+            node_modules.mkdir(parents=True, mode=0o700)
+            self._chmod_tree_private(release_dir)
+            declared_top_level = frozenset(
+                {"node_modules/prime-agent", "node_modules/@earendil-works/pi-ai"}
+            )
+            # Must not raise: "node_modules/@earendil-works/pi-ai" is not a
+            # key of the (deliberately empty, here) `packages` map.
+            installer.assert_materialized_node_modules_matches_lock(
+                release_dir, declared_top_level, {}, packages={}
+            )
+
+    def test_assert_materialized_node_modules_matches_lock_reverse_nested(
+        self,
+    ) -> None:
+        # Round 38 reverse-direction regression, nested: a declared child
+        # of a container that WAS materialized (the parent package's own
+        # nested node_modules/ genuinely exists on disk) is itself absent,
+        # with no os/cpu justification -- fails closed.
+        with tempfile.TemporaryDirectory() as directory:
+            release_dir = Path(directory).resolve() / "release"
+            container = release_dir / "node_modules/parent-pkg/node_modules"
+            (container / "present-child").mkdir(parents=True, mode=0o700)
+            self._chmod_tree_private(release_dir)
+            declared_top_level = frozenset({"node_modules/parent-pkg"})
+            declared_nested = {
+                "node_modules/parent-pkg/node_modules": frozenset(
+                    {"present-child", "missing-child"}
+                )
+            }
+            with self.assertRaisesRegex(
+                installer.PrimeInstallError,
+                r"declared nested node_modules package is missing from the "
+                r"materialized tree.*missing-child",
+            ):
+                installer.assert_materialized_node_modules_matches_lock(
+                    release_dir,
+                    declared_top_level,
+                    declared_nested,
+                    packages={
+                        "node_modules/parent-pkg/node_modules/missing-child": {
+                            "name": "missing-child",
+                            "version": "1.0.0",
+                        }
+                    },
+                )
+
+    def test_assert_materialized_node_modules_matches_lock_reverse_nested_container_absent_is_skipped(
+        self,
+    ) -> None:
+        # The container itself was never materialized at all (its own
+        # parent package directory is missing) -- deliberately NOT treated
+        # as "every declared child is individually unjustified", since
+        # that would not generally be true; this is skipped rather than
+        # guessed at (see this function's own round-38 comment at this
+        # exact `continue`).
+        with tempfile.TemporaryDirectory() as directory:
+            release_dir = Path(directory).resolve() / "release"
+            release_dir.mkdir(parents=True, mode=0o700)
+            (release_dir / "node_modules").mkdir(mode=0o700)
+            self._chmod_tree_private(release_dir)
+            # `parent-pkg` itself is declared top-level but genuinely
+            # excused (platform-conditional), so the top-level reverse
+            # check does not fire for it either -- isolating this test to
+            # the nested-container-absent skip specifically.
+            declared_top_level = frozenset({"node_modules/parent-pkg"})
+            declared_nested = {
+                "node_modules/parent-pkg/node_modules": frozenset({"missing-child"})
+            }
+            # Must not raise.
+            installer.assert_materialized_node_modules_matches_lock(
+                release_dir,
+                declared_top_level,
+                declared_nested,
+                packages={
+                    "node_modules/parent-pkg": {
+                        "name": "parent-pkg",
+                        "version": "1.0.0",
+                        "os": ["win32"],
+                        "optional": True,
+                    },
+                    "node_modules/parent-pkg/node_modules/missing-child": {
+                        "name": "missing-child",
+                        "version": "1.0.0",
+                    },
+                },
+            )
+
+    def _chmod_tree_private(self, root: Path) -> None:
+        for dirpath, _dirnames, _filenames in os.walk(root):
+            os.chmod(dirpath, 0o700)
+
+    def _round38_deny_unknown_tree_digest_harness(
+        self, *, plant_relative_dir: str | None, plant_relative_file: str
+    ) -> None:
+        """Shared harness for the round-38 tree_digest() deny-unknown
+        regression tests below: builds a minimal tree with ONE genuinely
+        pinned regular file, plants ONE extra, entirely unpinned regular
+        file at `plant_relative_file` (creating `plant_relative_dir`
+        first, if given), and confirms tree_digest() now refuses the call
+        -- exercising the round-38 "every observed regular file must be
+        pinned or an accepted exemption" half of the completeness
+        invariant directly, isolated from the full install() pipeline and
+        from the round-34 "every pinned key must be observed" half (see
+        `_round34_p1_1_completeness_harness()`, just above, for that other
+        half's own regression tests).
+
+        Verified to FAIL against pre-fix HEAD (commit 36a4008c08) via a
+        standalone scratch script importing that commit's tree_digest()
+        directly: for every one of the four locations this harness is
+        used against below (RELEASE_DIR root, bin/, toolchain/, and a
+        node_modules/-shaped path), tree_digest() returned a digest/count
+        pair successfully, silently folding the planted file into the
+        recorded baseline with zero comparison against anything -- exactly
+        as if `pinned_relative_digests` had never been passed for that
+        path at all.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            pinned_content = b"genuine pinned content\n"
+            pinned_path = root / "pinned-file.js"
+            pinned_path.write_bytes(pinned_content)
+            pinned_digest = installer.sha256_bytes(pinned_content)
+            if plant_relative_dir is not None:
+                (root / plant_relative_dir).mkdir(parents=True, mode=0o700)
+            stray_path = root / plant_relative_file
+            stray_path.write_bytes(b"attacker-controlled\n")
+            self._chmod_tree_private(root)
+            os.chmod(pinned_path, 0o600)
+            os.chmod(stray_path, 0o600)
+            pinned_relative_digests = {"pinned-file.js": pinned_digest}
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                with self.assertRaises(installer.PrimeInstallError) as cm:
+                    installer.tree_digest(
+                        root, pinned_relative_digests=pinned_relative_digests
+                    )
+            message = str(cm.exception)
+            self.assertIn(
+                "neither pinned nor an accepted unpinned exemption", message
+            )
+            self.assertIn(plant_relative_file, message)
+
+    def test_tree_digest_deny_unknown_catches_stray_file_at_release_root(
+        self,
+    ) -> None:
+        self._round38_deny_unknown_tree_digest_harness(
+            plant_relative_dir=None,
+            plant_relative_file="stray-root-file.js",
+        )
+
+    def test_tree_digest_deny_unknown_catches_stray_file_under_bin(self) -> None:
+        self._round38_deny_unknown_tree_digest_harness(
+            plant_relative_dir="bin",
+            plant_relative_file="bin/stray-bin-file.js",
+        )
+
+    def test_tree_digest_deny_unknown_catches_stray_file_under_toolchain(
+        self,
+    ) -> None:
+        self._round38_deny_unknown_tree_digest_harness(
+            plant_relative_dir="toolchain",
+            plant_relative_file="toolchain/stray-toolchain-file.js",
+        )
+
+    def test_tree_digest_deny_unknown_catches_stray_file_under_node_modules(
+        self,
+    ) -> None:
+        # Round 37's own zero-race P1-1(b) reproduction planted content at
+        # a declared-but-always-platform-skipped registry row's own path
+        # (`@mariozechner/clipboard-*` on this platform) -- this test
+        # models that same shape of location (a scoped package directory
+        # directly under node_modules/) generically, isolated from the
+        # full install() pipeline. See
+        # test_install_locked_detects_content_planted_at_always_skipped_registry_row()
+        # below for the full end-to-end reproduction through the real
+        # install() pipeline.
+        self._round38_deny_unknown_tree_digest_harness(
+            plant_relative_dir="node_modules/@mariozechner/clipboard-win32",
+            plant_relative_file="node_modules/@mariozechner/clipboard-win32/index.js",
+        )
+
+    def test_tree_digest_deny_unknown_accepts_allowed_unpinned_release_files(
+        self,
+    ) -> None:
+        # Negative counterpart to the four tests above: every path
+        # allowed_unpinned_release_files() names is exempt, so a tree
+        # containing ONLY a pinned file plus every one of those exempt
+        # paths (populated with arbitrary, unpinned content) is accepted
+        # normally -- proving the exemption set genuinely suppresses the
+        # new check for the paths it is supposed to, not merely that the
+        # check is broken/always-permissive.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            pinned_content = b"genuine pinned content\n"
+            pinned_path = root / "pinned-file.js"
+            pinned_path.write_bytes(pinned_content)
+            pinned_digest = installer.sha256_bytes(pinned_content)
+            for relative in installer.allowed_unpinned_release_files():
+                exempt_path = root / relative
+                exempt_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+                exempt_path.write_bytes(b"unpinned but accepted content\n")
+            self._chmod_tree_private(root)
+            os.chmod(pinned_path, 0o600)
+            for relative in installer.allowed_unpinned_release_files():
+                os.chmod(root / relative, 0o600)
+            pinned_relative_digests = {"pinned-file.js": pinned_digest}
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                # Must not raise.
+                installer.tree_digest(
+                    root, pinned_relative_digests=pinned_relative_digests
+                )
+
+    def _round38_full_install_stray_harness(
+        self,
+        *,
+        extra_registry_lock_path: str | None = None,
+        plant_relative_path: str,
+        expected_message_fragment: str,
+    ) -> None:
+        """Shared harness for the round-38 end-to-end regression tests
+        below: runs the REAL, unmocked `_install_locked_within_release_dir()`
+        pipeline (through the top-level `installer.install()` entry point,
+        the same way the round-36 registry-package and round-35
+        undeclared-sibling-package harnesses elsewhere in this file do),
+        with `fake_run_npm`'s "ci" branch materializing ONLY the genuine
+        prime-agent tree -- deliberately never creating anything at
+        `plant_relative_path` itself, modeling either a declared registry
+        row this platform's `npm ci` never downloads at all (round 37's
+        own zero-race P1-1(b) finding, when `extra_registry_lock_path` is
+        given) or the pre-move node_modules/ path after it has been
+        renamed away (round 37's own P1-2 finding, when it is not). The
+        plant itself happens via a wrapped, real
+        `atomic_create_private_file()` -- the FIRST call to it that
+        happens AFTER the launch guard is published, i.e. after the
+        node_modules -> lib/node_modules move -- landing a same-UID
+        racer's content at `plant_relative_path` sometime before
+        write_pending_install()'s own tree_digest() call, exactly
+        mirroring the existing
+        test_install_locked_detects_undeclared_sibling_package_planted_after_node_modules_move
+        test's own established technique.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            user_home = root / "user"
+            user_home.mkdir(mode=0o700)
+
+            local_assets = {
+                "prime-agent": installer.MAIN_PATCHED_ASSET,
+                **installer.WORKSPACE_ASSETS,
+            }
+            packages: dict[str, object] = {
+                "": {
+                    "name": "orca-managed-prime-agent",
+                    "version": installer.VERSION,
+                    "dependencies": {
+                        "prime-agent": f"file:assets/{installer.MAIN_PATCHED_ASSET}"
+                    },
+                },
+                **{
+                    f"node_modules/local-{index}": {
+                        "name": name,
+                        "version": installer.VERSION,
+                        "resolved": f"file:assets/{asset_name}",
+                        "integrity": "sha512-dGVzdA==",
+                    }
+                    for index, (name, asset_name) in enumerate(local_assets.items())
+                },
+            }
+            if extra_registry_lock_path is not None:
+                # The declared PACKAGE name (e.g. "@mariozechner/clipboard-win32"
+                # for a scoped package) -- everything after the row's OWN
+                # last "node_modules/" segment, matching exactly how
+                # package_name_from_lock_path()/declared_top_level_node_modules_packages()
+                # resolve a row's identity when it has no explicit "name"
+                # override that would take precedence. Deliberately NOT
+                # `.rsplit("/", 1)[-1]`, which would drop a scoped
+                # package's own "@scope/" prefix and make this row appear
+                # as an entirely different (unscoped) declared name than
+                # what actually gets materialized on disk.
+                declared_name = extra_registry_lock_path.split("node_modules/", 1)[-1]
+                bare_name = declared_name.rsplit("/", 1)[-1]
+                packages[extra_registry_lock_path] = {
+                    "name": declared_name,
+                    "version": "1.0.0",
+                    "resolved": (
+                        f"https://registry.npmjs.org/{bare_name}/-/"
+                        f"{bare_name}-1.0.0.tgz"
+                    ),
+                    "integrity": "sha512-dGVzdA==",
+                    # A real declared-but-always-skipped-on-darwin-arm64
+                    # row (round 37's own `@mariozechner/clipboard-*`
+                    # finding) genuinely carries an "os" constraint that
+                    # excludes this platform -- included here so this
+                    # fixture is a faithful model, not merely a row this
+                    # installer's own new reverse-direction check would
+                    # ALSO separately flag as unjustified.
+                    "os": ["win32"],
+                    "optional": True,
+                }
+            generated = {"lockfileVersion": 3, "packages": packages}
+            with mock.patch.object(installer, "RELEASE_DIR", release):
+                expected_lock_sha256 = installer.sha256_bytes(
+                    installer.normalized_production_lock(generated)
+                )
+            generated_lock_raw = installer.canonical_json(generated)
+
+            GENUINE_CLI_CONTENT = b"// genuine, tarball-pinned cli.js\n"
+
+            def fake_run_npm(
+                npm_path, node_path, args, cwd, cache, install_home, install_tmp,
+                timeout=300, child_umask=None, release_dir_fd=None,
+            ):
+                cwd = Path(cwd)
+                if args and args[0] == "install":
+                    lock_path = cwd / "package-lock.json"
+                    lock_path.write_bytes(generated_lock_raw)
+                    os.chmod(lock_path, 0o600)
+                elif args and args[0] == "ci":
+                    bundle = cwd / "node_modules/prime-agent/dist/bundle"
+                    bundle.mkdir(parents=True, mode=0o700)
+                    for ancestor in (
+                        cwd / "node_modules",
+                        cwd / "node_modules/prime-agent",
+                        cwd / "node_modules/prime-agent/dist",
+                        bundle,
+                    ):
+                        os.chmod(ancestor, 0o700)
+                    cli = bundle / "cli.js"
+                    cli.write_bytes(GENUINE_CLI_CONTENT)
+                    os.chmod(cli, 0o600)
+                    # Deliberately never materializes anything for
+                    # `extra_registry_lock_path` -- modeling this
+                    # platform's `npm ci` genuinely, unconditionally
+                    # skipping it (round 37's own zero-race P1-1(b)
+                    # finding: nothing legitimate ever contends for that
+                    # exact path).
+
+            def fake_make_patched_asset(
+                original_asset, original_sha256, upstream_lock, assets_dir,
+                *, expected_name, managed_name, output_name,
+            ):
+                patched = assets_dir / output_name
+                installer.atomic_create_private_file(patched, b"stub-asset", 0o600)
+                published_stat = patched.lstat()
+                content_digests = (
+                    {Path("dist/bundle/cli.js"): installer.sha256_bytes(GENUINE_CLI_CONTENT)}
+                    if managed_name == "prime-agent"
+                    else {}
+                )
+                return (
+                    patched,
+                    installer.sha256_bytes(b"stub-asset"),
+                    {"name": managed_name, "version": installer.VERSION},
+                    (published_stat.st_dev, published_stat.st_ino),
+                    content_digests,
+                )
+
+            def fake_safe_download(url, destination, expected_sha256, *, max_bytes=None):
+                if destination.name == "upstream-package-lock.json":
+                    payload = installer.canonical_json(
+                        {"lockfileVersion": 3, "packages": {}}
+                    )
+                else:
+                    payload = b"stub-download"
+                installer.atomic_create_private_file(destination, payload, 0o600)
+
+            fake_evidence = {
+                "volume_uuid": "TEST-UUID",
+                "node_version": installer.NODE_VERSION,
+                "npm_version": installer.NPM_VERSION,
+                "orca_support": {"test": "support"},
+            }
+
+            real_atomic_create_private_file = installer.atomic_create_private_file
+            planted = {"done": False}
+            launch_guard_path = release / "bin/prime-agent-launch-guard.py"
+
+            def plant_after_move(path, raw, mode=0o600):
+                real_atomic_create_private_file(path, raw, mode)
+                if path == launch_guard_path and not planted["done"]:
+                    target = release / plant_relative_path
+                    target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+                    target.write_bytes(b"attacker-controlled\n")
+                    os.chmod(target, 0o600)
+                    for dirpath, _dirnames, _filenames in os.walk(target.parent):
+                        os.chmod(dirpath, 0o700)
+                    planted["done"] = True
+
+            with contextlib.ExitStack() as stack:
+                enter = stack.enter_context
+                enter(mock.patch.object(installer, "SSD_ROOT", root))
+                enter(mock.patch.object(installer, "TOOL_ROOT", tool_root))
+                enter(mock.patch.object(installer, "RELEASE_DIR", release))
+                enter(mock.patch.object(installer, "STATE_DIR", tool_root / "state"))
+                enter(
+                    mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home")
+                )
+                enter(mock.patch.object(installer, "USER_HOME", user_home))
+                enter(mock.patch.object(installer, "STATE_LINK", user_home / ".prime"))
+                enter(
+                    mock.patch.object(
+                        installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "RECEIPT_PATH",
+                        tool_root / "receipts" / f"v{installer.VERSION}.json",
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "PENDING_PATH", tool_root / "pending-install.json"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_SHA256", expected_lock_sha256
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "GENERATED_LOCK_PACKAGE_COUNT",
+                        len(local_assets) + (1 if extra_registry_lock_path else 0),
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "volume_uuid", return_value="TEST-UUID")
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "verify_orca_support",
+                        return_value={"test": "support"},
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "prime_agent_command_candidates", return_value=[]
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "preflight", return_value=fake_evidence)
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "extract_node_toolchain",
+                        side_effect=self.fake_extract_node_toolchain,
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "exact_tool_version", return_value="stub"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "make_patched_asset",
+                        side_effect=fake_make_patched_asset,
+                    )
+                )
+                enter(mock.patch.object(installer, "run_npm", side_effect=fake_run_npm))
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "atomic_create_private_file",
+                        side_effect=plant_after_move,
+                    )
+                )
+
+                with self.assertRaises(installer.PrimeInstallError) as cm:
+                    installer.install()
+                self.assertIn(expected_message_fragment, str(cm.exception))
+
+            self.assertTrue(planted["done"])
+            self.assertFalse((tool_root / "pending-install.json").exists())
+            self.assertFalse(
+                (tool_root / "receipts" / f"v{installer.VERSION}.json").exists()
+            )
+
+    def test_install_locked_detects_content_planted_at_always_skipped_registry_row(
+        self,
+    ) -> None:
+        # Round 37's own P1-1(b) "zero-race" reproduction: a declared
+        # registry row this platform's `npm ci` unconditionally skips
+        # every single install (round 37's real finding:
+        # `@mariozechner/clipboard-*`, modeled here generically) has
+        # content planted at its exact declared-but-never-materialized
+        # path. Pre-fix (commit 36a4008c08), verified via a standalone
+        # scratch script exercising the equivalent pre-fix code path
+        # directly: the pre-move presence probe's bare `continue` silently
+        # excluded this row from `registry_pinned_digests` with nothing
+        # downstream re-checking it, and neither
+        # assert_materialized_node_modules_matches_lock() (only checks the
+        # materialized-but-undeclared direction) nor tree_digest() (no
+        # deny-unknown half) said anything about the planted content --
+        # install() completed successfully with a clean receipt. Post-fix,
+        # this is caught by the round-38 registry-pinning post-move
+        # completeness assertion in
+        # `_install_locked_within_release_dir()` (which raises first, with
+        # a specific message) and independently, structurally, by
+        # tree_digest()'s own deny-unknown check (see
+        # test_tree_digest_deny_unknown_catches_stray_file_under_node_modules()
+        # above for that check exercised in isolation) -- either mechanism
+        # alone already refuses this exact plant.
+        # Planted at its REAL post-move materialized location
+        # (lib/node_modules/..., matching where this installer's own
+        # `global_root.parent / lock_path` re-check looks -- see the
+        # registry-pinning post-move completeness assertion in
+        # `_install_locked_within_release_dir()`), NOT the pre-move
+        # "node_modules/..." path -- planting at the pre-move path models
+        # the DIFFERENT P1-2 finding instead (see the next test).
+        self._round38_full_install_stray_harness(
+            extra_registry_lock_path="node_modules/@mariozechner/clipboard-win32",
+            plant_relative_path="lib/node_modules/@mariozechner/clipboard-win32/index.js",
+            expected_message_fragment="@mariozechner/clipboard-win32",
+        )
+
+    def test_install_locked_detects_content_planted_at_pre_move_node_modules_path_after_move(
+        self,
+    ) -> None:
+        # Round 37's own P1-2 reproduction: RELEASE_DIR/node_modules (the
+        # pre-move path) is renamed away as a whole to lib/node_modules
+        # early in `_install_locked_within_release_dir()` and never looked
+        # at again by anything downstream through round 37 -- round 37's
+        # own empirical check confirmed this path genuinely sits on real
+        # Node's actual module resolution search path (walking up from the
+        # entrypoint's own directory), and the real pinned prime-agent
+        # 0.7.2 bundle unconditionally attempts to require() optional
+        # native accelerators (bufferutil, utf-8-validate) absent from the
+        # real closure -- so a same-UID racer recreating "node_modules"
+        # from scratch at the OLD path, after the move, plants something
+        # that would actually load at runtime. Pre-fix (commit
+        # 36a4008c08), verified via a standalone scratch script: nothing
+        # in `_install_locked_within_release_dir()` or tree_digest() ever
+        # looked at this path again once it reappeared post-move, and
+        # install() completed successfully with a clean receipt. Post-fix,
+        # tree_digest()'s own deny-unknown check catches it (this planted
+        # file has no pinned entry and is not one of
+        # allowed_unpinned_release_files()'s exemptions).
+        self._round38_full_install_stray_harness(
+            extra_registry_lock_path=None,
+            plant_relative_path="node_modules/bufferutil/index.js",
+            expected_message_fragment="node_modules/bufferutil/index.js",
+        )
+
+    def test_install_locked_detects_tampered_upstream_lock_after_download(
+        self,
+    ) -> None:
+        # Round 38, P2-1 regression: safe_download() verifies the
+        # downloaded upstream-package-lock.json bytes IN MEMORY, then
+        # writes them to disk -- before this round, the very next read of
+        # that same file was a bare `.read_bytes()` with no digest
+        # re-check at all, mirroring the exact TOCTOU gap round 13/14
+        # already closed for the Node.js toolchain tarball and the four
+        # locally patched packages' own source tarballs. This test's
+        # `fake_safe_download` writes DIFFERENT bytes than
+        # `installer.LOCK_SHA256` (left at its real, pinned value,
+        # unlike every OTHER full-install harness in this file, which
+        # patches `LOCK_SHA256` to match its own stub payload) --
+        # modeling a same-UID racer who swaps the file's on-disk content
+        # in the window between safe_download() writing it and this
+        # function reading it back, whatever the origin of the mismatch.
+        #
+        # Verified to FAIL against pre-fix HEAD (commit 36a4008c08) via a
+        # standalone scratch script: the bare `.read_bytes()` this round
+        # replaced had no digest comparison at all, so this exact
+        # mismatch went completely unnoticed at this point -- the
+        # (structurally valid but digest-mismatched) lock content was
+        # used to build `dependencies` further down, and only a
+        # coincidental downstream failure (or none at all, for lock
+        # content that still produces a valid closure) would have
+        # surfaced anything wrong.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            user_home = root / "user"
+            user_home.mkdir(mode=0o700)
+
+            def fake_safe_download(url, destination, expected_sha256, *, max_bytes=None):
+                if destination.name == "upstream-package-lock.json":
+                    # Deliberately NOT matching the real, un-patched
+                    # installer.LOCK_SHA256 -- modeling the tampered-content
+                    # scenario this fix closes.
+                    payload = installer.canonical_json(
+                        {"lockfileVersion": 3, "packages": {}, "tampered": True}
+                    )
+                else:
+                    payload = b"stub-download"
+                installer.atomic_create_private_file(destination, payload, 0o600)
+
+            fake_evidence = {
+                "volume_uuid": "TEST-UUID",
+                "node_version": installer.NODE_VERSION,
+                "npm_version": installer.NPM_VERSION,
+                "orca_support": {"test": "support"},
+            }
+
+            with contextlib.ExitStack() as stack:
+                enter = stack.enter_context
+                enter(mock.patch.object(installer, "SSD_ROOT", root))
+                enter(mock.patch.object(installer, "TOOL_ROOT", tool_root))
+                enter(mock.patch.object(installer, "RELEASE_DIR", release))
+                enter(mock.patch.object(installer, "STATE_DIR", tool_root / "state"))
+                enter(
+                    mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home")
+                )
+                enter(mock.patch.object(installer, "USER_HOME", user_home))
+                enter(mock.patch.object(installer, "STATE_LINK", user_home / ".prime"))
+                enter(
+                    mock.patch.object(
+                        installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "RECEIPT_PATH",
+                        tool_root / "receipts" / f"v{installer.VERSION}.json",
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "PENDING_PATH", tool_root / "pending-install.json"
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "volume_uuid", return_value="TEST-UUID")
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "verify_orca_support",
+                        return_value={"test": "support"},
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "prime_agent_command_candidates", return_value=[]
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "preflight", return_value=fake_evidence)
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "upstream package lock changed on disk before use",
+                ):
+                    installer.install()
+
+            self.assertFalse((tool_root / "pending-install.json").exists())
+            self.assertFalse(
+                (tool_root / "receipts" / f"v{installer.VERSION}.json").exists()
+            )
+
+    def test_install_locked_refuses_when_release_dir_present_after_quarantine_attempt(
+        self,
+    ) -> None:
+        # Round 38, P2-2 regression: STATE_DIR, PROBE_HOME, and the
+        # session directory each already have a "still present after the
+        # quarantine attempt above -> refuse" gate in `_install_locked()`
+        # -- RELEASE_DIR was the one managed root missing it.
+        # ensure_private_dir(RELEASE_DIR) (unlike
+        # create_fresh_private_dir(), used for other release-scoped
+        # extraction targets) ACCEPTS a pre-existing same-UID 0700
+        # directory rather than refusing one outright -- exactly right for
+        # TOOL_ROOT/the npm cache/scratch dirs it is also used for, but
+        # silently wrong for RELEASE_DIR if quarantine_partial_release()
+        # above did not (or could not) actually relocate it.
+        #
+        # This test models exactly that: RELEASE_DIR already exists (with
+        # a leftover, unrelated file inside) at the point _install_locked()
+        # is reached, while STATE_DIR/PROBE_HOME/the session directory do
+        # NOT exist and RECEIPT_PATH/PENDING_PATH/bin_link/STATE_LINK are
+        # all absent too -- so quarantine_partial_release()'s own
+        # `if not present: return {"ok": True, "state": "none"}` early-out
+        # fires for every OTHER managed root, but RELEASE_DIR alone was
+        # never in `present` either, because the outer `any(... for path
+        # in (RELEASE_DIR, STATE_DIR, PROBE_HOME, managed_session_dir()))`
+        # guard IS true (RELEASE_DIR exists) -- so
+        # quarantine_partial_release() DOES run and, since only RELEASE_DIR
+        # is actually present among the four, quarantines it successfully.
+        # To reach the specific gap this round closes (RELEASE_DIR
+        # SURVIVING the quarantine attempt), this test instead makes
+        # quarantine_partial_release() itself unable to relocate it, by
+        # mocking it to a no-op stand-in -- modeling either a same-UID
+        # racer recreating RELEASE_DIR in the narrow window between a real
+        # quarantine returning and this gate's check, or a partially
+        # failed quarantine this file's own rollback path could not fully
+        # undo.
+        #
+        # Verified to FAIL against pre-fix HEAD (commit 36a4008c08): with
+        # the same mock in place, `ensure_private_dir(RELEASE_DIR)` a few
+        # lines later silently ACCEPTED the pre-existing directory (a real,
+        # same-UID, 0700 directory -- exactly what that function's own
+        # accept-existing branch requires) instead of refusing it, and the
+        # install proceeded to build a fresh release INSIDE the leftover
+        # directory rather than raising.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            user_home = root / "user"
+            user_home.mkdir(mode=0o700)
+            release.mkdir(parents=True, mode=0o700)
+            for ancestor in (tool_root, tool_root / "releases", release):
+                os.chmod(ancestor, 0o700)
+            leftover = release / "leftover-from-a-prior-attempt.txt"
+            leftover.write_bytes(b"leftover\n")
+            os.chmod(leftover, 0o600)
+
+            fake_evidence = {
+                "volume_uuid": "TEST-UUID",
+                "node_version": installer.NODE_VERSION,
+                "npm_version": installer.NPM_VERSION,
+                "orca_support": {"test": "support"},
+            }
+
+            with contextlib.ExitStack() as stack:
+                enter = stack.enter_context
+                enter(mock.patch.object(installer, "SSD_ROOT", root))
+                enter(mock.patch.object(installer, "TOOL_ROOT", tool_root))
+                enter(mock.patch.object(installer, "RELEASE_DIR", release))
+                enter(mock.patch.object(installer, "STATE_DIR", tool_root / "state"))
+                enter(
+                    mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home")
+                )
+                enter(mock.patch.object(installer, "USER_HOME", user_home))
+                enter(mock.patch.object(installer, "STATE_LINK", user_home / ".prime"))
+                enter(
+                    mock.patch.object(
+                        installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "RECEIPT_PATH",
+                        tool_root / "receipts" / f"v{installer.VERSION}.json",
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "PENDING_PATH", tool_root / "pending-install.json"
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "volume_uuid", return_value="TEST-UUID")
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "verify_orca_support",
+                        return_value={"test": "support"},
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "prime_agent_command_candidates", return_value=[]
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "preflight", return_value=fake_evidence)
+                )
+                # Model a quarantine attempt that runs (since RELEASE_DIR
+                # is present) but fails to actually relocate RELEASE_DIR --
+                # the specific residual this round's gate closes.
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "quarantine_partial_release",
+                        return_value={"ok": True, "state": "quarantined", "items": []},
+                    )
+                )
+
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "managed Prime Agent release already exists; refusing to reuse it",
+                ):
+                    installer.install()
+
+            # Nothing was mutated inside the leftover release directory.
+            self.assertTrue(leftover.exists())
+            self.assertEqual(leftover.read_bytes(), b"leftover\n")
+            self.assertFalse((tool_root / "pending-install.json").exists())
+            self.assertFalse(
+                (tool_root / "receipts" / f"v{installer.VERSION}.json").exists()
+            )
 
 
 if __name__ == "__main__":
