@@ -898,3 +898,219 @@ for manifest_key, graph_key in source_map.items():
 ### 风险 8（新增）：Audit 1–4 报告未提交到仓库，本设计第 4 节的优先级判断依赖未持久化的外部结论
 
 对抗性复核独立核实了 4.1 节列出的 14 个新页面所引用的目录/文件在仓库里确实存在（不是虚构目标），第 4.0 节也已经把优先级判断所需的具体事实内联进本文档，使其不再依赖外部未提交文件才能自证。但根本问题仍未解决：**Audit 1–4 的完整报告本身仍不在仓库里**，本项目自身的双模型复核/可追溯性规范要求关键结论应当可被后续复核方独立核对原文，而不是仅有转述。后续验证方式：作为阶段 A 或阶段 B 的一个附带任务，把 Audit 1–4 的完整报告提交到仓库（例如放在 `reports/` 下），并在本设计文档顶部补充指向这些文件的相对路径引用，使 4.0 节的内联结论和外部原文可以交叉核对。
+
+---
+
+## 附录A：SSD 上完整对话记录纳入索引辨别
+
+*本附录基于两份独立审计撰写——一份现场复核了 Codex 与 Claude Code 完整对话记录在 SSD 上的真实物理布局，另一份核对了 `add_sessions()`/`sync_sessions.py`/`build_context_digest.py` 现有索引深度与仓库既有隐私/访问边界政策——用以回应用户新增需求："对话记录保存到 SSD 也要作为索引辨别的一部分，Codex 和 Claude Code 都要覆盖"。本附录初稿完成后又经过一轮独立对抗性代码复核，发现初稿里 §A.2/A.3 的代码引用有一处引用了仓库里不存在的符号（`ALLOWED_CATALOG_SESSION_KEYS`）、遗漏了 `Session` 数据类本身就丢弃文件路径这一前置缺口、`record_logical_home` 的取值设计会让一个既有代码明确要隐藏的账号 UUID 重新出现在图谱可读范围内、`record_path` 在账号池场景下独立地带有同一个 UUID 泄露面、以及"两个账号完全不在 SSD 上"这句话在符号链接被正确解析后其实不成立、并因此掩盖了一个更值得关注的真实 bug（跨 source 的会话重复计数与账号归属误判）。以下正文已经把这些发现直接改写进设计里，不再是勘误列表。*
+
+*范围界定：本附录只扩展 `session` 节点类型，只关闭既有审计称为 **Gap A** 的缺口——"没有任何字段能从图谱节点走到磁盘上那份具体记录文件"——不触碰第 1–6 节已经定案的时间戳语义、写屏障、wiki 校验逻辑，也不改变第 2 节反复确认的既有隐私边界："知识图谱只读取已脱敏 JSON，从不读取原始会话文本"。Gap B（内容从未被读入任何可被发现的产物）、Gap C（`redact_text()` 不足以处理全文）、Gap D（政策明确排除原始记录）三者本附录**明确保持不做**，理由见 A.5，不是遗漏。*
+
+### A.1 现状精确定位：两家完整对话记录在 SSD 上的真实位置
+
+现场用 `readlink` 复核确认三条符号链接均为真实符号链接（`lrwxr-xr-x`）：`$HOME/.claude -> /Volumes/Extreme SSD/Orca/local-homes/.claude`、`$HOME/.codex -> /Volumes/Extreme SSD/Orca/local-homes/.codex`、`$HOME/.codex-profiles -> /Volumes/Extreme SSD/Orca/local-homes/.codex-profiles`。但"`$HOME` 是符号链接"**不等于**"这台机器用到的所有 Codex home 都在 SSD 上"，也**不等于**"没有走 `$HOME` 符号链接的账号池目录就一定不在 SSD 上"——账号池里的路径即使物理落在系统盘的账号目录下，其内部文件也可能只是指回 SSD 的符号链接。这两层可能性都必须分别核实，不能互相替代，见下表账号池行与本附录风险 9/10。
+
+**Claude Code**（真实目录 `/Volumes/Extreme SSD/Orca/local-homes/.claude/projects/`）：
+
+| 维度 | 实际情况 |
+|---|---|
+| 目录命名 | 一个子目录对应一个不同的 cwd，目录名 = 该 cwd 绝对路径把 `/` 及其他非字母数字的运行边界字符（空格、标点）全部折叠替换为 `-`。例如 cwd `/Volumes/Extreme SSD/Orca/projects/orca` → 目录 `-Volumes-Extreme-SSD-Orca-projects-orca`。现场实测 104 个此类项目目录，另有 1 个非项目目录 `memory/`（用户自身 MEMORY.md 引用的自动记忆存储，不是会话记录目录，不在本附录索引范围内）。 |
+| 文件命名 | 每个项目目录下直接放会话文件，一个 session 一个文件：`<session-uuid>.jsonl`（如 `00a95664-4091-49c2-aeec-b09ccc4f7bed.jsonl`）。同一 UUID 有时还有一个同名兄弟目录，装该 session 的旁路数据 `subagents/agent-<id>.jsonl`+`.meta.json`、`tool-results/*.txt`——这些是该 session 的辅助产物，**不是**额外的独立记录，本附录索引不单独收录它们。 |
+| 单条记录 schema | 每行一个 JSON 对象，`type` 字段区分行类型：`last-prompt`/`mode`/`permission-mode`（小型会话状态行）；`attachment`（`sessionId, uuid, parentUuid, timestamp(ISO8601), isSidechain, userType, cwd, version, gitBranch, entrypoint`）；`user`（同一信封字段 + `message:{role:"user",content}` + `promptId,promptSource,origin,permissionMode`）；`assistant`（信封 + `message:{id,type,role:"assistant",model,content:[{type:"text",text}],stop_reason,...}` + `requestId,session_id,effort`）；`system`（`subtype,isMeta,durationMs,messageCount`+信封）；以及 `file-history-snapshot`/`file-history-delta`/`queue-operation`/`ai-title`/`bridge-session` 等辅助行。**`sessionId` 与文件名一致、每行带 `timestamp`、`parentUuid`/`uuid` 构成消息链**——具备一份可索引记录所需的最小结构。 |
+
+**Codex**（`discover_codex_files`/`discover_codex_homes`，`orca-context-bridge/scripts/build_context_digest.py`；账号池发现在 `orca-context-bridge/scripts/sync_sessions.py::all_primary_sessions`）：
+
+| 维度 | 实际情况 |
+|---|---|
+| home 发现逻辑 | `discover_codex_homes(default_home, profiles_root, include_profiles)` → `[("codex", default_home)] + [("codex:<name>", p) for p in profiles_root.iterdir() if (p/"sessions").is_dir()]`；`--codex-home` 默认取 `os.environ.get("CODEX_HOME") or ~/.codex`（**优先用 `CODEX_HOME` 环境变量，不是无条件用 `~/.codex`**）。账号池不经过 `discover_codex_homes`：`sync_sessions.py::all_primary_sessions` 单独对 `orca-codex-accounts-root` 下每个 `*/home` 目录调用 `Path.resolve()` 并以 `(st_dev, st_ino)` 身份算出一个**不可逆的哈希标签** `codex:orca-<sha256(dev:ino)[:12]>`（`opaque_codex_account_source()`，`sync_sessions.py:707-710`，函数自身文档字符串写明"按目录身份命名账号，不用路径别名"），这个哈希标签直接就是该账号 session 的 `source` 字段值——不是 `discover_codex_homes` 产出的标签，两条发现路径是独立的两段代码。 |
+| 常规目录 | `/Volumes/Extreme SSD/Orca/local-homes/.codex/sessions/2026/<MM>/<DD>/rollout-<ISO时间戳>-<codex-turn-uuid>.jsonl`（现场 310 个文件）。示例：`rollout-2026-08-14T16-18-00-019fff59-7329-7e43-9b1f-c4fc54d20a38.jsonl`。`~/.codex-profiles` 下 `acct-a`/`acct-b`/`acct-c` 三个账号目录物理上也全在 SSD（经 `.codex-profiles` 符号链接到达），但 `acct-c` 没有 `sessions/` 子目录，会被 `discover_codex_homes` 的 `(p/"sessions").is_dir()` 判断**静默跳过**——这不是账号池整体在 SSD 之外，而是发现逻辑本身的一个静默跳过分支，见风险 11。 |
+| **账号池路径细节（现场重新核实，纠正了本附录初稿的计数）** | `orca-codex-accounts-root` 的真实位置是 `~/Library/Application Support/orca/codex-accounts/`——**系统盘上的真实目录，不是符号链接**。4 个账号 UUID 目录中，`0b4cd443-...`/`b9f32a51-...` 的 `home` 本身就是符号链接、指向 SSD `local-homes/codex-accounts/<uuid>/home`；`235a57b1-...` 与 `8d7db875-...`（当前 shell `$CODEX_HOME` 实际绑定的账号）的 `home` 是系统盘上的**真实目录**。但真实目录不等于其内容不在 SSD 上：现场用 Python `Path.is_file()`（`discover_codex_files` 真实使用的判断，会跟随符号链接，不同于 shell `find -type f`）重新统计，`235a57b1-.../home/sessions/` 下 **0 个常规文件、308 个符号链接**，这 308 个符号链接**全部**指回 `~/.codex/sessions/...`（即 SSD 上的默认 home，示例 `rollout-2026-03-10T04-32-40-019cd44d-....jsonl`）——`is_file()` 对它们返回 `True`，也就是说真实代码路径会把这 308 个文件当作"存在的 session 文件"发现到，且解析后落在 SSD 上，不是 0 个、也不是不在 SSD 上。`8d7db875-.../home/sessions/` 下有 **81 个常规文件（489MB，只存在于系统盘，没有对应符号链接）+ 310 个符号链接（同样全部指回 SSD 上的 `~/.codex/sessions/...`）**。 |
+| 单条记录 schema | 每行 `{"timestamp","ordinal","type","payload"}`。`type` 含 `session_meta`（`payload.id`/`payload.session_id` 与文件名 UUID 一致，另有 `cli_version,originator,source,thread_source,cwd,git:{branch,commit_hash,repository_url}`）、`event_msg`、`response_item`（`payload.role ∈ {developer,user,assistant,...}, type:"message", content:[{type:"input_text"|"output_text"|...,text}]`）、`world_state`、`turn_context`（`model,effort,sandbox_policy,approval_policy,workspace_roots`）、`compacted`。同样具备 session id、逐行 `timestamp`、`role`（嵌套在 `payload.role` 下，与 Claude 顶层 `role` 的位置不同）。 |
+
+**结论（修正后，不含糊表述）**：Claude Code 一侧（`$HOME/.claude`）**已核实全部在 SSD 上**，无此项风险。Codex 一侧**不是均匀地**"部分在 SSD、部分不在"——真正只存在于系统盘、SSD 上没有任何等价副本的记录，只有 `8d7db875-...` 账号下那 **81 个常规文件**；`235a57b1-...` 账号下的 308 个"记录"和 `8d7db875-...` 账号下额外的 310 个"记录"，经真实代码路径（跟随符号链接的 `is_file()`）解析后，物理内容其实就落在 SSD 上的默认 `~/.codex/sessions/...` 里，是**同一份物理文件通过账号池符号链接被重复看见**，不是账号池自己产生的、系统盘独有的新数据。这个区分本身就是本附录必须做对的地方——如果只按"账号目录是不是符号链接"这一层浅层信号判断，会把 308+310 个其实已经在 SSD 上的记录也误判为"不在 SSD 上"；但如果反过来因为"两个账号的 home 目录都能在 SSD 上找到对应内容"就假定这两个账号完全没有游离于 SSD 之外的数据，又会漏掉 `8d7db875-...` 那 81 个真正只存在于系统盘的常规文件。两种简化都不对，必须逐条按解析后的物理路径判断，展开为风险 9；而"同一份物理文件被两个不同 source 标签重复索引"这个现象本身，是一个此前未被识别的独立正确性问题，展开为风险 10。
+
+### A.2 现有 `add_sessions()`/`sync_sessions.py`/`build_context_digest.py` 做到了什么、和"索引辨别完整记录本身"之间具体缺什么
+
+**已经做到的（元数据级）**：本设计第 5.2 节已经把 `add_sessions()` 改为 `add_sessions(self, payload, sources)`，为每个 `session` 节点写入 `meta={"provider":..., "source":..., "cwd":...}` 加上 `timestamps=make_timestamps(content_at=entry.get("updated_at"), source_mtime_ns=..., observed_at=self.generated_at)`。这一层的输入来自 `sync_sessions.py::validate_catalog_session`（`sync_sessions.py:745-796`）产出的目录（catalog）。**该函数内部并没有一个名为 `ALLOWED_CATALOG_SESSION_KEYS` 的模块级常量**（这是本附录初稿的一处错误引用，仓库里不存在这个符号）；真实的允许字段集合是函数体内的局部变量 `expected`（`sync_sessions.py:749-755`），且校验方式是**精确集合相等**：`if set(entry) != expected: raise ValueError(...)`，不是"在允许列表里即可"的子集/成员校验。这意味着 A.3 往这个集合里新增字段，等价于把新字段变成**每一条**目录条目（不区分 provider）都必须携带的必填键，而不是"新增了一个可选能力"——下面的 diff 与说明据此改写。
+
+**具体缺口（对照代码实现，不是抽象地说"不够完整"）**：
+
+- **Gap A——没有定位指针字段，且缺口比初稿描述的更靠前一层**。真正在磁盘发现阶段拿到每个 session 具体文件路径的，是 `select_sessions()`（`build_context_digest.py`）内部 `for path in recent:` 循环里的局部变量 `path`，它被传给 `parse_claude_session(path, ...)`/`parse_codex_session(path, ...)`。但这两个函数返回的 `Session` 数据类（`build_context_digest.py:118-128`）**当前没有 `path` 字段**——`path` 只在函数体内被用来算 `session_id`（`path.stem`/正则提取）和兜底 `updated_at`（`path.stat().st_mtime`），随后就被丢弃，不会被写回 `Session` 对象。也就是说，从"知道文件在哪"到"这个信息进入目录 JSON"之间，路径信息在**第一步**（`parse_*_session` 返回 `Session` 对象时）就已经不再存在，`build_catalog()`（`sync_sessions.py:963-993`，遍历 `result.sessions` 逐条构造 catalog 条目的地方）根本拿不到 `session.path` 可用——这是比"catalog 允许字段集合没加字段"更靠前一层、且必须先修的前置缺口，A.3 的 diff 需要同时覆盖这一步。
+- 现有允许字段集合里唯一路径形状的字段是 `codex_home`，且只对 Codex 有值，指向的是**home 根目录**（`build_catalog()` 里赋值为 `str(source_home) if result.provider == "codex" else None`），不是某一个 session 自己的 `.jsonl` 文件；而这个字段甚至连图谱节点都到不了——`add_sessions()` 目前只从 `entry` 里拷贝 `provider`/`source`/`cwd`/`updated_at` 四个键（本设计 5.2 节的 diff 同样只涉及这四个键 + 新增的 `timestamps`），`codex_home` 在拷贝时被丢弃。
+- **辨别粒度：现有 `source` 字段已经比初稿以为的更细，不需要再造一个新字段去做同一件事**。`provider` 只有 `"claude"`/`"codex"` 两个值，粒度确实太粗；但 `source` 字段的真实取值枚举已经现场核实清楚：Claude 侧固定为 `"claude"`；Codex 侧为 `"codex"`（默认 home）、`"codex:<profile-name>"`（`.codex-profiles` 下的具名 profile）、或 `"codex:orca-<sha256[:12]>"`（账号池账号，来自 `opaque_codex_account_source()`）。也就是说：**"能不能单独挑出账号池里某一个具体账号"这件事，`source` 字段现在就已经能做到**（只是标签是稳定的哈希而不是可读名字，这是既有代码刻意的隐私选择，见 A.3）。真正缺的只是"这条 session 具体落在磁盘哪个文件"和"这个文件是否在 SSD 上"这两件事——也就是 A.3 要新增的 `record_path`/`record_on_ssd` 两个字段，不需要第三个字段来重复 `source` 已经提供的辨别能力。
+
+结论：**"一个 session 被索引"目前等于一条脱离物理文件的元数据摘要**（provider/source 标签、cwd、`updated_at`）；从图谱节点走到磁盘上那份完整记录，没有任何字段能承担这一步——这正是 Gap A，也是本附录 A.3 要关闭的唯一缺口。
+
+### A.3 具体设计：给 session 节点新增定位指针字段
+
+**设计原则**：只存路径指针，不把原文塞进图谱/wiki JSON。原因直接对应既有隐私边界政策（`SKILL.md` "Privacy boundary" 与知识图谱章节，已在两份审计中逐条核实）：知识图谱当前"只读取已脱敏 JSON，从不读取原始会话文本"是明确写在文档里的既有设计（不是遗漏），wiki 页面"不得含凭据、记录原文或命令输出"同样是明文要求；一条文件系统路径字符串本身不含对话内容，只是"内容存放在哪"这一事实，不构成对上述边界的突破。
+
+**新增字段收窄为两个，不是三个**：初稿提出的 `record_logical_home` 被本轮直接取消，原因不是"多余"这么简单，而是它按初稿给出的取值形状（账号池账号用 `"codex-account:<raw-uuid>"`）会**主动逆转**一处既有代码刻意做出的隐私选择——`opaque_codex_account_source()` 的文档字符串原文是"按目录身份命名账号，不用路径别名"，函数体用 `sha256(f"{st_dev}:{st_ino}")[:12]` 生成不可逆标签，就是为了不让账号池的原始 UUID 出现在任何面向 catalog/图谱的字段里。A.2 已经确认这个哈希标签本来就是 `source` 字段的真实取值，`add_sessions()` 也早就把 `source` 拷进了节点 `meta` ——按 provider/账号筛选的能力已经存在，不需要再造一个字段，更不需要再造一个会把哈希故意还原回原始 UUID 的字段。
+
+`record_path` 单独构成一个例外，需要专门处理：即便不新增 `record_logical_home`，`record_path` 字符串本身在账号池场景下也会带着账号 UUID——但这个泄露面并不像 Claude 侧 cwd 编码目录名那样"反正 `meta.cwd` 已经原样存了同一份信息、不构成新暴露"，因为 Codex 侧现有字段里**没有**任何地方已经存了账号池的原始 UUID（`codex_home` 在拷进图谱节点前就被丢弃，`source` 只存哈希）。经 A.1 现场复核确认，这个泄露面比初稿设想的窄：账号池目录下的绝大多数 `.jsonl` 其实是指回 SSD 默认 home 的符号链接，`record_path` 写入前统一执行 `Path(...).resolve(strict=False)`，符号链接会被解析穿透，解析结果落在 `~/.codex/sessions/...`（即 SSD 默认 home），**不带任何账号 UUID**；真正会把 UUID 保留在解析后路径里的，只有账号自己的**常规（非符号链接）文件**——现场只有 `8d7db875-...` 账号下的 81 个文件符合。对这一小类，`record_path` 写入 catalog 前必须做一次显式替换：若解析后路径的某一段等于 `orca-codex-accounts-root/<uuid>/home` 这个前缀形状，把 `<uuid>` 段替换成该账号在 `source` 里已经使用的同一个哈希标签（`orca-<hash12>`，去掉 `codex:` 前缀），例如 `.../codex-accounts/8d7db875-541c-4499-b219-64ec9b7486d6/home/sessions/...` 写入 catalog 时变成 `.../codex-accounts/orca-<hash12>/home/sessions/...`。这样 `record_path` 依然是可用于区分"这是不是同一份物理文件"的真实指针，但不会成为图谱/wiki 里第二个泄露账号原始 UUID 的地方。
+
+三个字段收窄为两个后的类型与取值形状：
+
+| 字段名 | 类型 | 含义 | 示例值 |
+|---|---|---|---|
+| `record_path` | `string \| null` | 该 session 完整记录文件的绝对路径，写入前经 `Path(...).resolve(strict=False)` 解析符号链接，指向物理落盘位置而非逻辑 `$HOME` 路径；若路径落在 `orca-codex-accounts-root/<uuid>/home/...` 下，`<uuid>` 段替换为该账号 `source` 字段已用的同一哈希标签（见上）；发现阶段确实拿不到（理论上不应发生，但必须优雅降级而非让整次构建崩溃，同 `parse_timestamp` 返回 `None` 而非抛异常的既有原则）时为 `null` | Claude：`"/Volumes/Extreme SSD/Orca/local-homes/.claude/projects/-Volumes-Extreme-SSD-Orca-projects-orca/00a95664-4091-49c2-aeec-b09ccc4f7bed.jsonl"`；Codex 常规：`"/Volumes/Extreme SSD/Orca/local-homes/.codex/sessions/2026/08/14/rollout-2026-08-14T16-18-00-019fff59-7329-7e43-9b1f-c4fc54d20a38.jsonl"`；Codex 账号池符号链接条目（解析后落回 SSD 默认 home，不带 UUID）：同上一条常规路径；Codex 账号池 `8d7db875` 常规文件（UUID 段已替换为哈希标签）：`"/Users/www1adwawd/Library/Application Support/orca/codex-accounts/orca-<hash12>/home/sessions/2026/08/15/rollout-....jsonl"` |
+| `record_on_ssd` | `bool` | `record_path` 解析后的真实路径，是否落在本机 SSD 挂载根之下；用 `Path.is_relative_to(ssd_root)`（Python 3.9+ 原生方法，边界安全）判断，**禁止用 `str.startswith()`**——原始 UUID 字符串前缀比较无法区分"落在 SSD 挂载根内"与"路径字符串恰好以同一段字符开头但其实是另一个相邻目录"（例如 `/Volumes/Extreme SSD/Orca-decoy/...` 对 `/Volumes/Extreme SSD/Orca`），必须走真正的路径分段比较；发现阶段计算一次，不在图谱构建时重算 | `true`（`.claude`/`.codex`/`.codex-profiles` 常规路径下，以及账号池里解析后落回 SSD 的符号链接条目）；`false`（仅 `8d7db875-...` 账号下那 81 个常规文件） |
+
+**在 `sync_sessions.py::validate_catalog_session` 的局部变量 `expected` 中新增两个键（精确集合相等校验，新增即必填）**：
+
+```diff
+     expected = {
+         "provider", "source", "id", "title", "cwd", "updated_at", "cwd_available",
+         "original_cwd", "cwd_remapped", "remap_status", "path_map_id", "source_limited",
+-        "parse_errors", "codex_home",
++        "parse_errors", "codex_home", "record_path", "record_on_ssd",
+     }
+     if set(entry) != expected:
+         raise ValueError("catalog session entry schema is invalid")
+     ...
++    record_path = entry["record_path"]
++    if record_path is not None:
++        _catalog_string(record_path, "record_path", maximum=4096, absolute=True)
++    _catalog_bool(entry["record_on_ssd"], "record_on_ssd")
+```
+
+**`build_context_digest.py::Session` 必须先获得一个 `path` 字段，否则 `build_catalog()` 无从取值**（这是 A.2 指出的前置缺口，diff 落在这里）：
+
+```diff
+ @dataclass
+ class Session:
+     provider: str
+     session_id: str
+     cwd: str | None
+     updated_at: datetime
++    path: Path | None = None
+     launch_cwd: str | None = None
+     source: str | None = None
+     title: str | None = None
+     messages: list[Message] = field(default_factory=list)
+     source_limited: bool = False
+     parse_errors: int = 0
+```
+
+`parse_claude_session`/`parse_codex_session` 各自在末尾的 `return Session(...)` 调用里加一个 `path=path,`（两处函数签名本来就有 `path: Path` 形参，只是从未写回返回值）。
+
+**`sync_sessions.py::build_catalog()` 在已有的 `codex_home` 赋值旁新增 `record_path`/`record_on_ssd`**（新增一个模块级 `_is_under_ssd_root(path, ssd_root)` 辅助函数，内部用 `path.is_relative_to(ssd_root)`；账号池 UUID 替换逻辑封装在 `_sanitize_account_uuid(path, source_label)` 里，仅当 `source_label` 形如 `codex:orca-<hash>` 且解析后路径经过 `orca-codex-accounts-root/<uuid>/home` 时生效）：
+
+```diff
+                     "source_limited": session.source_limited,
+                     "parse_errors": session.parse_errors,
+                     "codex_home": str(source_home) if result.provider == "codex" else None,
++                    "record_path": (
++                        str(_sanitize_account_uuid(session.path.resolve(strict=False), source_label))
++                        if session.path is not None else None
++                    ),
++                    "record_on_ssd": (
++                        _is_under_ssd_root(session.path.resolve(strict=False), ssd_root)
++                        if session.path is not None else False
++                    ),
+                 }
+             )
+```
+
+**`add_sessions()` 在本设计第 5.2 节已改写版本基础上叠加这两个字段**（延续同一处 diff，不是另开一个方法）：
+
+```diff
+         session_source_mtime_ns = sources.get("sessions", {}).get("source_mtime_ns")
+         for entry in sessions:
+             ...
+             self.add_node(
+                 node_id,
+                 "session",
+                 label,
+                 {
+                     "provider": entry.get("provider"),
+                     "source": entry.get("source"),
+                     "cwd": normalize_cwd(entry.get("cwd")),
++                    "record_path": entry.get("record_path"),
++                    "record_on_ssd": entry.get("record_on_ssd"),
+                 },
+                 timestamps=make_timestamps(
+                     content_at=entry.get("updated_at"),
+                     source_mtime_ns=session_source_mtime_ns,
+                     observed_at=self.generated_at,
+                 ),
+             )
+```
+
+**为什么"只存路径指针、不把原文塞进图谱/wiki JSON"是正确设计，而不是偷懒**：这正是既有隐私边界政策已经确立、且被两份审计逐条核实为"深思熟虑而非疏漏"的分界线——`build_knowledge_graph.py` 目前导入 `build_context_digest.py` 时只导入 `redact_text, write_private`，从不导入任何读取 session 内容的函数（`parse_claude_session`/`parse_codex_session`/`read_jsonl_window`）；`--sessions` 输入结构性地无法携带消息内容。新增 `record_path` 不改变这条边界的任何一环——它依然是"目录 JSON 里的一个字符串字段"，图谱构建脚本依然不打开、不解析它指向的文件；对账号池 UUID 做的替换处理，是在这条既有边界之上再补一层，确保这个新字段不会成为账号身份这一单独维度上的新泄露点。
+
+### A.4 支持"按 provider / 时间范围 / 项目 cwd 辨别"的索引结构设计
+
+**决策：不新增知识图谱 edge 类型，也不新建独立轻量索引文件——复用现有 `session` 节点 + 现有 `meta.source` 字段 + A.3 新增的 `record_path`/`record_on_ssd` 两个 `meta` 字段 + 本设计第 5 节已经确立的 `timestamps` 子对象，把 `knowledge_graph.json` 本身当作这份索引。**
+
+**为什么不新增 edge 类型**：`record_path`/`record_on_ssd` 描述的是 session 节点自身的固有属性（"这条记录存在哪""在不在 SSD 上"），不是两个独立实体之间的关系——边（edge）在本设计里专门用来表达"两个不同节点之间存在某种关联"（如 `reviews`、`overlaps_with`）。第 5.3 节已经把"时间戳只在一个地方存一份、边通过端点节点间接获得信息、不做冗余存储"确立为明确原则；同一原则同样适用于定位指针——如果改用一条 `session --located_at--> record_file` 的边，`record_file` 又得是一个新节点类型，那就需要给这个新节点类型再补一整套 `timestamps`/`meta` 字段，纯粹为了表达一个本来就是 1:1、单值、只读的属性而制造出一个新的"两处数据可能漂移"风险点，得不偿失。
+
+**为什么不新建独立索引文件**：一份独立的 `records-index.json` 会和 `knowledge_graph.json` 里的 `session` 节点描述同一批 session、却分别由两条构建路径产生——这正是本设计从第 2 节 wiki/manifest 双写不同步问题里已经反复论证过的反模式（"两处数据可能漂移"）。`knowledge_graph.json` 已经是全仓库对"session 有哪些、属于谁、什么时候更新"这件事的唯一权威索引来源（第 5 节新增的 `timestamps.content_at` 已经是可排序的 ISO 8601 字符串），没有理由为同一批实体再造一份平行数据。
+
+**具体查询方式**（对既有节点数组的谓词过滤，不需要新的查询引擎或索引结构）：
+
+```python
+def find_sessions(nodes, provider=None, source=None, cwd=None, since=None, until=None, ssd_only=None):
+    for n in nodes:
+        if n["type"] != "session":
+            continue
+        m = n["meta"]
+        if provider is not None and m.get("provider") != provider:
+            continue
+        if source is not None and m.get("source") != source:
+            continue
+        if cwd is not None and m.get("cwd") != cwd:
+            continue
+        if ssd_only is not None and bool(m.get("record_on_ssd")) != ssd_only:
+            continue
+        content_at = n["timestamps"]["content_at"]
+        if since is not None and (content_at is None or content_at < since):
+            continue
+        if until is not None and (content_at is None or content_at > until):
+            continue
+        yield n
+```
+
+四个筛选维度都直接落在已有/新增字段上：**按 provider** → `meta.provider`（粗粒度）；**按具体账号/来源** → `meta.source`（细粒度，取值已在 A.2 现场核实清楚，能单独挑出账号池里某一个具体账号——但**必须**同时读一下风险 10：由于跨 source 目前没有基于 session id 的去重，同一份物理文件可能同时挂在 `source="codex"` 和 `source="codex:orca-<hash>"` 两条记录下，`meta.source` 筛选出来的结果在去重之前不能直接当作"这个账号独有的会话集合"使用）；**按时间范围** → `timestamps.content_at`（ISO 8601 字符串天然可比较排序，第 1.2 节已确立的统一格式在这里直接复用）；**按项目 cwd** → `meta.cwd`（已经过 `normalize_cwd` 规范化，第 5.2 节既有逻辑不变）。额外获得的第五个筛选维度是 `meta.record_on_ssd`——这不是本次要求的三项之一，但它是 A.3 设计的直接副产品，且恰好是审计出的真实缺口（风险 9）所需要的排查手段：运维/复核时可以直接筛出 `record_on_ssd=false` 的 session，逐条核对是否已被纳入迁移或备份范围。
+
+### A.5 隐私/脱敏边界：明确不做全文内容索引，以及为什么这是克制而不是遗漏
+
+**本设计明确不做的事**：不读取 `record_path` 指向的文件内容、不对其做全文关键词索引、不做摘要、不把任何一条消息文本写入 `knowledge_graph.json`/wiki JSON 的任何字段。`record_path` 是唯一新增的、与文件内容相关的字段，且它本身只是一个文件系统路径字符串。
+
+**为什么现在没有把 `redact_text()` 那套元数据脱敏惯例直接套用到全文内容索引上，是合理的克制，不是遗漏**——两份审计已经把这一点核实清楚，直接引用其结论：
+
+- `redact_text()`（`build_context_digest.py:166-183`，模式定义在 34-72 行）是一个**针对短字符串的固定模式/形状拒绝列表**：PEM 私钥、URL userinfo、固定查询参数名、`Bearer` 头、固定厂商 token 形状前缀（`sk-`/`sk-ant-`/`gh[pousr]_`/`xox[baprs]-`/`AKIA`/`AIza` 等）、JWT 形状、固定 `key: value` 字段名列表、≥96 字符的 base64 疑似 blob、home 路径剥离，再配合 `trim_text` 做硬截断（标题/命令 300 字符、摘要窗口约 1200 字符）。它的设计目标和现有全部调用点都是**短、有界、结构简单的字符串**（标题、命令、从头尾窗口截出的小段摘录），从未被设计为处理完整对话记录这种数量级、自由格式、可能包含任意粘贴代码/配置/命令输出的内容。
+- 如果不假思索地把它直接套在全文内容上，会产生三类具体失效，而不是"大体够用、还差一点"：**(a)** 超出截断长度的部分根本不会被扫描，只是被静默丢弃，等于对超长内容完全不脱敏；**(b)** 任何不匹配固定形状/固定字段名的敏感信息——自定义内部 token、嵌在句子中间的密钥、非常规命名的环境变量、姓名/邮箱/电话等个人信息、专有业务数据——会原样通过；**(c)** `redact_text()` 自身不做角色/内容类型过滤，现有 digest 管线对 `tool_use`/`tool_result` 载荷的排除是在更上游的 `content_text(content, allowed_types)` 完成的，不在 `redact_text()` 内部——如果直接把它指向一份未经过滤的原始记录，这层过滤也会一并丢失。
+- 这与仓库现有政策的措辞完全一致，不是本附录新提出的限制：知识图谱"从不读取原始会话文本"、wiki 页面"不得含记录原文"、启动上下文包"从不复制原始记录"，都是明文写在 `SKILL.md` 里的既有边界；唯一允许对话内容出现的地方是 `build_context_digest.py` 产出的独立本地摘要，且被明确要求只写到用户本地可控路径、不得由 agent 在用户未明确要求时主动读取/总结。**未来如果要支持"按内容关键词搜索"这类更深功能**，需要的不是把 `redact_text()` 拿来直接套用，而是一整套专门针对长文本设计的脱敏/分类机制，加上一次比照第 2.2.3 节 L1/L3 已审阅包同等级别的、需要人工审阅通过的显式例外——**本附录不做这件事，也不建议在没有这套机制之前做**，只交付路径级引用，这个边界必须在实现时原样保留，不能被后续 PR 顺手扩大。
+
+### A.6 小结
+
+`record_path`/`record_on_ssd` 两个新字段把 Gap A（无法从图谱节点走到磁盘上的具体记录文件）关闭，辨别能力（按 provider、按具体账号/来源、按时间范围、按项目 cwd，外加按是否在 SSD 上）全部落在对既有 `knowledge_graph.json` 节点数组的直接过滤上——按账号这一维度复用已有的 `meta.source`（无需新增第三个字段，也避免了重新暴露账号池原始 UUID），不引入新的 edge 类型、不引入独立索引文件、不读取任何记录内容。落地前必须先补上 `Session` 数据类缺失的 `path` 字段这一前置缺口，否则 `build_catalog()` 拿不到源。Gap B/C/D 按既有政策原样保持不做。跨 source 的重复计数问题（风险 10）独立于本附录存在，但会在 `record_path`/`meta.source` 上线后首次变得**可被观察到**，实现时应当一并处理或至少在文档里显式标注为已知限制，不能只字不提。
+
+### A.7 新增风险（延续第 6 节风险编号）
+
+#### 风险 9（最高，源自本次审计的真实发现，已按符号链接解析修正）：把账号池里"目录不在 SSD 上"等同于"内容不在 SSD 上"
+
+**已核实、精确点名**：`orca-codex-accounts-root`（`~/Library/Application Support/orca/codex-accounts/`，系统盘上的真实目录）下 4 个账号中，`0b4cd443-...`、`b9f32a51-...` 的 `home` 是指向 SSD 的符号链接。`235a57b1-...`、`8d7db875-...`（当前 `$CODEX_HOME` 实际绑定的账号）的 `home` 是系统盘上的真实目录，但这**不直接等于**其内容不在 SSD 上——真实代码路径（`Path.is_file()`，会跟随符号链接）现场核实：`235a57b1-.../home/sessions/` 下 308 个 `.jsonl` **全部**是指回 SSD 默认 home（`~/.codex/sessions/...`）的符号链接，解析后 100% 落在 SSD 上；`8d7db875-.../home/sessions/` 下有 310 个同样指回 SSD 的符号链接，**外加 81 个只存在于系统盘、没有 SSD 对应副本的常规文件（489MB）**。真正"不含糊地不在 SSD 上"的，只有这 81 个常规文件。
+
+失败场景（两个方向都要防）：**(a)** 如果实现时图省事，只看"账号 home 目录本身是不是符号链接"就下结论——`235a57b1-...`/`8d7db875-...` 的 home 都是真实目录，若因此把这两个账号名下**全部**记录标成 `record_on_ssd=false`，会把 618 条实际已在 SSD 上的记录（308+310）错误标记为"需要额外迁移/备份"，制造大量假阳性，浪费运维核对成本，长期会让人对这个字段失去信任、开始忽略它。**(b)** 反过来，如果实现时假定"$HOME 是符号链接、所以账号池一切都在 SSD 上"，直接把 `record_on_ssd` 硬编码为 `true`、或者干脆不实现这个字段，那么 `8d7db875-...` 那 81 个真正只在系统盘的记录会被**系统性地、静默地**漏掉——任何后续依赖"完整记录已全部在 SSD 上"这一假设的下游动作（备份/归档范围、SSD 容量规划、迁移脚本的目标目录枚举、"退役 SSD 前先确认所有记录已迁出"这类检查）都会在真正需要那 81 条数据、而 SSD 已经不可用时才发现漏了。`record_on_ssd` 字段必须在发现阶段对**每一条记录、按 `record_path` 解析后的真实路径独立计算**（`Path.is_relative_to()`，见 A.3 的边界安全要求），不能对整个 provider、整个 home、或"目录本身是不是符号链接"做一次性的粗粒度假设。测试要求：至少覆盖 `.codex`（应为 `true`）、`.codex-profiles/acct-a`（应为 `true`）、账号池符号链接账号 `0b4cd443`（应为 `true`）、账号池 `235a57b1` 的符号链接条目（应为 `true`，不是 `false`）、账号池 `8d7db875` 的符号链接条目（应为 `true`）、账号池 `8d7db875` 的常规文件条目（应为 `false`）六种真实场景各一条断言，专门覆盖"账号目录本身是不是符号链接"和"文件内容解析后是否落在 SSD 上"这两层判断不能互相替代的情形。
+
+#### 风险 10（新增，本轮复核发现的独立正确性问题）：账号池符号链接会让同一份物理会话被跨 source 重复索引、并被错误归属给错误的账号
+
+`sync_sessions.py::all_primary_sessions()` 用 `seen_codex_homes` 只防止**同一个 home 目录路径**被重复加入 `codex_sources` 列表，但 `235a57b1-.../home`、`8d7db875-.../home` 各自是独立于默认 `~/.codex`（解析后指向 SSD）的路径，不会被这个集合拦下，因此都会作为独立 source 参与 `select_sessions()`。`select_sessions()` 内部的 `seen_session_ids` 去重**只在单次调用范围内生效**（即只在同一个 source 内部去重），`build_catalog()` 把多个 source 的结果拼进同一个 `sessions` 列表时**没有跨 source 的 session-id 去重**；`load_catalog()` 的唯一去重检查是 `(provider, source, id)` 三元组不能重复——但 `235a57b1`/`8d7db875` 各自的 `source` 值（`codex:orca-<hash>`）本来就和默认 `codex_home` 的 `source="codex"` 不同，所以同一个 session id（现场实例：`019cd44d-4806-7290-8562-275a97a502c5`）会以**三条不同的 catalog 条目**出现——一条 `source="codex"`（默认 home 直接发现），一条 `source="codex:orca-<hash of 235a57b1>"`（通过符号链接被 `235a57b1` 账号"发现"），一条 `source="codex:orca-<hash of 8d7db875>"`（通过符号链接被 `8d7db875` 账号"发现"）——这三条全部通过 `load_catalog()` 的唯一性校验，因为三元组确实互不相同。
+
+这直接削弱 A.4 给 `meta.source` 赋予的"能单独挑出账号池里某一个具体账号"这个用途：`235a57b1`/`8d7db875` 名下通过 `find_sessions(source=...)` 筛出的结果，**很大一部分其实是默认 `~/.codex` home 的数据被符号链接重复带进来的**，不是这两个账号真正独有的会话；如果不加处理地把这类计数当作"这个账号有多少条记录"展示或用于统计，会产生系统性虚高，且虚高的比例（235a57b1 是 100%，8d7db875 是 310/391 ≈ 79%）在两个账号之间还不一样，容易被误读成"这两个账号本身活跃度差异"。缓解要求：在 A.3 的 `build_catalog()` 改动落地时，一并给账号池分支的 session 收集加一层"按解析后 `record_path` 去重、若与已有 source 的记录物理指向同一文件则跳过或合并标注"的逻辑（可以选择直接跳过、也可以选择保留但在条目上加一个 `record_duplicate_of` 之类的显式标注——具体取舍留给实现阶段决定，但**不能保持现状的静默重复**）；至少要作为已知限制显式写进实现文档，而不是等下游消费者自己发现计数对不上。测试要求：为"同一 session id 从默认 home 和至少一个账号池符号链接账号被两条 source 分别发现"这一具体场景写一条断言，确认最终产出（无论选择跳过还是标注）不会让读者在不知情的情况下把重复计数当作两条独立会话使用。
+
+#### 风险 11（原风险 10，序号顺延）：`discover_codex_homes` 的静默跳过分支（`acct-c` 无 `sessions/` 目录）会让"账号存在但未被索引"和"账号确实没有记录"无法区分
+
+`.codex-profiles/acct-c` 物理上确实存在，但因为没有 `sessions/` 子目录，被 `discover_codex_homes` 的 `(p/"sessions").is_dir()` 判断静默跳过——这本身是既有代码的既有行为，不是本附录制造的问题，但 A.3/A.4 的设计如果不专门处理这一点，会继承同一个盲区：`record_path`/`record_on_ssd` 这类新字段只能覆盖"被发现到的"记录，对于"账号目录存在但因缺 `sessions/` 而整个被跳过"的情形，索引里不会留下任何"这个账号被跳过了"的痕迹——读者看到 `acct-a`/`acct-b` 被索引、`acct-c` 完全不出现，无法区分"acct-c 从未产生过任何 Codex 记录"和"acct-c 的记录因为目录结构不符合发现逻辑的假设而被漏掉"这两种截然不同的情况。缓解要求：发现阶段对每一个被枚举到、但因缺少 `sessions/` 目录而跳过的 profile/账号，记录一条独立的、结构化的"发现被跳过"日志/清单条目（而不是仅仅让它在最终索引里无声消失），供后续人工确认是"确实无记录"还是"目录结构漂移导致漏发现"。测试要求：为 `acct-c` 这一具体场景写一条断言，确认它出现在"被跳过"清单里，而不是既不在索引里也不在任何日志里。
+
+#### 风险 12（原风险 11，序号顺延，并补充比较运算符本身的正确性要求）：`record_on_ssd` 依赖的判断方式如果实现成裸字符串前缀比较、或挂载根常量写死两份，都会悄悄失真
+
+这条风险其实包含两个必须分别测试的独立失效模式，不能只测一个就当作已覆盖：
+
+- **比较运算符本身不安全**：A.3 已把 `record_on_ssd` 的判断方式明确写成 `Path.is_relative_to(ssd_root)`，而不是 `str(record_path).startswith(str(ssd_root))`。这不是风格偏好——裸字符串前缀比较没有路径分段边界，`/Volumes/Extreme SSD/Orca-decoy/...` 会被误判为落在 `/Volumes/Extreme SSD/Orca` 挂载根之下，纯属字符串巧合造成的假阳性。测试要求：至少覆盖一条"路径字符串以挂载根前缀开头、但下一个字符不是路径分隔符"的反例（如 `.../Orca-decoy/...`），确认 `record_on_ssd` 判定为 `false`。
+- **挂载根常量本身可能写死两份并随时间漂移**：`record_on_ssd` 依赖一个"SSD 挂载根前缀"字符串（本机现场核实为 `/Volumes/Extreme SSD/Orca`）。如果实现时在 `sync_sessions.py` 里单独写死这个前缀，而仓库其他地方（安装器、备份闭环、per-workspace 环境脚本等）已经有另一份独立定义这个前缀的常量或配置项，两处定义会随时间漂移——例如 SSD 换盘后卷名变化、或本机之外的另一台机器挂载点不同——其中一处更新了、另一处没有，`record_on_ssd` 就会开始产出错误结果，而且是**看起来正常运行、不报错**的那种错误（判定为 `false` 的记录实际在 SSD 上，或反过来），比完全不实现这个字段更危险，因为它会被风险 9 描述的下游消费者当作可信信号使用。缓解要求：实现前必须先在仓库里检索是否已存在权威的 SSD 挂载根常量/配置（例如现有 SSD 相关 closure 目录、安装脚本里通常会有的路径配置），若存在则直接复用而不是重新声明一份字符串字面量；若确实不存在，本附录要求新增的这一份必须是仓库里**唯一**的定义来源，并在其定义处的注释里显式列出所有已知消费点，防止未来再长出第二份。
+
+这两个失效模式必须分别写测试用例覆盖，缺一不可——比较运算符正确不能替代常量只有一份，反之亦然。
