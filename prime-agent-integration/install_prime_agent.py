@@ -12,6 +12,7 @@ lock digest before npm ci may run.
 from __future__ import annotations
 
 import argparse
+import base64
 from contextlib import contextmanager
 import ctypes
 import errno
@@ -2781,6 +2782,337 @@ def declared_nested_node_modules_packages(
     return {container: frozenset(names) for container, names in grouped.items()}
 
 
+def declared_registry_package_lock_rows(
+    packages: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Round 36, 2026-08-20 (independent Claude opus/max round-35 review,
+    P1-1): every node_modules-relative row this closure's validated
+    generated package-lock.json declares for a REGISTRY dependency --
+    keyed by its own full `lock_path` string (e.g. "node_modules/undici",
+    or "node_modules/proxy-agent/node_modules/socks" for a row nested one
+    level deep) -- EXCLUDING the four locally patched packages/workspace
+    assets (prime-agent and the three `@earendil-works/pi-*` packages),
+    which already get their own complete, pre-npm-ci pinned digest map via
+    make_patched_asset() and never need this function's own, separate
+    npm-cache-derived mechanism (see verified_registry_package_tarball()).
+
+    `lock_path` is directly usable as a release-root-relative filesystem
+    path with NO further translation: npm's own lockfileVersion 3
+    "packages" map keys are always exactly the directory path npm
+    materializes a package at -- the same property
+    declared_top_level_node_modules_packages()/
+    declared_nested_node_modules_packages() already rely on to derive
+    materialized directory names from this same string.
+
+    Classifies rows IDENTICALLY to validate_generated_lock()'s own
+    registry-vs-local-asset split (same `package_name_from_lock_path()`
+    resolution, same `name in {"prime-agent", *WORKSPACE_PACKAGES}` test)
+    so this function's notion of "a registry row" never diverges from what
+    that function already validated every such row's own "resolved"/
+    "integrity" fields to be: a real `https://registry.npmjs.org/...` URL
+    and a well-formed `sha512-...` SRI digest. Callers of this function
+    only ever run AFTER validate_generated_lock() has already succeeded
+    for the exact same `packages` map, so every row this function returns
+    is guaranteed to have both fields in that validated shape.
+    """
+    local_names = frozenset({"prime-agent", *WORKSPACE_PACKAGES})
+    declared: dict[str, dict[str, Any]] = {}
+    for lock_path, row in packages.items():
+        if not isinstance(lock_path, str) or not lock_path.startswith("node_modules/"):
+            continue
+        if not isinstance(row, dict):
+            continue
+        name = package_name_from_lock_path(lock_path, row)
+        if name in local_names:
+            continue
+        declared[lock_path] = row
+    return declared
+
+
+def verified_registry_package_tarball(
+    cache: Path,
+    integrity: str,
+    package_label: str,
+    *,
+    max_bytes: int = MAX_TAR_EXPANDED_BYTES,
+) -> bytes:
+    """Round 36, 2026-08-20 (independent Claude opus/max round-35 review,
+    P1-1): read the exact tarball bytes npm's own local package cache
+    retained for a registry dependency during THIS install's `npm ci` run
+    -- from `cache`, the SAME private, this-installer-owned directory
+    managed_npm_environment() already points every `run_npm()` call's own
+    `npm_config_cache` at -- and independently re-verify, via a fresh
+    SHA-512 computed over the SAME bytes this call is about to return, that
+    they equal `integrity` (a "sha512-<base64>" SRI string, in the exact
+    format validate_generated_lock() already requires every registry row
+    in this pinned closure to declare).
+
+    Concretely feasible, not merely assumed: empirically confirmed (round
+    36, 2026-08-20, against a real `npm ci` run of a real registry package
+    with the pinned npm 11.17.0/Node 24.19.0 toolchain) that npm's local
+    cache is managed by its own `cacache` library, which stores every
+    tarball it downloads at a path FULLY DETERMINED by that tarball's own
+    content digest and NOTHING else -- `<cache>/_cacache/content-v2/sha512/
+    <first-2-hex-chars>/<next-2-hex-chars>/<remaining-hex-chars>`, where the
+    hex string is the digest already decoded from that exact package's own
+    package-lock.json "integrity" field. This means the tarball for any
+    registry row in the validated, pinned generated lock can be located
+    with NO dependency on cacache's own separate index/bookkeeping (never
+    read here at all) -- purely by decoding `integrity`, exactly as this
+    function does.
+
+    Does NOT trust cacache's own path-implies-hash addressing on its own:
+    a same-UID actor with write access to this SAME private cache
+    directory (same-UID threat model, unchanged from the rest of this
+    file) could, in principle, plant ARBITRARY bytes at the exact path
+    this function's own path computation names. The SHA-512 re-check
+    below, performed over the SAME bytes this call reads and returns (not
+    a second, independent re-read), is what actually defeats that -- not
+    the path convention. Winning that race without also producing a
+    SHA-512 SECOND PREIMAGE (bytes that genuinely hash to the exact
+    `integrity` value the validated, pinned generated lock this whole
+    install is already bound to declares for this row) is computationally
+    infeasible. This is the SAME "verify, using the bytes already in hand,
+    rather than trust-then-read-again" discipline sha256_file_verified()/
+    read_private_file() already apply to every other file this installer
+    reads, applied here to a tarball this installer did not itself
+    download -- npm did, into a cache directory this installer created and
+    privately owns -- rather than one safe_download() fetched directly.
+
+    Deliberately mirrors safe_extract_main_asset()'s own tar-safety
+    posture in its caller, registry_package_content_digests(), rather than
+    inventing a second one: the same member-type/path-traversal/size
+    bounds apply.
+
+    Fails closed (never silently returns a partial or substitute result)
+    if the cache path is missing (npm never downloaded this tarball for
+    this platform -- see this function's own caller for why that is
+    tolerated as "nothing to verify" rather than reached as an error at
+    all), if what is at that path is not a private, current-uid-owned
+    regular file, if it exceeds `max_bytes`, or if the freshly computed
+    SHA-512 over its content does not equal `integrity`.
+    """
+    if not re.fullmatch(r"sha512-[A-Za-z0-9+/=]+", integrity):
+        raise PrimeInstallError(
+            f"{package_label} has an unsafe pinned integrity value"
+        )
+    try:
+        expected_raw_digest = base64.b64decode(
+            integrity[len("sha512-"):], validate=True
+        )
+    except ValueError as exc:
+        raise PrimeInstallError(
+            f"{package_label} has a malformed pinned integrity value"
+        ) from exc
+    if len(expected_raw_digest) != hashlib.sha512().digest_size:
+        raise PrimeInstallError(
+            f"{package_label} pinned integrity value has an unexpected digest size"
+        )
+    hex_digest = expected_raw_digest.hex()
+    path = (
+        cache
+        / "_cacache"
+        / "content-v2"
+        / "sha512"
+        / hex_digest[0:2]
+        / hex_digest[2:4]
+        / hex_digest[4:]
+    )
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise PrimeInstallError(
+                f"{package_label} cached tarball is unsafe: {path}"
+            )
+        if info.st_size > max_bytes:
+            raise PrimeInstallError(
+                f"{package_label} cached tarball exceeds the approved size: {path}"
+            )
+        chunks: list[bytes] = []
+        digest = hashlib.sha512()
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    except FileNotFoundError as exc:
+        raise PrimeInstallError(
+            f"{package_label} tarball is not present in the managed npm cache "
+            f"after npm ci: {path}"
+        ) from exc
+    except OSError as exc:
+        raise PrimeInstallError(
+            f"cannot read cached tarball for {package_label}: {path}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if digest.hexdigest() != hex_digest:
+        raise PrimeInstallError(
+            f"{package_label} cached tarball content does not match its own "
+            "pinned SRI integrity"
+        )
+    return b"".join(chunks)
+
+
+def registry_package_content_digests(raw: bytes, package_label: str) -> dict[Path, str]:
+    """Round 36, 2026-08-20 (independent Claude opus/max round-35 review,
+    P1-1): derive a per-file SHA-256 content digest map from `raw` -- the
+    SAME digest-verified tarball bytes verified_registry_package_tarball()
+    just returned -- for every regular file it contains, keyed by its
+    package-relative path (e.g. Path("dist/index.js")), mirroring
+    safe_extract_main_asset()'s own posture (symlink/hardlink/device/fifo
+    refusal, path-traversal and member-count/expanded-size bounds) except
+    this never writes anything to disk: registry packages are already
+    materialized on disk by `npm ci` itself, so this only needs the
+    digests to compare that existing tree against, not a second
+    extraction of it.
+
+    Does NOT hardcode "package" as the required top-level tar directory
+    name the way safe_extract_main_asset() does. That hardcoding is
+    correct THERE -- this installer's own make_patched_asset() controls
+    the four locally patched packages' tarballs, and confirmed, across
+    many rounds, that they use it -- but it is not a general npm
+    requirement: real npm's own extractor strips whichever single
+    top-level path component every member happens to share, regardless of
+    its name. Found by this round's OWN real, non-mocked
+    tests/sandbox_e2e.py replay against the real closure, not by any
+    mocked unit test: at least one real registry package in this exact
+    pinned closure does not use "package" -- @types/mime-types's real
+    published tarball (fetched via `npm pack @types/mime-types` and
+    inspected directly with `tar tvzf`, round 36, 2026-08-20) uses
+    "mime-types/", the DefinitelyTyped `types-publisher` tooling's own
+    convention (the bare, unscoped package name), not plain `npm
+    publish`'s default. This function instead derives the top-level
+    component from the FIRST member in the archive, then requires EVERY
+    member to share that exact same component -- failing closed on a
+    tarball with more than one top-level directory, or a member with none
+    at all, which is exactly as suspicious for a registry package as it
+    would be for one of the four locally patched ones.
+
+    Does NOT fail closed merely because two raw tar member NAMES resolve
+    to the same normalized destination path (e.g. a redundant "." path
+    component -- PurePosixPath collapses "package/./dist/index.js" and
+    "package/dist/index.js" to the identical Path("dist/index.js") key,
+    the same way real npm/tar extraction target resolution does): real,
+    published npm tarballs can genuinely contain this -- reproduced for
+    real (round 36, 2026-08-20): agent-base@7.1.0 through 7.1.4's real
+    published tarballs, fetched via `npm pack` and inspected directly with
+    Python's own tarfile module, each contain BOTH spellings, byte-for-
+    byte identical. What DOES fail closed is two members resolving to the
+    same destination with DIFFERENT content -- a genuine ambiguity about
+    which one real extraction would keep, which this installer has no
+    independent way to resolve. See the loop's own comment, at the digest
+    comparison this paragraph describes, for the precise logic.
+    """
+    try:
+        archive = tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz")
+    except tarfile.TarError as exc:
+        raise PrimeInstallError(
+            f"cannot open cached tarball for {package_label}"
+        ) from exc
+    content_digests: dict[Path, str] = {}
+    with archive:
+        members = archive.getmembers()
+        if not members:
+            raise PrimeInstallError(f"cached tarball for {package_label} is empty")
+        if len(members) > MAX_TAR_MEMBERS:
+            raise PrimeInstallError(
+                f"cached tarball for {package_label} has too many members"
+            )
+        first_name = PurePosixPath(members[0].name)
+        if first_name.is_absolute() or ".." in first_name.parts or not first_name.parts:
+            raise PrimeInstallError(
+                f"unsafe cached tar member for {package_label}: {members[0].name}"
+            )
+        top = first_name.parts[0]
+        regular_bytes = 0
+        for member in members:
+            pure = PurePosixPath(member.name)
+            if (
+                pure.is_absolute()
+                or ".." in pure.parts
+                or not pure.parts
+                or pure.parts[0] != top
+                or member.issym()
+                or member.islnk()
+                or member.isdev()
+                or member.isfifo()
+                or (not member.isdir() and not member.isreg())
+            ):
+                raise PrimeInstallError(
+                    f"unsafe cached tar member for {package_label}: {member.name}"
+                )
+            relative = Path(*pure.parts)
+            if relative == Path(top) or not member.isreg():
+                continue
+            key = relative.relative_to(top)
+            regular_bytes += member.size
+            if regular_bytes > MAX_TAR_EXPANDED_BYTES:
+                raise PrimeInstallError(
+                    f"cached tarball for {package_label} expands beyond the "
+                    "approved limit"
+                )
+            source = archive.extractfile(member)
+            if source is None:
+                raise PrimeInstallError(
+                    f"cannot read cached tar member for {package_label}: {member.name}"
+                )
+            digest = hashlib.sha256()
+            remaining = member.size
+            while remaining:
+                chunk = source.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if remaining:
+                raise PrimeInstallError(
+                    f"short cached tar member for {package_label}: {member.name}"
+                )
+            digest_hex = digest.hexdigest()
+            if key in content_digests:
+                if content_digests[key] != digest_hex:
+                    raise PrimeInstallError(
+                        f"conflicting cached tar members for {package_label} "
+                        f"both resolve to {key}: {member.name}"
+                    )
+                # Round 36, 2026-08-20 (independent Claude opus/max
+                # round-35 review, P1-1 -- found by this round's OWN real,
+                # non-mocked sandbox_e2e.py replay against the real
+                # closure): TWO raw tar member names that normalize (via
+                # PurePosixPath, which collapses a redundant "." path
+                # component the same way real npm's own extraction target
+                # resolution does) to the SAME destination path are not
+                # automatically an attack or a corrupt tarball -- real
+                # published npm tarballs can genuinely contain this
+                # (reproduced for real: agent-base@7.1.0 through 7.1.4's
+                # real published tarballs, fetched and inspected directly
+                # with Python's own tarfile module, each contain BOTH
+                # "package/./dist/index.js" and "package/dist/index.js",
+                # byte-identical, evidently an artifact of whatever tool
+                # built those specific tarballs). Real npm/tar extraction
+                # simply writes the same destination twice in this case
+                # (last member wins; content is unchanged either way, so
+                # which one "wins" does not matter). Failing closed here
+                # ONLY when the two members' CONTENT actually differs
+                # (checked immediately above) -- not merely when the same
+                # logical destination path is named twice -- avoids
+                # rejecting this real, benign package while still catching
+                # a genuine ambiguity: two DIFFERENT byte sequences both
+                # claiming the same destination, where the observed
+                # digest could depend on npm's own extraction order this
+                # installer does not control.
+                continue
+            content_digests[key] = digest_hex
+    return content_digests
+
+
 # Round 27, 2026-08-19 (independent Claude opus/max round-27 review, P2-1):
 # the ONE non-directory entry a real `npm ci` -- run against this exact
 # pinned lock's closure, on a real darwin-arm64 install -- writes directly at
@@ -3068,9 +3400,10 @@ def assert_materialized_node_modules_matches_lock(
     those four packages is verified, immediately after this check runs, by
     assert_locally_patched_package_matches_pinned_digests() against the
     original, pre-npm-ci, tarball-derived digest map make_patched_asset()
-    already computed for each. It is NOT closed, and remains an accepted,
-    UNMITIGATED residual, for the content of any of this closure's ~196
-    third-party REGISTRY dependency packages' own files.
+    already computed for each. Through round 34, it was NOT closed for the
+    content of any of this closure's ~196 third-party REGISTRY dependency
+    packages' own files -- see the round-36 paragraph below for why that is
+    no longer the complete picture, and exactly what changed.
 
     Round 29, 2026-08-19 (independent Claude opus/max round-29 review,
     documentation finding): an earlier revision of this paragraph cited
@@ -3082,16 +3415,70 @@ def assert_materialized_node_modules_matches_lock(
     attacker tampering a file's content AFTER extraction, on disk, under
     this installer's own UID -- which is this file's entire stated threat
     model everywhere else (see e.g. run_npm()'s own docstring, or
-    capture_private_ssd_asset_digest()'s). There is nothing in this
-    installer, and nothing in npm's own SRI checking, that mitigates
-    same-UID post-extraction content tampering of these ~196 packages'
-    files. This is an accepted, unmitigated gap given this project's
-    practical scope constraints, not a covered case -- state it that
-    plainly. Be precise about this scope in any future review, matching
-    the lesson of rounds 25, 27, and now 29's own findings: an inaccurate
-    "covered" claim here is itself the kind of bug that lets real gaps go
-    undetected -- when in doubt, understate coverage rather than overstate
-    it.
+    capture_private_ssd_asset_digest()'s). At the time this paragraph was
+    written, there was nothing in this installer, and nothing in npm's own
+    SRI checking, that mitigated same-UID post-extraction content tampering
+    of these ~196 packages' files -- an accepted, unmitigated gap given
+    this project's practical scope constraints at the time, not a covered
+    case. Be precise about scope in any future review, matching the lesson
+    of rounds 25, 27, and 29's own findings: an inaccurate "covered" claim
+    here is itself the kind of bug that lets real gaps go undetected --
+    when in doubt, understate coverage rather than overstate it.
+
+    Round 36, 2026-08-20 (independent Claude opus/max round-35 review,
+    P1-1 and P1-2b): TWO separate fixes, both applied here:
+
+    P1-2b: this function used to be called exactly ONCE, before the
+    node_modules move (see _install_locked_within_release_dir()'s own
+    comments at each call site) -- despite the paragraph above already
+    claiming "a same-UID attacker who instead overwrites the CONTENT..."
+    as the only residual, which implicitly (and, for this specific case,
+    incorrectly) implied the STRUCTURAL check itself covered the whole
+    remaining window. A same-UID racer who plants an undeclared sibling
+    package directly under lib/node_modules/ AFTER the move -- during the
+    real window this function spans (the move itself, "bin" mkdir, the
+    entrypoint chmod, launch guard/wrapper generation) -- went completely
+    undetected: this function was never called again to look at the
+    POST-MOVE tree at all. Reproduced end-to-end through the real
+    install(): planting a sibling package the instant the launch guard is
+    published (after the move, well after this function's one and only
+    pre-fix call) let install() complete and verify() report ok:true. Fixed
+    by calling this function a SECOND time, against the post-move tree
+    (release_dir = RELEASE_DIR/"lib", so release_dir/"node_modules" is the
+    real global_root), at the same point _install_locked_within_release_dir()
+    already re-runs the per-package content digest sweep a second time
+    post-move (the round-29/30 pattern for the four locally patched
+    packages, applied here to this function too).
+
+    P1-1: the residual described above -- registry dependency packages'
+    own file CONTENT was completely unverified -- is now substantially
+    closed, not merely re-documented. `_install_locked_within_release_dir()`
+    derives a complete, independently-trustworthy per-file digest map for
+    every registry package `npm ci` actually materializes on this
+    platform, from npm's OWN local package cache (the same
+    `npm_config_cache` directory managed_npm_environment() already points
+    every `run_npm()` call at) -- see verified_registry_package_tarball()'s
+    own docstring for exactly how that cache is read and independently
+    re-verified (never merely trusted because of where it sits), and
+    registry_package_content_digests() for how a per-file digest map is
+    derived from it the same way make_patched_asset() already derives one
+    for the four locally patched packages' own tarballs. Those maps are
+    then verified against the actual on-disk tree via the SAME
+    assert_locally_patched_package_matches_pinned_digests() sweep the four
+    locally patched packages already get (pre-move AND post-move), and
+    folded into tree_digest()'s `pinned_relative_digests` so the
+    zero-install-time-window guarantee that mechanism already provides
+    extends to these packages too. What remains an accepted, documented
+    residual after this round -- see
+    _install_locked_within_release_dir()'s own comment where
+    `release_relative_pinned_digests` is assembled for the complete,
+    precise statement -- is narrower than "the whole ~196-package registry
+    closure is unmitigated": it is now limited to the handful of declared
+    registry rows this platform's `npm ci` never downloads at all (a
+    platform-specific optional dependency skipped for darwin-arm64, which
+    therefore has no content on disk to tamper in the first place) and the
+    same microsecond-scale, in-process open/lstat gap already accepted for
+    every OTHER pinned path in this file.
     """
     node_modules_root = release_dir / "node_modules"
     if node_modules_root.is_symlink() or not node_modules_root.is_dir():
@@ -3154,12 +3541,14 @@ def assert_locally_patched_package_matches_pinned_digests(
       * an extra, undeclared file present anywhere in the package's own
         directory tree that is not in `pinned_digests` -- caught even if it
         sits deeper than this package's own top level, since the walk below
-        is fully recursive (this is also what makes an undeclared nested
-        node_modules/ planted INSIDE one of these four packages redundant-
-        but-harmlessly caught here too, ahead of
+        recurses through every subdirectory EXCEPT one named "node_modules"
+        (round 36, 2026-08-20, P1-1 fix -- see that round's comment at the
+        walk's own node_modules-skip below for why: a nested node_modules/
+        belongs to a DIFFERENT declared package with its OWN separate call
+        to this function, not to `package_dir`'s own pinned map, and an
+        UNDECLARED one is still caught, unconditionally, by
         assert_materialized_node_modules_matches_lock()'s own nested check,
-        since any file under such a plant is necessarily not in the pinned
-        map);
+        run both before and after every call to this function);
       * a symlink, or any other non-regular-file entry, anywhere in the
         tree (the original tarball this digest map was built from contains
         no symlinks at all -- safe_extract_main_asset() itself refuses any
@@ -3180,13 +3569,15 @@ def assert_locally_patched_package_matches_pinned_digests(
     additionally compares every one of these same files' content directly
     against this SAME pinned baseline as part of computing the recorded
     release-tree digest (see tree_digest()'s `pinned_relative_digests`
-    parameter). What remains an accepted, UNMITIGATED residual after this
-    round: third-party REGISTRY dependency packages' own file content --
-    see assert_materialized_node_modules_matches_lock()'s own docstring
-    for the complete, precise statement of scope, and why "npm's own SRI
-    checking covers it" (an earlier revision of this paragraph's own
-    claim) was itself an inaccurate over-claim, not merely an incomplete
-    one.
+    parameter). Through round 34, what remained an accepted, UNMITIGATED
+    residual was third-party REGISTRY dependency packages' own file
+    content -- as of round 36 that is substantially closed too (this
+    function is now called for those packages as well, pre- and post-move,
+    the identical way); see assert_materialized_node_modules_matches_lock()'s
+    own docstring for the complete, precise, currently-accurate statement
+    of scope, and why "npm's own SRI checking covers it" (an earlier
+    revision of this paragraph's own claim) was itself an inaccurate
+    over-claim, not merely an incomplete one.
 
     Content digests here are computed via sha256_file_verified(), not the
     plain sha256_file() this function used through round 28: sha256_file()
@@ -3227,6 +3618,23 @@ def assert_locally_patched_package_matches_pinned_digests(
     this package by this caller" and is treated as nothing to verify, rather
     than requiring `package_dir` to exist -- there is no real content this
     call could compare against either way.
+
+    Round 36, 2026-08-20 (independent Claude opus/max round-35 review,
+    P1-1): despite this function's own name, it is, and always was, generic
+    over ANY package tree plus ANY independently-derived per-file digest
+    map for it -- nothing below is specific to the four locally patched
+    packages. As of this round it is ALSO called, unchanged, for every
+    registry dependency package `npm ci` materializes on this platform,
+    with `pinned_digests` derived from npm's own local cache instead of a
+    directly downloaded tarball -- see
+    verified_registry_package_tarball()/registry_package_content_digests()
+    and _install_locked_within_release_dir()'s own call sites. The function
+    was deliberately NOT renamed: every fail-closed property documented
+    above (content mismatch, missing pinned file, undeclared extra file,
+    any symlink/non-regular entry) applies identically regardless of which
+    kind of package tree `package_dir` names, and renaming risked
+    introducing a transcription error across this function's own
+    extensive, cross-referenced history above for no behavioral benefit.
     """
     if not pinned_digests:
         return
@@ -3250,6 +3658,49 @@ def assert_locally_patched_package_matches_pinned_digests(
                     f"{package_label} materialized an unexpected symlink: {relative}"
                 )
             if entry.is_dir(follow_symlinks=False):
+                if entry.name == "node_modules":
+                    # Round 36, 2026-08-20 (independent Claude opus/max
+                    # round-35 review, P1-1 -- found by this round's OWN
+                    # real, non-mocked sandbox_e2e.py replay against the
+                    # real closure, not by any mocked unit test): a nested
+                    # node_modules/ directory belongs to a DIFFERENT
+                    # declared package (or several) -- real npm legitimately
+                    # nests a private copy of a transitive dependency under
+                    # a package's own node_modules/ whenever a hoisting
+                    # conflict requires it (reproduced for real:
+                    # node_modules/@aws-sdk/credential-provider-sso/
+                    # node_modules/@aws-sdk/token-providers, in a real
+                    # darwin-arm64 npm ci replay of this exact pinned
+                    # lock). `pinned_digests` here is `package_dir`'s OWN
+                    # tarball-declared members only -- it was never
+                    # supposed to, and structurally cannot, also cover a
+                    # DIFFERENT package's files. Each such nested package is
+                    # its own separate row in the lock (see
+                    # declared_registry_package_lock_rows(), whose
+                    # `lock_path` keys already include nested paths like the
+                    # one above) and gets its OWN separate call to this
+                    # exact function, against its OWN pinned digest map --
+                    # so skipping descent here loses no coverage, it avoids
+                    # a double (and wrongly-scoped) scan of an area another
+                    # call already verifies correctly. An UNDECLARED nested
+                    # container, or a stray non-directory entry planted
+                    # directly inside one, is still caught regardless of
+                    # this skip: assert_materialized_node_modules_matches_lock()
+                    # walks every "node_modules"-named directory at any
+                    # depth (subdirectory-anchored or not --
+                    # _find_nested_node_modules_containers()) and is run,
+                    # unconditionally, both immediately before and
+                    # immediately after every call to this function (pre-
+                    # and post-move). This assumes -- as
+                    # safe_extract_main_asset()'s own "package/"-top-level
+                    # requirement already does -- that no REAL, published
+                    # npm tarball ships a literal "node_modules" directory
+                    # as its own content: `npm publish`/`npm pack`
+                    # unconditionally exclude node_modules/ from what gets
+                    # packed, so this is a documented convention this
+                    # installer already relies on elsewhere, not a new
+                    # assumption introduced here.
+                    continue
                 stack.append(entry_path)
                 continue
             if not entry.is_file(follow_symlinks=False):
@@ -3925,7 +4376,54 @@ def managed_entrypoint_script(
         'if [ "$session_start" -eq 1 ] && [ "${ORCA_PRIME_AGENT_ALLOW_PROJECT_RESOURCES-}" != "1" ]; then',
         "  export ORCA_PRIME_AGENT_RESOURCE_GUARD=1",
         "fi",
-        f'exec /usr/bin/python3 -B {shlex.quote(os.fspath(launch_guard))} "$@"',
+        # Round 36, 2026-08-20 (independent Claude opus/max round-35 review,
+        # P1-2a): `-B` alone leaves sys.path[0] (the launch guard's own
+        # directory, bin/) prepended to the interpreter's module search
+        # path, and CPython inserts that entry BEFORE this exec even reaches
+        # this script's own `import` statements -- so a same-UID racer who
+        # plants bin/hashlib.py (or bin/subprocess.py, bin/fcntl.py, ... any
+        # name this launch guard imports from the stdlib) during the install
+        # window has it silently imported and EXECUTED inside the launch
+        # guard's own process, before validate_exec_target() -- the very
+        # mechanism meant to verify NODE/CLI's identity and content -- ever
+        # runs, letting the racer forge that verification from inside the
+        # process that is supposed to be enforcing it. `-I` (isolated mode)
+        # closes this: since Python 3.4, `-I` has always excluded "the
+        # script's directory" from sys.path (this is `-I`'s own, original
+        # behavior, not something `-P`, added later in 3.11, split out of
+        # it) -- empirically confirmed this round, on BOTH interpreters this
+        # generated script can run under here (Xcode's /usr/bin/python3
+        # 3.9.6, and Homebrew's python3), that `-B -I` alone leaves the real
+        # stdlib hashlib imported (not a same-directory shadow) with
+        # sys.path containing no script-relative entry at all.
+        #
+        # `-P` (a narrower flag introduced in Python 3.11 that isolates
+        # sys.path without `-I`'s other side effects, e.g. ignoring
+        # PYTHON*-prefixed environment variables) is deliberately NOT added
+        # alongside it despite an earlier draft of this fix, and the review
+        # finding that prompted it, suggesting both: this exact machine's
+        # own `/usr/bin/python3` -- the literal, hardcoded interpreter path
+        # this line execs, not whatever `python3` a PATH lookup would find
+        # -- is Xcode Command Line Tools' Python 3.9.6, which does not
+        # implement `-P` at all (`Unknown option: -P`, exit 2) and would
+        # refuse to start entirely, breaking EVERY managed `prime-agent`
+        # invocation outright -- a strictly worse regression than the
+        # shadowing vector this fix closes. Verified empirically, not
+        # assumed: `/usr/bin/python3 -B -I -P <script>` fails to start on
+        # this machine's real interpreter; `/usr/bin/python3 -B -I <script>`
+        # succeeds and already defeats the shadow, on both interpreters.
+        # `-I` alone is therefore both necessary and sufficient here; `-P`
+        # would be a redundant no-op on a 3.11+ interpreter (already implied
+        # by `-I` there) and a hard failure on this one -- pure downside,
+        # no additional coverage, on the actual target platform. The launch
+        # guard imports only fcntl/hashlib/os/stat/subprocess/sys (all
+        # stdlib, resolved from the interpreter's own compiled-in search
+        # path, never from a script-relative directory), so `-I` removes
+        # nothing this script actually needs -- confirmed by this round's
+        # own regression test, which plants a shadowing bin/hashlib.py next
+        # to a real copy of this generated script and invokes it exactly
+        # this way, under both interpreters.
+        f'exec /usr/bin/python3 -B -I {shlex.quote(os.fspath(launch_guard))} "$@"',
         "",
     ]
     return "\n".join(lines).encode("utf-8")
@@ -5842,6 +6340,22 @@ def _install_locked_within_release_dir(
     declared_nested_packages = declared_nested_node_modules_packages(
         generated_lock["packages"]
     )
+    # Round 36, 2026-08-20 (independent Claude opus/max round-35 review,
+    # P1-1): every REGISTRY dependency row this closure declares --
+    # excluding the four locally patched packages/workspace assets, which
+    # already get their own complete pre-npm-ci pinned digest map from
+    # make_patched_asset() above -- captured from the SAME validated lock
+    # content declared_top_level_packages/declared_nested_packages already
+    # are, before `npm ci` runs. Used below, once `npm ci` returns, to
+    # derive each materialized registry package's OWN complete per-file
+    # digest map from npm's own local cache and verify it the same way the
+    # four locally patched packages already are (see
+    # verified_registry_package_tarball()'s own docstring for exactly how
+    # and why that is trustworthy, and declared_registry_package_lock_rows()
+    # for exactly which rows this covers).
+    declared_registry_rows = declared_registry_package_lock_rows(
+        generated_lock["packages"]
+    )
     # Re-verify both package.json and the just-validated package-lock.json
     # are still exactly what was read/validated above, immediately before
     # `npm ci` independently re-reads both from RELEASE_DIR on its own
@@ -5936,6 +6450,38 @@ def _install_locked_within_release_dir(
             RELEASE_DIR / "node_modules" / locally_patched_name,
             pinned_digests,
             locally_patched_name,
+        )
+    # Round 36, 2026-08-20 (independent Claude opus/max round-35 review,
+    # P1-1): the structural check above, and the per-package sweep just
+    # above it, both stop at the four locally patched packages -- the
+    # ~196 third-party REGISTRY dependency packages this closure declares
+    # had no content verification at all through round 35. For every such
+    # row actually materialized on this platform (a declared row that
+    # `npm ci` never downloaded -- e.g. an optional, platform-specific
+    # dependency -- has nothing on disk to verify, and is skipped exactly
+    # like assert_materialized_node_modules_matches_lock() already
+    # tolerates that same gap for its own structural check), derive a
+    # complete per-file digest map from npm's own local cache (the SAME
+    # `cache` directory `npm ci` just downloaded into) and verify the
+    # actual on-disk tree against it via the SAME sweep the four locally
+    # patched packages already get. `registry_pinned_digests` is kept for
+    # the post-move re-sweep and the `release_relative_pinned_digests`
+    # fold further below, so each package's cached tarball is only read
+    # and decompressed once, not once per sweep.
+    registry_pinned_digests: dict[str, dict[Path, str]] = {}
+    for lock_path in sorted(declared_registry_rows):
+        package_dir = RELEASE_DIR / lock_path
+        if package_dir.is_symlink() or not package_dir.is_dir():
+            continue
+        pinned_digests = registry_package_content_digests(
+            verified_registry_package_tarball(
+                cache, declared_registry_rows[lock_path]["integrity"], lock_path
+            ),
+            lock_path,
+        )
+        registry_pinned_digests[lock_path] = pinned_digests
+        assert_locally_patched_package_matches_pinned_digests(
+            package_dir, pinned_digests, lock_path
         )
     installed_package = RELEASE_DIR / "node_modules/prime-agent"
     if installed_package.is_symlink() or not installed_package.is_dir():
@@ -6219,6 +6765,16 @@ def _install_locked_within_release_dir(
         "production_lock_sha256": closure["lock_sha256"],
         "patched_asset_sha256": patched_assets,
         "patched_manifest_names": sorted(patched_manifests),
+        # Round 36, 2026-08-20 (P1-1): the lock_path of every registry
+        # dependency package this install actually content-verified against
+        # npm's own local cache (see registry_pinned_digests, built above,
+        # and declared_registry_package_lock_rows()'s own docstring for
+        # exactly which declared rows this can and cannot cover). Recorded
+        # for audit/observability -- not itself re-checked by verify(),
+        # which relies on the ongoing full-tree release_tree_sha256
+        # comparison for post-install drift the same way it already does
+        # for every other file (see verify()'s own tree_digest() call).
+        "registry_packages_content_verified": sorted(registry_pinned_digests),
         "closure": closure,
         "node_version": NODE_VERSION,
         "npm_version": NPM_VERSION,
@@ -6402,11 +6958,43 @@ def _install_locked_within_release_dir(
     # straightforward given the mechanism now built (add each path's
     # already-known-correct digest -- e.g. LICENSE_SHA256, the generated
     # lock's own hash -- to the same map) but is intentionally out of THIS
-    # round's required scope. Separately, and NOT newly introduced by this
-    # round: the ~196 third-party registry dependency packages' own file
-    # content remains unpinned by this mechanism -- see
-    # assert_materialized_node_modules_matches_lock()'s own docstring for
-    # the precise, previously-established statement of that scope.
+    # round's required scope.
+    #
+    # Round 36, 2026-08-20 (independent Claude opus/max round-35 review,
+    # P1-1): the paragraph above, through round 34, separately noted that
+    # "the ~196 third-party registry dependency packages' own file content
+    # remains unpinned by this mechanism" as an accepted, NOT-newly-
+    # introduced gap. That is no longer accurate, and leaving it unchanged
+    # would itself be the over-claiming-by-omission bug class this file has
+    # already flagged in itself at rounds 25, 27, 29, and 32 (this
+    # paragraph's own history, just above): `registry_pinned_digests`,
+    # built above from npm's own local cache (see
+    # verified_registry_package_tarball()'s own docstring for exactly how
+    # that is derived and independently re-verified), is folded into
+    # `release_relative_pinned_digests` the identical way the four locally
+    # patched packages' own maps are, immediately above. Every registry
+    # dependency package this closure's `npm ci` actually materializes on
+    # this platform is therefore now covered by this SAME zero-window
+    # mechanism -- not merely re-recorded as inert drift, but content- and
+    # completeness-verified (missing pinned file, extra undeclared file, or
+    # content mismatch each fail closed) the same way the four locally
+    # patched packages already were. What genuinely remains unmitigated,
+    # stated as precisely as this round can measure it: (a) any declared
+    # registry row this platform's `npm ci` never downloads at all -- a
+    # platform-specific optional dependency skipped for darwin-arm64 --
+    # has no cached tarball and no materialized directory, so there is
+    # nothing to derive a digest from OR anything on disk to tamper; this
+    # is not a gap in verification, it is the absence of anything to
+    # verify, and is unconditionally excluded from
+    # `declared_registry_package_lock_rows()`'s own registry_pinned_digests
+    # construction the same way assert_materialized_node_modules_matches_lock()
+    # already tolerates the identical gap for its own structural check; (b)
+    # the four bookkeeping files named at the start of this paragraph
+    # (package.json, package-lock.json, LICENSE, upstream-package-lock.json)
+    # -- unrelated to this round's fix, unchanged from round 34; and (c) the
+    # same microsecond-scale in-process lstat/open gap described in the
+    # paragraph just below, which applies identically to every pinned path
+    # regardless of which mechanism derived its expected digest.
     #
     # The one genuinely irreducible residual for every path that IS
     # pinned (including the toolchain's now-complete tree) is the same
@@ -6418,11 +7006,41 @@ def _install_locked_within_release_dir(
     # atomic snapshot) this installer does not have, and not something any
     # amount of re-sweeping can close further, since it is internal to the
     # one read a caller has no choice but to trust once taken.
+    #
+    # Round 36, 2026-08-20 (independent Claude opus/max round-35 review,
+    # P1-2b): assert_materialized_node_modules_matches_lock() above was, for
+    # every round through 35, called exactly ONCE -- before the move just
+    # above -- despite this function's own docstring already claiming a
+    # newly-planted sibling package is caught, full stop, with no caveat
+    # that this was only true BEFORE the move. A same-UID racer who plants
+    # an undeclared sibling package directly under global_root (the
+    # POST-MOVE node_modules/, now at lib/node_modules/) in the window this
+    # function spans -- the move itself, "bin" mkdir, the entrypoint chmod,
+    # launch guard/wrapper generation -- went completely undetected: this
+    # check was never run again against the tree that window actually
+    # produces. Re-run it now, against the post-move tree (global_root.parent
+    # is RELEASE_DIR/"lib", so global_root.parent/"node_modules" is
+    # global_root itself), at the same point the per-package content sweep
+    # just below is already re-run a second time post-move -- closing this
+    # the same way round 29/30 already established for that sweep.
+    assert_materialized_node_modules_matches_lock(
+        global_root.parent, declared_top_level_packages, declared_nested_packages
+    )
     for locally_patched_name, pinned_digests in patched_content_digests.items():
         assert_locally_patched_package_matches_pinned_digests(
             global_root / locally_patched_name,
             pinned_digests,
             locally_patched_name,
+        )
+    # Round 36, 2026-08-20 (P1-1): the registry-package counterpart of the
+    # loop just above -- re-verify every materialized registry package's
+    # content against the SAME cache-derived digest map the pre-move sweep
+    # already computed (registry_pinned_digests, reused rather than
+    # re-derived so each package's cached tarball is only read once), now
+    # against its post-move path.
+    for lock_path, pinned_digests in registry_pinned_digests.items():
+        assert_locally_patched_package_matches_pinned_digests(
+            global_root.parent / lock_path, pinned_digests, lock_path
         )
     release_relative_pinned_digests: dict[str, str] = {
         os.fspath(node.relative_to(RELEASE_DIR)): node_sha256,
@@ -6442,6 +7060,22 @@ def _install_locked_within_release_dir(
     for locally_patched_name, pinned_digests in patched_content_digests.items():
         package_relative = os.fspath(
             (global_root / locally_patched_name).relative_to(RELEASE_DIR)
+        )
+        for member_relative, member_sha256 in pinned_digests.items():
+            release_relative_pinned_digests[
+                f"{package_relative}/{member_relative.as_posix()}"
+            ] = member_sha256
+    # Round 36, 2026-08-20 (P1-1): fold every registry package's own
+    # cache-derived digest map into the same pinned baseline, exactly the
+    # same way the four locally patched packages' own maps are folded just
+    # above -- extending tree_digest()'s zero-install-time-window guarantee
+    # (see the long comment above `release_relative_pinned_digests` for
+    # what that guarantee actually is and is not) to every registry
+    # dependency package this closure materializes on this platform, not
+    # only the four locally patched ones.
+    for lock_path, pinned_digests in registry_pinned_digests.items():
+        package_relative = os.fspath(
+            (global_root.parent / lock_path).relative_to(RELEASE_DIR)
         )
         for member_relative, member_sha256 in pinned_digests.items():
             release_relative_pinned_digests[
