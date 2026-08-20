@@ -2022,6 +2022,93 @@ Codex 独立发现的 P1-C）全部关闭。** 已提交 `294144ba99`。**已派
 round 42 双复核**（Claude opus+max 与 Codex sol+max，针对
 round-40+41 合并后的完整提交）。
 
+### Round 42（重要检查点）：round 39 那三个发现真的关死了，但同一个"环境/解析边界"修复本身还留了两个缝——已派发 round 43
+
+**Codex 这一路**（`task_e5a6e5f87058`）正常派发中，结果尚未到。
+
+**Claude opus/max：NO_GO，0 P0、2 P1、2 P2、4 P3**——先用 29 条独立
+构造的探针（不是这份代码自己的测试）逐条验证了 round 39 那三个
+发现全部真的关死了：符号链接必须同时满足"在 `.bin/` 里"和"目标
+已钉住"这个联合条件，各种绕法（`.bin/` 本身是符号链接、多级符号
+链接、符号链接指目录等）全部正确拒绝；`is_dir() and not
+is_symlink()` → `exists() or is_symlink()` 那处改动确认应用对了
+地方；P1-C 在 3/4 层嵌套深度下都成立，平台排除的正控制也确认没被
+误伤；祖先目录检查对真实目录/符号链接/悬空符号链接/普通文件全部
+正确拦截。
+
+**但挖出 2 个新 P1，都是同一件事——round 40 给 P1-2 做的缓解本身
+覆盖面不够完整**：
+
+- **P1-A**：`NODE_ENV_SCRUB_KEYS` 是一份只有 5 个键的"黑名单"，
+  `OPENSSL_CONF` 不在里面——这也是文档记录在案的 Node 环境变量。
+  真实复现（走完整链路：生成的 `/bin/sh` wrapper → `/usr/bin/
+  python3 -B -I` → 生成的 launch guard → 真实钉住的 node）：攻击者
+  只需要提供一个指向恶意 OpenSSL provider 配置的 `OPENSSL_CONF`，
+  真实 Node v24.19.0/OpenSSL 3.5.7 会在启动时 `dlopen()` 这个
+  provider、在 CLI 真正跑起来之前就执行了攻击者的构造函数——早于
+  `validate_exec_target()` 的摘要校验还有任何意义的时刻。退出码
+  0、会话正常运行、攻击者用无回显载荷的话完全没有可观察痕迹。
+  opus/max 特别指出这和 round 39 的 P1-2（`NODE_OPTIONS`，已被
+  round 40 修好）是**同一类、同一严重程度**的问题，只是换了一个
+  没在黑名单里的变量名。同一模式下还有两个较轻的：
+  `NODE_TLS_REJECT_UNAUTHORIZED=0`（确认能关掉 TLS 校验）、
+  `NODE_EXTRA_CA_CERTS`（确认 Node 真的会加载）定级 P2；
+  `NODE_COMPILE_CACHE` 只是被 wrapper 里的
+  `NODE_DISABLE_COMPILE_CACHE=1` 间接挡住、不在清空清单里，定级
+  P3。opus/max 的结论：这个模式说明正确的修法是**换成白名单**，
+  不是继续往黑名单里加变量名。
+- **P1-B（全新的一类，不是变体）**：round 40 那两处祖先目录检查
+  实现的都是 `Module._nodeModulePaths`（单纯往上叠 `node_modules`
+  的祖先遍历），但 Node 真正用来解析模块的是
+  `Module._resolveLookupPaths`，等于`_nodeModulePaths` **再加上**
+  `Module.globalPaths`——对真实托管 CLI 路径现场测算：安装器建模
+  的祖先链有 13 个位置，Node 真正会搜索的有 16 个，多出来、且
+  从未被检查过的 3 个正是 Node 的"全局文件夹"：
+  `$HOME/.node_modules`、`$HOME/.node_libraries`、
+  `<release>/toolchain/lib/node`。真实对照复现（同一个真实生成的
+  launch guard、同一个包名、只换了种植位置）：种在
+  `TOOL_ROOT/node_modules`（round 40 覆盖的祖先链）——正确拒绝；
+  种在 `$HOME/.node_modules`（这三个全局文件夹之一）——**guard 不
+  拒绝，攻击者代码真的被执行**。真实 bundle 里确实有 `ws` 包这种
+  "环境变量没设就无条件尝试 `require()` 原生加速模块"的写法作为
+  前置条件；opus/max 如实标注了一个诚实的范围限制——没能在真实
+  安装的 `--version`/`status` 等命令路径上真正触发这次
+  `require()`，但同样的限制"逐字适用"于 round 39 那个已经被接受为
+  P1 的 P1-2 本身（round 40 自己的测试用的也是合成的、直接要求
+  `bufferutil` 的 `cli.js`，同样没有证明真实 bundle 会触发）。判定
+  仍是 P1 的理由：这三个未检查的位置里有两个就在用户自己的家目录
+  下——不需要抢时机、不需要控制环境变量、重启也不会失效，比 round
+  40 已经覆盖的祖先链更容易写入。
+
+opus/max 的建议修法：把黑名单换成白名单（或者至少把
+`OPENSSL_CONF`/`OPENSSL_MODULES`/`OPENSSL_ENGINES`/
+`NODE_EXTRA_CA_CERTS`/`NODE_TLS_REJECT_UNAUTHORIZED`/
+`NODE_COMPILE_CACHE`/`NODE_V8_COVERAGE`/`NODE_REDIRECT_WARNINGS`/
+`NODE_ICU_DATA` 都加进去）；两处祖先目录检查都扩展到完整的
+`_resolveLookupPaths` 集合、含三个全局文件夹。两处都是局部的小
+改动。
+
+4 条 P3：round 40 那条"搬移后种符号链接指向已跳过的 registry
+行"测试，对着 round-40 之前的基线也会通过——不是因为修复本身有
+问题，是因为真正抓住这个场景的是原有的结构性检查、不是 round 40
+新加的那部分逻辑，测试没有真正独立验证新代码（其余 6 条 round 40
+测试和两条 round 41 测试都确认正确区分了正反情况）；
+`managed_npm_environment()` 只管了 `install_home/.npmrc`，没管
+`RELEASE_DIR/.npmrc`（两次真实 npm 调用的 cwd 都在那里）——影响低，
+所有安全相关的键环境变量优先级都高于项目级 `.npmrc`；
+`NODE_COMPILE_CACHE` 只靠 wrapper 间接挡住、没进清空清单；
+`tree_digest()` 对常规文件和符号链接都有拒绝未知机制、唯独对目录
+没有，一个空的、被种进去的目录会被直接折进基线——单独种一个空
+目录不构成可利用性（里面任何文件都会被拒绝未知逮到），只是记录
+下来供完整性参考。
+
+169/169 测试（两个解释器各跑两次）全过，`py_compile` 干净，真实
+`sandbox_e2e.py` 跑了三次全部 `exit 0`/`ok:true`。
+
+**已派发 round 43**：把环境变量清空从黑名单改成白名单、把两处祖先
+目录检查都扩展到 Node 真正会用的 `_resolveLookupPaths` 完整集合
+（含三个全局文件夹）。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max

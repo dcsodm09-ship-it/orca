@@ -378,8 +378,15 @@ opus/max **NO_GO，2 个新 P1**——常规文件"拒绝未知"这一半确认�
 `node_modules` 容器缺失时被误判为父包缺失、真实声明的子依赖被漏检，修法和已有的
 顶层反方向检查完全对称、支持任意嵌套深度）。169/169 测试全过、真实回放两次
 `ok:true`、对真实闭包的嵌套容器零假阳性。**至此 round 39 一次性挖出的三个 P1
-全部关闭**。**round 42 双复核已派发**（针对 round 40+41 合并后的完整提交）。完整
-逐轮细节见 `reports/ORCA-COLLAB-STATE-AND-PRIME-AGENT-2026-08-18.md`。
+全部关闭**。**round 42（重要检查点）双复核结果**：Claude opus/max **NO_GO，2 个新
+P1**——用 29 条独立探针确认 round 39 那三个发现真的关死了，但同一个"环境/解析边界"
+缓解本身还留了两条缝：环境变量清空是黑名单漏了 `OPENSSL_CONF`（真实复现出 Node 启动
+时 `dlopen()` 恶意 OpenSSL provider、早于任何摘要校验就执行）；祖先目录检查建模的是
+Node 解析算法的一半（`_nodeModulePaths`），漏了另一半（`Module.globalPaths`，含
+`$HOME/.node_modules` 等三个全局文件夹，不需要抢时机、重启也不失效）。Codex 一路
+正常派发中，结果待补。**round 43 已派发**：黑名单换白名单、祖先检查扩展到完整
+`_resolveLookupPaths` 集合。完整逐轮细节见
+`reports/ORCA-COLLAB-STATE-AND-PRIME-AGENT-2026-08-18.md`。
 `fd6a683a4a` 这个双 GO 时点**已被 8 轮后续真实发现超越，不能再作为"可以安装"的
 依据**——按用户规则，需要在当前 HEAD 上重新拿到一次真正、当下有效的双路 GO。
 
