@@ -1911,6 +1911,82 @@ Monitor 自动处理，中途手动补发一次 Enter 后开始真正干活）�
 **已把 P1-C 并入 round 41 的修复范围**（round 40 已经在专门处理
 P1-1/P1-2，不打断它正在进行的工作）。
 
+### Round 40：符号链接盲点关死，架构层面的解析边界问题做了如实评估过的缓解（已验证关闭，未独立复核）
+
+**P1-1 两处都修好了**：`tree_digest()` 新增
+`observed_symlink_relative_paths`，一个符号链接现在必须**同时**满足
+两个条件才会被接受——(a) 直接位于某个 `.bin/` 目录下（真实 `npm ci`
+在 `RELEASE_DIR` 下唯一会产生符号链接的形状，其余所有内容来源早就
+靠 `assert_tree_has_no_symlinks()` 整体拒绝符号链接）、(b) 它解析
+出来的目标本身就是 `pinned_relative_digests` 的一个键（一个经过
+摘要验证、单独钉住的常规文件）。这直接堵死了 opus/max 和 Codex 都
+复现出来的"指向 `LICENSE`"那条路——`LICENSE` 本来就是那 14 个豁免
+文件之一、从来不是钉住表的键，符号链接不管放在哪、哪怕放进
+`.bin/` 目录，都会被拒绝。搬移后那个跳过检查也一并修好：原来的
+`post_move_dir.is_dir() and not post_move_dir.is_symlink()` 对
+"符号链接指向目录"这种形状恰好算出 `False`（"还是不存在、还是没
+问题"），改成 `exists() or is_symlink()`（这份代码在别处早就在用的
+"这里有东西、不管是什么类型"写法），对常规文件/符号链接（不管悬空
+与否）/目录任何一种搬移后的物化都会拒绝。
+
+**P1-2（架构层面的解析边界问题）做了组合缓解，如实评估了边界**：
+逐条核实了 opus/max 给的四个方向——(1) 环境变量清空：审计了全文件
+每一处调用 Node 的 `subprocess.run()`，发现 `run_npm()`/
+`exact_tool_version()`/`run_version_probe()` 本来就用全新构造的
+环境字典、这轮之前就不受继承的 `NODE_OPTIONS`/`NODE_PATH` 影响；
+**唯一真正没清空的点**是生成的 launch guard 自己那次
+`subprocess.run([NODE, CLI, ...])`，完全没传 `env=`。新增
+`scrubbed_node_environment()`（复制真实环境——CLI 本来就合法需要
+`HOME`/`PATH`/`TERM`/凭据——只挑掉 `NODE_OPTIONS`/`NODE_PATH`/
+`NODE_PRESERVE_SYMLINKS(_MAIN)`/`NODE_REPL_EXTERNAL_MODULE`）接进
+`main()` 真正执行的那一步；(2) 调研了 Node 有没有办法直接关掉祖先
+目录解析这个算法本身——没找到（`--preserve-symlinks` 只影响符号
+链接处理，不影响祖先遍历本身），考虑过 Node 的 Permission Model
+但认定这台机器上 CLI 合法需要广泛的文件系统读写，一轮之内做不到
+既收紧又不破坏合法用途，明确决定本轮不追这条路；(3) 真实核实了
+这台机器上的权限现状：`SSD_ROOT`/`/Volumes`/`/` 确认不是同 UID
+可写（APFS 启用了所有者管理、`root:wheel`），但从 `RELEASE_DIR`
+到 `SSD_ROOT` 之间真实存在 5 个同 UID 可写、而且真实出现在现场
+dump 出来的 Node 解析路径链上的祖先位置；(4) 用了一个更简单、更强
+的不变式做主要缓解，不是"和装机时的基线比对"——这些祖先位置本来
+就**不应该存在**（现场确认这台机器上确实没有，这个安装器从不往
+`RELEASE_DIR` 之外写任何东西）。新增
+`unexpected_ancestor_node_modules()` 接进生成的 launch guard，从
+`RELEASE_DIR` 一路往上走到真实文件系统根，任何一级祖先目录下出现
+`node_modules`（含悬空符号链接）就在真正执行 Node 之前拒绝；另外
+在 `verify()` 里加了一个纵深防御用的 Python 侧对应实现
+`assert_no_unexpected_ancestor_node_modules()`。
+
+14 条新回归测试（P1-1 七条，覆盖多个钉住目录形状的位置外加
+".bin/ 里但目标没被钉住"这种刁钻场景，加一条正控制测试证明真实
+`.bin/` 符号链接依然放行；P1-2 七条，用真实 Node 二进制——每条先
+用真实 Node 证明不加缓解时漏洞确实成立，再证明缓解措施能挡住同一
+个布局）全部确认对 round-38 基线 `8160356b9a` 可复现、修复后关闭。
+166/166 测试（两个解释器各跑两次，外加一轮最终确认，共 8 次干净
+运行）全过，`py_compile` 在三个相关文件、两个解释器下都干净。
+round 24-38 的既有回归测试逐条抽查仍然通过。真实（非 mock）
+`sandbox_e2e.py` 跑了两次，均 `ok:true`/`exit 0`/
+`real_user_state_changed:false`、26911 个条目、两次都精确匹配钉住
+的 lock/LICENSE 摘要。
+
+**对 P1-2 残留范围的如实说明**（没有过度断言）：没有从架构上真正
+锁死 Node 自己的解析算法——这是一道"存在性检查"，不是"结构性
+保证 Node 不可能到达那里"；新检查和真正 exec 之间还留有一个和
+`validate_exec_target()` 早就承认的同一类微秒级 TOCTOU 残留、
+本轮没有新增也没有关掉；这轮完全没碰"`RELEASE_DIR` 内部安装完之后
+被篡改"这个此前几轮已经记录过的独立残留；"这些祖先位置本不该
+存在"这条不变式是经验性的（今天在这台机器上核实确实不存在），不是
+结构性保证——一旦真的违反，安全的失败方式是拒绝启动，这是刻意
+选择的权衡，但确实是一个窄但真实的假阳性面，不是零成本；环境变量
+清空清单刻意收得很窄（只挑模块解析/代码注入相关的几个变量），不是
+对 Node 全部安全相关环境变量做了一遍通盘清理。
+
+已提交 `0dd1aadf3b`。**已派发 round 41**：先把 Codex round 39 独立
+发现、round 40 范围之外的 P1-C（父包存在但嵌套 `node_modules`
+容器缺失时被误判为父包缺失、子依赖漏检）修好，再对 round 40+41
+合并后的完整提交派发真正的双复核——不在一个已知还有未修复 P1 的
+提交上浪费一轮复核。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
