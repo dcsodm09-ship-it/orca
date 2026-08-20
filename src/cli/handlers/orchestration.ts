@@ -22,7 +22,10 @@ import type {
 } from '../../shared/orchestration-worker-output'
 import type { NativeChatMessage } from '../../shared/native-chat-types'
 import type { RuntimeStatus, RuntimeTerminalRead } from '../../shared/runtime-types'
-import { ORCHESTRATION_WORKER_LAUNCH_PREFERENCES_RUNTIME_CAPABILITY } from '../../shared/protocol-version'
+import {
+  ORCHESTRATION_WORKER_LAUNCH_PREFERENCES_RUNTIME_CAPABILITY,
+  ORCHESTRATION_WORKER_LIST_AGENT_FILTER_RUNTIME_CAPABILITY
+} from '../../shared/protocol-version'
 import { orchestrationMigrationData } from '../../shared/orchestration-rpc-contract'
 import { ORCHESTRATION_RUN_PAGE_LIMIT } from '../../shared/orchestration-run-pagination'
 import {
@@ -1059,6 +1062,20 @@ export const ORCHESTRATION_HANDLERS: Record<string, CommandHandler> = {
         `invalid --terminal-state '${terminalState}', expected one of: ${WORKER_TERMINAL_LIST_STATES.join(', ')}`
       )
     }
+    const agent = getOptionalStringFlag(flags, 'agent')
+    if (agent) {
+      const status = await client.call<RuntimeStatus>('status.get')
+      if (
+        !status.result.capabilities?.includes(
+          ORCHESTRATION_WORKER_LIST_AGENT_FILTER_RUNTIME_CAPABILITY
+        )
+      ) {
+        throw new RuntimeClientError(
+          'incompatible_runtime',
+          'The connected Orca runtime does not support filtering worker-list by --agent. Update or restart Orca and try again.'
+        )
+      }
+    }
     const result = await client.call<{
       workers: {
         dispatchId: string
@@ -1069,11 +1086,14 @@ export const ORCHESTRATION_HANDLERS: Record<string, CommandHandler> = {
         agentTerminalHandle: string | null
         terminalState: string | null
         resource: unknown
+        agent: string | null
+        model: string | null
       }[]
       counts: Record<string, number>
     }>('orchestration.workerList', {
       run: getOptionalStringFlag(flags, 'run'),
-      terminalState
+      terminalState,
+      agent
     })
     printResult(result, json, (r) => {
       if (r.workers.length === 0) {
@@ -1082,7 +1102,7 @@ export const ORCHESTRATION_HANDLERS: Record<string, CommandHandler> = {
       const rows = r.workers
         .map(
           (w) =>
-            `${w.dispatchId} task=${w.taskId} [${w.workerState}] terminal=${w.terminalState ?? 'none'}`
+            `${w.dispatchId} task=${w.taskId} [${w.workerState}] terminal=${w.terminalState ?? 'none'}${w.agent ? ` agent=${w.agent}${w.model ? `/${w.model}` : ''}` : ''}`
         )
         .join('\n')
       const counts = Object.entries(r.counts)

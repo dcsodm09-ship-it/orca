@@ -459,6 +459,11 @@ function formatCommandFlagHelp(flag: string, commandPath: string[]): string {
   if (command === 'orchestration worker-list' && flag === 'terminal-state') {
     return '--terminal-state <state> Terminal accounting filter: active, reclaimable, retained, release_pending, release_unknown, or released'
   }
+  // Why: the shared --agent help describes launching a TUI agent in a terminal,
+  // which is the wrong meaning here — this filters existing rows, it launches nothing.
+  if (command === 'orchestration worker-list' && flag === 'agent') {
+    return '--agent <id>           Filter to workers launched with this exact agent id (claude, codex, cursor, ...)'
+  }
   if (command === 'linear list-issues' && flag === 'workspace') {
     return '--workspace <id|all>  Connected Linear workspace id, or all'
   }

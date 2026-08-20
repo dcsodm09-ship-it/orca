@@ -4609,9 +4609,12 @@ export function registerPtyHandlers(
       }
       const isClaudeLaunch =
         !preAdoptedStablePane && !args.connectionId && isClaudeLaunchCommand(args.command)
-      if (isClaudeLaunch && isClaudeAuthSwitchInProgress()) {
-        throw new Error('A Claude account switch is in progress. Try again after it finishes.')
-      }
+      // Why: don't hard-fail just because a switch happens to be running -- prepareClaudeAuth
+      // (below) already serializes behind any in-flight switch via ClaudeRuntimeAuthService's
+      // own mutation queue, since both share the same runtimeAuth singleton (see
+      // ClaudeAccountService.syncRuntimeAuthWithLivePtyGate). The post-prepareClaudeAuth check
+      // further down still guards the narrow case where a *new* switch starts after this call's
+      // own read completed.
       // Why: runtime-created terminals carry no renderer-computed projectRuntime; resolve from worktreeId to honor the project's Windows runtime.
       const terminalRuntimeOptions =
         process.platform === 'win32' && !args.connectionId
@@ -6274,9 +6277,12 @@ export function registerPtyHandlers(
         }
         const isClaudeLaunch =
           !preAdoptedStablePane && !args.connectionId && isClaudeLaunchCommand(args.command)
-        if (isClaudeLaunch && isClaudeAuthSwitchInProgress()) {
-          throw new Error('A Claude account switch is in progress. Try again after it finishes.')
-        }
+        // Why: don't hard-fail just because a switch happens to be running -- prepareClaudeAuth
+        // (below) already serializes behind any in-flight switch via ClaudeRuntimeAuthService's
+        // own mutation queue, since both share the same runtimeAuth singleton (see
+        // ClaudeAccountService.syncRuntimeAuthWithLivePtyGate). The post-prepareClaudeAuth check
+        // further down still guards the narrow case where a *new* switch starts after this
+        // call's own read completed.
         const terminalRuntimeOptions =
           process.platform === 'win32' && !args.connectionId
             ? resolveLocalWindowsTerminalRuntimeOptions({

@@ -109,3 +109,43 @@ export function deriveWorkerTerminalListState(params: {
     ? 'retained'
     : 'active'
 }
+
+// Projects a dispatch's frozen start_options JSON into worker-list's agent/model columns.
+const EMPTY_WORKER_LIST_LAUNCH_SELECTION = { agent: null, model: null } as const
+
+/** Why: unlike exposeWorker's equivalent unguarded JSON.parse (which only fails the ONE
+ *  dispatch being queried by worker-show), this feeds a worker-list row map — one malformed
+ *  or non-object start_options value (e.g. literal "null", matching JSON.stringify(null))
+ *  would otherwise throw uncaught through the whole query and blank the entire list, not just
+ *  the offending row. Not reachable from either current insert path (both pass object
+ *  literals), but createStartingWorkerDispatch's startOptions param is typed `unknown` with no
+ *  validation, so this is defense against a real latent input shape, not a hypothetical one. */
+export function deriveWorkerListLaunchSelection(startOptionsJson: string | null): {
+  agent: string | null
+  model: string | null
+} {
+  if (!startOptionsJson) {
+    return EMPTY_WORKER_LIST_LAUNCH_SELECTION
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(startOptionsJson)
+  } catch {
+    return EMPTY_WORKER_LIST_LAUNCH_SELECTION
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    return EMPTY_WORKER_LIST_LAUNCH_SELECTION
+  }
+  const receipt = parsed as {
+    agent?: string | null
+    launch?: {
+      effective?: { model?: string | null } | null
+      requested?: { model?: string | null }
+    }
+  }
+  const rawModel = receipt.launch?.effective?.model ?? receipt.launch?.requested?.model ?? null
+  return {
+    agent: typeof receipt.agent === 'string' ? receipt.agent : null,
+    model: typeof rawModel === 'string' ? rawModel : null
+  }
+}

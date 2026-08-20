@@ -1,5 +1,8 @@
 import type { DispatchStatus } from '../../types'
-import { deriveWorkerTerminalListState } from '../../worker-terminal-ownership'
+import {
+  deriveWorkerListLaunchSelection,
+  deriveWorkerTerminalListState
+} from '../../worker-terminal-ownership'
 import type {
   WorkerDispatchListState,
   WorkerTerminalResourceRow,
@@ -94,13 +97,16 @@ export function listWorkerTerminalResources(
   agentTerminalHandle: string | null
   terminalState: WorkerTerminalListState | null
   resource: WorkerTerminalResourceRow | null
+  agent: string | null
+  model: string | null
 }[] {
   const rows = this.db
     .prepare(
       `SELECT d.id AS dispatch_id,
               COALESCE(w.state, 'unsupervised') AS worker_state,
               COALESCE(w.agent_terminal_handle, d.assignee_handle) AS agent_terminal_handle,
-              d.task_id, d.run_id, d.status AS dispatch_status
+              d.task_id, d.run_id, d.status AS dispatch_status,
+              w.start_options AS start_options
          FROM dispatch_contexts d
          LEFT JOIN worker_dispatches w ON w.dispatch_id = d.id
         ${params.runId ? 'WHERE d.run_id = ?' : ''}
@@ -113,6 +119,7 @@ export function listWorkerTerminalResources(
     task_id: string
     run_id: string
     dispatch_status: DispatchStatus
+    start_options: string | null
   }[]
   const resources = this.db
     .prepare(
@@ -126,6 +133,7 @@ export function listWorkerTerminalResources(
   )
   return rows.map((row) => {
     const resource = resourceByOwner.get(row.dispatch_id) ?? null
+    const { agent, model } = deriveWorkerListLaunchSelection(row.start_options)
     return {
       dispatchId: row.dispatch_id,
       taskId: row.task_id,
@@ -138,7 +146,9 @@ export function listWorkerTerminalResources(
         agentTerminalHandle: row.agent_terminal_handle,
         resource
       }),
-      resource
+      resource,
+      agent,
+      model
     }
   })
 }

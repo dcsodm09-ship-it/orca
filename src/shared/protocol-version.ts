@@ -49,6 +49,13 @@ export const ORCHESTRATION_WORKER_STOP_VERDICT_RUNTIME_CAPABILITY =
   'orchestration.worker-stop-verdict.v1' as const
 export const ORCHESTRATION_WORKER_LAUNCH_PREFERENCES_RUNTIME_CAPABILITY =
   'orchestration.worker-launch-preferences.v1' as const
+// Why: older hosts silently strip worker-list's agent request/response fields
+// (a plain zod object with no .strict()), so a filtered query against an old
+// host returns the full unfiltered list with no error the caller could act
+// on. Clients may only send --agent, or trust the response's agent/model
+// fields, once this is advertised.
+export const ORCHESTRATION_WORKER_LIST_AGENT_FILTER_RUNTIME_CAPABILITY =
+  'orchestration.worker-list-agent-filter.v1' as const
 export const ORCHESTRATION_FEDERATION_CONTROL_MAIL_PROTOCOL_VERSION = 2 as const
 export const ORCHESTRATION_FEDERATION_LIFECYCLE_SETTLEMENT_PROTOCOL_VERSION = 3 as const
 export const ORCHESTRATION_CONTRACT_VERSION = 1 as const
@@ -119,6 +126,7 @@ export const RUNTIME_CAPABILITIES = [
   ORCHESTRATION_FEDERATION_LIFECYCLE_SETTLEMENT_RUNTIME_CAPABILITY,
   ORCHESTRATION_WORKER_STOP_VERDICT_RUNTIME_CAPABILITY,
   ORCHESTRATION_WORKER_LAUNCH_PREFERENCES_RUNTIME_CAPABILITY,
+  ORCHESTRATION_WORKER_LIST_AGENT_FILTER_RUNTIME_CAPABILITY,
   ORCHESTRATION_CONTRACT_RUNTIME_CAPABILITY,
   BROWSER_SCREENCAST_RUNTIME_CAPABILITY,
   BROWSER_TAB_CREATE_KNOWN_ID_RUNTIME_CAPABILITY,

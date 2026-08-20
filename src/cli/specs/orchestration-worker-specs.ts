@@ -109,11 +109,12 @@ export const ORCHESTRATION_WORKER_COMMAND_SPECS: CommandSpec[] = [
     path: ['orchestration', 'worker-list'],
     summary: 'List supervised worker terminal resource accounting',
     usage:
-      'orca orchestration worker-list [--run <run_id>] [--terminal-state <active|reclaimable|retained|release_pending|release_unknown|released>] [--json]',
-    allowedFlags: [...GLOBAL_FLAGS, 'run', 'terminal-state'],
+      'orca orchestration worker-list [--run <run_id>] [--terminal-state <active|reclaimable|retained|release_pending|release_unknown|released>] [--agent <agent>] [--json]',
+    allowedFlags: [...GLOBAL_FLAGS, 'run', 'terminal-state', 'agent'],
     notes: [
       'Terminal state is process accounting and is reported separately from Task status; a completed Task can still own a live terminal.',
-      'Context-only Dispatches created by orchestration dispatch are included as unsupervised with terminal state retained.'
+      'Context-only Dispatches created by orchestration dispatch are included as unsupervised with terminal state retained.',
+      '--agent filters to workers launched with that exact agent id (claude, codex, cursor, ...); Context-only Dispatches and reused terminals record no agent and never match a non-empty filter.'
     ]
   }
 ]

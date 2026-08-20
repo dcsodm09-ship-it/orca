@@ -6,7 +6,12 @@ import { delimiter } from 'node:path'
 import { LocalPtyProvider } from '../providers/local-pty-provider'
 import { __resetPersistedWindowsPathCacheForTests } from '../pty/windows-environment-path'
 import { __setWindowsPathRegistryLoaderForTests } from '../pty/windows-path-registry-reader'
-import { hasLiveClaudePtys, markClaudePtySpawned } from '../claude-accounts/live-pty-gate'
+import {
+  hasLiveClaudePtys,
+  markClaudePtySpawned,
+  beginClaudeAuthSwitch,
+  endClaudeAuthSwitch
+} from '../claude-accounts/live-pty-gate'
 import { registerPtyHandlers, buildPtyHostEnv, clearProviderPtyState } from './pty'
 
 vi.mock('electron', () => import('./pty-ipc-mock-registry').then((m) => m.electronModuleMock()))
@@ -155,6 +160,72 @@ describe('registerPtyHandlers', () => {
       await handlers.get('pty:kill')!(null, { id: spawnResult.id })
 
       expect(hasLiveClaudePtys()).toBe(false)
+    })
+    it('spawns a local Claude launch that started while an account switch was in flight', async () => {
+      let exitCb: ((info: { exitCode: number }) => void) | undefined
+      spawnMock.mockReturnValue({
+        onData: vi.fn(() => makeDisposable()),
+        onExit: vi.fn((cb: (info: { exitCode: number }) => void) => {
+          exitCb = cb
+          return makeDisposable()
+        }),
+        write: vi.fn(),
+        resize: vi.fn(),
+        kill: vi.fn(() => exitCb?.({ exitCode: -1 })),
+        process: 'zsh',
+        pid: 12346
+      })
+      beginClaudeAuthSwitch()
+      const prepareClaudeAuth = vi.fn(async () => {
+        // Real prepareForClaudeLaunch serializes behind the in-flight switch via
+        // ClaudeRuntimeAuthService's own mutation queue, and the switch's finally
+        // block flips isClaudeAuthSwitchInProgress() back to false before this
+        // settles -- simulate that ordering here.
+        endClaudeAuthSwitch()
+        return {
+          configDir: '/tmp/claude',
+          envPatch: {},
+          stripAuthEnv: false,
+          provenance: 'managed:account-1'
+        }
+      })
+      registerPtyHandlers(mainWindow as never, undefined, undefined, undefined, prepareClaudeAuth)
+
+      try {
+        const spawnResult = (await handlers.get('pty:spawn')!(null, {
+          cols: 80,
+          rows: 24,
+          command: 'claude'
+        })) as { id: string }
+        expect(spawnResult.id).toEqual(expect.any(String))
+        expect(prepareClaudeAuth).toHaveBeenCalledTimes(1)
+        await handlers.get('pty:kill')!(null, { id: spawnResult.id })
+      } finally {
+        endClaudeAuthSwitch()
+      }
+    })
+    it('still blocks a spawn when a new account switch starts while prepareClaudeAuth is resolving', async () => {
+      const prepareClaudeAuth = vi.fn(async () => {
+        // A brand-new switch begins in the narrow window between this call's own
+        // auth read settling and the post-check line running.
+        beginClaudeAuthSwitch()
+        return {
+          configDir: '/tmp/claude',
+          envPatch: {},
+          stripAuthEnv: false,
+          provenance: 'managed:account-1'
+        }
+      })
+      registerPtyHandlers(mainWindow as never, undefined, undefined, undefined, prepareClaudeAuth)
+
+      try {
+        await expect(
+          handlers.get('pty:spawn')!(null, { cols: 80, rows: 24, command: 'claude' })
+        ).rejects.toThrow('A Claude account switch is in progress')
+        expect(prepareClaudeAuth).toHaveBeenCalledTimes(1)
+      } finally {
+        endClaudeAuthSwitch()
+      }
     })
     it('clears Claude live-PTY tracking from shared provider teardown', () => {
       markClaudePtySpawned('ssh-claude-pty')

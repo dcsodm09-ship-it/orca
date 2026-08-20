@@ -22,7 +22,8 @@ const WORKER_TERMINAL_LIST_STATES = [
 
 const WorkerListParams = z.object({
   run: z.string().min(1).optional(),
-  terminalState: z.enum(WORKER_TERMINAL_LIST_STATES).optional()
+  terminalState: z.enum(WORKER_TERMINAL_LIST_STATES).optional(),
+  agent: z.string().min(1).optional()
 })
 
 export const ORCHESTRATION_WORKER_RELEASE_METHODS: RpcMethod[] = [
@@ -146,7 +147,11 @@ export const ORCHESTRATION_WORKER_RELEASE_METHODS: RpcMethod[] = [
       const db = runtime.getOrchestrationDb()
       const rows = db.listWorkerTerminalResources({ runId: params.run })
       const workers = rows
-        .filter((row) => !params.terminalState || row.terminalState === params.terminalState)
+        .filter(
+          (row) =>
+            (!params.terminalState || row.terminalState === params.terminalState) &&
+            (!params.agent || row.agent === params.agent)
+        )
         .map((row) => ({
           dispatchId: row.dispatchId,
           taskId: row.taskId,
@@ -155,7 +160,9 @@ export const ORCHESTRATION_WORKER_RELEASE_METHODS: RpcMethod[] = [
           dispatchStatus: row.dispatchStatus,
           agentTerminalHandle: row.agentTerminalHandle,
           terminalState: row.terminalState,
-          resource: row.resource ? exposeWorkerTerminalResource(row.resource) : null
+          resource: row.resource ? exposeWorkerTerminalResource(row.resource) : null,
+          agent: row.agent,
+          model: row.model
         }))
       const counts: Partial<Record<WorkerTerminalListState, number>> = {}
       for (const row of rows) {

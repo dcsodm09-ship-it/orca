@@ -7,6 +7,7 @@ import {
 import { setupPtyIpcSuite } from './pty-ipc-test-harness'
 import { makePaneKey } from '../../shared/stable-pane-id'
 import { registerPtyHandlers, getPtyIdForPaneKey, setLocalPtyProvider } from './pty'
+import { beginClaudeAuthSwitch, endClaudeAuthSwitch } from '../claude-accounts/live-pty-gate'
 
 vi.mock('electron', () => import('./pty-ipc-mock-registry').then((m) => m.electronModuleMock()))
 vi.mock('fs', () => import('./pty-ipc-mock-registry').then((m) => m.fsModuleMock()))
@@ -575,4 +576,141 @@ describe('registerPtyHandlers', () => {
       ).toHaveLength(1)
     }
   )
+
+  describe('runtime-dispatched Claude spawn vs an in-flight account switch', () => {
+    type RuntimeSpawnController = {
+      spawn(args: Record<string, unknown>): Promise<{ id: string }>
+    }
+
+    function registerFreshRuntimeSpawnHarness(
+      prepareClaudeAuth: () => Promise<{
+        configDir: string
+        envPatch: Record<string, string>
+        stripAuthEnv: boolean
+        provenance: string
+      }>
+    ): RuntimeSpawnController {
+      const providerSpawn = vi.fn(async () => ({ id: 'pty-runtime-claude' }))
+      setLocalPtyProvider({
+        spawn: providerSpawn,
+        write: vi.fn(),
+        resize: vi.fn(),
+        kill: vi.fn(),
+        shutdown: vi.fn(),
+        sendSignal: vi.fn(),
+        getCwd: vi.fn(),
+        getInitialCwd: vi.fn(),
+        clearBuffer: vi.fn(),
+        acknowledgeDataEvent: vi.fn(),
+        hasChildProcesses: vi.fn(),
+        getForegroundProcess: vi.fn(),
+        serialize: vi.fn(),
+        revive: vi.fn(),
+        onData: vi.fn(() => () => {}),
+        onReplay: vi.fn(() => () => {}),
+        onExit: vi.fn(() => () => {}),
+        listProcesses: vi.fn(async () => []),
+        attach: vi.fn(),
+        getDefaultShell: vi.fn(),
+        getProfiles: vi.fn()
+      } as never)
+      const store = { persistPtyBinding: vi.fn() }
+      let controller: RuntimeSpawnController | null = null
+      const runtime = {
+        setPtyController: vi.fn((value) => {
+          controller = value
+        }),
+        resolveTerminalPane: vi.fn(() => {
+          throw new Error('terminal_not_found')
+        }),
+        createPreAllocatedTerminalHandle: vi.fn(() => 'term-runtime-claude'),
+        preAllocateHandleForPty: vi.fn(() => 'term-runtime-claude'),
+        registerPreAllocatedHandleForPty: vi.fn(),
+        beginPtyRegistration: vi.fn(),
+        cancelPendingPtyRegistration: vi.fn(),
+        assertPtyRegistrationAllowed: vi.fn(),
+        registerPty: vi.fn(),
+        noteTerminalSpawnCommand: vi.fn(),
+        seedHeadlessTerminal: vi.fn(),
+        onPtySpawned: vi.fn(),
+        onPtyExit: vi.fn(),
+        onPtyData: vi.fn()
+      }
+      registerPtyHandlers(
+        mainWindow as never,
+        runtime as never,
+        undefined,
+        undefined,
+        prepareClaudeAuth,
+        store as never
+      )
+      if (!controller) {
+        throw new Error('runtime pty controller was not registered')
+      }
+      return controller
+    }
+
+    it('lets a fresh runtime-dispatched Claude spawn proceed when it starts mid account-switch', async () => {
+      beginClaudeAuthSwitch()
+      const prepareClaudeAuth = vi.fn(async () => {
+        // Mirrors ClaudeRuntimeAuthService.prepareForClaudeLaunch: it serializes
+        // behind the in-flight switch via the service's own mutation queue, and the
+        // switch's finally block flips isClaudeAuthSwitchInProgress() back to false
+        // before this settles.
+        endClaudeAuthSwitch()
+        return {
+          configDir: '/tmp/claude',
+          envPatch: {},
+          stripAuthEnv: false,
+          provenance: 'managed:account-1'
+        }
+      })
+      const spawnController = registerFreshRuntimeSpawnHarness(prepareClaudeAuth)
+
+      try {
+        await expect(
+          spawnController.spawn({
+            cols: 80,
+            rows: 24,
+            cwd: '/tmp/runtime-claude',
+            worktreeId: 'repo-1::/tmp/runtime-claude',
+            command: 'claude'
+          })
+        ).resolves.toMatchObject({ id: 'pty-runtime-claude' })
+        expect(prepareClaudeAuth).toHaveBeenCalledTimes(1)
+      } finally {
+        endClaudeAuthSwitch()
+      }
+    })
+
+    it('still blocks a fresh runtime-dispatched Claude spawn when a new switch starts while prepareClaudeAuth is resolving', async () => {
+      const prepareClaudeAuth = vi.fn(async () => {
+        // A brand-new switch begins in the narrow window between this call's own
+        // auth read settling and the post-check line running.
+        beginClaudeAuthSwitch()
+        return {
+          configDir: '/tmp/claude',
+          envPatch: {},
+          stripAuthEnv: false,
+          provenance: 'managed:account-1'
+        }
+      })
+      const spawnController = registerFreshRuntimeSpawnHarness(prepareClaudeAuth)
+
+      try {
+        await expect(
+          spawnController.spawn({
+            cols: 80,
+            rows: 24,
+            cwd: '/tmp/runtime-claude-2',
+            worktreeId: 'repo-1::/tmp/runtime-claude-2',
+            command: 'claude'
+          })
+        ).rejects.toThrow('A Claude account switch is in progress')
+        expect(prepareClaudeAuth).toHaveBeenCalledTimes(1)
+      } finally {
+        endClaudeAuthSwitch()
+      }
+    })
+  })
 })
