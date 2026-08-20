@@ -2605,6 +2605,29 @@ sol+max）——按用户规则，任一路 P0/P1 都阻断，修复后必须对
 那一路的独立结果，两路综合判断后再决定是否值得再开一轮 round 49 把
 CLI 侧这个更大的口子真正关上，而不是仅凭一路意见就自行拍板。
 
+### Round 48 Codex 一路第 5 次撞上 Trusted Access 墙——但撞墙前先真跑出了一个新的、独立的可疑发现，已改用 gpt-5.6-terra/high 重派并把这个发现带进新一轮任务书
+
+Codex sol/max 一路（`task_13e5e8fdbede`）真的干了活——"这轮要格外广"的
+要求下，它在环境变量/模块解析这条线索之外，找到并开始复现一个新的、独立
+的可疑点：**`atomic_write()`（用于 recovery-manifest 状态转换）在遇到一个
+"确定性的后来占用者"时会无条件覆盖，且一次注入的真实文件系统竞态让它在
+最终 manifest 路径其实是符号链接、且目标的 mode 已被改动的情况下仍然返回
+成功**——原话还没写完（"I'll finish the..."）就被截断在了同一堵墙上：这是
+本条 prime-agent 复核线索里第 5 次撞上 OpenAI 自己的"Trusted Access for
+Cyber"内容策略墙（round 35、round 42 旧提交复核、round 46 第一次尝试、
+round 46 最终一次、这次 round 48）。
+
+按 round 46 已经验证过、用户当时明确授权过的同一套处理方式：直接改派
+`gpt-5.6-terra`/`high` 重跑，这次没有再重新请示——同一条复核线索里同一个
+反复出现的基础设施问题，视为已授权模式的延续，而不是每次重新问一遍。新
+任务书里把上面这条 `atomic_write()`/recovery-manifest 发现明确列为**第一
+优先级**，要求新的一路真跑代码复现或证伪它，而不是重新从头走一遍已经被
+opus/max 那一路和上一次尝试覆盖过的内容。派发过程再次撞上（第 N 次）那个
+共享 `hooks.json` 信任竞态，用已经验证过的"3+Enter 恢复终端 → 新建
+task-create + `worker-start --terminal` 重新挂载到真实 Orca 追踪下"套路
+恢复，确认 `task_7cf74c3fc490` / dispatch `ctx_4bb51f477f0b` 已在真实
+工作。结果未出，继续等待。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
