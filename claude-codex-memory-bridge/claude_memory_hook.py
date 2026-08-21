@@ -1913,6 +1913,22 @@ _EMAIL_RE = re.compile(
 )
 _LONG_BLOB_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9+/=_-]{48,}(?![A-Za-z0-9])")
 _HOME_RE = re.compile(r"/Users/[^/\s]+")
+# Structured PII beyond credentials (2026-08-22 gap-analysis finding): a mainland China mobile
+# number and 18-digit resident ID number are exactly the kind of fixed-shape "structured
+# sensitive field" that must not reach another agent's context unredacted -- unlike a personal
+# name or street address, both have a checkable format a regex can target without an NLP model.
+# Same `[A-Za-z0-9]` boundary idiom as `_LONG_BLOB_RE`/`_EMAIL_RE` above (not `\b`, which silently
+# fails at a CJK-glued edge -- see `_BEARER_RE`'s own comment on this exact bug class), so this
+# cannot partially match a digit run embedded inside a longer alnum token (order id, hash) and
+# cannot leave a boundary-adjacent fragment leaked either. Verified empirically before landing:
+# "ORD1385551234567X99" and "deadbeef13800138000cafebabe" (digits glued to letters on both sides)
+# do not match either pattern; "手机13800138000该" (CJK-glued, no whitespace) matches and redacts
+# in full; redact(redact(x)) == redact(x) holds since the replacement token is pure ASCII letters.
+_CN_ID_NUMBER_RE = re.compile(
+    r"(?<![A-Za-z0-9])[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])"
+    r"(?:0[1-9]|[12]\d|3[01])\d{3}[0-9Xx](?![A-Za-z0-9])"
+)
+_CN_MOBILE_RE = re.compile(r"(?<![A-Za-z0-9])1[3-9]\d{9}(?![A-Za-z0-9])")
 
 
 def _redact_ipv6(match: re.Match[str]) -> str:
@@ -1942,6 +1958,11 @@ def redact(text: str) -> str:
     text = _MAC_ADDRESS_RE.sub("[REDACTED_IP]", text)
     text = _EMAIL_RE.sub("[REDACTED_EMAIL]", text)
     text = _LONG_BLOB_RE.sub("[REDACTED_BLOB]", text)
+    # Structured PII passes (2026-08-22): same alnum-boundary family as the patterns immediately
+    # above, so ordering relative to them does not matter; placed here rather than after the
+    # CJK-secret passes below purely to keep all alnum-boundary patterns grouped together.
+    text = _CN_ID_NUMBER_RE.sub("[REDACTED_ID]", text)
+    text = _CN_MOBILE_RE.sub("[REDACTED_PHONE]", text)
     # CJK-secret passes run last (round-2 dual-review finding, 2026-08-22, item 1): every pattern
     # above already gets first crack at any ASCII run in the text, so these three passes can only
     # add further redaction on top of what's left -- never truncate an ASCII run that one of the

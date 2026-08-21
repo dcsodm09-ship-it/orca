@@ -1442,6 +1442,41 @@ class ClaudeMemoryHookTests(unittest.TestCase):
         self.assertNotIn("00:1B:44:11:3A:B7", context)
         self.assertEqual(context.count("[REDACTED_IP]"), 3)
 
+    def test_redacts_cn_mobile_number_glued_to_cjk(self) -> None:
+        # 2026-08-22 gap-analysis finding: redact() covered credential/network
+        # identifiers but not a mainland China mobile number, which is exactly
+        # the kind of fixed-shape structured PII this bridge should not forward
+        # unredacted into another agent's context. Includes a CJK-glued case
+        # (no whitespace) and an alnum-glued non-match to confirm the boundary
+        # does not misfire on an order id / hash containing the same digits.
+        self.fixture.add_memory(
+            "# contact notes\n"
+            "call me at 13800138000 anytime\n"
+            "手机13800138000该号码勿外传\n"
+            "order id ORD1385551234567X99 is unrelated\n"
+        )
+        output = self.fixture.run("contact notes")
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("13800138000", context)
+        self.assertIn("[REDACTED_PHONE]", context)
+        self.assertIn("ORD1385551234567X99", context)
+
+    def test_redacts_cn_id_number_does_not_leak_partial_digits(self) -> None:
+        # Companion to the mobile-number test above: an 18-digit resident ID
+        # number is likewise a fixed, checkable structured-PII shape. Confirms
+        # a longer digit run that merely contains a valid-looking substring
+        # (no letter/digit boundary either side) is not left half-redacted.
+        self.fixture.add_memory(
+            "# contact notes\n"
+            "id number 110101199003077758 on file\n"
+            "tracking 84123800138000123456789 is unrelated\n"
+        )
+        output = self.fixture.run("contact notes")
+        context = json.loads(output)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("110101199003077758", context)
+        self.assertIn("[REDACTED_ID]", context)
+        self.assertIn("84123800138000123456789", context)
+
     def test_ipv4_redaction_not_defeated_by_adjacent_non_ascii_digit(self) -> None:
         # Exhaustive-audit finding (independent dual review, 2026-08-20, P2-2): every `\d` in the
         # old `_IPV4_RE` -- the boundary lookarounds *and* the three octet alternatives themselves
