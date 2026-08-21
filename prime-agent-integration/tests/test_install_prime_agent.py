@@ -186,6 +186,224 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             "plain",
         )
 
+    def test_compute_lock_drift_reports_only_real_version_mismatches(self) -> None:
+        generated = {
+            "node_modules/chalk": {
+                "version": "5.6.2",
+                "resolved": "https://registry.npmjs.org/chalk/-/chalk-5.6.2.tgz",
+            },
+            "node_modules/zod": {
+                "version": "4.4.3",
+                "resolved": "https://registry.npmjs.org/zod/-/zod-4.4.3.tgz",
+            },
+            # Same version as upstream -- must NOT be reported.
+            "node_modules/unchanged": {
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/unchanged/-/unchanged-1.0.0.tgz",
+            },
+            # Only present in the generated lock (no upstream match at all)
+            # -- must NOT be reported (presence-only differences are
+            # deliberately excluded, see compute_lock_drift()'s docstring).
+            "node_modules/only-generated": {
+                "version": "2.0.0",
+                "resolved": "https://registry.npmjs.org/only-generated/-/only-generated-2.0.0.tgz",
+            },
+            # A locally patched (file:) row -- must be skipped entirely,
+            # even though its name coincidentally matches something in
+            # upstream with a different "version".
+            "node_modules/prime-agent": {
+                "version": "9.9.9",
+                "resolved": "file:$RELEASE_DIR/assets/prime-agent-0.7.2-orca-pinned.tgz",
+            },
+        }
+        upstream = {
+            "node_modules/chalk": {
+                "version": "5.6.0",
+                "resolved": "https://registry.npmjs.org/chalk/-/chalk-5.6.0.tgz",
+            },
+            "node_modules/zod": {
+                "version": "3.25.76",
+                "resolved": "https://registry.npmjs.org/zod/-/zod-3.25.76.tgz",
+            },
+            "node_modules/unchanged": {
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/unchanged/-/unchanged-1.0.0.tgz",
+            },
+            "node_modules/only-upstream": {
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/only-upstream/-/only-upstream-1.0.0.tgz",
+            },
+            "node_modules/prime-agent": {
+                "version": "0.7.2",
+                "resolved": "https://registry.npmjs.org/prime-agent/-/prime-agent-0.7.2.tgz",
+            },
+        }
+        drift = installer.compute_lock_drift(generated, upstream)
+        self.assertEqual(
+            drift,
+            [
+                {
+                    "name": "chalk",
+                    "generated_version": "5.6.2",
+                    "upstream_versions": ["5.6.0"],
+                },
+                {
+                    "name": "zod",
+                    "generated_version": "4.4.3",
+                    "upstream_versions": ["3.25.76"],
+                },
+            ],
+        )
+
+    def test_compute_lock_drift_empty_upstream_reports_nothing(self) -> None:
+        generated = {
+            "node_modules/chalk": {
+                "version": "5.6.2",
+                "resolved": "https://registry.npmjs.org/chalk/-/chalk-5.6.2.tgz",
+            },
+        }
+        self.assertEqual(installer.compute_lock_drift(generated, {}), [])
+
+    def test_generated_lock_pin_age_days_computes_from_pinned_constant(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        pinned = datetime.strptime(
+            installer.GENERATED_LOCK_PINNED_AT, "%Y-%m-%d"
+        ).replace(tzinfo=timezone.utc)
+        self.assertEqual(installer.generated_lock_pin_age_days(pinned), 0)
+        self.assertEqual(
+            installer.generated_lock_pin_age_days(pinned + timedelta(days=5, hours=2)), 5
+        )
+
+    def test_leaf_advisory_records_dedupes_propagated_string_entries(self) -> None:
+        # The exact shape a real `npm audit --omit=dev --json` run produced
+        # against this installer's own generated production lock,
+        # 2026-08-22 (trimmed to the fields this function reads): the
+        # underlying advisory is reported once as a real record under
+        # "extract-zip", and again, redundantly, as a bare string under
+        # "prime-agent" purely because it depends on extract-zip.
+        vulnerabilities = {
+            "extract-zip": {
+                "name": "extract-zip",
+                "severity": "high",
+                "via": [
+                    {
+                        "name": "extract-zip",
+                        "severity": "high",
+                        "url": "https://github.com/advisories/GHSA-jmr9-qjv8-65gv",
+                        "title": "extract-zip unvalidated symlink path traversal",
+                    }
+                ],
+            },
+            "prime-agent": {
+                "name": "prime-agent",
+                "severity": "high",
+                "via": ["extract-zip"],
+            },
+        }
+        records = installer._leaf_advisory_records(vulnerabilities)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["name"], "extract-zip")
+
+    def test_leaf_advisory_records_fails_closed_on_unexpected_shape(self) -> None:
+        with self.assertRaisesRegex(installer.PrimeInstallError, "unexpected shape"):
+            installer._leaf_advisory_records({"pkg": {"via": [123]}})
+        with self.assertRaisesRegex(installer.PrimeInstallError, "unexpected shape"):
+            installer._leaf_advisory_records({"pkg": {"via": "not-a-list"}})
+        with self.assertRaisesRegex(installer.PrimeInstallError, "unexpected shape"):
+            installer._leaf_advisory_records({"pkg": "not-a-dict"})
+
+    def test_audit_installed_lock_passes_on_allowlisted_advisory_only(self) -> None:
+        receipt = {
+            "release_dir": "/tmp/does-not-matter",
+            "node_target": "/tmp/node",
+            "npm_target": "/tmp/npm-cli.js",
+            "node_sha256": "n" * 64,
+            "npm_cli_sha256": "n" * 64,
+        }
+        audit_report = {
+            "auditReportVersion": 2,
+            "vulnerabilities": {
+                "extract-zip": {
+                    "name": "extract-zip",
+                    "via": [{"name": "extract-zip", "severity": "high"}],
+                },
+                "prime-agent": {"name": "prime-agent", "via": ["extract-zip"]},
+            },
+        }
+        completed = subprocess.CompletedProcess(
+            args=["npm", "audit"], returncode=1, stdout=json.dumps(audit_report), stderr=""
+        )
+        with (
+            mock.patch.object(installer, "load_receipt", return_value=receipt),
+            mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
+            mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
+            mock.patch.object(installer, "sha256_file_verified", return_value="n" * 64),
+            mock.patch.object(
+                installer,
+                "managed_npm_environment",
+                return_value={"npm_config_audit": "false"},
+            ),
+            mock.patch.object(subprocess, "run", return_value=completed) as run_mock,
+        ):
+            result = installer.audit_installed_lock()
+        self.assertTrue(result["ok"])
+        self.assertEqual([entry["name"] for entry in result["accepted_advisories"]], ["extract-zip"])
+        # The one deliberate override of the blanket npm_config_audit=false.
+        self.assertEqual(run_mock.call_args.kwargs["env"]["npm_config_audit"], "true")
+
+    def test_audit_installed_lock_fails_closed_on_unlisted_advisory(self) -> None:
+        receipt = {
+            "release_dir": "/tmp/does-not-matter",
+            "node_target": "/tmp/node",
+            "npm_target": "/tmp/npm-cli.js",
+            "node_sha256": "n" * 64,
+            "npm_cli_sha256": "n" * 64,
+        }
+        audit_report = {
+            "auditReportVersion": 2,
+            "vulnerabilities": {
+                "some-other-package": {
+                    "name": "some-other-package",
+                    "via": [{"name": "some-other-package", "severity": "critical"}],
+                },
+            },
+        }
+        completed = subprocess.CompletedProcess(
+            args=["npm", "audit"], returncode=1, stdout=json.dumps(audit_report), stderr=""
+        )
+        with (
+            mock.patch.object(installer, "load_receipt", return_value=receipt),
+            mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
+            mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
+            mock.patch.object(installer, "sha256_file_verified", return_value="n" * 64),
+            mock.patch.object(
+                installer,
+                "managed_npm_environment",
+                return_value={"npm_config_audit": "false"},
+            ),
+            mock.patch.object(subprocess, "run", return_value=completed),
+        ):
+            with self.assertRaisesRegex(installer.PrimeInstallError, "some-other-package"):
+                installer.audit_installed_lock()
+
+    def test_audit_installed_lock_rejects_tampered_toolchain(self) -> None:
+        receipt = {
+            "release_dir": "/tmp/does-not-matter",
+            "node_target": "/tmp/node",
+            "npm_target": "/tmp/npm-cli.js",
+            "node_sha256": "n" * 64,
+            "npm_cli_sha256": "m" * 64,
+        }
+        with (
+            mock.patch.object(installer, "load_receipt", return_value=receipt),
+            mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
+            mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
+            mock.patch.object(installer, "sha256_file_verified", return_value="0" * 64),
+        ):
+            with self.assertRaisesRegex(installer.PrimeInstallError, "does not match"):
+                installer.audit_installed_lock()
+
     def test_exact_dependency_versions_uses_top_level_release_choice(self) -> None:
         manifest = {"dependencies": {"chalk": "^5", "@earendil-works/pi-ai": "remote"}}
         lock = {
@@ -15923,6 +16141,20 @@ class PrimeAgentInstallerTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         payload = json.loads(buffer.getvalue())
         self.assertEqual(payload, {"ok": False, "error": "boom"})
+
+    def test_main_dispatches_audit_action(self) -> None:
+        with (
+            mock.patch.object(sys, "argv", ["install_prime_agent.py", "audit"]),
+            mock.patch.object(
+                installer, "audit_installed_lock", return_value={"ok": True}
+            ) as audit_mock,
+        ):
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = installer.main()
+        self.assertEqual(exit_code, 0)
+        audit_mock.assert_called_once_with()
+        self.assertEqual(json.loads(buffer.getvalue()), {"ok": True})
 
     def test_main_does_not_swallow_system_exit_or_keyboard_interrupt(self) -> None:
         # The round-51 widening deliberately uses `except Exception`, not

@@ -40,11 +40,12 @@ upstream-immutable changes on re-check):
 
 - the four release-tarball SHA-256 hashes above are unchanged -- confirmed
   byte-identical via `gh api repos/PrimeIntellect-ai/prime-agent/releases/tags/v0.7.2`
-  and its `SHA256SUMS` asset (GitHub release assets are immutable once
-  published);
+  and its `SHA256SUMS` asset (GitHub release assets are conventionally
+  treated as immutable once published, though see the 2026-08-22
+  correction below -- byte-level SHA-256 comparison, not that assumption,
+  is what this pin actually relies on);
 - the Node.js `v24.19.0` darwin-arm64 SHA-256 pin is unchanged -- confirmed
-  against nodejs.org's own `SHASUMS256.txt` for that exact release (published
-  Node binaries are also immutable);
+  against nodejs.org's own `SHASUMS256.txt` for that exact release;
 - the source `package-lock.json` pin (v0.7.2's own *direct* dependencies) is
   unchanged -- only the generated *transitive* closure below had drifted.
 
@@ -159,6 +160,74 @@ change, unusually-new package, or other supply-chain anomaly was found. This
 closure refresh, and the resulting `GENERATED_LOCK_SHA256` and
 `install_prime_agent.py` update, is itself the kind of upstream-trust
 judgment call this section exists to leave a paper trail for.
+
+Independent round-53 QA (2026-08-22) re-verified the 2026-08-21 pin above
+from scratch -- live anchors, a third independent isolated replay
+(reproduced `fe4402ae74...` again), all 196 registry rows checked
+(exhaustive, not sampled), the three `@smithy/*` rows' Sigstore/SLSA
+attestation bundles downloaded and their SHA-512 subject digests verified
+against independently downloaded tarballs, actual old/new tarball content
+diffs reviewed (not just registry metadata), three real non-mocked
+`sandbox_e2e.py` lifecycle runs, and the full test suite twice under each
+Python interpreter -- and reached an independent **GO**. Its full report is
+archived at `../reports/PRIME-AGENT-ROUND53-CODEX-QA-REPORT-2026-08-22.md`
+(one directory up, outside this package). It also found four concrete,
+non-blocking follow-ups, addressed as part of this same 2026-08-22 change:
+
+1. **`extract-zip<=2.0.1` advisory** (`GHSA-jmr9-qjv8-65gv`, high severity,
+   no upstream fix): confirmed unreachable on this installer's supported
+   darwin-arm64 path (the `fd`/`rg` assets it downloads are `.tar.gz`,
+   extracted with the system `tar`, never extract-zip's ZIP branch) --
+   but flagged that disabling `npm audit` during hermetic lock generation
+   means a separate, explicit audit gate/cadence is needed rather than
+   relying on someone remembering to check by hand. Added: `python3
+   install_prime_agent.py audit` (`audit_installed_lock()`), a read-only,
+   explicitly opt-in command that runs a real `npm audit` against an
+   already-installed release's lock and fails closed on any advisory for
+   a package not on a small, reviewed, documented allowlist
+   (`ACCEPTED_ADVISORY_PACKAGES` -- currently just `extract-zip`, with
+   the reasoning above recorded inline). Deliberately NOT part of
+   plan/install/verify/enable, which stay fully offline and hermetic.
+2. **Generated-registry-lock drift versus the pinned upstream *source*
+   lock** (not versus the prior generated-lock pin -- a different,
+   stronger baseline): roughly 36 version differences across the
+   registry-resolved closure (e.g. `zod` 3.25.76->4.4.3,
+   `@types/node` 22->26), confirming the four Prime Agent tarballs are
+   byte-pinned but the full 196-package runtime closure is not claimed to
+   be identical to the exact tree reviewed at the v0.7.2 source commit.
+   The report's own "even stronger architectural option" -- seed the
+   production lock directly from the pinned upstream source lock instead
+   of a fresh floating resolution -- was attempted and empirically
+   disproven this same round: seeding `npm install --package-lock-only`
+   with upstream-pinned versions for the 63 overlapping-by-name packages
+   found only 10 of 200 final rows actually differed from an unseeded
+   floating resolution, and several of those differences were themselves
+   immediately re-resolved forward again by npm regardless of the seed
+   (`npm install`, unlike `npm ci`, treats an existing lock as an
+   optimization hint, not a hard constraint, absent an exact version
+   pinned directly in a manifest it reads). Reliably forcing the full
+   tree to the exact upstream-pinned versions would require reimplementing
+   npm's own dependency resolution against the source lock by hand --
+   assessed as materially riskier, for a security-critical installer,
+   than the drift this is meant to reduce. Implemented instead, as the
+   report's own concretely-actionable recommendation #1 ("persist
+   generated-lock evidence and full tuple diffs"): `compute_lock_drift()`
+   now runs automatically on every real install, recording every
+   registry package resolved to a version different from the pinned
+   upstream source lock directly in that install's receipt
+   (`lock_drift_from_upstream_source`) -- durable, automatic evidence
+   in place of a hand-reconstructed one-off diff every future review
+   round.
+3. **GitHub release API metadata correction**: the release currently
+   reports `"immutable": false`, contradicting this document's prior,
+   more categorical wording (corrected above). The byte-level SHA-256
+   comparisons this pin actually relies on were unaffected and all still
+   passed.
+4. **Pin-staleness cadence**: added `GENERATED_LOCK_PINNED_AT` (the date
+   `GENERATED_LOCK_SHA256` was last re-pinned) and
+   `generated_lock_pin_age_days()`, surfaced in `plan()`'s evidence.
+   Deliberately informational only, never a hard gate -- a stale pin is a
+   prompt to re-verify, not proof anything is wrong today.
 
 ## Installation contract
 

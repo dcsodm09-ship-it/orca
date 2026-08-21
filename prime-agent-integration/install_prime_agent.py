@@ -85,6 +85,18 @@ LICENSE_SHA256 = "b288615fb31dc504623582fb790a28e6d86bc2f5c1396845af555e43386da5
 # section for the full re-verification record.
 GENERATED_LOCK_SHA256 = "fe4402ae740cc0d2f326baf58f80543ecf8e9668e22f6434f0941bed43c732f5"
 GENERATED_LOCK_PACKAGE_COUNT = 200
+# The UTC calendar date GENERATED_LOCK_SHA256 above was last re-pinned (not
+# when this file was edited for any other reason). Every review round of
+# this file has independently rediscovered that npm's transitive resolution
+# keeps drifting a few days after each pin -- round-53 QA (2026-08-22)
+# recommended a visible revalidation cadence instead of relying on someone
+# remembering to check; generated_lock_pin_age_days() reads this purely to
+# report elapsed time, offline, in plan()'s evidence. Deliberately NOT a
+# hard gate: a stale pin is a prompt to re-verify, not proof anything is
+# actually wrong today, and turning wall-clock age into a hard failure
+# would make every install eventually stop working on its own even when
+# nothing upstream has changed.
+GENERATED_LOCK_PINNED_AT = "2026-08-22"
 ASSETS = {
     "prime-agent-0.7.2.tgz": "bc5471f2a626d727b88a45eb745fff93b10c554a3c4fc5912f25d8c64b987f5e",
     "prime-agent-ai-0.7.2.tgz": "0777108abbe12ffcd3efdbf063e1f321ff2a1b16c08a81867d9a6c0addcd1f8d",
@@ -2804,6 +2816,95 @@ def normalized_production_lock(generated: dict[str, Any]) -> bytes:
         if "integrity" in row:
             row["integrity"] = f"managed-local:{name}@{VERSION}"
     return canonical_json(normalized)
+
+
+def generated_lock_pin_age_days(now: datetime | None = None) -> int:
+    """Purely offline: elapsed whole days since GENERATED_LOCK_PINNED_AT.
+    Informational only (see that constant's own comment for why this is
+    deliberately never a hard gate) -- read by plan() so a human deciding
+    whether to re-verify has the number in front of them without needing
+    to check README.md or git blame by hand first.
+    """
+    pinned_at = datetime.strptime(GENERATED_LOCK_PINNED_AT, "%Y-%m-%d").replace(
+        tzinfo=timezone.utc
+    )
+    current = now if now is not None else datetime.now(timezone.utc)
+    return (current - pinned_at).days
+
+
+def _registry_resolved_versions_by_name(packages: dict[str, Any]) -> dict[str, set[str]]:
+    by_name: dict[str, set[str]] = {}
+    for lock_path, row in packages.items():
+        if not isinstance(lock_path, str) or not isinstance(row, dict) or not lock_path:
+            continue
+        resolved = row.get("resolved")
+        version = row.get("version")
+        if not isinstance(resolved, str) or not resolved.startswith(
+            "https://registry.npmjs.org/"
+        ):
+            continue
+        if not isinstance(version, str) or not version:
+            continue
+        name = package_name_from_lock_path(lock_path, row)
+        if not name:
+            continue
+        by_name.setdefault(name, set()).add(version)
+    return by_name
+
+
+def compute_lock_drift(
+    generated_packages: dict[str, Any], upstream_packages: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Pure, offline comparison between this install's freshly generated
+    production lock and the pinned upstream source lock (LOCK_SHA256),
+    both already fully parsed by the time _install_locked_within_release_
+    dir() calls this. Every review round of this file has had to
+    reconstruct a version of this exact tuple-level diff by hand, from
+    scratch, via an ad-hoc standalone replica script (see e.g. the
+    round-53 QA report, 2026-08-22) -- this makes it a durable, automatic
+    part of every real install instead, closing the specific gap that
+    round's own recommendation #1 asked for ("persist generated-lock
+    evidence and full tuple diffs").
+
+    Matches registry-resolved rows only, by bare package NAME (not lock
+    path -- the same package legitimately sits at different nesting
+    depths in either lock, and the two trees have entirely different
+    shapes: this install's own closure is one production package's
+    narrow transitive runtime tree, while the upstream source lock spans
+    the whole upstream monorepo -- every workspace member, every dev
+    dependency). A `file:`-resolved row on either side (the four locally
+    patched packages) is skipped: those are pinned and verified through
+    an entirely separate, stronger, already-existing mechanism (see
+    normalized_production_lock() and make_patched_asset()), not this one.
+
+    Deliberately reports version MISMATCHES only, never bare presence
+    differences (a package this install resolves that the source lock
+    never mentions, or vice versa) -- the shape mismatch between the two
+    trees described above would make a presence diff dominated by exactly
+    that kind of noise rather than by anything resembling real drift.
+    This is real, useful signal, not a proof: it cannot see whether a
+    same-named, same-VERSION row's resolved URL or integrity value
+    silently changed underneath an unmoved version number (a stronger,
+    heavier check the round-53 QA report also names and this round
+    deliberately did not attempt to automate).
+    """
+    generated_by_name = _registry_resolved_versions_by_name(generated_packages)
+    upstream_by_name = _registry_resolved_versions_by_name(upstream_packages)
+    drift: list[dict[str, Any]] = []
+    for name, generated_versions in generated_by_name.items():
+        upstream_versions = upstream_by_name.get(name)
+        if not upstream_versions:
+            continue
+        for generated_version in sorted(generated_versions - upstream_versions):
+            drift.append(
+                {
+                    "name": name,
+                    "generated_version": generated_version,
+                    "upstream_versions": sorted(upstream_versions),
+                }
+            )
+    drift.sort(key=lambda entry: (entry["name"], entry["generated_version"]))
+    return drift
 
 
 def validate_generated_lock(
@@ -7764,6 +7865,13 @@ def _install_locked_within_release_dir(
     if not isinstance(generated_lock, dict):
         raise PrimeInstallError("generated lock is invalid")
     closure = validate_generated_lock(generated_lock_raw, generated_lock, patched_assets)
+    # Offline, pure comparison against upstream_lock (already parsed and
+    # digest-verified above) -- see compute_lock_drift()'s own docstring.
+    # Threaded into the receipt below so every real install now leaves a
+    # durable, automatic record of this diff instead of it having to be
+    # hand-reconstructed by a review agent from scratch (round-53 QA,
+    # 2026-08-22, recommendation #1).
+    lock_drift = compute_lock_drift(generated_lock["packages"], upstream_lock["packages"])
     # The set of top-level node_modules/ package directory names this
     # closure DECLARES -- derived from the SAME "packages" map
     # validate_generated_lock() just pinned the whole install to (via
@@ -8235,6 +8343,15 @@ def _install_locked_within_release_dir(
         # comparison for post-install drift the same way it already does
         # for every other file (see verify()'s own tree_digest() call).
         "registry_packages_content_verified": sorted(registry_pinned_digests),
+        # See compute_lock_drift()'s own docstring: a durable, automatic
+        # record of every registry package this install resolved to a
+        # DIFFERENT version than the pinned upstream source lock
+        # (LOCK_SHA256) declares, keyed by bare package name. Real,
+        # useful signal for the next re-pin review -- not itself a
+        # pass/fail gate; this install already succeeded by the time this
+        # is recorded (round-53 QA, 2026-08-22, recommendation #1).
+        "lock_drift_from_upstream_source": lock_drift,
+        "generated_lock_pinned_at": GENERATED_LOCK_PINNED_AT,
         "closure": closure,
         "node_version": NODE_VERSION,
         "npm_version": NPM_VERSION,
@@ -9093,6 +9210,156 @@ def verify(expected_lock_identity: tuple[int, int] | None = None) -> dict[str, A
     }
 
 
+# Packages with advisories already reviewed and explicitly accepted for
+# this installer's generated production lock -- see README.md's "Pinned
+# upstream evidence" section for the full justification each entry
+# required. audit_installed_lock() fails closed on any advisory for a
+# package NOT listed here, and on any unrecognized/unparseable `npm audit`
+# response shape (see that function's own docstring). Matches by package
+# name, not by advisory id: `npm audit --json`'s own `via` shape is not
+# stable enough across npm versions to parse a specific GHSA id safely
+# without real risk of a brittle parser silently accepting the wrong
+# thing, so this deliberately accepts ALL current and future advisories
+# against a listed package -- the coarser, fail-closed-favoring direction.
+# Re-review this entry (and consider tightening it to a specific id, or
+# removing it) whenever `npm audit` reports something new against a
+# package already on this list.
+ACCEPTED_ADVISORY_PACKAGES = {
+    "extract-zip": (
+        "GHSA-jmr9-qjv8-65gv, extract-zip <=2.0.1, unvalidated symlink path "
+        "traversal, no upstream fix released. Reachable only via its ZIP-"
+        "extraction code path; this installer's supported darwin-arm64 "
+        "target downloads .tar.gz assets (fd/rg) and extracts them with the "
+        "system `tar`, never extract-zip's ZIP branch. Re-review if a "
+        "future asset or platform target ever downloads a .zip file. "
+        "Verified by independent round-53 QA, 2026-08-22."
+    ),
+}
+
+
+def _leaf_advisory_records(vulnerabilities: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every root advisory record `npm audit --json` reports, walked out of
+    every top-level `vulnerabilities` entry's own `via` list. Verified
+    empirically 2026-08-22 (real `npm audit --omit=dev --json` run against
+    this exact generated production lock, live registry, pinned Node/npm
+    toolchain): a `via` entry is either a real advisory record (a dict,
+    naming the package that is ACTUALLY vulnerable) or a bare package-name
+    string meaning "vulnerable only because it depends on that other,
+    already-separately-reported package" -- `npm audit` reports the SAME
+    root advisory again, redundantly, under every package name in the
+    affected dependency chain. For this lock that real run reported two
+    top-level entries for the one underlying extract-zip advisory:
+    `extract-zip` itself (a dict-shaped `via` record) and `prime-agent`
+    (a string-shaped `via: ["extract-zip"]`, since it merely depends on
+    the vulnerable package). Only the dict-shaped records carry real
+    advisory identity and are returned here; string entries are the
+    reason this exists at all -- naively checking every top-level key
+    against ACCEPTED_ADVISORY_PACKAGES would wrongly flag "prime-agent"
+    itself as an unreviewed package on every single audit run.
+    """
+    records: list[dict[str, Any]] = []
+    for entry in vulnerabilities.values():
+        if not isinstance(entry, dict):
+            raise PrimeInstallError("npm audit returned an unexpected shape")
+        via = entry.get("via")
+        if not isinstance(via, list):
+            raise PrimeInstallError("npm audit returned an unexpected shape")
+        for item in via:
+            if isinstance(item, dict):
+                records.append(item)
+            elif not isinstance(item, str):
+                raise PrimeInstallError("npm audit returned an unexpected shape")
+    return records
+
+
+def audit_installed_lock() -> dict[str, Any]:
+    """Read-only: run `npm audit` against an ALREADY-installed release's
+    generated production lock (RELEASE_DIR/package-lock.json).
+    managed_npm_environment() deliberately sets `npm_config_audit=false`
+    for every OTHER npm invocation in this file (install/enable/verify
+    stay fully offline, hermetic, and deterministic -- a transient
+    advisory-API outage or rate limit must never fail closed on an
+    ordinary lifecycle call). This is the separate, explicitly opt-in gate
+    round-53's independent QA review asked for instead: call it whenever
+    re-verifying trust (e.g. before a re-pin, or on whatever cadence a
+    human decides), not as part of every plan/install/verify/enable.
+    Requires live network access to the npm registry; does not modify
+    anything on disk.
+    """
+    receipt = load_receipt()
+    release = verify_private_ssd_dir(Path(receipt["release_dir"]))
+    node = resolve_ssd(Path(receipt["node_target"]))
+    npm_cli = resolve_ssd(Path(receipt["npm_target"]))
+    for label, path, field in (
+        ("Node.js runtime", node, "node_sha256"),
+        ("npm CLI", npm_cli, "npm_cli_sha256"),
+    ):
+        expected = receipt.get(field)
+        if not isinstance(expected, str) or not expected:
+            raise PrimeInstallError(f"managed receipt is missing a pinned {label} digest")
+        if sha256_file_verified(path) != expected:
+            raise PrimeInstallError(
+                f"managed {label} content does not match the pinned installed digest"
+            )
+    cache = verify_private_ssd_dir(TOOL_ROOT / "npm-cache")
+    install_home = verify_private_ssd_dir(TOOL_ROOT / "install-home")
+    install_tmp = verify_private_ssd_dir(TOOL_ROOT / "install-tmp")
+    environment = managed_npm_environment(os.fspath(node), cache, install_home, install_tmp)
+    # The one deliberate exception to managed_npm_environment()'s blanket
+    # `npm_config_audit=false` -- this function's entire purpose is to run
+    # that check for real, on demand.
+    environment["npm_config_audit"] = "true"
+    try:
+        result = subprocess.run(
+            [os.fspath(node), os.fspath(npm_cli), "audit", "--omit=dev", "--json"],
+            cwd=release,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise PrimeInstallError("cannot run npm audit") from exc
+    # `npm audit` exits non-zero whenever it finds any vulnerability at
+    # all, including ones already on ACCEPTED_ADVISORY_PACKAGES -- exit
+    # code is deliberately not treated as pass/fail here; the allowlist
+    # comparison below is.
+    try:
+        report = strict_json(result.stdout.encode("utf-8"))
+    except PrimeInstallError as exc:
+        raise PrimeInstallError("npm audit returned unparseable output") from exc
+    if not isinstance(report, dict) or report.get("auditReportVersion") != 2:
+        raise PrimeInstallError("npm audit returned an unexpected shape")
+    vulnerabilities = report.get("vulnerabilities")
+    if not isinstance(vulnerabilities, dict):
+        raise PrimeInstallError("npm audit returned an unexpected shape")
+    accepted: list[dict[str, Any]] = []
+    unexpected: list[dict[str, Any]] = []
+    for record in _leaf_advisory_records(vulnerabilities):
+        name = record.get("name")
+        if not isinstance(name, str) or not name:
+            raise PrimeInstallError("npm audit returned an unexpected shape")
+        info = {
+            "name": name,
+            "severity": record.get("severity"),
+            "url": record.get("url"),
+            "title": record.get("title"),
+        }
+        (accepted if name in ACCEPTED_ADVISORY_PACKAGES else unexpected).append(info)
+    if unexpected:
+        raise PrimeInstallError(
+            "npm audit found advisories for packages not on the reviewed "
+            f"allowlist: {sorted({item['name'] for item in unexpected})}"
+        )
+    return {
+        "ok": True,
+        "accepted_advisories": accepted,
+        "audited_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def _uninstall_locked(lock_identity: tuple[int, int]) -> dict[str, Any]:
     receipt = load_receipt()
     # enable() (_enable_locked() -> verify(lock_identity)) re-asserts the
@@ -9223,6 +9490,8 @@ def plan() -> dict[str, Any]:
         "upstream_lock_sha256": LOCK_SHA256,
         "license_sha256": LICENSE_SHA256,
         "generated_production_lock_sha256": GENERATED_LOCK_SHA256,
+        "generated_lock_pinned_at": GENERATED_LOCK_PINNED_AT,
+        "generated_lock_pin_age_days": generated_lock_pin_age_days(),
         "orca_support": evidence["orca_support"],
         "lifecycle_scripts": "disabled",
         "daemon": "not_started",
@@ -9239,7 +9508,8 @@ def plan() -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "action", choices=("plan", "install", "verify", "uninstall", "enable", "recover")
+        "action",
+        choices=("plan", "install", "verify", "uninstall", "enable", "recover", "audit"),
     )
     args = parser.parse_args()
     try:
@@ -9253,6 +9523,8 @@ def main() -> int:
             result = uninstall()
         elif args.action == "enable":
             result = enable()
+        elif args.action == "audit":
+            result = audit_installed_lock()
         else:
             result = recover()
     except PrimeInstallError as exc:
