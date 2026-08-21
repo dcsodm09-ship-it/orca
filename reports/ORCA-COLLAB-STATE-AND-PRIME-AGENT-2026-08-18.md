@@ -3009,6 +3009,65 @@ TOCTOU"这类修复，而是把 docstring 改成如实描述残留风险**（不
 **已派发 round 52 双复核**（Claude opus+max 与 Codex sol+max，对
 `fc9f43ddca`）。
 
+派发之后本机 Orca 运行时中途重启了一次（`runtimeId` 变了、desktop-control
+等几个 MCP 连接断线重连），两路都受到了影响：opus/max 一路的后台 agent
+被打断（转录里最后一条是空内容的截断输出），Codex 一路的终端直接变成
+`terminal_handle_stale`、dispatch 状态被 Orca 自己的编排恢复机制标成
+`failed`（"assigned worker terminal is no longer live after
+orchestration recovery"）。
+
+opus/max 一路：没有用 Agent 工具重新起一个全新 agent 去接（那样会丢掉
+已经做的验证工作，还可能导致两个独立 opus 结论互相打架），本应该用
+SendMessage 接续原 agent——**这里记录一个操作失误**：手滑用了 Agent 工具
+而不是 SendMessage，实际上还是另起了一个新 agent，只是这个新 agent 收到
+的提示明确告诉了它"接着已经确认过的状态继续"，所以效果上等同于一次完整
+独立复核，没有真正复用旧 agent 的会话，但也没有产生两份互相矛盾的结论
+（旧 agent 那份不完整的转录没有被当作结论使用）。
+
+Codex 一路：终端确认真的死了（`terminal_handle_stale`），直接重新派发。
+这次很意外地**没有撞常规的 hooks 竞态**，直接 `state: ready`，确认在
+真实工作。
+
+### Round 52 Claude opus/max（重新完整跑完）结果：**GO，0 P0，0 P1，2 P2，1 P3**——直接命中了我自己复核 round 51 时标出的那个 lstat-then-open 残留，判定不阻断，并给出了一个能真正彻底关闭（不只是收窄）的具体方案
+
+重新确认了 HEAD（`f394532d67`，`fc9f43ddca` 的直接子提交）与
+`prime-agent-integration/` 在两个提交之间字节级不变。
+
+对我自己复核 round 51 时标出的那个残留（新加的 `os.lstat(path)` 和
+随后 `os.open(path, O_RDONLY | O_NOFOLLOW)` 是两次独立系统调用，理论上
+同 UID 攻击者能在这两次调用之间的窄窗口里把 FIFO 换进去）给出了具体、
+有说服力的判断：**P2，不阻断**，理由——窗口只有微秒级（几条 CPython
+字节码指令的间隙），比 round 49 之前"完全没有防护"的原始窗口没有实质性
+变大；前提条件已经是同 UID 代码执行（攻击者已经和受害者共享权限，这个
+前提本身就是这份文件里所有已被接受的残留发现共同的前提）；影响面只是
+拒绝服务（挂起），不是数据篡改或提权，身份/内容校验对真正的篡改仍然
+正确拒绝；而且这和文件里其他好几处（`install_prime_agent.py:251,
+834-928, 2615, 6323-6378, 8329, 8453-8462`）已经被多轮 opus/max 和 Codex
+sol/max 独立接受为残留的"微秒级 lstat/open 窗口"是同一类，不是新的风险
+类别。
+
+**这一路独立复核时还顺带发现了一个新东西**：`read_private_file()`
+（第 772-809 行）本身就有**一模一样**的 lstat-then-open 写法（775 行
+`path.lstat()` → 784 行 `os.open(...)`），round 51 的提交信息里只把它
+当作"照抄的对象"引用，从没被当成它自己的独立发现点过——讽刺的是，被
+照抄的那个原始写法自己也带着同样的窄口子，只是早于本轮、不在这次 diff
+范围内。
+
+给出了一个**真正能彻底关闭**（不是继续收窄）这个口子的具体方案，留给
+以后的轮次：用 `O_NONBLOCK` 打开（不管目标是什么文件类型都不会阻塞，
+`os.replace()` 能合法产生的类型更是如此）、再对着已经打开的描述符做
+`fstat` 去拒绝 `S_ISFIFO`/非 `S_ISREG`——这样 TOCTOU 直接被描述符绑定
+消掉，而不是像现在这样只是缩小窗口；而且这个方案能一次性同时覆盖
+`atomic_write()` 和 `read_private_file()` 两处。
+
+1 个 P3：`main()` 新加的通用异常分支把 `str(exc)` 原样带进 JSON 错误
+输出——纯本机同 UID CLI，信息量很小，不构成真正的泄露关切。
+
+206/206 测试双解释器重新独立跑过全过，`py_compile` 干净；2 次真实
+`sandbox_e2e.py` 都稳定复现已知的、和本轮无关的上游锁定哈希漂移，
+沙箱自身的"真实托管路径污染检测"两次都没有触发，确认 fail-closed、
+零真实状态变更。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
