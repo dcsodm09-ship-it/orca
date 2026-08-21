@@ -74,16 +74,21 @@ LICENSE_SHA256 = "b288615fb31dc504623582fb790a28e6d86bc2f5c1396845af555e43386da5
 # Filled from independent darwin-arm64 replays using the pinned Node/npm toolchain.
 # The normalized hash retains the complete registry dependency graph, URLs, and
 # integrity digests while canonicalizing only path-dependent managed file assets.
-# npm ci is not allowed to run until that exact closure is reproduced. Refreshed
-# 2026-08-21 after two independent, real isolated replays found the 2026-08-19
-# value stale (npm's transitive resolution had moved again, not this file's own
-# pinned direct dependencies or release assets): 3 of 196 registry rows changed,
-# all @smithy/* patch bumps published 2026-08-20 by the same official
-# aws-sdk-js maintainers via GitHub Actions OIDC trusted publishing (verified
-# against real Sigstore/SLSA attestations, not just registry metadata); row
-# count is unchanged at 200. See README.md's "Pinned upstream evidence"
-# section for the full re-verification record.
-GENERATED_LOCK_SHA256 = "fe4402ae740cc0d2f326baf58f80543ecf8e9668e22f6434f0941bed43c732f5"
+# npm ci is not allowed to run until that exact closure is reproduced. Re-pinned
+# 2026-08-22 (round 56) after real sandbox_e2e.py runs -- both this project's own
+# and an independent Codex sol/max round-55 re-review's -- found the 2026-08-21
+# value stale within roughly a day: 17 of 200 registry rows changed, all
+# @aws-sdk/* patch bumps (one nested copy a minor bump within the same pinned
+# major line) published by the same official aws-sdk-bot automation account;
+# no publisher-identity change, no new dependency or lifecycle script on any
+# changed row, row count unchanged at 200. This @aws-sdk/* family does not
+# publish Sigstore/GitHub-OIDC provenance attestation at all (confirmed via the
+# live registry, and confirmed the check itself works by testing it against
+# known-provenance packages) -- a pre-existing, package-wide gap, not a
+# regression from this bump; unlike @smithy/*, whose 2026-08-19/2026-08-21
+# refreshes did carry genuine attestation. See README.md's "Pinned upstream
+# evidence" section for the full re-verification record.
+GENERATED_LOCK_SHA256 = "006d6d1493b35f973316e2bcd8724a26b7bda5a427dbe6ca73447440b929e092"
 GENERATED_LOCK_PACKAGE_COUNT = 200
 # The UTC calendar date GENERATED_LOCK_SHA256 above was last re-pinned (not
 # when this file was edited for any other reason). Every review round of
@@ -98,16 +103,14 @@ GENERATED_LOCK_PACKAGE_COUNT = 200
 # nothing upstream has changed.
 #
 # Round-54 dual review (2026-08-22, both Claude opus/max and Codex sol/max
-# independently) caught this constant wrong on arrival: GENERATED_LOCK_SHA256
-# was actually re-pinned by commit bafce01bf5, authored 2026-08-21T23:58:36
-# +08:00 = 2026-08-21T15:58:36Z -- not 2026-08-22 (that was this constant's
-# own author's LOCAL calendar date while writing the round-54 follow-up
-# commit, a different thing). The wrong value made plan()'s
-# generated_lock_pin_age_days report -1 on this file's own re-verification
-# run, for the first several hours of every day this constant is ever
-# updated on a UTC+ timezone machine -- see that function's own clamp for
-# the other half of this fix.
-GENERATED_LOCK_PINNED_AT = "2026-08-21"
+# independently) caught this constant wrong on arrival once already: it had
+# been set to the constant-author's own local calendar date, not the actual
+# re-pin commit's date -- see generated_lock_pin_age_days()'s clamp for the
+# other half of that fix. Kept in mind updating it again here, for the
+# round-56 re-pin above: this value is GENERATED_LOCK_SHA256's own commit
+# date, not whatever date any later, unrelated change to this file happens
+# to land on.
+GENERATED_LOCK_PINNED_AT = "2026-08-22"
 ASSETS = {
     "prime-agent-0.7.2.tgz": "bc5471f2a626d727b88a45eb745fff93b10c554a3c4fc5912f25d8c64b987f5e",
     "prime-agent-ai-0.7.2.tgz": "0777108abbe12ffcd3efdbf063e1f321ff2a1b16c08a81867d9a6c0addcd1f8d",
@@ -2860,26 +2863,36 @@ def _registry_resolved_versions_by_name(packages: dict[str, Any]) -> dict[str, s
     explicit `resolved` field starting with the registry URL prefix,
     which silently dropped 122 of 184 comparable names from the real
     pinned upstream source lock -- a real npm lockfile-v3 property, not a
-    malformed input: 242 of its 463 rows are genuine registry packages
+    malformed input: 234 of its 463 rows are genuine registry packages
     recorded with only `version` (no `resolved`/`integrity` at all).
-    Verified empirically against that exact lock which of the three real
-    row shapes each marker distinguishes: a `link: true` row (npm
-    workspace member, e.g. `@earendil-works/pi-ai`) always pairs with a
-    `resolved` value that is a plain relative path (`packages/...`), never
-    absent and never a registry URL; every other row either carries a
-    real `https://registry.npmjs.org/...` `resolved` value, a local
-    `file:...` value (the four locally patched packages' own generated-
-    lock rows), or nothing at all -- there is no observed case of a
-    `link: true` row with a missing `resolved`. So a row is accepted here
-    when `resolved` is a registry URL OR entirely absent, and rejected
-    only when `resolved` is present and is something else (`file:`, a
-    relative workspace path, or `link: true` as an explicit second,
-    defense-in-depth check in case some other npm version ever omits
-    `resolved` on a link row).
+    Verified empirically against that exact lock which of the real row
+    shapes each marker distinguishes: a `link: true` row (an npm
+    workspace member's `node_modules/`-prefixed *pointer* entry, e.g.
+    `node_modules/@earendil-works/pi-ai`) always pairs with a `resolved`
+    value that is a plain relative path (`packages/...`), never absent and
+    never a registry URL; every other `node_modules/`-prefixed row either
+    carries a real `https://registry.npmjs.org/...` `resolved` value, a
+    local `file:...` value (the four locally patched packages' own
+    generated-lock rows), or nothing at all -- there is no observed case
+    of a `link: true` row with a missing `resolved`. So a row is accepted
+    here when it is keyed under `node_modules/` (excludes the 8 workspace
+    members' own non-`node_modules/`-prefixed *definition* rows, e.g.
+    `packages/agent` -- round-55 dual review, 2026-08-22, opus/max: these
+    have no `resolved` and no `link` marker either, so without this check
+    they were admitted as if they were registry packages; harmless for
+    every lock pair checked so far -- their names never overlap this
+    installer's own generated closure -- but a latent drift-suppression
+    vector worth closing outright) and `resolved` is a registry URL OR
+    entirely absent, rejected only when `resolved` is present and is
+    something else (`file:`, a relative workspace path, or `link: true` as
+    an explicit second, defense-in-depth check in case some other npm
+    version ever omits `resolved` on a link row).
     """
     by_name: dict[str, set[str]] = {}
     for lock_path, row in packages.items():
         if not isinstance(lock_path, str) or not isinstance(row, dict) or not lock_path:
+            continue
+        if "node_modules/" not in lock_path:
             continue
         if row.get("link") is True:
             continue
@@ -4505,26 +4518,32 @@ def allowed_unpinned_release_files() -> frozenset[str]:
     literal, so this set self-corrects if any of those constants ever
     change:
 
-      * Five bookkeeping files this installer downloads, generates, or
-        copies at the top of RELEASE_DIR / inside lib/node_modules/, whose
-        content is either independently digest-verified at the moment it
-        is written (LICENSE, upstream-package-lock.json -- see
-        safe_download() and, as of this same round, the re-verified read
-        in _install_locked_within_release_dir()) or re-derivable/re-
-        validated by other means (package.json is a literal this
-        installer's own root_manifest constructs and immediately re-reads
-        via verify_unchanged_private_ssd_file(); package-lock.json is
-        validated in full by validate_generated_lock() against
-        GENERATED_LOCK_SHA256 before `npm ci` ever runs;
-        lib/node_modules/.package-lock.json is `npm ci`'s own hidden
-        top-level bookkeeping marker -- see
+      * Three bookkeeping files this installer downloads or copies at the
+        top of RELEASE_DIR / inside lib/node_modules/, whose content is
+        independently digest-verified at the moment it is written
+        (LICENSE, upstream-package-lock.json -- see safe_download()) or is
+        `npm ci`'s own hidden top-level bookkeeping marker
+        (lib/node_modules/.package-lock.json -- see
         KNOWN_NON_DIRECTORY_NODE_MODULES_ENTRIES's own comment for the
         empirical confirmation that this is the ONE non-package entry a
-        real install ever materializes there) -- none of these four is
+        real install ever materializes there). None of these three is
         individually pinned (an accepted, long-documented residual; see
         the comment above `release_relative_pinned_digests`'s own
         construction), and none is ever read or executed again by this
         installer or its generated scripts after install.
+
+        Round 56, 2026-08-22 (independent Codex sol/max round-55
+        re-review, P1/blocker): package.json and package-lock.json used
+        to be listed here too, on the same "never read again after
+        install" reasoning -- which the round-54 `audit` action
+        (audit_installed_lock(), which runs real `npm audit` with
+        `cwd=release`, genuinely reading both again) falsified. Both are
+        now individually pinned in `release_relative_pinned_digests`
+        instead (see that construction's own round-56 comment) and are
+        REMOVED from this exemption set -- tree_digest()'s deny-unknown
+        check now requires them to match their pinned digest exactly,
+        the same as every other file this installer or its generated
+        scripts ever reads again.
       * Every file this installer downloads into RELEASE_DIR/assets/ --
         the four official release tarballs (ASSETS), the Node.js tarball
         (NODE_ASSET), and the four locally-patched tarballs this installer
@@ -4546,8 +4565,6 @@ def allowed_unpinned_release_files() -> frozenset[str]:
     literal_bookkeeping_files = frozenset(
         {
             "LICENSE",
-            "package.json",
-            "package-lock.json",
             "upstream-package-lock.json",
             "lib/node_modules/.package-lock.json",
         }
@@ -8730,6 +8747,43 @@ def _install_locked_within_release_dir(
         # guard, the command wrapper) now has a pinned entry here.
         os.fspath(launch_guard.relative_to(RELEASE_DIR)): launch_guard_sha256,
         os.fspath(command_wrapper.relative_to(RELEASE_DIR)): command_wrapper_sha256,
+        # Round 56, 2026-08-22 (independent Codex sol/max round-55
+        # re-review, P1/blocker): package.json and package-lock.json used
+        # to be deliberately left OUT of this map -- allowed_unpinned_
+        # release_files()'s own docstring justified that as safe because
+        # "none is ever read or executed again by this installer or its
+        # generated scripts after install." Round 54's new `audit` action
+        # (audit_installed_lock()) broke that premise: it runs `npm audit`
+        # with `cwd=release`, which DOES read both files again, for real,
+        # after install. That reopened the exact same class of hole this
+        # file has closed for every other pinned artifact: a same-UID
+        # racer who overwrote either file in the real window between this
+        # function's own last pre-npm-ci `verify_unchanged_private_ssd_
+        # file()` re-check and write_pending_install()'s tree_digest()
+        # baseline capture would have had the poisoned bytes silently
+        # adopted as the permanent baseline -- verify() would (correctly)
+        # confirm the tree still matches THAT baseline forever after, and
+        # `npm audit` would then unknowingly audit the attacker's own
+        # substituted, "clean" manifest/lock. Pinned here to the exact
+        # bytes this function itself already validated moments ago
+        # (`manifest_raw` via validate_generated_lock()-adjacent checks;
+        # `generated_lock_raw` via validate_generated_lock() against
+        # GENERATED_LOCK_SHA256 itself) -- the same zero-window guarantee
+        # every other entry in this map already gets, not a new or weaker
+        # one. allowed_unpinned_release_files() no longer exempts either
+        # path; see that function's own updated docstring.
+        # Literal relative paths, not `manifest_path.relative_to(...)`/
+        # `lock_path.relative_to(...)`: `lock_path` in particular is
+        # reused as a plain loop variable name (a lock-map key, a bare
+        # str) by both the `skipped_registry_lock_paths` loop just above
+        # and the `registry_pinned_digests` loop just below, so resolving
+        # through it here would silently break the moment dict ordering
+        # changed which one ran first -- caught for real, not just in
+        # theory, by this file's own full-install regression suite before
+        # this round ever landed. The two literals below are exactly the
+        # same ones `allowed_unpinned_release_files()` used to exempt.
+        "package.json": sha256_bytes(manifest_raw),
+        "package-lock.json": sha256_bytes(generated_lock_raw),
     }
     for locally_patched_name, pinned_digests in patched_content_digests.items():
         package_relative = os.fspath(
@@ -9262,16 +9316,20 @@ def verify(expected_lock_identity: tuple[int, int] | None = None) -> dict[str, A
 # this installer's generated production lock -- see README.md's "Pinned
 # upstream evidence" section for the full justification each entry
 # required. audit_installed_lock() fails closed on any advisory for a
-# package NOT listed here, and on any unrecognized/unparseable `npm audit`
-# response shape (see that function's own docstring). Matches by package
-# name, not by advisory id: `npm audit --json`'s own `via` shape is not
-# stable enough across npm versions to parse a specific GHSA id safely
-# without real risk of a brittle parser silently accepting the wrong
-# thing, so this deliberately accepts ALL current and future advisories
-# against a listed package -- the coarser, fail-closed-favoring direction.
-# Re-review this entry (and consider tightening it to a specific id, or
-# removing it) whenever `npm audit` reports something new against a
-# package already on this list.
+# package/GHSA-id pair NOT listed here, and on any unrecognized/
+# unparseable `npm audit` response shape (see that function's own
+# docstring, and _advisory_ghsa_id()'s below).
+#
+# Round-55 dual review (2026-08-22, opus/max, mutation-tested): this
+# comment block previously (round 54) said the OPPOSITE of what the code
+# below does -- claimed matching was deliberately by bare package name
+# only, "because npm audit's via shape isn't stable enough to parse a
+# GHSA id safely". That claim was itself round 54's P1/blocker (see
+# below); the stale paragraph making the now-false claim was left in
+# place by round 55's own fix and is removed here, not just superseded,
+# so a reader going top-down doesn't get the wrong model of a security-
+# critical control from a comment that outlived the code it described.
+#
 # Round-54 dual review (2026-08-22, both Claude opus/max and Codex sol/max
 # independently, rated P1/blocker): this was originally keyed by bare
 # package name alone, which silently accepts EVERY current and future

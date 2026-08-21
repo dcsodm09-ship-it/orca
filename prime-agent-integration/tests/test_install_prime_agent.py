@@ -264,6 +264,73 @@ class PrimeAgentInstallerTests(unittest.TestCase):
         }
         self.assertEqual(installer.compute_lock_drift(generated, {}), [])
 
+    def test_registry_resolved_versions_by_name_widened_filter(self) -> None:
+        # Round-55 dual review (2026-08-22, opus/max): this exact filter had
+        # ZERO regression coverage -- restoring round 54's original,
+        # stricter-than-needed filter still passed the full suite. Real
+        # pinned-upstream-lock row shapes, verified against the actual
+        # lock: a genuine registry package with NO resolved/integrity at
+        # all (common -- 234 of 463 real rows), a workspace-member
+        # POINTER row (`link: true`, resolved is a relative path, always
+        # under node_modules/), and a workspace-member DEFINITION row
+        # (no node_modules/ prefix at all, no resolved, no link marker).
+        packages = {
+            "node_modules/@babel/runtime": {"version": "7.29.2"},
+            "node_modules/@earendil-works/pi-ai": {
+                "resolved": "packages/ai",
+                "link": True,
+            },
+            "packages/ai": {
+                "name": "@earendil-works/pi-ai",
+                "version": "0.7.2",
+                "dependencies": {},
+            },
+            "node_modules/chalk": {
+                "version": "5.6.2",
+                "resolved": "https://registry.npmjs.org/chalk/-/chalk-5.6.2.tgz",
+            },
+            "node_modules/prime-agent": {
+                "version": "0.7.2",
+                "resolved": "file:$RELEASE_DIR/assets/prime-agent-0.7.2-orca-pinned.tgz",
+            },
+        }
+        by_name = installer._registry_resolved_versions_by_name(packages)
+        self.assertEqual(by_name.get("@babel/runtime"), {"7.29.2"})
+        self.assertEqual(by_name.get("chalk"), {"5.6.2"})
+        # The link:true pointer row must not itself be admitted...
+        self.assertNotIn("@earendil-works/pi-ai", by_name)
+        # ...and neither must the non-node_modules/ definition row it
+        # points at, even though IT has no resolved/link field either.
+        self.assertNotIn("packages/ai", by_name)
+        # The four locally patched (file:) packages stay excluded.
+        self.assertNotIn("prime-agent", by_name)
+
+    def test_compute_lock_drift_recognizes_resolved_less_upstream_rows(self) -> None:
+        # End-to-end version of the filter test above, through
+        # compute_lock_drift() itself: a real drift on a package whose
+        # upstream row has no `resolved` field at all must still be
+        # reported -- this is exactly the class of row round 54's filter
+        # silently dropped (122 of 184 comparable names, 16% undercount).
+        generated = {
+            "node_modules/@babel/runtime": {
+                "version": "7.29.7",
+                "resolved": "https://registry.npmjs.org/@babel/runtime/-/runtime-7.29.7.tgz",
+            },
+        }
+        upstream = {
+            "node_modules/@babel/runtime": {"version": "7.29.2"},
+        }
+        self.assertEqual(
+            installer.compute_lock_drift(generated, upstream),
+            [
+                {
+                    "name": "@babel/runtime",
+                    "generated_version": "7.29.7",
+                    "upstream_versions": ["7.29.2"],
+                }
+            ],
+        )
+
     def test_generated_lock_pin_age_days_computes_from_pinned_constant(self) -> None:
         from datetime import datetime, timedelta, timezone
 
@@ -12588,6 +12655,297 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             ),
         )
 
+    def _round56_tamper_manifest_or_lock_during_npm_ci_window_harness(
+        self, *, target_relative: str, error_regex: str
+    ) -> None:
+        """Shared harness for the two round-56 regression tests just below.
+
+        Regression for independent Codex sol/max round-55 re-review,
+        2026-08-22, P1/blocker: package.json and package-lock.json were
+        both individually verified once before `npm ci` runs (`validate_
+        generated_lock()` for the lock; `verify_unchanged_private_ssd_
+        file()` for both, immediately before the same call) but neither
+        had a pinned entry in `release_relative_pinned_digests` -- so a
+        same-UID racer who overwrote either file DURING `npm ci`'s own
+        real, multi-minute subprocess window (the same window this file
+        already defends node/npm-cli/the entrypoint against -- see
+        test_install_locked_detects_entrypoint_content_swap_during_npm_ci_window
+        just above for the sibling case this harness is modeled on) had
+        the tampered bytes silently adopted as the permanent
+        release_tree_sha256 baseline. `npm audit` (the round-54 `audit`
+        action) then reads exactly that attacker-controlled content,
+        producing a false-clean result for a lock/manifest that was never
+        actually reviewed.
+
+        Models the swap as a side effect of the SAME fake `run_npm()` "ci"
+        call that materializes the (genuine) entrypoint content -- not via
+        `atomic_create_private_file()`, which only publishes each file
+        ONCE, before `npm ci` ever runs, and would be caught by the
+        earlier `verify_unchanged_private_ssd_file()` re-check instead of
+        proving this specific, later window.
+
+        Verified to FAIL against pre-fix HEAD (commit 8db19bdab6, before
+        this round's fix): `release_relative_pinned_digests` had no entry
+        for either path, so tree_digest()'s pinned-digest comparison had
+        nothing to compare `target_relative` against and simply recorded
+        the already-tampered bytes as the permanent baseline;
+        `installer.install()` completed successfully with a clean receipt
+        instead of raising.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            release = tool_root / "releases" / f"v{installer.VERSION}"
+            user_home = root / "user"
+            user_home.mkdir(mode=0o700)
+
+            local_assets = {
+                "prime-agent": installer.MAIN_PATCHED_ASSET,
+                **installer.WORKSPACE_ASSETS,
+            }
+            generated = {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {
+                        "name": "orca-managed-prime-agent",
+                        "version": installer.VERSION,
+                        "dependencies": {
+                            "prime-agent": f"file:assets/{installer.MAIN_PATCHED_ASSET}"
+                        },
+                    },
+                    **{
+                        f"node_modules/local-{index}": {
+                            "name": name,
+                            "version": installer.VERSION,
+                            "resolved": f"file:assets/{asset_name}",
+                            "integrity": "sha512-dGVzdA==",
+                        }
+                        for index, (name, asset_name) in enumerate(local_assets.items())
+                    },
+                },
+            }
+            with mock.patch.object(installer, "RELEASE_DIR", release):
+                expected_lock_sha256 = installer.sha256_bytes(
+                    installer.normalized_production_lock(generated)
+                )
+            generated_lock_raw = installer.canonical_json(generated)
+
+            GENUINE_CLI_CONTENT = b"// genuine, tarball-pinned cli.js\n"
+            ATTACKER_CONTENT = (
+                b'{"ATTACKER":"controlled content, swapped IN PLACE during the '
+                b'real npm ci subprocess window -- BEFORE write_pending_install() '
+                b'later reaches this path, AFTER the last pre-npm-ci '
+                b'verify_unchanged_private_ssd_file() re-check"}\n'
+            )
+
+            def fake_run_npm(
+                npm_path, node_path, args, cwd, cache, install_home, install_tmp,
+                timeout=300, child_umask=None, release_dir_fd=None,
+            ):
+                cwd = Path(cwd)
+                if args and args[0] == "install":
+                    lock_path = cwd / "package-lock.json"
+                    lock_path.write_bytes(generated_lock_raw)
+                    os.chmod(lock_path, 0o600)
+                elif args and args[0] == "ci":
+                    bundle = cwd / "node_modules/prime-agent/dist/bundle"
+                    bundle.mkdir(parents=True, mode=0o700)
+                    for ancestor in (
+                        cwd / "node_modules",
+                        cwd / "node_modules/prime-agent",
+                        cwd / "node_modules/prime-agent/dist",
+                        bundle,
+                    ):
+                        os.chmod(ancestor, 0o700)
+                    cli = bundle / "cli.js"
+                    cli.write_bytes(GENUINE_CLI_CONTENT)
+                    os.chmod(cli, 0o600)
+                    # The in-place same-UID swap this test is actually
+                    # about: same inode, same mode -- exactly modeling a
+                    # racer overwriting the already-published file's
+                    # CONTENT during this real subprocess's own window,
+                    # not replacing the file (which a symlink/identity
+                    # check would already catch a different way).
+                    target = cwd / target_relative
+                    with open(target, "r+b") as handle:
+                        handle.seek(0)
+                        handle.write(ATTACKER_CONTENT)
+                        handle.truncate()
+
+            def fake_make_patched_asset(
+                original_asset,
+                original_sha256,
+                upstream_lock,
+                assets_dir,
+                *,
+                expected_name,
+                managed_name,
+                output_name,
+            ):
+                patched = assets_dir / output_name
+                installer.atomic_create_private_file(patched, b"stub-asset", 0o600)
+                published_stat = patched.lstat()
+                content_digests = (
+                    {
+                        Path("dist/bundle/cli.js"): installer.sha256_bytes(
+                            GENUINE_CLI_CONTENT
+                        ),
+                    }
+                    if managed_name == "prime-agent"
+                    else {}
+                )
+                return (
+                    patched,
+                    installer.sha256_bytes(b"stub-asset"),
+                    {"name": managed_name, "version": installer.VERSION},
+                    (published_stat.st_dev, published_stat.st_ino),
+                    content_digests,
+                )
+
+            def fake_safe_download(url, destination, expected_sha256, *, max_bytes=None):
+                if destination.name == "upstream-package-lock.json":
+                    payload = installer.canonical_json(
+                        {"lockfileVersion": 3, "packages": {}}
+                    )
+                else:
+                    payload = b"stub-download"
+                installer.atomic_create_private_file(destination, payload, 0o600)
+
+            fake_evidence = {
+                "volume_uuid": "TEST-UUID",
+                "node_version": installer.NODE_VERSION,
+                "npm_version": installer.NPM_VERSION,
+                "orca_support": {"test": "support"},
+            }
+
+            with contextlib.ExitStack() as stack:
+                enter = stack.enter_context
+                enter(mock.patch.object(installer, "SSD_ROOT", root))
+                enter(mock.patch.object(installer, "TOOL_ROOT", tool_root))
+                enter(mock.patch.object(installer, "RELEASE_DIR", release))
+                enter(mock.patch.object(installer, "STATE_DIR", tool_root / "state"))
+                enter(
+                    mock.patch.object(installer, "PROBE_HOME", tool_root / "probe-home")
+                )
+                enter(mock.patch.object(installer, "USER_HOME", user_home))
+                enter(mock.patch.object(installer, "STATE_LINK", user_home / ".prime"))
+                enter(
+                    mock.patch.object(
+                        installer, "BIN_LINK", user_home / ".local/bin/prime-agent"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "RECEIPT_PATH",
+                        tool_root / "receipts" / f"v{installer.VERSION}.json",
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "PENDING_PATH", tool_root / "pending-install.json"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_SHA256", expected_lock_sha256
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "GENERATED_LOCK_PACKAGE_COUNT", len(local_assets)
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "volume_uuid", return_value="TEST-UUID")
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "verify_orca_support",
+                        return_value={"test": "support"},
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "prime_agent_command_candidates", return_value=[]
+                    )
+                )
+                enter(
+                    mock.patch.object(installer, "preflight", return_value=fake_evidence)
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "safe_download", side_effect=fake_safe_download
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "LOCK_SHA256", STUB_UPSTREAM_LOCK_SHA256
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "extract_node_toolchain",
+                        side_effect=self.fake_extract_node_toolchain,
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer, "exact_tool_version", return_value="stub"
+                    )
+                )
+                enter(
+                    mock.patch.object(
+                        installer,
+                        "make_patched_asset",
+                        side_effect=fake_make_patched_asset,
+                    )
+                )
+                enter(mock.patch.object(installer, "run_npm", side_effect=fake_run_npm))
+
+                with self.assertRaisesRegex(installer.PrimeInstallError, error_regex):
+                    installer.install()
+
+            self.assertFalse((tool_root / "pending-install.json").exists())
+            self.assertFalse(
+                (tool_root / "receipts" / f"v{installer.VERSION}.json").exists()
+            )
+
+    def test_install_locked_detects_manifest_content_swap_during_npm_ci_window(
+        self,
+    ) -> None:
+        # Regression for independent Codex sol/max round-55 re-review,
+        # 2026-08-22, P1/blocker: see
+        # _round56_tamper_manifest_or_lock_during_npm_ci_window_harness()'s
+        # own docstring for the full finding. This is the package.json
+        # half.
+        self._round56_tamper_manifest_or_lock_during_npm_ci_window_harness(
+            target_relative="package.json",
+            error_regex=(
+                r"release tree content does not match its digest-verified "
+                r"pre-npm-ci pinned baseline: package\.json$"
+            ),
+        )
+
+    def test_install_locked_detects_generated_lock_content_swap_during_npm_ci_window(
+        self,
+    ) -> None:
+        # Regression for independent Codex sol/max round-55 re-review,
+        # 2026-08-22, P1/blocker: see
+        # _round56_tamper_manifest_or_lock_during_npm_ci_window_harness()'s
+        # own docstring for the full finding. This is the
+        # package-lock.json half -- the file `npm audit` (the round-54
+        # `audit` action) actually reads to decide what is "clean".
+        self._round56_tamper_manifest_or_lock_during_npm_ci_window_harness(
+            target_relative="package-lock.json",
+            error_regex=(
+                r"release tree content does not match its digest-verified "
+                r"pre-npm-ci pinned baseline: package-lock\.json$"
+            ),
+        )
+
     def test_install_locked_detects_npm_cli_content_swap_during_npm_ci_window(
         self,
     ) -> None:
@@ -14688,9 +15046,16 @@ class PrimeAgentInstallerTests(unittest.TestCase):
     def test_allowed_unpinned_release_files_is_derived_from_current_constants(
         self,
     ) -> None:
-        # Round 37's own reproduction, against a real install, measured
-        # this exemption set at exactly 14 entries: 5 bookkeeping literals
-        # plus 9 "assets/<name>" entries. Assert the CURRENT, real value
+        # Round 37's own reproduction, against a real install, originally
+        # measured this exemption set at 14 entries: 5 bookkeeping literals
+        # plus 9 "assets/<name>" entries. Round 56 (independent Codex
+        # sol/max round-55 re-review, P1/blocker) removed package.json and
+        # package-lock.json from the exemption set -- both are now
+        # individually pinned in release_relative_pinned_digests instead,
+        # since the round-54 `audit` action reads them again for real (see
+        # allowed_unpinned_release_files()'s own updated docstring) -- so
+        # the current, correct count is 12: 3 bookkeeping literals plus the
+        # same 9 "assets/<name>" entries. Assert the CURRENT, real value
         # matches that count and content exactly, AND assert the function
         # actually tracks ASSETS/WORKSPACE_ASSETS/MAIN_PATCHED_ASSET/
         # NODE_ASSET rather than being a hardcoded literal that happens to
@@ -14702,8 +15067,6 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             frozenset(
                 {
                     "LICENSE",
-                    "package.json",
-                    "package-lock.json",
                     "upstream-package-lock.json",
                     "lib/node_modules/.package-lock.json",
                     *(f"assets/{name}" for name in installer.ASSETS),
@@ -14716,7 +15079,9 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 }
             ),
         )
-        self.assertEqual(len(exempt), 14)
+        self.assertEqual(len(exempt), 12)
+        self.assertNotIn("package.json", exempt)
+        self.assertNotIn("package-lock.json", exempt)
         # Every entry is genuinely derived from a constant, not hardcoded:
         # mutating ASSETS to add a new download must add a new
         # "assets/<name>" exemption with no other change.
@@ -14727,7 +15092,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
         ):
             grown = installer.allowed_unpinned_release_files()
         self.assertIn("assets/extra-fake-asset.tgz", grown)
-        self.assertEqual(len(grown), 15)
+        self.assertEqual(len(grown), 13)
 
     def test_lock_row_platform_excludes_current_target(self) -> None:
         excludes = installer.lock_row_platform_excludes_current_target

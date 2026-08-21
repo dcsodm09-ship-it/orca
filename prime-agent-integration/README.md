@@ -182,7 +182,7 @@ non-blocking follow-ups, addressed as part of this same 2026-08-22 change:
    means a separate, explicit audit gate/cadence is needed rather than
    relying on someone remembering to check by hand. Added: `python3
    install_prime_agent.py audit` (`audit_installed_lock()`, see "Operator
-   commands" above), a read-only, explicitly opt-in command that first
+   commands" below), a read-only, explicitly opt-in command that first
    runs the complete `verify` gate (so a tampered lock or release tree is
    caught before anything about it is trusted), then runs a real `npm
    audit` against the installed production lock and fails closed on any
@@ -194,7 +194,7 @@ non-blocking follow-ups, addressed as part of this same 2026-08-22 change:
    plan/install/verify/enable, which stay fully offline and hermetic.
 2. **Generated-registry-lock drift versus the pinned upstream *source*
    lock** (not versus the prior generated-lock pin -- a different,
-   stronger baseline): roughly 37 version differences across the
+   stronger baseline): roughly 36 version differences across the
    registry-resolved closure (e.g. `zod` 3.25.76->4.4.3,
    `@types/node` 22->26), confirming the four Prime Agent tarballs are
    byte-pinned but the full 196-package runtime closure is not claimed to
@@ -233,13 +233,15 @@ non-blocking follow-ups, addressed as part of this same 2026-08-22 change:
 4. **Pin-staleness cadence**: added `GENERATED_LOCK_PINNED_AT` (the date
    `GENERATED_LOCK_SHA256` was last re-pinned) and
    `generated_lock_pin_age_days()`, surfaced in `plan()`'s evidence.
+   Deliberately informational only, never a hard gate -- a stale pin is a
+   prompt to re-verify, not proof anything is wrong today.
 
 Round-54's own dual review (Claude opus/max + Codex sol/max, both
 independent, 2026-08-22) then found real defects in this same change before
 it was allowed to stand: `compute_lock_drift()`'s registry-row filter
 silently ignored 122 of 184 comparable upstream package names (a genuine
 npm lockfile-v3 property -- many real registry rows carry no `resolved`
-field at all), undercounting drift by 16% (31 reported vs. 37 real);
+field at all), undercounting drift by 16% (31 reported vs. 36 real);
 `GENERATED_LOCK_PINNED_AT` was itself off by one day (`bafce01bf5`, the
 commit that actually re-pinned `GENERATED_LOCK_SHA256`, is dated
 2026-08-21, not 2026-08-22), which made `plan()` briefly report a negative
@@ -251,11 +253,104 @@ name only, silently accepting any *future* advisory against `extract-zip`
 alongside the one actually reviewed. All four are fixed: `audit` now calls
 `verify()`'s complete gate first; the allowlist is keyed by the exact
 `(package, GHSA id)` pair; the drift filter now also accepts registry rows
-with no `resolved` field (rejecting only `file:`/workspace-link rows);
+with no `resolved` field (rejecting only `file:`/workspace-link rows, and
+requiring a `node_modules/`-prefixed lock path so a workspace member's own
+non-`node_modules/` definition row is never admitted either);
 `GENERATED_LOCK_PINNED_AT` corrected to `2026-08-21` with a
 `max(0, ...)` clamp against ever reporting a negative age again.
-   Deliberately informational only, never a hard gate -- a stale pin is a
-   prompt to re-verify, not proof anything is wrong today.
+
+A subsequent round-55 re-review (opus/max, mutation-tested: each fix was
+independently confirmed by reverting it and re-running the suite) found no
+new P0/P1 in the code, but did find the drift-filter widening had zero
+regression coverage (now added) and a stale, factually-superseded comment
+that had been left standing directly above `ACCEPTED_ADVISORIES` even
+though it asserted the opposite of what the fixed code does (removed, not
+just supplemented). It also caught this document itself still saying "37"
+in two places where the real, hash-verified drift count is 36 (corrected
+above) -- worth naming plainly: this section exists specifically to leave
+an accurate paper trail, and it twice needed correcting by later rounds
+after inheriting a manual arithmetic slip forward from an earlier one.
+
+That same round-55 re-review, independently and in parallel (both Claude
+opus/max and Codex sol/max), also found one more real defect: the `audit`
+action reads `package.json`/`package-lock.json`, but neither file had ever
+been individually pinned (an accepted residual dating back to before `audit`
+existed, when nothing read either file again after install) -- so a
+same-UID racer who swapped either file's content during `npm ci`'s own
+real, multi-minute subprocess window could have had the poisoned bytes
+adopted as the permanent baseline, with `npm audit` then unknowingly
+auditing the attacker's own substituted "clean" manifest/lock. Fixed
+(round 56): both files are now pinned in `release_relative_pinned_digests`
+the same way every other executed/read-again file already is, and removed
+from `allowed_unpinned_release_files()`'s exemption set. Two new real,
+non-mocked-`run_npm()` regression tests reproduce the exact attack (content
+swapped as a side effect of the real `npm ci` window, verified to make
+pre-fix `install()` complete successfully with the attacker's bytes baked
+into the trusted baseline, and to fail closed post-fix).
+
+Re-pinned 2026-08-22 (round 56; v0.7.2 remains current for every
+upstream-immutable item above; nothing upstream-immutable changed on
+re-check). The **generated production closure** changed again, for the
+same reason as every prior refresh: npm always resolves to the *highest
+currently-published* version satisfying each floating range, and this time
+the drift was caught live, mid-review -- both this project's own
+`sandbox_e2e.py` runs and an independent Codex sol/max round-55 re-review's
+own real replay failed closed within the same ~15-minute window that
+`@aws-sdk/core@3.977.9` published upstream, roughly a day after the
+round-54/55 pin.
+
+- package-row count: **200 rows, unchanged** from the round-54/55 capture;
+- normalized lock SHA-256: **`006d6d1493b35f973316e2bcd8724a26b7bda5a427dbe6ca73447440b929e092`**
+  (was `fe4402ae740cc0d2f326baf58f80543ecf8e9668e22f6434f0941bed43c732f5`).
+
+Reproduction: the real `install()` code path (not a hand-rolled npm
+replica) was independently re-run twice with a fully fresh npm cache/home
+each time, producing the identical normalized hash both times; a third,
+fully independent confirmation came from the round-55 Codex reviewer's own
+concurrent real run. Both the old and new hash were then independently
+recomputed directly with the installer's own `normalized_production_lock()`
+-- catching and correcting a real mocking mistake along the way (the
+generic path-scrub is a no-op unless `RELEASE_DIR` is mocked to the exact
+absolute base path a given capture actually used, since two of the four
+locally patched packages' own manifests embed sibling `file:` paths built
+from it) -- and, once corrected, both matched exactly.
+
+Diff methodology: every node_modules/-prefixed row matched by exact lock
+path across both locks, name+version compared exhaustively (not sampled),
+plus a full-row (all-keys) equality check on every unchanged-version row to
+catch silent drift behind a stable version string (found none, across all
+183 unchanged rows). Result: **17 of 200 registry rows changed (8.5%)**,
+every one in the already-pinned `@aws-sdk/*` scope --
+`@aws-sdk/core`, `credential-provider-{env,http,ini,login,node,process,sso,
+web-identity}`, `eventstream-handler-node`,
+`middleware-{eventstream,websocket}`, `nested-clients`,
+`signature-v4-multi-region`, `types`, `xml-builder`, all strict
+patch-level bumps within an already-pinned major.minor line, plus a nested
+copy (under `credential-provider-sso`) of `token-providers`
+(3.1111.0->3.1116.0, a minor bump still within the same already-pinned
+major line -- the separate, top-level hoisted `token-providers` copy,
+pinned at 3.1095.0, is untouched). No new package, no major/minor jump on
+any directly AWS-published row, no new dependency or lifecycle script on
+any of the 17 rows -- only internal `@aws-sdk`/`@smithy` sibling
+version-range floors moved. Provenance was checked per row against the
+live registry, not assumed: all 17 show byte-identical publisher identity
+(`aws-sdk-bot <aws-sdk-js-automation@amazon.com>`) between old and new
+version. None of the 17 carry Sigstore/GitHub-OIDC provenance attestation
+on either version (`/-/npm/v1/attestations` returns 404, before and after,
+for every row, independently confirmed to be a real absence rather than a
+broken check by querying the same live endpoint against several
+known-provenance packages) -- a pre-existing, package-wide gap for the
+entire `@aws-sdk/*` family, unlike `@smithy/*` (whose 2026-08-19/2026-08-21
+refreshes did carry genuine Sigstore/SLSA attestation), not a regression
+introduced by this bump, and worth continuing to flag separately to the
+security-review track rather than treating as newly acceptable. The
+remaining 183 registry rows, and all four locally patched managed-asset
+rows, are unchanged -- the latter four confirmed byte-for-byte identical
+in their fully normalized form. No new package, maintainer change,
+unusually-new package, or other supply-chain anomaly was found. This
+closure refresh, and the resulting `GENERATED_LOCK_SHA256` and
+`install_prime_agent.py` update, is itself the kind of upstream-trust
+judgment call this section exists to leave a paper trail for.
 
 ## Installation contract
 
