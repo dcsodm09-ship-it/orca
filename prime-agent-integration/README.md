@@ -91,6 +91,75 @@ are unchanged. This closure refresh, and the resulting `GENERATED_LOCK_SHA256`
 and `install_prime_agent.py` update, is itself the kind of upstream-trust
 judgment call this section exists to leave a paper trail for.
 
+Re-verified 2026-08-21 (v0.7.2 remains current for every item below; nothing
+upstream-immutable changed on re-check):
+
+- the four release-tarball SHA-256 hashes above are unchanged -- confirmed
+  byte-identical via `gh api repos/PrimeIntellect-ai/prime-agent/releases/tags/v0.7.2`
+  and its `SHA256SUMS` asset, and independently confirmed a third way by
+  downloading all four real tarballs and hashing the bytes directly with
+  `shasum -a 256`;
+- the Node.js `v24.19.0` darwin-arm64 SHA-256 pin is unchanged -- confirmed
+  against nodejs.org's own `SHASUMS256.txt` for that exact release;
+- the source `package-lock.json` and MIT `LICENSE` pins (v0.7.2's own commit-
+  pinned files) are unchanged -- re-fetched from the exact pinned commit and
+  re-hashed;
+- two newer stable releases now exist upstream: `v0.7.3` (2026-08-17,
+  already known as of the prior refresh) and a new `v0.7.4` (published
+  2026-08-19T23:44:42Z, now GitHub's own "latest"). Informational only --
+  this candidate deliberately stays on `v0.7.2` for the same reason as
+  before: all security review rounds verified behavior against v0.7.2's
+  exact bundled JS, and moving versions would invalidate that review.
+
+The one stale value found and refreshed, again: the **generated production
+closure**. As before, npm always resolves to the *highest currently-
+published* version satisfying each floating range, and roughly two days had
+passed since the 2026-08-19 refresh:
+
+- package-row count: **200 rows, unchanged** from the 2026-08-19 capture;
+- normalized lock SHA-256: **`fe4402ae740cc0d2f326baf58f80543ecf8e9668e22f6434f0941bed43c732f5`**
+  (was `d6da1eea7d0f2d0a7c14251dde34e31d799edad6c78bea6c08cf33294727ee32`).
+
+Reproduction: two fully independent, live-registry, real isolated replays of
+this installer's own `npm install --package-lock-only` step (pinned Node
+`v24.19.0`/npm `11.17.0`, private HOME/cache/temp, no project or user npm
+config -- one reusing `tests/sandbox_e2e.py`'s fixture, the other a
+from-scratch driver with its own private sandbox root, independently
+monkey-patched paths, and verified-clean contamination checks both before
+and after) both produced the identical `fe4402ae74...` hash, each also
+cross-checked internally by a second, independently-invoked hashing path
+over the same normalized bytes. The two replays agree with each other
+bit-for-bit; no divergence was found.
+
+Diff methodology: identical to the 2026-08-19 refresh. All 196 non-local-
+asset rows in the freshly generated closure were checked, exhaustively (not
+sampled), against the npm registry's own per-version publish timestamp for
+that exact resolved version, using the confirmed-good 2026-08-19 pin as the
+cutoff. Result: **3 of 196 registry rows changed** (1.5%), all in the
+already-pinned `@smithy/*` scope -- `@smithy/core` 3.33.2->3.33.3,
+`@smithy/node-http-handler` 4.11.2->4.11.3, `@smithy/signature-v4`
+5.7.2->5.7.3, all three published within a ~2-minute window
+(2026-08-20T16:01:44Z-16:03:42Z UTC) by the identical maintainer pair
+(`smithy-team` / `aws-sdk-bot`, both `@amazon.com`) via npm's GitHub Actions
+OIDC trusted-publisher mechanism -- the same pattern as the 2026-08-15
+release accepted in the prior refresh. Each is a strict patch-level bump
+within an already-pinned major.minor line (no new package, no major/minor
+jump). Provenance was independently queried against the registry API per
+row, not assumed: `_npmUser` shows `GitHub Actions <npm-oidc-no-reply@github.com>`
+with a `trustedPublisher` OIDC config on all three, `dist.signatures` is
+present on all three, and the fetched attestation bundle for
+`@smithy/core@3.33.3` contains both a valid npm publish attestation and an
+SLSA v1 provenance attestation, both Sigstore-signed -- genuine cryptographic
+provenance, not merely a metadata field. Repository remains
+`github.com/smithy-lang/smithy-typescript`; maturity is 102-162 prior
+published versions per package. The remaining 193 registry rows, and all
+four locally patched managed-asset rows, are unchanged, confirmed on or
+before 2026-08-19 for every one, 0 lookup errors. No new package, maintainer
+change, unusually-new package, or other supply-chain anomaly was found. This
+closure refresh, and the resulting `GENERATED_LOCK_SHA256` and
+`install_prime_agent.py` update, is itself the kind of upstream-trust
+judgment call this section exists to leave a paper trail for.
+
 ## Installation contract
 
 The installer does not execute the upstream `curl | sh` installer. It:
