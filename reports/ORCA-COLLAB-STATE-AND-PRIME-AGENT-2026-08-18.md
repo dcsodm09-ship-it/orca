@@ -3068,6 +3068,11 @@ sol/max 独立接受为残留的"微秒级 lstat/open 窗口"是同一类，不�
 沙箱自身的"真实托管路径污染检测"两次都没有触发，确认 fail-closed、
 零真实状态变更。
 
+Codex 一路重新派发后连续撞了 2 次 Trusted Access（总计第 9、第 10
+次），都是刚派发就立刻撞上、没有任何真实工作痕迹——换成
+`gpt-5.6-terra/high` 后确认真实在跑（`task_3f280591fe79` /
+dispatch `ctx_48cdcd27cec2`）。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
