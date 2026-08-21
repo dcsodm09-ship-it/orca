@@ -4,6 +4,8 @@ import contextlib
 import fcntl
 import json
 import os
+import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -15,7 +17,9 @@ from unittest import mock
 
 sys.path.insert(0, os.fspath(Path(__file__).resolve().parents[1]))
 
+import claude_memory_hook as hook
 import install_bridge as installer
+import write_candidate_capture as wtc
 
 
 def base_config() -> bytes:
@@ -71,6 +75,265 @@ class InstallBridgeTests(unittest.TestCase):
         with self.assertRaises(installer.InstallError):
             installer.update_hook_config(b'{"hooks":{},"extra":1}', "command")
 
+    # -- SessionEnd hook-registration capability (AUTO-LEARN-TRIGGER-DESIGN-2026-08-19.md
+    # section 4.2): make_handler()/update_hook_config() gained an explicit `timeout`/`event`
+    # parameter so a future caller can register a handler under an event other than
+    # "UserPromptSubmit". Every test above this line calls these functions exactly as it did
+    # before that change (no `event`/`timeout` kwarg) and still passes unchanged -- proving the
+    # new parameters' defaults reproduce the old hardcoded behavior byte-for-byte. The tests
+    # below exercise the new, explicit-event path itself.
+
+    def test_make_handler_default_timeout_is_unchanged(self) -> None:
+        # Pinned regression: DEFAULT_HOOK_TIMEOUT must still be the exact value every
+        # already-installed UserPromptSubmit handler was created with.
+        self.assertEqual(installer.DEFAULT_HOOK_TIMEOUT, 5)
+        handler = installer.make_handler("some command")
+        self.assertEqual(handler["hooks"][0]["timeout"], 5)
+
+    def test_make_handler_accepts_an_explicit_timeout(self) -> None:
+        handler = installer.make_handler("some command", timeout=99)
+        self.assertEqual(handler["hooks"][0]["timeout"], 99)
+        self.assertEqual(handler["hooks"][0]["command"], "some command")
+
+    def test_update_hook_config_default_event_is_unchanged(self) -> None:
+        self.assertEqual(installer.DEFAULT_HOOK_EVENT, "UserPromptSubmit")
+
+    def test_update_hook_config_session_end_against_config_missing_the_key_entirely(self) -> None:
+        # A real, currently-un-migrated hooks.json has no "SessionEnd" key at all (design doc
+        # section 0/4.2). The presence check must now *initialize* an empty list for it rather
+        # than raise InstallError, so this event can be registered for the first time.
+        raw = json.dumps({"hooks": {}}, sort_keys=True).encode()
+        command = f"/usr/bin/python3 write_candidate_capture.py --bridge-id {installer.BRIDGE_ID}"
+        updated = installer.update_hook_config(raw, command, event="SessionEnd")
+        payload = json.loads(updated)
+        self.assertEqual(list(payload["hooks"].keys()), ["SessionEnd"])
+        handlers = payload["hooks"]["SessionEnd"]
+        self.assertEqual(len(handlers), 1)
+        self.assertTrue(installer.owned_handler(handlers[0]))
+        self.assertEqual(handlers[0]["hooks"][0]["command"], command)
+
+    def test_update_hook_config_default_event_still_raises_when_key_entirely_missing(self) -> None:
+        # Regression pin (independent dual review, 2026-08-20): the SessionEnd
+        # auto-initialize-empty-list branch above must NOT apply to the default event.
+        # install()/plan() call update_hook_config() with zero non-default args -- exactly this
+        # shape -- and _enumerate_hook_configs() includes every codex-accounts/*/home/hooks.json
+        # unconditionally, so a freshly-discovered account config can genuinely have no
+        # "UserPromptSubmit" key at all (e.g. only a SessionStart hook so far). This must still
+        # fail closed exactly as it did before the SessionEnd capability was added, not silently
+        # create the key and proceed with install. No test pinned this before, which is why the
+        # regression was not caught the first time.
+        raw = json.dumps({"hooks": {"SessionStart": []}}, sort_keys=True).encode()
+        with self.assertRaises(installer.InstallError):
+            installer.update_hook_config(raw, "command")
+        # Same for the fully-empty-hooks case, and with the default event passed explicitly.
+        empty_raw = json.dumps({"hooks": {}}, sort_keys=True).encode()
+        with self.assertRaises(installer.InstallError):
+            installer.update_hook_config(empty_raw, "command")
+        with self.assertRaises(installer.InstallError):
+            installer.update_hook_config(empty_raw, "command", event=installer.DEFAULT_HOOK_EVENT)
+
+    def test_update_hook_config_session_end_does_not_disturb_other_existing_events(self) -> None:
+        # base_config() already has "SessionStart" (empty) and "UserPromptSubmit" (one
+        # pre-existing unrelated handler) -- neither key exists as "SessionEnd" yet. Registering
+        # SessionEnd must leave both of those completely untouched.
+        raw = base_config()
+        command = f"/usr/bin/python3 write_candidate_capture.py --bridge-id {installer.BRIDGE_ID}"
+        updated = installer.update_hook_config(raw, command, event="SessionEnd")
+        payload = json.loads(updated)
+        self.assertEqual(payload["hooks"]["SessionStart"], [])
+        self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
+        self.assertEqual(payload["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"], "/usr/bin/true")
+        self.assertFalse(installer.owned_handler(payload["hooks"]["UserPromptSubmit"][0]))
+        session_end_handlers = payload["hooks"]["SessionEnd"]
+        self.assertEqual(len(session_end_handlers), 1)
+        self.assertTrue(installer.owned_handler(session_end_handlers[0]))
+        # And, unchanged from before this change: the original UserPromptSubmit content is
+        # byte-for-byte the same JSON sub-document it always was.
+        original_payload = json.loads(raw)
+        self.assertEqual(payload["hooks"]["UserPromptSubmit"], original_payload["hooks"]["UserPromptSubmit"])
+
+    def test_update_hook_config_session_end_is_idempotent_and_removable(self) -> None:
+        raw = base_config()
+        command = f"/usr/bin/python3 write_candidate_capture.py --bridge-id {installer.BRIDGE_ID}"
+        first = installer.update_hook_config(raw, command, event="SessionEnd")
+        second = installer.update_hook_config(first, command, event="SessionEnd")
+        self.assertEqual(first, second)
+        payload = json.loads(second)
+        self.assertEqual(len(payload["hooks"]["SessionEnd"]), 1)
+        removed = installer.update_hook_config(second, command, event="SessionEnd", remove=True)
+        removed_payload = json.loads(removed)
+        self.assertEqual(removed_payload["hooks"]["SessionEnd"], [])
+        # UserPromptSubmit was never touched by any of this.
+        self.assertEqual(len(removed_payload["hooks"]["UserPromptSubmit"]), 1)
+
+    def test_update_hook_config_session_end_still_raises_on_malformed_existing_key(self) -> None:
+        # A present-but-wrong-shape key is real corruption, not "absent" -- must still fail
+        # closed exactly like the pre-existing UserPromptSubmit malformed-shape check does.
+        raw = json.dumps({"hooks": {"SessionEnd": "not-a-list"}}, sort_keys=True).encode()
+        with self.assertRaises(installer.InstallError):
+            installer.update_hook_config(raw, "command", event="SessionEnd")
+
+    def test_owned_shape_match_defaults_to_userpromptsubmit_and_ignores_other_events(self) -> None:
+        # A payload shaped like ours under "UserPromptSubmit" (empty, no owned handler) but
+        # carrying an owned handler under "SessionEnd" instead. The default call (no `event`
+        # kwarg, exactly what every existing caller does) must report False, exactly as it did
+        # before this parameterization existed -- SessionEnd is invisible unless explicitly
+        # asked for.
+        payload = {
+            "hooks": {
+                "UserPromptSubmit": [],
+                "SessionEnd": [
+                    {"hooks": [{"command": f"run --bridge-id {installer.BRIDGE_ID}"}]}
+                ],
+            }
+        }
+        self.assertFalse(installer._owned_shape_match(payload))
+        self.assertTrue(installer._owned_shape_match(payload, event="SessionEnd"))
+
+    def test_contains_owned_handler_defaults_to_userpromptsubmit_and_ignores_other_events(self) -> None:
+        raw = json.dumps(
+            {
+                "hooks": {
+                    "UserPromptSubmit": [],
+                    "SessionEnd": [
+                        {"hooks": [{"command": f"run --bridge-id {installer.BRIDGE_ID}"}]}
+                    ],
+                }
+            }
+        ).encode()
+        self.assertFalse(installer._contains_owned_handler(raw))
+        self.assertTrue(installer._contains_owned_handler(raw, event="SessionEnd"))
+
+    # -- Whole-candidate acceptance review, 2026-08-20: two cross-file gaps between this file's
+    # SessionEnd capability and write_candidate_capture.py, its documented future consumer.
+    #
+    # Finding 1: owned_handler()/_owned_shape_match()/_attempt_structural_detection()/
+    # _contains_owned_handler() all hardcoded BRIDGE_ID (this module's own constant), but
+    # write_candidate_capture.py defines a distinct MODULE_ID ("orca-claude-codex-memory-write-
+    # trigger-v1", write_candidate_capture.py:60) and requires any command it registers to carry
+    # `--bridge-id <MODULE_ID>` (write_candidate_capture.py:2237), matching the design doc's own
+    # example wiring (write_candidate_capture.py:2321, "NOT WIRED IN. Example only"). Reproduced
+    # directly (isolated scratch copy with only this fix's hunks reverted, per this file's
+    # established verification method -- see AUTO-LEARN-TRIGGER-DESIGN-2026-08-19.md section 17):
+    # registering `--bridge-id <MODULE_ID>` through the pre-fix update_hook_config() three times
+    # produced 1 -> 2 -> 3 duplicate SessionEnd handlers instead of being idempotent, remove=True
+    # left all 3 in place, and both _contains_owned_handler() and owned_handler() reported False
+    # for a handler that was, in fact, this installer's own. All four functions now accept an
+    # explicit `bridge_id` parameter (default: BRIDGE_ID, so every existing call site -- none of
+    # which pass it -- is unaffected).
+    #
+    # Finding 2: make_handler() unconditionally wrote a "timeout" key, but write_candidate_capture
+    # .py's own documented SessionEnd wiring (write_candidate_capture.py:2330-2336) explicitly
+    # carries no "timeout" key at all (its scan has unbounded latency by design; SessionEnd has no
+    # output contract for Codex to enforce one against). Worse, update_hook_config() -- the only
+    # real config-writing entry point -- never forwarded a `timeout` value to make_handler() at
+    # all, so make_handler()'s existing `timeout` parameter was unreachable through the supported
+    # API. make_handler() now accepts `timeout: int | None`, omitting the "timeout" key entirely
+    # when `None` (default unchanged: DEFAULT_HOOK_TIMEOUT), and update_hook_config() now accepts
+    # and forwards `timeout` too.
+
+    def test_update_hook_config_bridge_id_reproduces_reviewers_exact_failure_shape_then_works(
+        self,
+    ) -> None:
+        # The reviewer's exact repro: a command whose --bridge-id is write_candidate_capture's
+        # MODULE_ID, not this module's own BRIDGE_ID. Passing bridge_id=<that different string>
+        # must make registration idempotent, removal effective, and detection correct -- exactly
+        # the three guarantees the pre-fix code failed (see the class comment above).
+        write_trigger_bridge_id = "orca-claude-codex-memory-write-trigger-v1"  # write_candidate_capture.MODULE_ID
+        command = f"/usr/bin/python3 write_candidate_capture.py scan --bridge-id {write_trigger_bridge_id}"
+        raw = base_config()
+
+        first = installer.update_hook_config(raw, command, event="SessionEnd", bridge_id=write_trigger_bridge_id)
+        second = installer.update_hook_config(first, command, event="SessionEnd", bridge_id=write_trigger_bridge_id)
+        self.assertEqual(first, second)  # idempotent: still exactly 1 handler, not 2
+        payload = json.loads(second)
+        session_end_handlers = payload["hooks"]["SessionEnd"]
+        self.assertEqual(len(session_end_handlers), 1)
+
+        self.assertTrue(installer.owned_handler(session_end_handlers[0], bridge_id=write_trigger_bridge_id))
+        self.assertTrue(
+            installer._contains_owned_handler(second, event="SessionEnd", bridge_id=write_trigger_bridge_id)
+        )
+
+        removed = installer.update_hook_config(
+            second, command, event="SessionEnd", bridge_id=write_trigger_bridge_id, remove=True
+        )
+        removed_payload = json.loads(removed)
+        self.assertEqual(removed_payload["hooks"]["SessionEnd"], [])
+
+        # Untouched throughout: the pre-existing UserPromptSubmit handler from base_config().
+        self.assertEqual(len(removed_payload["hooks"]["UserPromptSubmit"]), 1)
+        self.assertEqual(removed_payload["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"], "/usr/bin/true")
+
+    def test_bridge_id_default_still_only_recognizes_this_modules_own_bridge_id(self) -> None:
+        # A handler carrying a DIFFERENT bridge_id must be invisible to every default (no
+        # `bridge_id` kwarg) call -- the live, already-installed UserPromptSubmit path never
+        # passes one, and must keep behaving exactly as it always has.
+        other_bridge_id = "orca-claude-codex-memory-write-trigger-v1"
+        handler = {"hooks": [{"command": f"run --bridge-id {other_bridge_id}"}]}
+        self.assertFalse(installer.owned_handler(handler))
+        self.assertTrue(installer.owned_handler(handler, bridge_id=other_bridge_id))
+
+        raw = json.dumps(
+            {"hooks": {"SessionEnd": [handler]}},
+            sort_keys=True,
+        ).encode()
+        self.assertFalse(installer._contains_owned_handler(raw, event="SessionEnd"))
+        self.assertTrue(installer._contains_owned_handler(raw, event="SessionEnd", bridge_id=other_bridge_id))
+        self.assertFalse(installer._owned_shape_match(json.loads(raw), event="SessionEnd"))
+        self.assertTrue(
+            installer._owned_shape_match(json.loads(raw), event="SessionEnd", bridge_id=other_bridge_id)
+        )
+
+    def test_update_hook_config_userpromptsubmit_default_path_unaffected_by_bridge_id_parameter(self) -> None:
+        # Zero-regression pin for the existing, live UserPromptSubmit path: identical to
+        # test_update_preserves_existing_and_is_idempotent/test_remove_owned_handler_only above,
+        # now with the new `bridge_id` parameter never mentioned at all -- proving its presence
+        # alone changes nothing for a caller that does not use it.
+        command = f"/usr/bin/python3 hook.py --bridge-id {installer.BRIDGE_ID}"
+        first = installer.update_hook_config(base_config(), command)
+        second = installer.update_hook_config(first, command)
+        self.assertEqual(first, second)
+        payload = json.loads(second)
+        handlers = payload["hooks"]["UserPromptSubmit"]
+        self.assertEqual(len(handlers), 2)
+        removed = installer.update_hook_config(second, command, remove=True)
+        self.assertEqual(len(json.loads(removed)["hooks"]["UserPromptSubmit"]), 1)
+
+    def test_make_handler_default_timeout_still_unchanged_and_none_omits_the_key(self) -> None:
+        self.assertEqual(installer.make_handler("cmd")["hooks"][0]["timeout"], installer.DEFAULT_HOOK_TIMEOUT)
+        handler = installer.make_handler("cmd", timeout=None)
+        self.assertNotIn("timeout", handler["hooks"][0])
+        self.assertEqual(handler["hooks"][0]["command"], "cmd")
+
+    def test_update_hook_config_default_timeout_path_is_byte_identical_to_before(self) -> None:
+        # No `timeout` argument passed anywhere (matching every real install()/plan() call site
+        # today) must still produce "timeout": 5, byte-for-byte identical to before this
+        # parameter existed.
+        raw = json.dumps({"hooks": {}}, sort_keys=True).encode()
+        command = "/usr/bin/python3 hook.py --bridge-id x"
+        updated = installer.update_hook_config(raw, command, event="SessionEnd")
+        handler = json.loads(updated)["hooks"]["SessionEnd"][0]["hooks"][0]
+        self.assertEqual(handler["timeout"], 5)
+        self.assertEqual(handler, installer.make_handler(command)["hooks"][0])
+
+    def test_update_hook_config_timeout_none_is_reachable_end_to_end_and_omits_the_key(self) -> None:
+        # The exact shape write_candidate_capture.py's SessionEnd handler requires (write_
+        # candidate_capture.py:2330-2336): no "timeout" key at all, reached through
+        # update_hook_config() itself -- the real, supported config-writing API -- not just by
+        # calling make_handler() directly.
+        raw = json.dumps({"hooks": {}}, sort_keys=True).encode()
+        command = f"/usr/bin/python3 write_candidate_capture.py scan --bridge-id {installer.BRIDGE_ID}"
+        updated = installer.update_hook_config(raw, command, event="SessionEnd", timeout=None)
+        handler = json.loads(updated)["hooks"]["SessionEnd"][0]["hooks"][0]
+        self.assertNotIn("timeout", handler)
+        self.assertEqual(handler["command"], command)
+        # Idempotent under timeout=None too, and removable.
+        again = installer.update_hook_config(updated, command, event="SessionEnd", timeout=None)
+        self.assertEqual(updated, again)
+        removed = installer.update_hook_config(again, command, event="SessionEnd", timeout=None, remove=True)
+        self.assertEqual(json.loads(removed)["hooks"]["SessionEnd"], [])
+
     def test_atomic_write_sets_private_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "hooks.json"
@@ -85,6 +348,49 @@ class InstallBridgeTests(unittest.TestCase):
                 {"hooks": [{"command": f"run --bridge-id {installer.BRIDGE_ID}"}]}
             )
         )
+
+    def test_owned_handler_rejects_invalid_bridge_id_instead_of_silently_returning_false(self) -> None:
+        # Pre-fix, owned_handler(handler, bridge_id=None) never raised -- it just never matched any
+        # token (a silent no-op returning False, despite contradicting the `str` annotation), and
+        # bridge_id="" would structurally match the bare `--bridge-id ` marker text present in
+        # essentially any owned-shaped command. Both must now fail closed with a clear InstallError
+        # instead (AUTO-LEARN-TRIGGER-DESIGN-2026-08-19.md section 19.3 item 4 / section 26.1).
+        handler = {"hooks": [{"command": f"run --bridge-id {installer.BRIDGE_ID}"}]}
+        with self.assertRaises(installer.InstallError):
+            installer.owned_handler(handler, bridge_id=None)  # type: ignore[arg-type]
+        with self.assertRaises(installer.InstallError):
+            installer.owned_handler(handler, bridge_id="")
+        # Unaffected: the real, only-ever-exercised default-bridge_id call shape.
+        self.assertTrue(installer.owned_handler(handler))
+
+    def test_update_hook_config_rejects_invalid_bridge_id_and_event(self) -> None:
+        raw = base_config()
+        command = f"/usr/bin/python3 hook.py --bridge-id {installer.BRIDGE_ID}"
+        for bad_bridge_id in (None, ""):
+            with self.assertRaises(installer.InstallError):
+                installer.update_hook_config(raw, command, bridge_id=bad_bridge_id)  # type: ignore[arg-type]
+        for bad_event in (None, "", "not a valid event!", "123StartsWithDigit"):
+            with self.assertRaises(installer.InstallError):
+                installer.update_hook_config(raw, command, event=bad_event)  # type: ignore[arg-type]
+        # Unaffected: the real, only-ever-exercised default-parameter call shape still works.
+        updated = installer.update_hook_config(raw, command)
+        self.assertEqual(len(json.loads(updated)["hooks"]["UserPromptSubmit"]), 2)
+
+    def test_find_untracked_owned_configs_rejects_invalid_bridge_id_and_event_before_touching_disk(self) -> None:
+        # Validated as the very first statements of the function, before any real filesystem
+        # access -- proven here by calling it with none of the SSD-fixture path mocking that
+        # InstallEndToEndTests-style classes set up: a pre-fix call would either have walked the
+        # real local-homes tree looking for a degenerate marker, or (for bridge_id=None) silently
+        # found nothing everywhere instead of rejecting the bad value outright. This also covers
+        # the whole internal detection chain (_contains_owned_handler() and everything it calls),
+        # which has no other call site in this file. AUTO-LEARN-TRIGGER-DESIGN-2026-08-19.md
+        # section 19.3 item 4 / section 26.1.
+        for bad_bridge_id in (None, ""):
+            with self.assertRaises(installer.InstallError):
+                installer._find_untracked_owned_configs(set(), bridge_id=bad_bridge_id)  # type: ignore[arg-type]
+        for bad_event in (None, "", "not a valid event!"):
+            with self.assertRaises(installer.InstallError):
+                installer._find_untracked_owned_configs(set(), event=bad_event)  # type: ignore[arg-type]
 
     def test_owned_handler_rejects_bridge_id_as_a_mere_substring(self) -> None:
         # A substring check would wrongly treat any of these as "owned by
@@ -373,6 +679,340 @@ class InstallBridgeTests(unittest.TestCase):
             whole_path.write_bytes(b"a" * 100 + marker + b"b" * (chunk_size * 2))
             self.assertTrue(installer._stream_scan_oversized_for_bridge_marker(whole_path))
 
+    def test_stream_scan_oversized_respects_a_non_default_bridge_id(self) -> None:
+        # Both independent reviewers' repro (2026-08-20): unlike its non-streaming sibling
+        # _raw_bytes_contain_bridge_marker() (already parameterized in the prior round),
+        # _stream_scan_oversized_for_bridge_marker() used to hardcode BRIDGE_ID with no way to
+        # search for any other identity at all -- so an oversized file carrying a real handler
+        # under write_candidate_capture.MODULE_ID (or any other non-default bridge_id) was
+        # invisible to this scanner no matter what was passed, while the SAME content under the
+        # module's own default BRIDGE_ID was correctly found. This constructs exactly that pair
+        # and checks both directions plus the byte-identical default-identity behavior.
+        other_bridge_id = "orca-claude-codex-memory-write-trigger-v1"  # write_candidate_capture.MODULE_ID
+        other_marker = f"--bridge-id {other_bridge_id}".encode()
+        default_marker = f"--bridge-id {installer.BRIDGE_ID}".encode()
+        padding = b"a" * (installer.MAX_MANAGED_FILE_BYTES + 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            other_id_path = root / "other-bridge-id.bin"
+            other_id_path.write_bytes(padding + other_marker + b"b" * 2000)
+            self.assertGreater(other_id_path.stat().st_size, installer.MAX_MANAGED_FILE_BYTES)
+            # Pre-fix behavior for this exact content: not found under any bridge_id, since the
+            # function never accepted one to search for.
+            self.assertFalse(installer._stream_scan_oversized_for_bridge_marker(other_id_path))
+            # Post-fix: passing the matching bridge_id finds it.
+            self.assertTrue(
+                installer._stream_scan_oversized_for_bridge_marker(other_id_path, bridge_id=other_bridge_id)
+            )
+            # Searching for a THIRD, still-different bridge_id must not match either.
+            self.assertFalse(
+                installer._stream_scan_oversized_for_bridge_marker(other_id_path, bridge_id="some-unrelated-id")
+            )
+
+            # Default-identity oversized-file behavior is byte-for-byte/result-for-result
+            # unaffected when no override is passed at all -- same content shape, this module's
+            # own BRIDGE_ID instead.
+            default_id_path = root / "default-bridge-id.bin"
+            default_id_path.write_bytes(padding + default_marker + b"b" * 2000)
+            self.assertTrue(installer._stream_scan_oversized_for_bridge_marker(default_id_path))
+
+    # -- §19.3 P2-1/P2-2/P2-3 fixes (2026-08-21): see AUTO-LEARN-TRIGGER-DESIGN-2026-08-19.md
+    # section 19.3 for the original 3 documented-not-fixed gaps this closes.
+
+    def test_raw_bytes_marker_finds_a_double_quoted_bridge_id_in_real_json_serialized_bytes(self) -> None:
+        # P2-1: _bridge_id_marker_value_forms() used to search for an unescaped, literal
+        # `"<id>"` double-quote form, which can never match real hooks.json bytes -- JSON always
+        # escapes an embedded `"` as `\"` on disk. This builds a REAL hooks.json-shaped fixture
+        # the way it would actually be produced -- a Python command string containing literal
+        # double quotes around the bridge_id, serialized with json.dumps() exactly like
+        # canonical_json() does -- not a hand-simplified stand-in.
+        command = f'/usr/bin/python3 hook.py --bridge-id "{installer.BRIDGE_ID}" --timeout 5'
+        raw = json.dumps(
+            {"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": command}]}]}},
+            indent=2,
+        ).encode("utf-8")
+        # Pin down the fixture is genuinely realistic: the on-disk bytes contain the JSON-escaped
+        # `\"` form around the bridge_id, never a literal unescaped `"`.
+        self.assertIn(f'\\"{installer.BRIDGE_ID}\\"'.encode(), raw)
+        self.assertNotIn(f'"{installer.BRIDGE_ID}"'.encode(), raw)
+        self.assertTrue(installer._raw_bytes_contain_bridge_marker(raw))
+        # A different bridge_id must still not match this content.
+        self.assertFalse(installer._raw_bytes_contain_bridge_marker(raw, bridge_id="some-unrelated-id"))
+
+    def test_raw_bytes_marker_is_whitespace_tolerant_like_the_structural_detector(self) -> None:
+        # P2-2: owned_handler()'s shlex.split()-based structural detector (Stage 1) already treats
+        # a double space or a tab between `--bridge-id` and its value as an ordinary token
+        # separator -- but the raw-bytes fallback scanners used to search for a single literal
+        # space only, missing both variants. Builds both shapes as real JSON-serialized bytes (a
+        # literal tab is itself a JSON control character requiring the `\t` escape on disk -- this
+        # fixture goes through json.dumps() for real) and confirms Stage 1 and the raw-bytes
+        # scanner now agree for both.
+        for separator, label in ((" " * 2, "double-space"), ("\t", "tab")):
+            with self.subTest(label=label):
+                command = f"/usr/bin/python3 hook.py --bridge-id{separator}{installer.BRIDGE_ID} --timeout 5"
+                handler = {"hooks": [{"type": "command", "command": command}]}
+                self.assertTrue(installer.owned_handler(handler))  # Stage 1 already got this right
+                raw = json.dumps({"hooks": {"UserPromptSubmit": [handler]}}).encode()
+                self.assertTrue(installer._raw_bytes_contain_bridge_marker(raw))
+
+    def test_raw_bytes_marker_finds_u_escaped_json_variants_a_different_encoder_could_legitimately_write(
+        self,
+    ) -> None:
+        # P2-A fix (independent Claude opus5/max review, 2026-08-21): _json_string_body() -- and so
+        # both raw-bytes marker scanners built on it -- only ever recognized json.dumps()'s OWN
+        # choice of escaped rendering (`\"`, `\t`, ...). RFC 8259 section 7 equally permits
+        # representing the same characters as `\uXXXX` numeric escapes instead, which real encoders
+        # other than json.dumps() legitimately choose by default (.NET's System.Text.Json is the
+        # reviewer's cited example). The reviewer reproduced legal-JSON variants where the
+        # structural detector (Stage 1, via owned_handler()) says True but the raw-bytes scanner
+        # (Stage 2) said False, because Stage 2 only ever searched for json.dumps()'s shorthand --
+        # traced to a real failure path: an oversized, relocated hooks.json written by such an
+        # alternate encoder (not by this tool -- Stage 2 exists precisely to scan files this tool
+        # did NOT write) carrying a genuine handler would make the streaming scanner return False
+        # even though the handler is genuinely present, and uninstall() would then delete the
+        # receipt while the handler stays live.
+        #
+        # Builds each of the 6 characters this file's own marker text can ever need to escape --
+        # quote, single-quote, backslash, tab, CR, LF -- as REAL, valid, json.loads()-parseable JSON
+        # bytes with that ONE character rendered via `\uXXXX` instead of json.dumps()'s shorthand --
+        # not a hand-simplified stand-in -- and confirms the raw-bytes scanner now finds each one.
+        # CR/LF/backslash also get an uppercase-hex-digit variant (their hex representation contains
+        # a letter, unlike quote/single-quote/tab's), confirming both cases a real encoder could
+        # choose are recognized, not just one.
+        bridge_id = installer.BRIDGE_ID
+        backslash_bridge_id = "back\\slash-id"  # a literal backslash inside the bridge_id itself
+
+        def hooks_json_bytes(command_body: str) -> bytes:
+            # Deliberately NOT built via json.dumps(): `command_body` already carries its own
+            # `\uXXXX`/literal escaping exactly as the fixture wants it on disk, and json.dumps()
+            # would double-escape it (turning our literal `"` text into `\\u0022`) instead of
+            # leaving it as the single escape sequence a real encoder would write once.
+            return (
+                '{"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "'
+                + command_body
+                + '"}]}]}}'
+            ).encode()
+
+        cases = [
+            ("quote", f"/usr/bin/python3 hook.py --bridge-id \\u0022{bridge_id}\\u0022 --timeout 5", bridge_id),
+            ("single-quote", f"/usr/bin/python3 hook.py --bridge-id \\u0027{bridge_id}\\u0027 --timeout 5", bridge_id),
+            ("tab", f"/usr/bin/python3 hook.py --bridge-id\\u0009{bridge_id} --timeout 5", bridge_id),
+            ("cr-lower", f"/usr/bin/python3 hook.py --bridge-id\\u000d{bridge_id} --timeout 5", bridge_id),
+            ("cr-upper", f"/usr/bin/python3 hook.py --bridge-id\\u000D{bridge_id} --timeout 5", bridge_id),
+            ("lf-lower", f"/usr/bin/python3 hook.py --bridge-id\\u000a{bridge_id} --timeout 5", bridge_id),
+            ("lf-upper", f"/usr/bin/python3 hook.py --bridge-id\\u000A{bridge_id} --timeout 5", bridge_id),
+            (
+                # Single-quoted (shlex.split() keeps a backslash inside single quotes completely
+                # literal, unlike outside quotes where it is an escape character consuming the next
+                # character -- an unquoted `back\slash-id` would shlex-parse to `backslash-id`, not
+                # this bridge_id, so the single-quoted marker-value-form is the one that actually
+                # round-trips through Stage 1 for a bridge_id containing a literal backslash).
+                "backslash-lower",
+                "/usr/bin/python3 hook.py --bridge-id \\u0027back\\u005cslash-id\\u0027 --timeout 5",
+                backslash_bridge_id,
+            ),
+            (
+                "backslash-upper",
+                "/usr/bin/python3 hook.py --bridge-id \\u0027back\\u005Cslash-id\\u0027 --timeout 5",
+                backslash_bridge_id,
+            ),
+        ]
+        for label, command_body, case_bridge_id in cases:
+            with self.subTest(label=label):
+                raw = hooks_json_bytes(command_body)
+                # Fixture sanity: genuinely valid JSON (json.loads() must not raise), and its
+                # on-disk bytes genuinely use a `\u` numeric escape rather than accidentally
+                # collapsing to json.dumps()'s own shorthand or an unescaped literal byte.
+                decoded = json.loads(raw)
+                handler = decoded["hooks"]["UserPromptSubmit"][0]
+                self.assertTrue(installer.owned_handler(handler, bridge_id=case_bridge_id))
+                self.assertIn(b"\\u0", raw)
+                self.assertTrue(installer._raw_bytes_contain_bridge_marker(raw, bridge_id=case_bridge_id))
+                # A different bridge_id must still not match this content.
+                self.assertFalse(
+                    installer._raw_bytes_contain_bridge_marker(raw, bridge_id="some-unrelated-id")
+                )
+
+    def test_stream_scan_oversized_is_whitespace_tolerant_across_a_chunk_boundary(self) -> None:
+        # P2-2, oversized-streaming twin: the same whitespace tolerance as the test above, but for
+        # _stream_scan_oversized_for_bridge_marker(), including a marker straddling a chunk
+        # boundary the way test_stream_scan_oversized_finds_a_marker_split_exactly_across_a_chunk_
+        # boundary already covers for the plain bare-space marker.
+        #
+        # P2-B fix (independent Claude opus5/max review, 2026-08-21): the original version of this
+        # test padded with `chunk_size - 5` bytes and then wrote the WHOLE json.dumps()-serialized
+        # document (`raw`) starting there, on the theory that this put the marker "a few bytes
+        # before the boundary" -- but the marker text sits well INSIDE `raw`, after the
+        # `{"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/usr/bin/
+        # python3 hook.py ` prefix (dozens of bytes), so the marker actually landed dozens of bytes
+        # PAST the chunk boundary, entirely inside the second chunk -- never straddling it at all.
+        # Proof this was not exercising the overlap-window logic it claimed to: shrinking
+        # `overlap_len` in _stream_scan_oversized_for_bridge_marker() (this file, ~line 976) still
+        # left every test in this suite passing, including this one, even though that change
+        # genuinely makes the scanner miss real straddling offsets. This rewrite computes the
+        # marker's own exact byte offset inside `raw` and positions the padding so the chunk
+        # boundary falls strictly inside the marker's own byte span -- verified explicitly below,
+        # not just assumed from the padding arithmetic -- so a corrupted overlap window has
+        # something genuine to fail against.
+        command = f"/usr/bin/python3 hook.py --bridge-id\t{installer.BRIDGE_ID} --timeout 5"
+        raw = json.dumps({"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": command}]}]}}).encode()
+        # The exact on-disk marker bytes: "--bridge-id", the JSON-escaped tab (`\t`, two literal
+        # characters -- json.dumps() always escapes a raw tab this way), then BRIDGE_ID.
+        marker_bytes = (
+            "--bridge-id" + installer._json_string_body("\t") + installer.BRIDGE_ID
+        ).encode()
+        marker_offset_in_raw = raw.index(marker_bytes)
+        chunk_size = 1_048_576
+        straddle_into = 5  # bytes of the marker that must land in the FIRST chunk
+        self.assertGreater(len(marker_bytes), straddle_into)  # marker must also reach the 2nd chunk
+        padding_len = chunk_size - marker_offset_in_raw - straddle_into
+        self.assertGreater(padding_len, 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            straddle_path = root / "tab_straddle.bin"
+            straddle_path.write_bytes(b"a" * padding_len + raw + b"b" * 2000)
+            # Confirm the marker genuinely straddles the chunk boundary before trusting the
+            # scanner's result on it -- byte index `chunk_size` must fall strictly inside the
+            # marker's own span in the file, not merely somewhere inside the surrounding document.
+            marker_start = padding_len + marker_offset_in_raw
+            marker_end = marker_start + len(marker_bytes)
+            self.assertLess(marker_start, chunk_size)
+            self.assertGreater(marker_end, chunk_size)
+            self.assertTrue(installer._stream_scan_oversized_for_bridge_marker(straddle_path))
+
+    # -- `install-write-trigger` CLI action (AUTO-LEARN-TRIGGER-DESIGN-2026-08-19.md,
+    # "install-write-trigger" section): make_handler()'s new `status_message` parameter, and
+    # _load_write_trigger_config()'s fail-closed policy validation. The full transactional
+    # install/dry-run/idempotency/uninstall/recover cycle is in InstallWriteTriggerEndToEndTests
+    # below, which needs the isolated fake-SSD fixture; these test the two pieces that do not.
+
+    def test_make_handler_default_status_message_is_unchanged(self) -> None:
+        self.assertEqual(installer.DEFAULT_STATUS_MESSAGE, "Loading Claude memory from verified SSD")
+        handler = installer.make_handler("some command")
+        self.assertEqual(handler["hooks"][0]["statusMessage"], installer.DEFAULT_STATUS_MESSAGE)
+
+    def test_make_handler_accepts_an_explicit_status_message(self) -> None:
+        handler = installer.make_handler("some command", status_message="custom message")
+        self.assertEqual(handler["hooks"][0]["statusMessage"], "custom message")
+
+    def test_update_hook_config_status_message_is_reachable_end_to_end(self) -> None:
+        # Mirrors §17.2's `timeout=None` reachability fix: the parameter must actually be
+        # forwarded by update_hook_config(), the one real config-writing entry point, not only
+        # exercisable by calling make_handler() directly.
+        raw = json.dumps({"hooks": {}}, sort_keys=True).encode()
+        command = f"/usr/bin/python3 write_candidate_capture.py scan --bridge-id {wtc.MODULE_ID}"
+        updated = installer.update_hook_config(
+            raw, command, event="SessionEnd", bridge_id=wtc.MODULE_ID, timeout=None,
+            status_message="Scanning session for durable memory candidates",
+        )
+        payload = json.loads(updated)
+        handler = payload["hooks"]["SessionEnd"][0]["hooks"][0]
+        self.assertEqual(handler["statusMessage"], "Scanning session for durable memory candidates")
+        self.assertNotIn("timeout", handler)
+        # Default (no status_message kwarg) is still unchanged.
+        default_updated = installer.update_hook_config(raw, "cmd", event="SessionEnd")
+        default_handler = json.loads(default_updated)["hooks"]["SessionEnd"][0]["hooks"][0]
+        self.assertEqual(default_handler["statusMessage"], installer.DEFAULT_STATUS_MESSAGE)
+
+    @staticmethod
+    def _write_trigger_policy_bytes(
+        *, enabled: bool = True, max_candidates_per_project: int = 50, max_candidate_bytes: int = 1500
+    ) -> bytes:
+        return json.dumps(
+            {
+                "write_trigger": {
+                    "enabled": enabled,
+                    "max_candidates_per_project": max_candidates_per_project,
+                    "max_candidate_bytes": max_candidate_bytes,
+                }
+            }
+        ).encode()
+
+    def test_load_write_trigger_config_requires_a_readable_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "does-not-exist.json"
+            with self.assertRaises(installer.InstallError):
+                installer._load_write_trigger_config(missing)
+
+    def test_load_write_trigger_config_requires_a_json_object(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "policy.json"
+            path.write_bytes(b"[]")
+            with self.assertRaises(installer.InstallError):
+                installer._load_write_trigger_config(path)
+
+    def test_load_write_trigger_config_fails_closed_when_write_trigger_key_is_absent(self) -> None:
+        # No `write_trigger` key at all -- write_candidate_capture._parse_write_trigger_block(None)
+        # returns enabled=False, so this must fail closed exactly like an explicit
+        # `"enabled": false` does, not silently install an inert handler.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "policy.json"
+            path.write_bytes(json.dumps({"schema": "irrelevant-for-this-function"}).encode())
+            with self.assertRaises(installer.InstallError) as ctx:
+                installer._load_write_trigger_config(path)
+            self.assertIn("write_trigger.enabled", str(ctx.exception))
+
+    def test_load_write_trigger_config_fails_closed_when_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "policy.json"
+            path.write_bytes(self._write_trigger_policy_bytes(enabled=False))
+            with self.assertRaises(installer.InstallError) as ctx:
+                installer._load_write_trigger_config(path)
+            self.assertIn("write_trigger.enabled", str(ctx.exception))
+
+    def test_load_write_trigger_config_fails_closed_on_malformed_write_trigger_block(self) -> None:
+        # write_candidate_capture.WriteCaptureError (unexpected keys) must surface as this file's
+        # own InstallError, not propagate as a foreign exception type.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "policy.json"
+            path.write_bytes(json.dumps({"write_trigger": {"enabled": True}}).encode())
+            with self.assertRaises(installer.InstallError):
+                installer._load_write_trigger_config(path)
+
+    def test_load_write_trigger_config_succeeds_and_returns_module_id_and_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "policy.json"
+            path.write_bytes(
+                self._write_trigger_policy_bytes(max_candidates_per_project=77, max_candidate_bytes=1234)
+            )
+            config = installer._load_write_trigger_config(path)
+            self.assertEqual(
+                config,
+                {"bridge_id": wtc.MODULE_ID, "max_candidates_per_project": 77, "max_candidate_bytes": 1234},
+            )
+
+    def test_write_trigger_bridge_id_constant_matches_write_candidate_capture_module_id(self) -> None:
+        # Round-52 fix (converged independent Claude opus/max + Codex gpt-5.6-sol/max review,
+        # 2026-08-21): install_bridge.WRITE_TRIGGER_BRIDGE_ID is a hardcoded literal, deliberately
+        # NOT imported from write_candidate_capture (see that constant's own comment for why: base-
+        # only paths must not depend on that sibling module being importable at all). This is the
+        # drift guard the reviewers explicitly asked for: if a future change to either module's own
+        # literal ever desynchronizes them, this test -- not a confusing runtime symptom somewhere
+        # else in the file -- is what fails.
+        self.assertEqual(installer.WRITE_TRIGGER_BRIDGE_ID, wtc.MODULE_ID)
+
+    def test_import_write_candidate_capture_does_not_grow_sys_path_unboundedly(self) -> None:
+        # P2 fix, lower priority (independent Claude opus5/max review, 2026-08-21):
+        # _import_write_candidate_capture() used to unconditionally `sys.path.insert(0, ...)` on
+        # every call -- uninstall()/recover_pending_install() each call it (indirectly, via
+        # _untracked_owned_including_write_trigger() pre-fix, or verify() post-fix) once per action,
+        # so a long-lived caller invoking this module's actions repeatedly grew sys.path by one
+        # duplicate entry per call, unboundedly. Fixed by checking membership first.
+        module_dir = os.fspath(Path(installer.__file__).resolve().parent)
+        original_sys_path = list(sys.path)
+        try:
+            # The test file's own bootstrap (this file's line 17) already inserted this exact
+            # directory once -- strip every occurrence first so this test genuinely exercises
+            # dedup-across-repeated-calls rather than starting from an already-ambiguous state.
+            sys.path[:] = [entry for entry in sys.path if entry != module_dir]
+            self.assertNotIn(module_dir, sys.path)  # fixture precondition
+            for _ in range(5):
+                installer._import_write_candidate_capture()
+            self.assertEqual(sys.path.count(module_dir), 1)
+        finally:
+            sys.path[:] = original_sys_path
+
 
 class InstallEndToEndTests(unittest.TestCase):
     # plan()/install()/verify()/uninstall() were entirely uncovered by the
@@ -462,6 +1102,106 @@ class InstallEndToEndTests(unittest.TestCase):
         self.assertTrue(verify_result["ok"])
         self.assertEqual(verify_result["release_id"], receipt["release_id"])
         self.assertEqual(sorted(verify_result["configs"]), sorted(os.fspath(p) for p in (self.main_config, self.account_config)))
+
+    def test_make_release_bridge_id_fragment_is_findable_by_the_raw_bytes_marker_search_for_a_single_quote_value(
+        self,
+    ) -> None:
+        # §19.3 P2-3 (2026-08-21): make_release() used to build its `--bridge-id <value>` fragment
+        # via an inline shlex.quote() call, entirely independent of _bridge_id_marker_value_forms()
+        # -- coincidentally compatible for a typical value, but nothing enforced or tested the
+        # coupling. A bridge_id containing a literal single quote is exactly the case that breaks
+        # the coincidence: shlex.quote() renders it via an embedded `'...'"'"'...'` form (which
+        # itself contains a literal `"` that real JSON serialization would escape), a shape neither
+        # of the two hand-rolled quoted marker forms (`"<id>"`, `'<id>'`) could ever match on their
+        # own. This calls the REAL make_release() (not a simplified stand-in) with such a bridge_id
+        # and confirms its actual constructed command -- embedded in a genuinely
+        # json.dumps()-serialized hooks.json, not just checked as a bare string -- is genuinely
+        # findable by the raw-bytes marker search.
+        weird_bridge_id = "orca-can't-quote-me"
+        with mock.patch.object(installer, "BRIDGE_ID", weird_bridge_id):
+            release = installer.make_release()
+        command = release["command"]
+        # Sanity: this is a genuine, round-trippable command line, not a hand-simplified stand-in
+        # -- shlex.split() recovers the exact original value.
+        tokens = shlex.split(command)
+        self.assertEqual(tokens[tokens.index("--bridge-id") + 1], weird_bridge_id)
+        self.assertIn("'", command)  # confirms this test actually exercises shlex.quote()'s embedded-quote path
+
+        raw = json.dumps(
+            {"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": command}]}]}}
+        ).encode()
+        self.assertTrue(installer._raw_bytes_contain_bridge_marker(raw, bridge_id=weird_bridge_id))
+        # A different bridge_id must not match this content.
+        self.assertFalse(installer._raw_bytes_contain_bridge_marker(raw, bridge_id="some-unrelated-id"))
+
+    def test_userpromptsubmit_full_cycle_snapshot_unchanged_by_session_end_capability(self) -> None:
+        # Regression/snapshot guard for the SessionEnd hook-registration capability (AUTO-LEARN-
+        # TRIGGER-DESIGN-2026-08-19.md section 4.2). This drives the exact same top-level
+        # plan()/install()/verify()/uninstall() path every real UserPromptSubmit-only install
+        # goes through, with none of make_handler()/update_hook_config()/_owned_shape_match()/
+        # _attempt_structural_detection()/_contains_owned_handler() ever passed a non-default
+        # `event`/`timeout` -- and pins the exact resulting hooks.json bytes (not just counts/
+        # shape, the way the other tests in this class do) plus the exact verify()/uninstall()
+        # result shape, so any accidental behavior drift introduced while adding the new
+        # parameters would fail this test even if every other test in this file still passed.
+        plan_result = installer.plan()
+        self.assertTrue(plan_result["ok"])
+        self.assertTrue(all(row["will_change"] for row in plan_result["configs"]))
+
+        receipt = installer.install()
+        command = receipt["command"]
+        # The command line must still route through the plain UserPromptSubmit hook script --
+        # nothing about this change makes a plain install reference write_candidate_capture.py
+        # or any other event's handler.
+        self.assertIn("claude_memory_hook.py", command)
+        self.assertNotIn("write_candidate_capture.py", command)
+
+        expected_config = installer.canonical_json(
+            {
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {"hooks": [{"type": "command", "command": "/usr/bin/true"}]},
+                        installer.make_handler(command),
+                    ]
+                }
+            }
+        )
+        # Both fixture configs started byte-identical, so both must land on the same exact
+        # post-install bytes.
+        self.assertEqual(self.main_config.read_bytes(), expected_config)
+        self.assertEqual(self.account_config.read_bytes(), expected_config)
+        for config_path in (self.main_config, self.account_config):
+            self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
+            payload = json.loads(config_path.read_bytes())
+            # Only ever the one event key -- SessionEnd (or any other event) must never appear
+            # in a plain UserPromptSubmit-only install's output.
+            self.assertEqual(list(payload["hooks"].keys()), ["UserPromptSubmit"])
+
+        verify_result = installer.verify()
+        self.assertEqual(
+            verify_result,
+            {
+                "ok": True,
+                "release_id": receipt["release_id"],
+                "script_sha256": receipt["script_sha256"],
+                "policy_sha256": receipt["policy_sha256"],
+                "volume_uuid": receipt["volume_uuid"],
+                "configs": sorted(os.fspath(p) for p in (self.main_config, self.account_config)),
+                "unreachable": [],
+            },
+        )
+
+        uninstall_result = installer.uninstall()
+        self.assertTrue(uninstall_result["ok"])
+        self.assertEqual(
+            sorted(uninstall_result["restored"]),
+            sorted(os.fspath(p) for p in (self.main_config, self.account_config)),
+        )
+        self.assertEqual(uninstall_result["unreachable"], [])
+        # Exactly restored to the pristine pre-install bytes -- the SessionEnd capability must
+        # leave zero trace in a plain UserPromptSubmit-only uninstall.
+        self.assertEqual(self.main_config.read_bytes(), self._base_hooks_json())
+        self.assertEqual(self.account_config.read_bytes(), self._base_hooks_json())
 
     def test_install_is_idempotent_replan_shows_no_change(self) -> None:
         installer.install()
@@ -1329,6 +2069,111 @@ class InstallEndToEndTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertFalse(installer.PENDING_PATH.exists())
 
+    def test_find_untracked_owned_configs_detects_an_oversized_non_default_bridge_id_handler_when_matching_bridge_id_is_passed(
+        self,
+    ) -> None:
+        # Both independent reviewers' exact repro (2026-08-20), at the level of the real caller
+        # (_find_untracked_owned_configs()) rather than just the leaf scanner it delegates to:
+        # _stream_scan_oversized_for_bridge_marker() used to hardcode BRIDGE_ID with no `bridge_id`
+        # parameter at all, and its sole caller here did not accept or forward one either -- so an
+        # oversized (> MAX_MANAGED_FILE_BYTES) hooks.json under RUNTIME_BASE carrying a real
+        # SessionEnd handler under write_candidate_capture.MODULE_ID (a non-default bridge_id) was
+        # silently invisible to this whole safety scan no matter what was passed, while the SAME
+        # content under this module's own default BRIDGE_ID was already correctly found (round-13/
+        # 14 fixes). This means a future wiring step that threads a non-default bridge_id into this
+        # function would have the untracked-owned-handler scan work for hooks.json files at or
+        # under the size cap but go silently blind for larger ones -- reopening the exact defect
+        # round 13 already closed for the default identity.
+        other_bridge_id = "orca-claude-codex-memory-write-trigger-v1"  # write_candidate_capture.MODULE_ID
+        handler_command = f"/usr/bin/python3 write_candidate_capture.py scan --bridge-id {other_bridge_id}"
+        payload = {
+            "hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": handler_command}]}]},
+            "_operator_notes": "x" * (installer.MAX_MANAGED_FILE_BYTES + 16_384),
+        }
+        padded = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode()
+        self.assertGreater(len(padded), installer.MAX_MANAGED_FILE_BYTES)
+
+        stray_dir = self.runtime_base / "backups/misc-staging/other-bridge-id-account"
+        stray_dir.mkdir(parents=True)
+        stray_config = stray_dir / "hooks.json"
+        stray_config.write_bytes(padded)
+
+        # Default-identity behavior (the real, only-ever-exercised call shape today --
+        # install()/uninstall()/recover_pending_install() never pass bridge_id) is completely
+        # unaffected: this content was never claimed to be owned by BRIDGE_ID, so it must still
+        # find nothing here, exactly as it did before this fix.
+        self.assertEqual(installer._find_untracked_owned_configs(set()), [])
+
+        # The matching bridge_id now catches it -- positive evidence, fails closed with the
+        # candidate's path in the error, same as the default-identity oversized case.
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer._find_untracked_owned_configs(set(), bridge_id=other_bridge_id)
+        self.assertIn("cannot rule out", str(ctx.exception))
+        self.assertIn(os.fspath(stray_config), str(ctx.exception))
+
+        # A third, still-different bridge_id must not match either.
+        self.assertEqual(installer._find_untracked_owned_configs(set(), bridge_id="some-unrelated-id"), [])
+
+    def test_find_untracked_owned_configs_detects_a_normal_sized_non_default_event_handler_when_matching_event_is_passed(
+        self,
+    ) -> None:
+        # The inverted, reintroduced version of the gap the test above closes -- same shape,
+        # `event` instead of `bridge_id` (2026-08-20). _find_untracked_owned_configs() had no
+        # `event` parameter at all, so its call to _contains_owned_handler() always checked the
+        # candidate's DEFAULT_HOOK_EVENT ("UserPromptSubmit") handler list, never whatever event
+        # a real non-default handler actually lived under. Unlike the bridge_id gap, this one
+        # was reachable at ANY file size -- no oversized-file requirement -- because it broke
+        # Stage 1 (_attempt_structural_detection(), the whole-file-read path), not just the
+        # oversized-streaming fallback: a NORMAL-sized hooks.json (well under
+        # MAX_MANAGED_FILE_BYTES) containing both an existing UserPromptSubmit handler and a
+        # real SessionEnd handler under a non-default bridge_id was silently invisible to this
+        # scan no matter what bridge_id was passed, while the exact same content over
+        # MAX_MANAGED_FILE_BYTES was already correctly found by the event-agnostic streaming
+        # scanner (the sibling test above) -- the inversion the reviewer found.
+        other_bridge_id = "orca-claude-codex-memory-write-trigger-v1"  # write_candidate_capture.MODULE_ID
+        handler_command = f"/usr/bin/python3 write_candidate_capture.py scan --bridge-id {other_bridge_id}"
+        payload = {
+            "hooks": {
+                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/usr/bin/true"}]}],
+                "SessionEnd": [{"hooks": [{"type": "command", "command": handler_command}]}],
+            }
+        }
+        raw = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode()
+        self.assertLess(len(raw), installer.MAX_MANAGED_FILE_BYTES)  # normal-sized, not oversized
+
+        stray_dir = self.local_homes / "codex-accounts/other-acct/home"
+        stray_dir.mkdir(parents=True)
+        stray_config = stray_dir / "hooks.json"
+        stray_config.write_bytes(raw)
+
+        # Default-identity, default-event behavior (the real, only-ever-exercised call shape
+        # today -- install()/uninstall()/recover_pending_install() never pass either override)
+        # is completely unaffected: this content's UserPromptSubmit handler is not this
+        # bridge's own, so it must still find nothing here, exactly as before this fix.
+        self.assertEqual(installer._find_untracked_owned_configs(set()), [])
+
+        # bridge_id alone, with no event override, still misses it -- it checks the matching
+        # bridge_id against the WRONG event's handler list (UserPromptSubmit, which carries no
+        # marker for this bridge at all). This pins down that bridge_id threading (the prior
+        # round's fix) is not, by itself, sufficient without event threading too.
+        self.assertEqual(installer._find_untracked_owned_configs(set(), bridge_id=other_bridge_id), [])
+
+        # The matching bridge_id AND matching event now correctly finds it. Unlike the
+        # oversized-file sibling test above (which only ever reaches Stage 2's ambiguous
+        # marker-only raise), a normal-sized file's SessionEnd handler is structurally
+        # verified by Stage 1 (_attempt_structural_detection()) and returned as a definitive,
+        # positively-identified match in the result list -- closing the specific inversion the
+        # reviewer found: this now detects correctly, matching (not contradicting) what the
+        # oversized-file path already did correctly before this fix.
+        found = installer._find_untracked_owned_configs(set(), bridge_id=other_bridge_id, event="SessionEnd")
+        self.assertEqual(found, [os.fspath(stray_config)])
+
+        # A third, unrelated bridge_id under the correct event must still not match.
+        self.assertEqual(
+            installer._find_untracked_owned_configs(set(), bridge_id="some-unrelated-id", event="SessionEnd"),
+            [],
+        )
+
     def test_uninstall_still_fails_closed_on_an_oversized_file_outside_runtime_base_even_with_a_marker(self) -> None:
         # Sibling control for the fix above: the round-13 streaming-scan
         # fallback is deliberately scoped to RUNTIME_BASE only.  Outside it,
@@ -2031,6 +2876,1466 @@ installer.install()
             self.assertFalse(self.pending_path.exists())
             payload = json.loads(self.account_config.read_bytes())
             self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 1)
+
+
+class InstallWriteTriggerEndToEndTests(unittest.TestCase):
+    # Full transactional cycle for the `install-write-trigger` CLI action
+    # (installer.install_write_trigger()): dry-run, install, non-disturbance of the existing
+    # UserPromptSubmit handler, idempotent re-install, verify (including both-scripts hash-
+    # pinning), fail-closed-when-disabled, uninstall (rollback), and a genuine injected-mid-
+    # transaction-failure recovery -- through the same isolated fake-SSD fixture pattern
+    # InstallEndToEndTests already uses, extended with a second fixture source file for
+    # write_candidate_capture.py.
+
+    def setUp(self) -> None:
+        self._stack = contextlib.ExitStack()
+        self.addCleanup(self._stack.close)
+        self.temp = self._stack.enter_context(tempfile.TemporaryDirectory())
+        root = Path(self.temp).resolve()
+        ssd_root = root / "ssd"
+        local_homes = ssd_root / "Orca/local-homes"
+        runtime_base = local_homes / ".shared-runtime/claude-codex-memory-bridge"
+        pending_path = runtime_base / "pending-install.json"
+        source_dir = ssd_root / "source"
+        source_script = source_dir / "claude_memory_hook.py"
+        write_trigger_source_script = source_dir / "write_candidate_capture.py"
+
+        local_homes.mkdir(parents=True)
+        (local_homes / ".codex").mkdir()
+        (local_homes / ".claude/projects").mkdir(parents=True)
+        (local_homes / "codex-accounts/acct-one/home").mkdir(parents=True)
+        source_dir.mkdir()
+
+        InstallEndToEndTests._write(local_homes / ".codex/hooks.json", InstallEndToEndTests._base_hooks_json())
+        InstallEndToEndTests._write(
+            local_homes / "codex-accounts/acct-one/home/hooks.json", InstallEndToEndTests._base_hooks_json()
+        )
+        InstallEndToEndTests._write(source_script, b"#!/usr/bin/env python3\n# fixture hook script\n")
+        InstallEndToEndTests._write(
+            write_trigger_source_script, b"#!/usr/bin/env python3\n# fixture write-trigger script\n"
+        )
+
+        self._stack.enter_context(mock.patch.object(installer, "SSD_ROOT", ssd_root))
+        self._stack.enter_context(mock.patch.object(installer, "LOCAL_HOMES_ROOT", local_homes))
+        self._stack.enter_context(mock.patch.object(installer, "RUNTIME_BASE", runtime_base))
+        self._stack.enter_context(mock.patch.object(installer, "PENDING_PATH", pending_path))
+        self._stack.enter_context(mock.patch.object(installer, "SOURCE_SCRIPT", source_script))
+        self._stack.enter_context(
+            mock.patch.object(installer, "WRITE_TRIGGER_SOURCE_SCRIPT", write_trigger_source_script)
+        )
+        self._stack.enter_context(
+            mock.patch.object(
+                installer, "volume_uuid", lambda ssd_root=None: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+            )
+        )
+        self._stack.enter_context(mock.patch.object(Path, "home", lambda: local_homes))
+
+        self.runtime_base = runtime_base
+        self.main_config = local_homes / ".codex/hooks.json"
+        self.account_config = local_homes / "codex-accounts/acct-one/home/hooks.json"
+
+        self.policy_path = root / "write-trigger-policy.json"
+        self.policy_path.write_bytes(
+            json.dumps(
+                {"write_trigger": {"enabled": True, "max_candidates_per_project": 50, "max_candidate_bytes": 1500}}
+            ).encode()
+        )
+        self.disabled_policy_path = root / "write-trigger-policy-disabled.json"
+        self.disabled_policy_path.write_bytes(
+            json.dumps(
+                {"write_trigger": {"enabled": False, "max_candidates_per_project": 50, "max_candidate_bytes": 1500}}
+            ).encode()
+        )
+
+    def _session_end_handler(self, payload: dict) -> dict:
+        handlers = payload["hooks"].get("SessionEnd", [])
+        self.assertEqual(len(handlers), 1)
+        return handlers[0]["hooks"][0]
+
+    def test_dry_run_reports_would_change_without_writing_anything(self) -> None:
+        result = installer.install_write_trigger(self.policy_path, dry_run=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action"], "plan")
+        self.assertIn("write_trigger_script_sha256", result)
+        self.assertTrue(all(row["will_change"] for row in result["configs"]))
+
+        self.assertFalse((self.runtime_base / "pending-install.json").exists())
+        self.assertFalse((self.runtime_base / "latest-receipt.json").exists())
+        self.assertEqual(self.main_config.read_bytes(), InstallEndToEndTests._base_hooks_json())
+        self.assertEqual(self.account_config.read_bytes(), InstallEndToEndTests._base_hooks_json())
+
+    def test_install_registers_session_end_alongside_userpromptsubmit_with_both_scripts_hash_pinned(self) -> None:
+        receipt = installer.install_write_trigger(self.policy_path)
+        self.assertEqual(receipt["bridge_id"], installer.BRIDGE_ID)
+        self.assertEqual(receipt["write_trigger_bridge_id"], wtc.MODULE_ID)
+
+        for config_path in (self.main_config, self.account_config):
+            payload = json.loads(config_path.read_bytes())
+            user_prompt_handlers = payload["hooks"]["UserPromptSubmit"]
+            self.assertEqual(len(user_prompt_handlers), 2)
+            self.assertTrue(installer.owned_handler(user_prompt_handlers[1]))
+            session_end_handler = self._session_end_handler(payload)
+            self.assertTrue(installer.owned_handler({"hooks": [session_end_handler]}, bridge_id=wtc.MODULE_ID))
+            # Not owned under this module's own default bridge_id -- the two handlers carry
+            # genuinely different identities, not just different events.
+            self.assertFalse(installer.owned_handler({"hooks": [session_end_handler]}))
+            self.assertNotIn("timeout", session_end_handler)
+            self.assertEqual(session_end_handler["statusMessage"], "Scanning session for durable memory candidates")
+            self.assertIn("write_candidate_capture.py", session_end_handler["command"])
+            self.assertIn(" scan ", session_end_handler["command"])
+            self.assertIn(f"--bridge-id {wtc.MODULE_ID}", session_end_handler["command"])
+
+        release_dir = Path(receipt["release_dir"])
+        write_trigger_script = release_dir / "write_candidate_capture.py"
+        self.assertTrue(write_trigger_script.exists())
+        self.assertEqual(
+            installer.sha256_bytes(write_trigger_script.read_bytes()), receipt["write_trigger_script_sha256"]
+        )
+        self.assertTrue((release_dir / "claude_memory_hook.py").exists())
+        self.assertEqual(installer.sha256_bytes((release_dir / "claude_memory_hook.py").read_bytes()), receipt["script_sha256"])
+
+        verify_result = installer.verify()
+        self.assertTrue(verify_result["ok"])
+        self.assertEqual(verify_result["write_trigger_script_sha256"], receipt["write_trigger_script_sha256"])
+
+    def test_install_does_not_disturb_the_existing_base_install_unrelated_handler_or_ownership(self) -> None:
+        # Layering the write-trigger handler onto an already-installed base bridge is an ordinary
+        # "upgrade" in this file's existing sense (a new release_id/command -- see
+        # test_upgrade_reinstall_does_not_poison_the_uninstall_baseline's own comment for why that
+        # is expected, not a regression: write_trigger's own config/script hash is part of the
+        # release-content-addressing key, exactly like claude_memory_hook.py's own script hash
+        # already was). What must NOT change is the pre-existing, unrelated handler, and exactly
+        # one owned UserPromptSubmit handler must be present throughout -- verified here, not just
+        # assumed from the generic upgrade machinery working for the plain case.
+        installer.install()
+        for config_path in (self.main_config, self.account_config):
+            payload = json.loads(config_path.read_bytes())
+            self.assertEqual(payload["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"], "/usr/bin/true")
+
+        installer.install_write_trigger(self.policy_path)
+
+        for config_path in (self.main_config, self.account_config):
+            payload = json.loads(config_path.read_bytes())
+            handlers = payload["hooks"]["UserPromptSubmit"]
+            self.assertEqual(len(handlers), 2)
+            self.assertEqual(handlers[0]["hooks"][0]["command"], "/usr/bin/true")
+            self.assertTrue(installer.owned_handler(handlers[1]))
+            self.assertEqual(len(payload["hooks"]["SessionEnd"]), 1)
+
+    def test_install_is_idempotent_no_duplicate_handler(self) -> None:
+        installer.install_write_trigger(self.policy_path)
+        first_bytes = self.main_config.read_bytes()
+        second_receipt = installer.install_write_trigger(self.policy_path)
+        second_bytes = self.main_config.read_bytes()
+        self.assertEqual(first_bytes, second_bytes)
+        payload = json.loads(second_bytes)
+        self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 2)
+        self.assertEqual(len(payload["hooks"]["SessionEnd"]), 1)
+        self.assertTrue(installer.verify()["ok"])
+        self.assertEqual(second_receipt["release_id"], installer.read_receipt()["release_id"])
+
+    def test_make_release_rejects_a_none_write_trigger_bridge_id_before_it_reaches_shlex_quote(self) -> None:
+        # P2-C fix (independent Claude opus5/max review, 2026-08-21): the round that added
+        # _validate_bridge_id()/_validate_hook_event() wired them into update_hook_config(),
+        # owned_handler(), and _find_untracked_owned_configs() -- but NOT into make_release(),
+        # which is where write_trigger["bridge_id"] actually first gets consumed (passed to
+        # shlex.quote() while building the registered write-trigger command), and which runs
+        # BEFORE the validating update_hook_config() call in both install()'s and plan()'s own
+        # sequences. Pre-fix, write_trigger["bridge_id"] = None was silently accepted by
+        # shlex.quote()'s own `if not s: return ''` branch, baking an EMPTY bridge id into the
+        # actually-registered command -- permanently undetectable by any real
+        # owned_handler(bridge_id=...) search expecting a real id.
+        #
+        # Round-52 fix (converged independent Claude opus/max + Codex gpt-5.6-sol/max review,
+        # 2026-08-21): _validate_write_trigger_argument() now requires write_trigger["bridge_id"] to
+        # EXACTLY equal WRITE_TRIGGER_BRIDGE_ID, not merely "any non-empty string" -- so the
+        # assertion below now checks the new, more specific exact-identity message rather than the
+        # old generic "non-empty string" one; `None` still fails to equal the constant, so this
+        # still raises the same InstallError-not-TypeError guarantee the original P2-C fix intended.
+        #
+        # Deliberately calls the REAL make_release() directly with a hand-built write_trigger dict
+        # (bypassing install_write_trigger()'s own always-valid _load_write_trigger_config() path)
+        # inside THIS class's fully-mocked SSD fixture -- both SOURCE_SCRIPT and
+        # WRITE_TRIGGER_SOURCE_SCRIPT are mocked here (unlike InstallBridgeTests' plain unit tests),
+        # so a pre-fix call genuinely reaches shlex.quote() instead of coincidentally raising an
+        # unrelated InstallError from an unmocked path first -- confirmed below by asserting on the
+        # validator's own exact message, not merely "raises InstallError", so this test cannot be
+        # fooled by an unrelated failure the way an earlier draft of this test (caught during this
+        # same fix) was.
+        write_trigger = {
+            "bridge_id": None,
+            "max_candidates_per_project": 50,
+            "max_candidate_bytes": 1500,
+        }
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.make_release(write_trigger=write_trigger)  # type: ignore[arg-type]
+        self.assertIn(f"must be {installer.WRITE_TRIGGER_BRIDGE_ID!r}", str(ctx.exception))
+
+    def test_make_release_rejects_a_non_str_write_trigger_bridge_id_instead_of_a_bare_typeerror(self) -> None:
+        # P2-C fix, sibling of the None case above: pre-fix, write_trigger["bridge_id"] = 123 (a
+        # non-str) raised a bare, uncaught TypeError out of shlex.quote() -- escaping past main()'s
+        # own `except InstallError` handler entirely, a genuine unhandled-exception crash for any
+        # library caller of make_release()/install_write_trigger(), not the clean, expected
+        # InstallError every other entry point that accepts a caller-supplied bridge_id already
+        # raises for bad input. See the None-case test above for why this runs inside this class's
+        # fully-mocked fixture rather than as a bare unit test, and for why the assertion below now
+        # checks the round-52 exact-identity message instead of the old generic one.
+        write_trigger = {
+            "bridge_id": 123,
+            "max_candidates_per_project": 50,
+            "max_candidate_bytes": 1500,
+        }
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.make_release(write_trigger=write_trigger)  # type: ignore[arg-type]
+        self.assertIn(f"must be {installer.WRITE_TRIGGER_BRIDGE_ID!r}", str(ctx.exception))
+
+    def test_make_release_rejects_a_write_trigger_dict_missing_the_bridge_id_key(self) -> None:
+        # Not explicitly one of the reviewer's two reproduced failure modes, but the same exact-key-
+        # set check the round-52 fix added (_validate_write_trigger_argument(), see its own comment)
+        # means a write_trigger dict missing the key entirely fails this same clean way too, instead
+        # of a bare KeyError -- now via the exact-key-set message rather than the old
+        # "bridge_id must be a non-empty string" one, since a missing key is caught before bridge_id
+        # is ever read at all.
+        write_trigger = {"max_candidates_per_project": 50, "max_candidate_bytes": 1500}
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.make_release(write_trigger=write_trigger)
+        self.assertIn("write_trigger must have exactly these keys", str(ctx.exception))
+
+    # P2-1 fix (independent Claude opus5/max + Codex review, 2026-08-21): the prior round
+    # (test_make_release_rejects_*_write_trigger_bridge_id_* above) validated only `bridge_id` in
+    # make_release()'s write_trigger argument. The two sibling limit fields --
+    # `max_candidates_per_project` / `max_candidate_bytes` -- were still consumed via bare dict
+    # subscripts, unvalidated, and fed straight into canonical_json()/the release-key computation.
+    # Both reviewers independently reproduced the same three failure modes and specifically called
+    # out the third as the worst: a value that is technically present but wrong-shaped passes
+    # make_release() cleanly, gets baked into the installed policy.json, and makes install()/verify()
+    # both report ok: true -- while every REAL SessionEnd invocation afterward fails inside
+    # write_candidate_capture._parse_write_trigger_block() at runtime, silently swallowed by scan()'s
+    # own fail-closed `except Exception`, permanently and silently inerting the write-trigger handler
+    # with no external signal anything is wrong. These tests cover every one of the specific
+    # silent-failure input shapes both reviewers listed for BOTH limit fields: "5" (numeric string),
+    # 5.0 (float), True/False (bool -- Python's bool is an int subtype, so a naive isinstance(x, int)
+    # check would wrongly accept it), None, [5] (list), -1 (negative), 0 (zero, below the >=1 floor),
+    # and 10**30 (an absurdly large number, above the hard ceiling) -- plus a missing sibling key for
+    # each field and a non-dict write_trigger entirely.
+    #
+    # Verified by reverting _validate_write_trigger_argument()'s call in make_release() (replacing it
+    # with the prior round's bare `_validate_bridge_id(write_trigger.get("bridge_id"))`) in isolation:
+    # every subTest below then failed to raise at all for the numeric-string/float/bool/None/list
+    # cases (make_release() returned a result cleanly -- the exact silent-success failure mode both
+    # reviewers reported) or raised a bare KeyError/TypeError instead of InstallError for the
+    # missing-key/out-of-range cases, confirming this test suite genuinely exercises the fix rather
+    # than a precondition that was already true.
+
+    _WRITE_TRIGGER_BAD_LIMIT_VALUES: list[tuple[str, Any]] = [
+        ("numeric_string", "5"),
+        ("float", 5.0),
+        ("bool_true", True),
+        ("bool_false", False),
+        ("none", None),
+        ("list", [5]),
+        ("negative", -1),
+        ("zero", 0),
+        ("huge", 10**30),
+    ]
+
+    def _assert_make_release_rejects_before_any_io(self, write_trigger: Any) -> None:
+        with self.assertRaises(installer.InstallError):
+            installer.make_release(write_trigger=write_trigger)  # type: ignore[arg-type]
+        # "before any I/O" -- none of make_release()'s own writes (it does not itself write files,
+        # but install()/install_write_trigger() built on top of it must never get far enough to
+        # create a pending journal or receipt from a call this rejects) and the live hooks.json
+        # configs are byte-for-byte untouched.
+        self.assertFalse((self.runtime_base / "pending-install.json").exists())
+        self.assertFalse((self.runtime_base / "latest-receipt.json").exists())
+        self.assertEqual(self.main_config.read_bytes(), InstallEndToEndTests._base_hooks_json())
+        self.assertEqual(self.account_config.read_bytes(), InstallEndToEndTests._base_hooks_json())
+
+    def test_make_release_rejects_every_bad_shaped_max_candidates_per_project(self) -> None:
+        for label, value in self._WRITE_TRIGGER_BAD_LIMIT_VALUES:
+            with self.subTest(field="max_candidates_per_project", shape=label):
+                write_trigger = {
+                    "bridge_id": wtc.MODULE_ID,
+                    "max_candidates_per_project": value,
+                    "max_candidate_bytes": 1500,
+                }
+                self._assert_make_release_rejects_before_any_io(write_trigger)
+
+    def test_make_release_rejects_every_bad_shaped_max_candidate_bytes(self) -> None:
+        for label, value in self._WRITE_TRIGGER_BAD_LIMIT_VALUES:
+            with self.subTest(field="max_candidate_bytes", shape=label):
+                write_trigger = {
+                    "bridge_id": wtc.MODULE_ID,
+                    "max_candidates_per_project": 50,
+                    "max_candidate_bytes": value,
+                }
+                self._assert_make_release_rejects_before_any_io(write_trigger)
+
+    def test_make_release_rejects_write_trigger_missing_max_candidates_per_project_key(self) -> None:
+        write_trigger = {"bridge_id": wtc.MODULE_ID, "max_candidate_bytes": 1500}
+        self._assert_make_release_rejects_before_any_io(write_trigger)
+
+    def test_make_release_rejects_write_trigger_missing_max_candidate_bytes_key(self) -> None:
+        write_trigger = {"bridge_id": wtc.MODULE_ID, "max_candidates_per_project": 50}
+        self._assert_make_release_rejects_before_any_io(write_trigger)
+
+    def test_make_release_rejects_a_non_dict_write_trigger(self) -> None:
+        # `write_trigger=None` is the valid sentinel meaning "no write-trigger release at all" (every
+        # call site except install-write-trigger) and must NOT be included here -- that is covered by
+        # every other test in this file that calls make_release()/install() with no write_trigger=.
+        for label, value in [
+            ("string", "not-a-dict"),
+            ("list", [wtc.MODULE_ID, 50, 1500]),
+            ("int", 1),
+        ]:
+            with self.subTest(shape=label):
+                self._assert_make_release_rejects_before_any_io(value)
+
+    # Round-52 fix (converged independent Claude opus/max + Codex gpt-5.6-sol/max review,
+    # 2026-08-21). Two prior rounds' NO-GO both converged on the same root cause from different
+    # angles: receipt/argument-field-based tracking of the write-trigger identity is fragile. The
+    # architectural fix is two changes:
+    #   (a) write_trigger["bridge_id"] must EXACTLY equal WRITE_TRIGGER_BRIDGE_ID -- not merely be
+    #       "any non-empty string" (the prior round's own validation, see the moved
+    #       test_make_release_rejects_a_none_write_trigger_bridge_id_*/test_make_release_rejects_a_
+    #       non_str_write_trigger_bridge_id_* tests above, which now assert the new message).
+    #   (b) write_trigger's key set must be EXACTLY {"bridge_id", "max_candidates_per_project",
+    #       "max_candidate_bytes"} -- checked before any field is consumed or reaches
+    #       canonical_json().
+    # The tests below cover (a) with a syntactically well-formed but WRONG identity (the actual gap
+    # Codex reproduced end-to-end: install succeeds, verify() says ok:true, the registered command
+    # is permanently, silently inert), and (b) with the specific silent-failure shapes both
+    # reviewers called out: an extra key (including `enabled`, investigated below rather than
+    # assumed -- see WRITE_TRIGGER_BRIDGE_ID's own comment and _validate_write_trigger_argument()'s),
+    # a non-JSON-serializable extra value, and a non-string key.
+
+    def test_make_release_rejects_a_custom_but_well_formed_write_trigger_bridge_id(self) -> None:
+        # THE core P1 fix, verified by reverting _validate_write_trigger_argument()'s exact-identity
+        # check in isolation (replacing `if write_trigger["bridge_id"] != WRITE_TRIGGER_BRIDGE_ID:
+        # raise ...` with the prior round's bare `_validate_bridge_id(write_trigger.get("bridge_id"))`):
+        # this exact write_trigger dict then passed cleanly -- make_release() returned a result, no
+        # exception at all -- confirming this test genuinely exercises the fix rather than a
+        # precondition that was already true. A syntactically well-formed, non-empty string that is
+        # simply NOT the one real identity is exactly the shape the prior round's validation could
+        # never catch (it only checked "is this a non-empty string", which a custom id trivially
+        # satisfies) -- and exactly the shape Codex proved installs a real, permanently silently
+        # inert handler that this file's own untracked-owned-handler safety scan and verify() can
+        # never detect, because both only ever look for WRITE_TRIGGER_BRIDGE_ID.
+        write_trigger = {
+            "bridge_id": "some-other-custom-identity-v1",
+            "max_candidates_per_project": 50,
+            "max_candidate_bytes": 1500,
+        }
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.make_release(write_trigger=write_trigger)
+        self.assertIn(f"must be {installer.WRITE_TRIGGER_BRIDGE_ID!r}", str(ctx.exception))
+        self.assertIn("some-other-custom-identity-v1", str(ctx.exception))
+        # Also confirmed through the real install_write_trigger()/install() path, not just the bare
+        # make_release() unit call above -- no pending journal, no receipt, no config file touched.
+        self._assert_make_release_rejects_before_any_io(write_trigger)
+        with self.assertRaises(installer.InstallError):
+            installer.install(write_trigger=write_trigger)
+        self.assertFalse((self.runtime_base / "pending-install.json").exists())
+        self.assertFalse((self.runtime_base / "latest-receipt.json").exists())
+
+    def test_make_release_rejects_write_trigger_with_an_unexpected_extra_key(self) -> None:
+        # P2 fix, opus + Codex (same finding): the prior round's synthetic-dict-rebuild approach in
+        # _validate_write_trigger_argument() silently dropped any extra/unexpected key before it
+        # reached the real validator (_parse_write_trigger_block()), and the ORIGINAL caller dict --
+        # not the synthetic one -- is what make_release() later feeds into canonical_json() for the
+        # release-key computation. Verified by reverting the exact-key-set check in isolation: every
+        # subTest below then passed straight through to canonical_json() (the "set"/"path" cases
+        # raised a bare, uncaught TypeError there instead of a clean InstallError; the "enabled_*"
+        # cases were silently ignored -- make_release() returned a result cleanly, using the
+        # unconditionally-hardcoded `enabled: True` regardless of the value the caller actually
+        # passed -- confirming this genuinely exercises the fix, not an already-true precondition).
+        base = {
+            "bridge_id": wtc.MODULE_ID,
+            "max_candidates_per_project": 50,
+            "max_candidate_bytes": 1500,
+        }
+        extra_cases: list[tuple[str, Any]] = [
+            ("enabled_true", True),
+            ("enabled_false", False),
+            ("enabled_non_bool", "not-a-bool"),
+            ("plain_unexpected_key", None),
+        ]
+        for label, enabled_value in extra_cases:
+            with self.subTest(shape=label):
+                write_trigger = dict(base)
+                key = "enabled" if label != "plain_unexpected_key" else "some_unexpected_key"
+                write_trigger[key] = enabled_value
+                with self.assertRaises(installer.InstallError) as ctx:
+                    installer.make_release(write_trigger=write_trigger)
+                self.assertIn("write_trigger must have exactly these keys", str(ctx.exception))
+                self._assert_make_release_rejects_before_any_io(write_trigger)
+
+    def test_make_release_rejects_write_trigger_extra_key_before_a_non_serializable_value_reaches_canonical_json(
+        self,
+    ) -> None:
+        # The specific worst-case both reviewers called out: an extra key whose VALUE is not
+        # JSON-serializable (a `set` here; `Path`/`bytes`/an arbitrary object are equally not
+        # serializable by json.dumps()) used to reach canonical_json() unguarded and raise a bare
+        # TypeError -- the exact failure class this whole validation exists to eliminate. The
+        # exact-key-set check now runs BEFORE any field is consumed, so this never gets anywhere
+        # near canonical_json() -- confirmed by asserting the exception is exactly InstallError (a
+        # bare TypeError is not a subclass of InstallError, so assertRaises below would itself fail
+        # if this regressed) and that no partial write of any kind occurred.
+        write_trigger = {
+            "bridge_id": wtc.MODULE_ID,
+            "max_candidates_per_project": 50,
+            "max_candidate_bytes": 1500,
+            "not_json_serializable": {1, 2, 3},
+        }
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.make_release(write_trigger=write_trigger)
+        self.assertIn("write_trigger must have exactly these keys", str(ctx.exception))
+        self._assert_make_release_rejects_before_any_io(write_trigger)
+
+    def test_make_release_rejects_a_write_trigger_with_a_non_string_key(self) -> None:
+        # Sibling of the extra-key tests above: a non-string key used to reach
+        # canonical_json()'s own `sort_keys=True` and raise a bare TypeError from comparing an int
+        # key against str keys. The exact-key-set check catches this the same way (the non-string
+        # key is simply not a member of the expected key set either), before canonical_json() is
+        # ever reached.
+        write_trigger = {
+            "bridge_id": wtc.MODULE_ID,
+            "max_candidates_per_project": 50,
+            "max_candidate_bytes": 1500,
+            7: "seven",
+        }
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.make_release(write_trigger=write_trigger)  # type: ignore[arg-type]
+        self.assertIn("write_trigger must have exactly these keys", str(ctx.exception))
+        self._assert_make_release_rejects_before_any_io(write_trigger)
+
+    def test_install_write_trigger_custom_id_ordering_finding_is_now_unreachable(self) -> None:
+        # Reproduces Codex's exact reported sequence -- well-known-ID write-trigger install, then a
+        # SECOND write-trigger install attempt under a DIFFERENT, custom identity, then a plain
+        # install -- and confirms the middle step is now unreachable: it fails cleanly, before any
+        # I/O, so there is never a second, differently-identified live handler for the
+        # untracked-owned-handler safety net to miss in the first place. Reproduction of the
+        # reviewer's finding, not merely an assertion that make_release() rejects a bad shape in
+        # isolation (see test_make_release_rejects_a_custom_but_well_formed_write_trigger_bridge_id
+        # above for that unit-level coverage).
+        receipt1 = installer.install_write_trigger(self.policy_path)
+        self.assertEqual(receipt1["write_trigger_bridge_id"], wtc.MODULE_ID)
+        main_bytes_after_step1 = self.main_config.read_bytes()
+        account_bytes_after_step1 = self.account_config.read_bytes()
+        latest_receipt_after_step1 = (self.runtime_base / "latest-receipt.json").read_bytes()
+
+        custom_write_trigger = {
+            "bridge_id": "attacker-or-typo-custom-identity",
+            "max_candidates_per_project": 50,
+            "max_candidate_bytes": 1500,
+        }
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.install(write_trigger=custom_write_trigger)
+        self.assertIn(f"must be {installer.WRITE_TRIGGER_BRIDGE_ID!r}", str(ctx.exception))
+
+        # Nothing changed: no second handler under the custom identity was ever written, no pending
+        # journal, receipt untouched -- proving there is no orphaned-under-a-different-identity state
+        # for uninstall()'s/recover_pending_install()'s safety net to have to catch.
+        self.assertFalse((self.runtime_base / "pending-install.json").exists())
+        self.assertEqual((self.runtime_base / "latest-receipt.json").read_bytes(), latest_receipt_after_step1)
+        self.assertEqual(self.main_config.read_bytes(), main_bytes_after_step1)
+        self.assertEqual(self.account_config.read_bytes(), account_bytes_after_step1)
+        for config_path in (self.main_config, self.account_config):
+            payload = json.loads(config_path.read_bytes())
+            self.assertFalse(
+                any(
+                    installer.owned_handler(handler, bridge_id="attacker-or-typo-custom-identity")
+                    for handler in payload["hooks"].get("SessionEnd", [])
+                )
+            )
+
+        # An ordinary, unrelated plain install() afterward still succeeds cleanly -- the rejected
+        # attempt left no wedge behind.
+        result = installer.install()
+        self.assertTrue(result.get("release_id"))
+        self.assertTrue(installer.verify()["ok"])
+
+    def test_fails_closed_and_changes_nothing_when_write_trigger_not_enabled(self) -> None:
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.install_write_trigger(self.disabled_policy_path)
+        self.assertIn("write_trigger.enabled", str(ctx.exception))
+        self.assertFalse((self.runtime_base / "pending-install.json").exists())
+        self.assertFalse((self.runtime_base / "latest-receipt.json").exists())
+        self.assertEqual(self.main_config.read_bytes(), InstallEndToEndTests._base_hooks_json())
+        self.assertEqual(self.account_config.read_bytes(), InstallEndToEndTests._base_hooks_json())
+
+    def test_uninstall_removes_both_handlers_full_rollback(self) -> None:
+        installer.install_write_trigger(self.policy_path)
+        result = installer.uninstall()
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.main_config.read_bytes(), InstallEndToEndTests._base_hooks_json())
+        self.assertEqual(self.account_config.read_bytes(), InstallEndToEndTests._base_hooks_json())
+        self.assertFalse((self.runtime_base / "latest-receipt.json").exists())
+
+    def test_uninstall_catches_an_untracked_write_trigger_handler_the_base_identity_scan_alone_misses(
+        self,
+    ) -> None:
+        # P2-D fix (independent Claude opus5/max review, 2026-08-21): the untracked-owned-handler
+        # safety scan uninstall()/recover_pending_install() run before finishing (see
+        # _untracked_owned_including_write_trigger()'s own comment) used to run ONLY under the base
+        # identity (BRIDGE_ID, UserPromptSubmit) -- never under the write-trigger identity, even
+        # though nothing in the scan's own design prevented it, and a comment nearby described a
+        # caller passing the write-trigger identity here as if it already existed when it did not.
+        # This constructs a shape the base-identity-only scan genuinely cannot see: an untracked
+        # hooks.json carrying ONLY a write-trigger SessionEnd handler, no UserPromptSubmit handler
+        # under BRIDGE_ID at all, so the base-identity scan finds nothing and the write-trigger-
+        # identity scan is the only thing that can catch it -- proving this fix is load-bearing, not
+        # merely a comment correction.
+        installer.install_write_trigger(self.policy_path)
+        local_homes = self.main_config.parent.parent
+        stray_dir = local_homes / "codex-accounts/acct-stray/home"
+        stray_dir.mkdir(parents=True)
+        stray_config = stray_dir / "hooks.json"
+        stray_command = f"/usr/bin/python3 write_candidate_capture.py scan --bridge-id {wtc.MODULE_ID}"
+        InstallEndToEndTests._write(
+            stray_config,
+            json.dumps(
+                {"hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": stray_command}]}]}}
+            ).encode(),
+        )
+
+        receipt = installer.read_receipt()
+        self.assertIn("write_trigger_bridge_id", receipt)  # fixture precondition
+        receipt_paths = {row["path"] for row in receipt["configs"]}
+        resolved_stray = os.fspath(installer.resolve_ssd_path(stray_config))
+
+        # Confirm the fixture genuinely isolates the write-trigger-identity half: the base-identity
+        # scan alone (the function's own pre-fix call shape) does not see this stray file at all.
+        self.assertEqual(installer._find_untracked_owned_configs(receipt_paths), [])
+
+        # The combined helper uninstall()/recover_pending_install() now both use DOES catch it.
+        combined = installer._untracked_owned_including_write_trigger(receipt, receipt_paths)
+        self.assertIn(resolved_stray, combined)
+
+        # And uninstall() itself now refuses because of it, leaving everything untouched.
+        receipt_before = (self.runtime_base / "latest-receipt.json").read_bytes()
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.uninstall()
+        self.assertIn("does not track", str(ctx.exception))
+        self.assertFalse(installer.PENDING_PATH.exists())
+        self.assertEqual((self.runtime_base / "latest-receipt.json").read_bytes(), receipt_before)
+
+        # No permanent lockout: removing the stray file lets uninstall() proceed normally.
+        stray_config.unlink()
+        result = installer.uninstall()
+        self.assertTrue(result["ok"])
+
+    def test_plain_reinstall_after_write_trigger_does_not_disarm_the_untracked_write_trigger_safety_net(
+        self,
+    ) -> None:
+        # P2-2 fix (independent Claude opus5/max review, 2026-08-21). Reproduces the reviewer's exact
+        # sequence: the prior round's fix decided whether to ALSO scan for the write-trigger identity
+        # by checking `receipt.get("write_trigger_bridge_id") is not None` on the ONE receipt currently
+        # in hand -- a real, reproduced gap, because a LATER, entirely ordinary plain install() (no
+        # write_trigger= argument -- e.g. redeploying just a claude_memory_hook.py fix, independent of
+        # any write-trigger decision) overwrites latest-receipt.json with a receipt that has no
+        # write_trigger_bridge_id field at all, even though nothing about that plain install touches an
+        # already-registered SessionEnd handler a PRIOR install-write-trigger call added
+        # (update_hook_config()'s per-event layering is additive, not a full reset). Pre-fix, the
+        # safety net would then silently stop checking the write-trigger identity for every subsequent
+        # uninstall()/recover_pending_install() call, and the very next uninstall() would succeed and
+        # delete the receipt while an orphaned write-trigger handler stayed live in hooks.json.
+        #
+        # The stray untracked write-trigger handler this test constructs is deliberately introduced
+        # AFTER the plain reinstall (not before): install()'s own finalizing recover_pending_install()
+        # call already runs this exact untracked-owned-handler safety scan for the BASE identity today,
+        # unconditionally, completely independent of write-trigger (R9-P1-A, pre-existing, unrelated to
+        # this fix -- confirmed empirically: an ordinary second install() with an untracked BASE-
+        # identity handler present anywhere already refuses today, with or without this fix). This
+        # fix's job is only to make the write-trigger identity get that exact same, already-established
+        # treatment -- so once it does, a stray write-trigger handler present DURING a plain reinstall
+        # would correctly block that reinstall too, for the same pre-existing reason an untracked base
+        # handler already would. Introducing it afterward isolates the ONE thing this fix actually
+        # changes: whether the safety net still checks the write-trigger identity for a receipt that no
+        # longer records write_trigger_bridge_id, independent of that separate, pre-existing behavior.
+        #
+        # Sequence: install WITH write_trigger (safety net correctly catches an orphaned write-trigger
+        # handler; verified first, exactly like the P2-D test above) -> plain install() with NO
+        # write_trigger, succeeding cleanly (the receipt's write_trigger_bridge_id field genuinely
+        # disappears -- checked explicitly below, not assumed) -> a write-trigger handler becomes
+        # orphaned -> the safety net must STILL catch it using this NEW, write_trigger_bridge_id-less
+        # receipt (proving the check no longer depends on that one receipt field) -> uninstall() must
+        # still refuse, not silently succeed and abandon the handler.
+        installer.install_write_trigger(self.policy_path)
+        receipt1 = installer.read_receipt()
+        self.assertIn("write_trigger_bridge_id", receipt1)  # fixture precondition
+
+        # Plain reinstall with NO write_trigger -- an ordinary, unrelated "redeploy the base bridge
+        # only" operation, independent of any write-trigger decision (matches the same operation
+        # already discussed and performed for real earlier in this project). Must succeed: nothing
+        # untracked exists yet at this point.
+        result = installer.install()
+        self.assertTrue(result.get("release_id"))
+
+        receipt2 = installer.read_receipt()
+        # Precondition confirming this genuinely reproduces the reviewer's scenario: the new receipt
+        # has lost the write_trigger_bridge_id field entirely, even though the write-trigger handler a
+        # prior install-write-trigger call registered is untouched and still live in the TRACKED
+        # configs (additive per-event layering, not a full reset -- checked explicitly, not assumed).
+        self.assertNotIn("write_trigger_bridge_id", receipt2)
+        self.assertNotIn("write_trigger_script_sha256", receipt2)
+        for config_path in (self.main_config, self.account_config):
+            payload = json.loads(config_path.read_bytes())
+            self.assertEqual(len(payload["hooks"].get("SessionEnd", [])), 1)
+        receipt_paths2 = {row["path"] for row in receipt2["configs"]}
+
+        # NOW a write-trigger handler becomes orphaned: an account directory carrying ONLY a
+        # write-trigger SessionEnd handler (no UserPromptSubmit handler at all), nested one level
+        # deeper than _enumerate_hook_configs()'s own one-level-deep shape
+        # (codex-accounts/<name>/home/hooks.json -- see that function's own comment) so it is genuinely
+        # untracked -- not something a fresh discover_hook_configs() call would adopt as a normal new
+        # account (matching the R8-P1-B scenario: a relocated account whose own home/ subdirectory was
+        # renamed).
+        local_homes = self.main_config.parent.parent
+        stray_dir = local_homes / "codex-accounts/acct-stray/relocated/home"
+        stray_dir.mkdir(parents=True)
+        stray_config = stray_dir / "hooks.json"
+        stray_command = f"/usr/bin/python3 write_candidate_capture.py scan --bridge-id {wtc.MODULE_ID}"
+        InstallEndToEndTests._write(
+            stray_config,
+            json.dumps(
+                {"hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": stray_command}]}]}}
+            ).encode(),
+        )
+        resolved_stray = os.fspath(installer.resolve_ssd_path(stray_config))
+
+        # The safety net must catch the stray handler using receipt2 -- the receipt with NO
+        # write_trigger_bridge_id field -- proving the check no longer silently stops just because this
+        # particular receipt lost that field.
+        combined = installer._untracked_owned_including_write_trigger(receipt2, receipt_paths2)
+        self.assertIn(resolved_stray, combined)
+
+        # And uninstall() itself must still correctly refuse, not silently succeed and abandon the
+        # orphaned write-trigger handler.
+        receipt_before = (self.runtime_base / "latest-receipt.json").read_bytes()
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.uninstall()
+        self.assertIn("does not track", str(ctx.exception))
+        self.assertFalse(installer.PENDING_PATH.exists())
+        self.assertEqual((self.runtime_base / "latest-receipt.json").read_bytes(), receipt_before)
+
+        # No permanent lockout: removing the stray file lets uninstall() proceed normally.
+        stray_config.unlink()
+        result = installer.uninstall()
+        self.assertTrue(result["ok"])
+
+    def test_recover_after_injected_failure_mid_write_trigger_upgrade_rolls_back_to_prev(self) -> None:
+        # Base install first (v1: UserPromptSubmit only), then attempt the write-trigger upgrade
+        # with a failure injected on the second config's live write -- mirrors this file's own
+        # test_interrupted_upgrade_install_recovers_to_the_previous_working_state pattern
+        # (path-addressed in-process atomic_write side_effect, not a real SIGKILL), proving
+        # install()'s existing self-heal/recover_pending_install() rollback genuinely covers this
+        # new write_trigger= call shape too, not just the plain-UserPromptSubmit one -- checked
+        # explicitly, not assumed.
+        installer.install()
+
+        real_atomic_write = installer.atomic_write
+
+        def failing_atomic_write(path, raw, mode=0o600):
+            if path == self.account_config:
+                raise installer.InstallError("simulated disk error")
+            return real_atomic_write(path, raw, mode)
+
+        with mock.patch.object(installer, "atomic_write", side_effect=failing_atomic_write):
+            with self.assertRaises(installer.InstallError):
+                installer.install_write_trigger(self.policy_path)
+
+        for config_path in (self.main_config, self.account_config):
+            payload = json.loads(config_path.read_bytes())
+            self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 2)
+            self.assertNotIn("SessionEnd", payload["hooks"])
+
+        self.assertTrue(installer.verify()["ok"])
+        self.assertTrue(installer.plan()["ok"])
+        self.assertEqual(installer.recover_pending_install(), {"ok": True, "state": "none"})
+
+        # A subsequent, un-injected retry completes cleanly -- the recovery left a genuinely
+        # working, retryable state, not a permanent wedge.
+        receipt = installer.install_write_trigger(self.policy_path)
+        self.assertIn("write_trigger_bridge_id", receipt)
+        payload = json.loads(self.account_config.read_bytes())
+        self.assertEqual(len(payload["hooks"]["SessionEnd"]), 1)
+
+    def test_verify_tolerates_a_non_list_pre_existing_session_end_value_on_a_plain_install(self) -> None:
+        # P2-A fix regression (round-53, independent Claude opus/max review, 2026-08-21): a NEW
+        # regression this round's verify() rewrite introduced, unrelated to write-trigger. install()
+        # never inspects or normalizes SessionEnd on a plain (non-write-trigger) install -- only the
+        # event actually being registered gets validated -- so a user's PRE-EXISTING SessionEnd key
+        # (legitimately some other tool's own hook, nothing to do with this bridge) is written back
+        # verbatim, whatever shape it has, including a non-list JSON scalar. The old (pre-this-round)
+        # verify() returned ok=True in every one of these cases; the unguarded rewrite instead crashed
+        # with an uncaught TypeError iterating a non-iterable.
+        for bad_session_end in (None, 0, True, "not-a-list-of-handlers"):
+            with self.subTest(bad_session_end=bad_session_end):
+                main_payload = {
+                    "hooks": {
+                        "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/usr/bin/true"}]}],
+                        "SessionEnd": bad_session_end,
+                    }
+                }
+                InstallEndToEndTests._write(self.main_config, json.dumps(main_payload).encode())
+                InstallEndToEndTests._write(self.account_config, InstallEndToEndTests._base_hooks_json())
+
+                try:
+                    receipt = installer.install()
+                    self.assertNotIn("write_trigger_bridge_id", receipt)  # fixture precondition: plain install
+
+                    result = installer.verify()
+                    self.assertTrue(result["ok"], result)
+                finally:
+                    # Reset to a clean not-installed baseline for the next variant regardless of
+                    # whether the assertions above passed -- keeps a real failure on one variant from
+                    # cascading into unrelated "hook config no longer matches" errors on the rest.
+                    installer.uninstall()
+
+    def test_verify_error_on_a_config_missing_the_write_trigger_hook_names_the_remediation(self) -> None:
+        # P2-B fix regression (round-53, independent Claude opus/max review, 2026-08-21). Sequence:
+        # install-write-trigger on the existing configs -> a NEW Codex account config appears (this
+        # machine legitimately runs multiple pooled Codex account homes) -> an ordinary plain
+        # install() (no write_trigger= argument) correctly picks up the new config and registers ONLY
+        # the base UserPromptSubmit handler on it (plain install must never silently also add a
+        # SessionEnd handler nobody asked for). verify() then correctly hard-fails -- that part was
+        # already right -- but the message named no remediation and gave no hint this is an EXPECTED
+        # consequence of a plain install after write-trigger was enabled elsewhere, leaving an operator
+        # with no idea what to do next. Asserts on the message's actual substance, not just that
+        # InstallError was raised.
+        installer.install_write_trigger(self.policy_path)
+
+        local_homes = self.main_config.parent.parent  # main_config == local_homes / ".codex/hooks.json"
+        new_account_home = local_homes / "codex-accounts/acct-two/home"
+        new_account_home.mkdir(parents=True)
+        new_account_config = new_account_home / "hooks.json"
+        InstallEndToEndTests._write(new_account_config, InstallEndToEndTests._base_hooks_json())
+
+        receipt = installer.install()
+        self.assertNotIn("write_trigger_bridge_id", receipt)  # fixture precondition: plain install this time
+        payload = json.loads(new_account_config.read_bytes())
+        self.assertEqual(len(payload["hooks"]["UserPromptSubmit"]), 2)  # base handler present
+        self.assertNotIn("SessionEnd", payload["hooks"])  # write-trigger handler correctly NOT added
+
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.verify()
+        message = str(ctx.exception)
+        self.assertIn(os.fspath(new_account_config), message)
+        self.assertIn("base", message.lower())
+        self.assertIn("write-trigger", message.lower())
+        self.assertIn("expected", message.lower())
+        self.assertIn("install-write-trigger", message)  # names the actual remediation action
+
+    def test_verify_detects_write_trigger_script_tampering(self) -> None:
+        receipt = installer.install_write_trigger(self.policy_path)
+        release_dir = Path(receipt["release_dir"])
+        write_trigger_script = release_dir / "write_candidate_capture.py"
+        original_mode = stat.S_IMODE(write_trigger_script.stat().st_mode)
+        write_trigger_script.chmod(0o600)
+        write_trigger_script.write_bytes(b"#!/usr/bin/env python3\n# tampered\n")
+        write_trigger_script.chmod(original_mode)
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.verify()
+        self.assertIn("write-trigger script digest mismatch", str(ctx.exception))
+
+    def test_verify_detects_write_trigger_script_tampering_after_a_plain_reinstall_drops_the_receipt_fields(
+        self,
+    ) -> None:
+        # Round-52 fix (converged independent Claude opus/max + Codex gpt-5.6-sol/max review,
+        # 2026-08-21). Reproduces Codex's exact sequence: install-write-trigger (receipt1 records
+        # write_trigger_script_sha256) -> an ordinary, unrelated plain install() (no write_trigger=
+        # argument -- e.g. redeploying just a claude_memory_hook.py fix) succeeds and overwrites
+        # latest-receipt.json with a receipt that has NEITHER write_trigger_* field, even though the
+        # SessionEnd handler a prior install-write-trigger call registered is untouched and still
+        # genuinely live (update_hook_config()'s per-event layering is additive, not a full reset) ->
+        # tamper with the ACTUAL FILE the still-live handler's own command line references (a
+        # DIFFERENT, OLDER release directory than the one the CURRENT receipt now points at, since a
+        # plain reinstall's release_id is content-addressed without any write_trigger fields at all
+        # -- see make_release()'s release_key_fields) -> verify() must now catch it, not report
+        # ok: true.
+        #
+        # Verified by reverting verify()'s independent, live-hooks.json-driven write-trigger
+        # detection in isolation (replacing it with the prior round's
+        # `if receipt.get("write_trigger_script_sha256") is not None:`-gated block, which reads
+        # write_candidate_capture.py from receipt["release_dir"] -- the WRONG, newer directory after
+        # a plain reinstall): verify() then returned {"ok": True, ...} for this exact tampered state
+        # -- the write-trigger check silently never ran at all, since receipt2 (below) has neither
+        # field -- confirming this test genuinely exercises the fix rather than an already-true
+        # precondition.
+        receipt1 = installer.install_write_trigger(self.policy_path)
+        self.assertIn("write_trigger_script_sha256", receipt1)  # fixture precondition
+        live_release_dir = Path(receipt1["release_dir"])
+        live_write_trigger_script = live_release_dir / "write_candidate_capture.py"
+        self.assertTrue(live_write_trigger_script.exists())
+
+        # Ordinary, unrelated plain reinstall -- succeeds, and drops both write_trigger_* receipt
+        # fields (checked explicitly, not assumed -- matches the precondition
+        # test_plain_reinstall_after_write_trigger_does_not_disarm_the_untracked_write_trigger_safety_net
+        # already established for the untracked-handler safety net; this test covers verify()
+        # instead). The new receipt's own release_dir is genuinely a DIFFERENT directory, and does
+        # not even contain a write_candidate_capture.py file at all (write_runtime() only writes the
+        # write-trigger script triple when write_trigger= is passed) -- checked explicitly, since
+        # this is exactly what makes the pre-fix release_dir-relative check silently wrong instead
+        # of merely silently skipped.
+        result = installer.install()
+        self.assertTrue(result.get("release_id"))
+        receipt2 = installer.read_receipt()
+        self.assertNotIn("write_trigger_script_sha256", receipt2)
+        self.assertNotIn("write_trigger_bridge_id", receipt2)
+        self.assertNotEqual(receipt2["release_dir"], receipt1["release_dir"])
+        self.assertFalse((Path(receipt2["release_dir"]) / "write_candidate_capture.py").exists())
+
+        # Pre-tamper: verify() must still pass -- the live SessionEnd handler is genuinely untouched
+        # and its referenced script genuinely matches what its own command line asserts.
+        self.assertTrue(installer.verify()["ok"])
+
+        # Tamper with the file the STILL-LIVE handler's own command references -- the OLD release
+        # directory, not receipt2["release_dir"].
+        original_mode = stat.S_IMODE(live_write_trigger_script.stat().st_mode)
+        live_write_trigger_script.chmod(0o600)
+        live_write_trigger_script.write_bytes(b"#!/usr/bin/env python3\n# tampered after plain reinstall\n")
+        live_write_trigger_script.chmod(original_mode)
+
+        with self.assertRaises(installer.InstallError) as ctx:
+            installer.verify()
+        self.assertIn("write-trigger script digest mismatch", str(ctx.exception))
+
+    def test_cli_dry_run_and_missing_policy_flag_and_real_install(self) -> None:
+        # Drives the real, unmocked main()/argparse dispatch (mirrors this file's own
+        # test_main_install_succeeds_end_to_end_when_shared_runtime_does_not_yet_exist pattern) --
+        # not install_write_trigger() called directly, which every other test in this class does
+        # and which never exercises the CLI argument parsing or the exclusive-lock acquisition at
+        # all. Still fully isolated: SSD_ROOT/RUNTIME_BASE/etc. are the fixture's own mocked temp
+        # paths throughout, so this never touches a real path.
+        with mock.patch.object(sys, "argv", ["install_bridge.py", "install-write-trigger"]):
+            self.assertEqual(installer.main(), 1)  # missing --write-trigger-policy: fails closed
+        self.assertFalse((self.runtime_base / "latest-receipt.json").exists())
+
+        argv = ["install_bridge.py", "install-write-trigger", "--write-trigger-policy", str(self.policy_path)]
+        with mock.patch.object(sys, "argv", argv + ["--dry-run"]):
+            self.assertEqual(installer.main(), 0)
+        self.assertFalse((self.runtime_base / "latest-receipt.json").exists())
+        self.assertEqual(self.main_config.read_bytes(), InstallEndToEndTests._base_hooks_json())
+
+        with mock.patch.object(sys, "argv", argv):
+            self.assertEqual(installer.main(), 0)
+        payload = json.loads(self.main_config.read_bytes())
+        self.assertEqual(len(payload["hooks"]["SessionEnd"]), 1)
+        self.assertTrue((self.runtime_base / "latest-receipt.json").exists())
+
+
+class BaseOnlyPathsWithoutWriteCandidateCaptureModuleTests(unittest.TestCase):
+    """P1 fix regression (converged independent Claude opus/max + Codex gpt-5.6-sol/max review,
+    2026-08-21): install_bridge.py must not depend on write_candidate_capture.py being importable AT
+    ALL for its base-only actions (plain install/uninstall/recover/verify -- no write_trigger=
+    anywhere in the call). write_candidate_capture.py is genuinely an UNTRACKED file in this exact
+    repo's own git history today (independently confirmed via `git status --short` at review time),
+    so `git checkout`/`git clean`/a fresh clone that does not preserve untracked files can leave
+    install_bridge.py present without its sibling. Before this fix,
+    _untracked_owned_including_write_trigger() -- called unconditionally by both uninstall() and
+    recover_pending_install()'s own finishing pass, for every action, including a plain one -- did an
+    unconditional _import_write_candidate_capture(), so a plain, no-write-trigger uninstall()/
+    recover_pending_install() call raised an uncaught ModuleNotFoundError straight past main()'s own
+    `except InstallError` handler: a total lockout, including of the emergency-recovery path itself.
+
+    This class proves the fix with a REAL subprocess whose sys.path contains ONLY a fresh, isolated
+    copy of install_bridge.py -- never the real repo directory write_candidate_capture.py actually
+    lives in -- run under `-I` (isolated mode: ignores PYTHONPATH, user site-packages, and the
+    script's own directory), so `import write_candidate_capture` genuinely raises
+    ModuleNotFoundError if anything on the base-only call path still attempts it. An in-process
+    mock.patch-based test could not tell "never imports" apart from "imports, but happens to succeed
+    because the real module is already on this process's own sys.path anyway" -- exactly the
+    distinction this fix is about.
+    """
+
+    def setUp(self) -> None:
+        self._stack = contextlib.ExitStack()
+        self.addCleanup(self._stack.close)
+        self.temp = self._stack.enter_context(tempfile.TemporaryDirectory())
+        root = Path(self.temp).resolve()
+
+        self.isolated_dir = root / "isolated-install-bridge-only"
+        self.isolated_dir.mkdir()
+        shutil.copy2(installer.__file__, self.isolated_dir / "install_bridge.py")
+        # Deliberately NOT copying write_candidate_capture.py -- reproduces install_bridge.py being
+        # present without its sibling.
+        self.assertFalse((self.isolated_dir / "write_candidate_capture.py").exists())  # fixture precondition
+
+        self.ssd_root = root / "ssd"
+        self.local_homes = self.ssd_root / "Orca/local-homes"
+        self.runtime_base = self.local_homes / ".shared-runtime/claude-codex-memory-bridge"
+        self.pending_path = self.runtime_base / "pending-install.json"
+        source_dir = self.ssd_root / "source"
+        self.source_script = source_dir / "claude_memory_hook.py"
+
+        self.local_homes.mkdir(parents=True)
+        (self.local_homes / ".codex").mkdir()
+        (self.local_homes / ".claude/projects").mkdir(parents=True)
+        (self.local_homes / "codex-accounts/acct-one/home").mkdir(parents=True)
+        source_dir.mkdir()
+
+        InstallEndToEndTests._write(self.local_homes / ".codex/hooks.json", InstallEndToEndTests._base_hooks_json())
+        InstallEndToEndTests._write(
+            self.local_homes / "codex-accounts/acct-one/home/hooks.json", InstallEndToEndTests._base_hooks_json()
+        )
+        InstallEndToEndTests._write(self.source_script, b"#!/usr/bin/env python3\n# fixture hook script\n")
+
+    def _run_isolated_child(self, body: str) -> subprocess.CompletedProcess:
+        script = f"""
+import sys
+sys.path.insert(0, {str(self.isolated_dir)!r})
+try:
+    import write_candidate_capture  # noqa: F401
+except ModuleNotFoundError:
+    pass
+else:
+    raise SystemExit("FAIL: write_candidate_capture unexpectedly importable -- fixture isolation broken")
+
+from pathlib import Path
+import install_bridge as installer
+
+installer.SSD_ROOT = Path({str(self.ssd_root)!r})
+installer.LOCAL_HOMES_ROOT = Path({str(self.local_homes)!r})
+installer.RUNTIME_BASE = Path({str(self.runtime_base)!r})
+installer.PENDING_PATH = Path({str(self.pending_path)!r})
+installer.SOURCE_SCRIPT = Path({str(self.source_script)!r})
+installer.volume_uuid = lambda ssd_root=None: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+Path.home = classmethod(lambda cls: Path({str(self.local_homes)!r}))
+
+{body}
+
+assert "write_candidate_capture" not in sys.modules, "write_candidate_capture must never be imported on this path"
+print("ISOLATED-OK")
+"""
+        script_path = Path(self.temp) / "child.py"
+        script_path.write_text(script)
+        # -I: isolated mode -- ignores PYTHONPATH/user site-packages and excludes the script's own
+        # directory from sys.path, so the only way this subprocess can find `write_candidate_capture`
+        # at all is via the one directory this test itself inserted (self.isolated_dir, which
+        # deliberately does not contain it) -- a robust reproduction, not merely "no import statement
+        # was typed at module level".
+        return subprocess.run(
+            [sys.executable, "-I", os.fspath(script_path)], capture_output=True, text=True, timeout=60
+        )
+
+    def test_plain_install_uninstall_recover_verify_all_work_without_the_module_present(self) -> None:
+        body = """
+outcome0 = installer.recover_pending_install()
+assert outcome0 == {"ok": True, "state": "none"}, outcome0
+
+receipt = installer.install()
+assert "write_trigger_bridge_id" not in receipt, receipt
+assert "write_trigger_script_sha256" not in receipt, receipt
+
+verify_result = installer.verify()
+assert verify_result["ok"] is True, verify_result
+
+uninstall_result = installer.uninstall()
+assert uninstall_result["ok"] is True, uninstall_result
+
+outcome1 = installer.recover_pending_install()
+assert outcome1 == {"ok": True, "state": "none"}, outcome1
+"""
+        result = self._run_isolated_child(body)
+        self.assertEqual(result.returncode, 0, msg=f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        self.assertIn("ISOLATED-OK", result.stdout)
+        self.assertNotIn("ModuleNotFoundError", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_verify_of_a_live_write_trigger_handler_raises_installerror_not_modulenotfounderror(self) -> None:
+        # P1 fix regression (round-53, independent Claude opus/max review, 2026-08-21). A comment
+        # directly above verify()'s own _import_write_candidate_capture() call claimed that a missing
+        # write_candidate_capture.py there "surfaces as a clean InstallError from verify() alone, not
+        # a lockout of install()/uninstall()/recover()" -- false: the import itself was unguarded, so
+        # it raised an uncaught ModuleNotFoundError straight past main()'s own `except InstallError`
+        # handler (empty stdout, rc=1, a raw traceback on stderr -- unlike every other failure mode in
+        # this file).
+        #
+        # Distinct from this class's other test above: that one never installs a write-trigger handler
+        # at all, so it never even reaches this import. This test installs one FOR REAL first (needs
+        # write_candidate_capture genuinely importable -- done in-process here, where install_bridge.py
+        # (this real repo file, `installer.__file__`) has its real, genuinely-present sibling
+        # write_candidate_capture.py next to it), then calls verify() from a SEPARATE, genuinely fresh
+        # `-I`-isolated child process (this class's own `_run_isolated_child`) that has never imported
+        # write_candidate_capture and cannot find it on its own sys.path -- reproducing "module
+        # genuinely absent" rather than merely deleting the file's content, which would NOT reproduce
+        # this defect: once a process has imported write_candidate_capture, it stays cached in
+        # sys.modules regardless of what happens to the file on disk afterward.
+        write_trigger_source_script = self.ssd_root / "source/write_candidate_capture.py"
+        InstallEndToEndTests._write(
+            write_trigger_source_script, b"#!/usr/bin/env python3\n# fixture write-trigger script\n"
+        )
+        policy_path = Path(self.temp) / "write-trigger-policy.json"
+        policy_path.write_bytes(InstallBridgeTests._write_trigger_policy_bytes())
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(installer, "SSD_ROOT", self.ssd_root))
+            stack.enter_context(mock.patch.object(installer, "LOCAL_HOMES_ROOT", self.local_homes))
+            stack.enter_context(mock.patch.object(installer, "RUNTIME_BASE", self.runtime_base))
+            stack.enter_context(mock.patch.object(installer, "PENDING_PATH", self.pending_path))
+            stack.enter_context(mock.patch.object(installer, "SOURCE_SCRIPT", self.source_script))
+            stack.enter_context(
+                mock.patch.object(installer, "WRITE_TRIGGER_SOURCE_SCRIPT", write_trigger_source_script)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    installer, "volume_uuid", lambda ssd_root=None: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+                )
+            )
+            stack.enter_context(mock.patch.object(Path, "home", lambda: self.local_homes))
+            receipt = installer.install_write_trigger(policy_path)
+        self.assertIn("write_trigger_bridge_id", receipt)  # fixture precondition: a live handler exists
+        self.assertTrue("write_candidate_capture" in sys.modules)  # fixture precondition: really imported here
+
+        # The receipt/hooks.json state above is now durable on disk under self.ssd_root -- the
+        # isolated child below reads it fresh, from a process that never imported
+        # write_candidate_capture and cannot reach it (see _run_isolated_child's own `-I` isolation).
+        body = """
+try:
+    installer.verify()
+except installer.InstallError as exc:
+    message = str(exc)
+    assert "cannot verify write-trigger liveness" in message, message
+    assert "write_candidate_capture module unavailable" in message, message
+else:
+    raise SystemExit("FAIL: verify() unexpectedly succeeded with write_candidate_capture unimportable")
+"""
+        result = self._run_isolated_child(body)
+        self.assertEqual(result.returncode, 0, msg=f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        self.assertIn("ISOLATED-OK", result.stdout)
+        self.assertNotIn("ModuleNotFoundError", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+
+class WriteCandidateCaptureImportErrorGuardTests(unittest.TestCase):
+    """Round-54 fix (independent Claude opus5/max GO + Codex gpt-5.6-sol/max NO-GO dual review,
+    2026-08-21, issues 1-3 from that round). Three gaps in how this file's 3 call sites that lazily
+    import write_candidate_capture (via _import_write_candidate_capture()) handle an import-time
+    failure:
+
+      1. [Issue 1] The exc.name-blind message on verify()'s own guard (round-53 fix) always blamed
+         write_candidate_capture, even when write_candidate_capture.py itself was genuinely present
+         and importable but ITS OWN `import claude_memory_hook` failed -- the real missing module's
+         name was visible only inside the parenthetical `(exc)` suffix, not the message's own claim
+         about which module was unavailable.
+      2. [Issue 2] _load_write_trigger_config() and _validate_write_trigger_argument() made the
+         identical unguarded _import_write_candidate_capture() call verify() had before round-53 --
+         so `install-write-trigger` (dry-run and real alike) still raised a raw, uncaught
+         ModuleNotFoundError with write_candidate_capture.py genuinely absent, the same failure
+         shape round-53 fixed for verify() but never propagated to this action's own entry points.
+      3. [Issue 3] All 3 call sites caught only ModuleNotFoundError, not SyntaxError -- a corrupted
+         or half-written write_candidate_capture.py (an interrupted copy, a bad merge) raises
+         SyntaxError at import time, not ModuleNotFoundError, and was uncaught everywhere.
+
+    Every test here runs the guarded call in a genuinely fresh, `-I`-isolated subprocess whose only
+    source of `write_candidate_capture` is this test's own fixture directory -- never this test
+    process's own sys.path/sys.modules (mirrors BaseOnlyPathsWithoutWriteCandidateCaptureModuleTests'
+    own rationale, above: an in-process mock.patch-based test cannot tell "module genuinely
+    missing/broken" apart from "already cached in sys.modules from an earlier import in this same
+    process").
+    """
+
+    def setUp(self) -> None:
+        self._stack = contextlib.ExitStack()
+        self.addCleanup(self._stack.close)
+        self.temp = self._stack.enter_context(tempfile.TemporaryDirectory())
+        self.isolated_dir = Path(self.temp) / "isolated"
+        self.isolated_dir.mkdir()
+        shutil.copy2(installer.__file__, self.isolated_dir / "install_bridge.py")
+        self.policy_path = Path(self.temp) / "write-trigger-policy.json"
+        self.policy_path.write_bytes(InstallBridgeTests._write_trigger_policy_bytes())
+
+    def _write_transitive_failure_fixture(self) -> None:
+        # write_candidate_capture.py genuinely present and importable in isolation, but its own
+        # `import claude_memory_hook` fails: copies the REAL write_candidate_capture.py (so its
+        # content, and thus its own `import claude_memory_hook`, is exactly what production runs)
+        # into self.isolated_dir WITHOUT also copying its sibling claude_memory_hook.py --
+        # reproduces the transitive-dependency gap specifically, as the task calls for ("hiding/
+        # renaming claude_memory_hook.py specifically, not write_candidate_capture.py"). Distinct
+        # from the module-itself-missing scenario (below), which never writes this file at all.
+        real_write_candidate_capture = Path(installer.__file__).resolve().parent / "write_candidate_capture.py"
+        shutil.copy2(real_write_candidate_capture, self.isolated_dir / "write_candidate_capture.py")
+        self.assertFalse((self.isolated_dir / "claude_memory_hook.py").exists())  # fixture precondition
+
+    def _write_corrupted_module_fixture(self) -> None:
+        (self.isolated_dir / "write_candidate_capture.py").write_text("def broken(:\n")
+
+    def _run_isolated(self, body: str) -> subprocess.CompletedProcess:
+        script = f"""
+import sys
+sys.path.insert(0, {str(self.isolated_dir)!r})
+from pathlib import Path
+import install_bridge as installer
+
+{body}
+
+print("ISOLATED-OK")
+"""
+        script_path = Path(self.temp) / "child.py"
+        script_path.write_text(script)
+        # -I: isolated mode, exactly like BaseOnlyPathsWithoutWriteCandidateCaptureModuleTests'
+        # own _run_isolated_child -- the only way this subprocess can find `write_candidate_capture`
+        # at all is via self.isolated_dir, which each fixture method above controls precisely.
+        return subprocess.run(
+            [sys.executable, "-I", os.fspath(script_path)], capture_output=True, text=True, timeout=60
+        )
+
+    def _assert_clean_and_closed(self, result: subprocess.CompletedProcess) -> None:
+        self.assertEqual(result.returncode, 0, msg=f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        self.assertIn("ISOLATED-OK", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+
+    # -- Issue 1: exc.name-based message distinguishes the two ModuleNotFoundError shapes ---------
+
+    def test_transitive_claude_memory_hook_failure_is_named_correctly_not_write_candidate_capture(self) -> None:
+        self._write_transitive_failure_fixture()
+        body = """
+try:
+    installer._import_write_candidate_capture()
+except (ModuleNotFoundError, SyntaxError, ImportError) as exc:
+    err = installer._wrap_write_candidate_capture_import_error(exc, "cannot verify write-trigger liveness")
+    message = str(err)
+    assert "claude_memory_hook" in message, message
+    assert "write_candidate_capture.py exists but failed to import" in message, message
+    # The pre-fix wording always claimed write_candidate_capture ITSELF was unavailable, even here
+    # -- the actual bug this test guards against.
+    assert "write_candidate_capture module unavailable" not in message, message
+else:
+    raise SystemExit("FAIL: import unexpectedly succeeded -- fixture isolation broken")
+"""
+        result = self._run_isolated(body)
+        self._assert_clean_and_closed(result)
+
+    def test_write_candidate_capture_itself_missing_keeps_the_original_wording(self) -> None:
+        # write_candidate_capture.py is never written into self.isolated_dir at all here --
+        # confirms the Issue 1 fix did not change behavior for the pre-existing, already-tested
+        # module-itself-missing scenario (verify()'s own end-to-end coverage of this exact wording
+        # lives in BaseOnlyPathsWithoutWriteCandidateCaptureModuleTests, above).
+        body = """
+try:
+    installer._import_write_candidate_capture()
+except (ModuleNotFoundError, SyntaxError, ImportError) as exc:
+    err = installer._wrap_write_candidate_capture_import_error(exc, "cannot verify write-trigger liveness")
+    message = str(err)
+    assert message == (
+        "cannot verify write-trigger liveness: write_candidate_capture module unavailable "
+        "(No module named 'write_candidate_capture')"
+    ), message
+else:
+    raise SystemExit("FAIL: import unexpectedly succeeded -- fixture isolation broken")
+"""
+        result = self._run_isolated(body)
+        self._assert_clean_and_closed(result)
+
+    # -- Issue 2: _load_write_trigger_config() and _validate_write_trigger_argument() are guarded --
+
+    def test_load_write_trigger_config_fails_closed_not_raw_modulenotfounderror(self) -> None:
+        # write_candidate_capture.py is genuinely absent from self.isolated_dir.
+        body = f"""
+try:
+    installer._load_write_trigger_config(Path({str(self.policy_path)!r}))
+except installer.InstallError as exc:
+    assert "write_candidate_capture module unavailable" in str(exc), str(exc)
+else:
+    raise SystemExit("FAIL: _load_write_trigger_config() unexpectedly succeeded")
+"""
+        result = self._run_isolated(body)
+        self._assert_clean_and_closed(result)
+        self.assertNotIn("ModuleNotFoundError", result.stderr)
+
+    def test_validate_write_trigger_argument_fails_closed_not_raw_modulenotfounderror(self) -> None:
+        # write_candidate_capture.py is genuinely absent from self.isolated_dir.
+        body = """
+write_trigger = {
+    "bridge_id": installer.WRITE_TRIGGER_BRIDGE_ID,
+    "max_candidates_per_project": 50,
+    "max_candidate_bytes": 1500,
+}
+try:
+    installer._validate_write_trigger_argument(write_trigger)
+except installer.InstallError as exc:
+    assert "write_candidate_capture module unavailable" in str(exc), str(exc)
+else:
+    raise SystemExit("FAIL: _validate_write_trigger_argument() unexpectedly succeeded")
+"""
+        result = self._run_isolated(body)
+        self._assert_clean_and_closed(result)
+        self.assertNotIn("ModuleNotFoundError", result.stderr)
+
+    def test_install_write_trigger_action_fails_closed_dry_run_and_real_not_raw_modulenotfounderror(self) -> None:
+        # Reproduces the action's own contract, not just the underlying helper: both dry_run=True
+        # (the --dry-run CLI flag's own code path, calling plan()) and dry_run=False (the real
+        # install() path) must fail closed the same way, since _load_write_trigger_config() runs
+        # before either branch. Calls install_write_trigger() directly rather than through main()'s
+        # own argparse dispatch for the dry_run=False case -- that path additionally acquires
+        # main()'s exclusive lock first (unrelated machinery this fix does not touch), and the
+        # failure under test here is entirely inside _load_write_trigger_config(), before install()
+        # or plan() -- and therefore before dry_run is even branched on -- ever run.
+        body = f"""
+for dry_run in (True, False):
+    try:
+        installer.install_write_trigger(Path({str(self.policy_path)!r}), dry_run=dry_run)
+    except installer.InstallError as exc:
+        assert "write_candidate_capture module unavailable" in str(exc), (dry_run, str(exc))
+    else:
+        raise SystemExit(f"FAIL: install_write_trigger(dry_run={{dry_run}}) unexpectedly succeeded")
+"""
+        result = self._run_isolated(body)
+        self._assert_clean_and_closed(result)
+        self.assertNotIn("ModuleNotFoundError", result.stderr)
+
+    # -- Issue 3: SyntaxError (a corrupted module) is caught at all 3 guarded call sites -----------
+
+    def test_syntaxerror_from_corrupted_module_is_caught_at_verify_call_site(self) -> None:
+        self._write_corrupted_module_fixture()
+        body = """
+try:
+    installer._import_write_candidate_capture()
+except (ModuleNotFoundError, SyntaxError, ImportError) as exc:
+    err = installer._wrap_write_candidate_capture_import_error(exc, "cannot verify write-trigger liveness")
+    message = str(err)
+    assert "write_candidate_capture module exists but failed to import" in message, message
+    assert "invalid syntax" in message, message
+else:
+    raise SystemExit("FAIL: import unexpectedly succeeded -- fixture isolation broken")
+"""
+        result = self._run_isolated(body)
+        self._assert_clean_and_closed(result)
+        self.assertNotIn("SyntaxError", result.stderr)
+
+    def test_syntaxerror_from_corrupted_module_is_caught_at_load_write_trigger_config(self) -> None:
+        self._write_corrupted_module_fixture()
+        body = f"""
+try:
+    installer._load_write_trigger_config(Path({str(self.policy_path)!r}))
+except installer.InstallError as exc:
+    assert "write_candidate_capture module exists but failed to import" in str(exc), str(exc)
+    assert "invalid syntax" in str(exc), str(exc)
+else:
+    raise SystemExit("FAIL: _load_write_trigger_config() unexpectedly succeeded")
+"""
+        result = self._run_isolated(body)
+        self._assert_clean_and_closed(result)
+        self.assertNotIn("SyntaxError", result.stderr)
+
+    def test_syntaxerror_from_corrupted_module_is_caught_at_validate_write_trigger_argument(self) -> None:
+        self._write_corrupted_module_fixture()
+        body = """
+write_trigger = {
+    "bridge_id": installer.WRITE_TRIGGER_BRIDGE_ID,
+    "max_candidates_per_project": 50,
+    "max_candidate_bytes": 1500,
+}
+try:
+    installer._validate_write_trigger_argument(write_trigger)
+except installer.InstallError as exc:
+    assert "write_candidate_capture module exists but failed to import" in str(exc), str(exc)
+    assert "invalid syntax" in str(exc), str(exc)
+else:
+    raise SystemExit("FAIL: _validate_write_trigger_argument() unexpectedly succeeded")
+"""
+        result = self._run_isolated(body)
+        self._assert_clean_and_closed(result)
+        self.assertNotIn("SyntaxError", result.stderr)
+
+
+class InstallWriteTriggerRealCommandEndToEndTests(unittest.TestCase):
+    """P0 regression: an independent review found the registered SessionEnd
+    command was a permanent, silent no-op in production. Root cause:
+    write_candidate_capture.default_write_candidates_root() (invoked when no
+    `write_candidates_root` is passed explicitly) lazily does `import
+    install_bridge` to derive the default write-candidates storage path --
+    which works from this repo's own working tree, and in every pre-existing
+    test (every call site passes `write_candidates_root` explicitly,
+    bypassing this function entirely), but NOT inside the isolated release
+    directory the REGISTERED command actually runs from, which contains only
+    write_candidate_capture.py + policy.json -- never install_bridge.py. The
+    resulting ModuleNotFoundError was silently swallowed by scan()'s own
+    fail-closed `except Exception: return None`: exit 0, empty stdout/
+    stderr, write-candidates/ never created, forever, on every future
+    invocation, with no error surfaced anywhere.
+
+    Fix: install_bridge.py's make_release() now resolves the correct
+    write-candidates-root itself, at install/registration time (it already
+    has RUNTIME_BASE, the one constant default_write_candidates_root()
+    derives from, directly in scope), and bakes it into the registered
+    command as an explicit `--write-candidates-root` flag -- the same
+    pattern `--policy`/`--expected-policy-sha256`/`--expected-script-sha256`/
+    `--bridge-id` already use. write_candidate_capture.py's own `_main_scan`
+    now accepts that flag as an optional 5th `--flag value` pair.
+
+    Unlike InstallWriteTriggerEndToEndTests above (whose setUp() installs a
+    one-line STUB in place of write_candidate_capture.py -- sufficient for
+    testing installation mechanics, but incapable of reproducing this bug: a
+    stub has no `import install_bridge` to fail), this class installs the
+    REAL claude_memory_hook.py and the REAL write_candidate_capture.py, then
+    executes the ACTUAL registered command as a REAL subprocess -- exactly
+    the reproduction method the independent review used -- against a real
+    transcript file containing a genuine human correction.
+
+    One deliberate, narrow exception to "every module-level path constant
+    is the fixture's own mocked temp path": `SSD_ROOT` itself is NOT mocked
+    away from the real `/Volumes/Extreme SSD` mount point here, unlike every
+    other test class in this file. `claude_memory_hook._disk_volume_uuid`
+    (the volume-UUID check `hook.verify_storage` runs, independently, at
+    real scan time -- not the separate `install_bridge.volume_uuid` every
+    other test mocks away) shells out to the REAL `diskutil info -plist
+    <ssd_root>`, which only resolves a UUID for an actual mounted volume's
+    own path, not an arbitrary fake subdirectory -- confirmed empirically
+    while building this test (a fake `ssd_root` under a plain tempdir
+    produces `diskutil: returned non-zero exit status 1` /
+    `BridgeError("cannot verify SSD volume")` inside the REAL subprocess,
+    not a reproduction of the bug under test). This is the one thing a real,
+    unmocked subprocess run cannot avoid depending on: it genuinely needs to
+    run on a machine with this exact volume mounted, matching this whole
+    project's own hardcoded `SSD_ROOT = Path("/Volumes/Extreme SSD")`
+    portability assumption (install_bridge.py:90). `LOCAL_HOMES_ROOT`,
+    `RUNTIME_BASE`, `SOURCE_SCRIPT`, `WRITE_TRIGGER_SOURCE_SCRIPT`, and
+    `Path.home` remain fully isolated under a throwaway temp directory
+    (itself created under `/Volumes/Extreme SSD`, cleaned up in `tearDown`)
+    that is NOT the real production `Orca/local-homes` tree -- no real
+    Codex/Claude config, no real installed bridge state, is ever touched.
+    `installer.volume_uuid` is deliberately left UNMOCKED too (unlike every
+    other test class): both the install-time computation and the real
+    scan-time re-verification independently call the real `diskutil` against
+    the real mount and must naturally agree, the most faithful reproduction
+    possible -- mocking one side without the other is exactly what silently
+    hid the second gap (`atomic_write`'s own lazy import, see that
+    function's docstring) this test discovered.
+    """
+
+    def setUp(self) -> None:
+        self._stack = contextlib.ExitStack()
+        self.addCleanup(self._stack.close)
+        # Anchored under the REAL /Volumes/Extreme SSD mount -- see this class's own docstring for
+        # why SSD_ROOT cannot be faked here the way every other test class in this file fakes it.
+        # `Orca/tmp` (not the SSD root itself, which is not user-writable) is this same project's
+        # own established scratch location on this volume.
+        self.temp = self._stack.enter_context(
+            tempfile.TemporaryDirectory(prefix="p0-real-command-repro-", dir="/Volumes/Extreme SSD/Orca/tmp")
+        )
+        root = Path(self.temp).resolve()
+        ssd_root = Path("/Volumes/Extreme SSD")
+        local_homes = root / "local-homes"
+        runtime_base = local_homes / ".shared-runtime/claude-codex-memory-bridge"
+        pending_path = runtime_base / "pending-install.json"
+        source_dir = root / "source"
+        source_script = source_dir / "claude_memory_hook.py"
+        write_trigger_source_script = source_dir / "write_candidate_capture.py"
+        claude_projects = local_homes / ".claude/projects"
+
+        local_homes.mkdir(parents=True)
+        (local_homes / ".codex").mkdir()
+        claude_projects.mkdir(parents=True)
+        (local_homes / "codex-accounts/acct-one/home").mkdir(parents=True)
+        source_dir.mkdir()
+
+        InstallEndToEndTests._write(local_homes / ".codex/hooks.json", InstallEndToEndTests._base_hooks_json())
+        InstallEndToEndTests._write(
+            local_homes / "codex-accounts/acct-one/home/hooks.json", InstallEndToEndTests._base_hooks_json()
+        )
+        # The REAL claude_memory_hook.py AND the REAL write_candidate_capture.py, both copied
+        # byte-for-byte -- unlike InstallWriteTriggerEndToEndTests' stubs, write_candidate_capture.py
+        # does `import claude_memory_hook as hook` at its own module level and calls real attributes
+        # off it (e.g. `hook._disk_volume_uuid`) as function-default arguments evaluated at import
+        # time, so a one-line stub fails this test in an unrelated way (ImportError/AttributeError
+        # before scan() is ever reached) rather than reproducing the actual P0 bug under test.
+        InstallEndToEndTests._write(source_script, Path(hook.__file__).read_bytes())
+        InstallEndToEndTests._write(write_trigger_source_script, Path(wtc.__file__).read_bytes())
+
+        self._stack.enter_context(mock.patch.object(installer, "SSD_ROOT", ssd_root))
+        self._stack.enter_context(mock.patch.object(installer, "LOCAL_HOMES_ROOT", local_homes))
+        self._stack.enter_context(mock.patch.object(installer, "RUNTIME_BASE", runtime_base))
+        self._stack.enter_context(mock.patch.object(installer, "PENDING_PATH", pending_path))
+        self._stack.enter_context(mock.patch.object(installer, "SOURCE_SCRIPT", source_script))
+        self._stack.enter_context(
+            mock.patch.object(installer, "WRITE_TRIGGER_SOURCE_SCRIPT", write_trigger_source_script)
+        )
+        self._stack.enter_context(mock.patch.object(Path, "home", lambda: local_homes))
+
+        self.runtime_base = runtime_base
+        self.claude_projects = claude_projects
+        self.main_config = local_homes / ".codex/hooks.json"
+
+        self.policy_path = root / "write-trigger-policy.json"
+        self.policy_path.write_bytes(
+            json.dumps(
+                {"write_trigger": {"enabled": True, "max_candidates_per_project": 50, "max_candidate_bytes": 1500}}
+            ).encode()
+        )
+
+    def test_registered_session_end_command_writes_a_real_pending_candidate(self) -> None:
+        installer.install_write_trigger(self.policy_path)
+        payload = json.loads(self.main_config.read_bytes())
+        session_end_handlers = payload["hooks"]["SessionEnd"]
+        self.assertEqual(len(session_end_handlers), 1)
+        command = session_end_handlers[0]["hooks"][0]["command"]
+        # The whole point of this test: assert on the REGISTERED command exactly as install()
+        # wrote it, never a hand-built equivalent.
+        self.assertIn("--write-candidates-root", command)
+
+        # A real transcript, under the fixture's own mocked ~/.claude/projects, containing a
+        # genuine human correction (the exact text TriggerMatchingTests.test_t1_explicit_correction
+        # already proves triggers a real T1 match).
+        cwd = "/Users/tester/p0-repro-project"
+        project_dirname = hook.claude_project_dirname(cwd)
+        project_dir = self.claude_projects / project_dirname
+        project_dir.mkdir(mode=0o700, parents=True)
+        session_id = "33333333-3333-3333-3333-333333333333"
+        transcript_path = project_dir / f"{session_id}.jsonl"
+        records = [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "I'll delete the old config file to clean things up."}],
+                },
+                "sessionId": session_id,
+                "cwd": cwd,
+                "uuid": "uuid-0",
+                "parentUuid": None,
+                "isSidechain": False,
+                "timestamp": "2026-08-20T12:00:00.000Z",
+            },
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "No, don't delete it, revert that -- we still need it for the legacy importer.",
+                },
+                "sessionId": session_id,
+                "cwd": cwd,
+                "uuid": "uuid-1",
+                "parentUuid": "uuid-0",
+                "isSidechain": False,
+                "timestamp": "2026-08-20T12:00:01.000Z",
+            },
+        ]
+        with transcript_path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        transcript_path.chmod(0o600)
+
+        stdin_payload = json.dumps({"hook_event_name": "SessionEnd", "cwd": cwd, "session_id": session_id}).encode()
+
+        # The REAL registered command, executed as a REAL subprocess -- not scan() called directly
+        # in-process, not a hand-simplified equivalent. This is exactly the reproduction method the
+        # independent review used to find the original bug: before the P0 fix, this exact command
+        # exited 0 with empty stdout/stderr and never created write-candidates/ at all.
+        result = subprocess.run(command, shell=True, input=stdin_payload, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"")
+
+        write_candidates_root = self.runtime_base / "write-candidates"
+        self.assertTrue(
+            write_candidates_root.exists(), "the registered command must actually create write-candidates/"
+        )
+        project_ref = wtc.project_ref_for(project_dir)
+        pending = wtc.list_pending(write_candidates_root, project_ref)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["trigger"], "T1")
 
 
 if __name__ == "__main__":

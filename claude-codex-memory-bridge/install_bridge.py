@@ -26,6 +26,58 @@ from typing import Any, Callable
 
 
 BRIDGE_ID = "orca-claude-native-memory-v1"
+# The only Codex hook event this tool has ever registered a handler under. Every function that
+# reads, writes, or detects hook-config content (update_hook_config(), _owned_shape_match(),
+# _attempt_structural_detection(), _contains_owned_handler(), _find_untracked_owned_configs())
+# takes an optional `event` parameter defaulting to this constant, so any call site that does not
+# pass a different event -- every call site in this file today -- behaves exactly as it always
+# has. Parameterized (not made a second hardcoded event) so a future caller can register a handler
+# under a different Codex hook event (e.g. "SessionEnd") without this file's own detection/rewrite
+# logic silently missing it; see AUTO-LEARN-TRIGGER-DESIGN-2026-08-19.md section 4.2 and its
+# "SessionEnd hook-registration capability" section for the full rationale. This file does not
+# itself register anything under any event other than DEFAULT_HOOK_EVENT. make_handler() itself
+# takes NO `event` parameter -- it only ever builds the "hooks" list value that goes under
+# whichever event key the caller chooses; event parameterization lives entirely in the functions
+# listed above, not in handler construction. make_handler()'s own optional parameters are
+# `timeout` and `status_message` (see its own docstring). (Corrected 2026-08-21 -- this paragraph
+# previously, incorrectly, listed make_handler() among the event-optional functions; see
+# AUTO-LEARN-TRIGGER-DESIGN-2026-08-19.md section 19.3 item 5 / section 26.2.)
+# _find_untracked_owned_configs() forwards `event` only to _contains_owned_handler() -- Stage 2's
+# raw-marker scanners (_raw_bytes_contain_bridge_marker(), _stream_scan_oversized_for_bridge_marker())
+# are event-agnostic by construction, so there is nothing to forward it into there (fix round,
+# 2026-08-20: this parameter was missing from _find_untracked_owned_configs() entirely until this
+# round, the same shape of gap as the bridge_id one closed the round before, but reachable at any
+# hooks.json file size, not just oversized ones -- see this file's test suite and
+# AUTO-LEARN-TRIGGER-DESIGN-2026-08-19.md for the reproduction).
+DEFAULT_HOOK_EVENT = "UserPromptSubmit"
+# make_handler()'s command-handler timeout, unchanged from the value every UserPromptSubmit
+# handler this tool has ever installed has always used.
+DEFAULT_HOOK_TIMEOUT = 5
+# The same detection/rewrite chain -- owned_handler(), _owned_shape_match(),
+# _attempt_structural_detection(), _contains_owned_handler(), Stage 2's
+# _raw_bytes_contain_bridge_marker(), and Stage 2's fixed-memory streaming twin
+# _stream_scan_oversized_for_bridge_marker() (the alternate path taken only for a hooks.json
+# candidate too large for _read_for_detection() to load whole, i.e. over MAX_MANAGED_FILE_BYTES;
+# see that function's own comment) -- all six take an optional `bridge_id` parameter defaulting to
+# BRIDGE_ID, parameterized for the identical reason `event` is above: write_candidate_capture.py
+# defines its own distinct MODULE_ID and requires any command it registers to carry
+# `--bridge-id <MODULE_ID>`, not this module's own BRIDGE_ID (write_candidate_capture.py:60,
+# :2237). Without this, ownership detection/rewrite for a handler shaped that way silently failed
+# end-to-end -- idempotency, removal, and detection all broken for exactly the handler shape this
+# capability exists to support (independent Claude opus5/max whole-candidate acceptance review,
+# 2026-08-20). _find_untracked_owned_configs(), the caller that ties the whole-file-read detection
+# path and the oversized-streaming detection path together for the untracked-owned-handler safety
+# scan, also takes and forwards the same `bridge_id` parameter -- without that, an initial pass at
+# this parameterization left _stream_scan_oversized_for_bridge_marker() and its sole caller
+# hardcoded to BRIDGE_ID even after every other function in the chain was fixed, so the
+# oversized-file half of the safety scan stayed silently blind to any other bridge_id (converged
+# independent Claude opus/max and Codex gpt-5.6-sol/max review, 2026-08-20). A future caller
+# registering that module's SessionEnd handler passes bridge_id=write_candidate_capture.MODULE_ID
+# explicitly -- as a plain string value, the same way `command` itself is already a plain value --
+# not by importing write_candidate_capture into this file (that would add a new cross-module
+# dependency this installer does not otherwise have). Every call site in this file today passes
+# neither an `event` nor a `bridge_id` override, so detection/rewrite for the live, already-installed
+# UserPromptSubmit handler under BRIDGE_ID is completely unaffected by this parameterization.
 POLICY_SCHEMA = "orca.claude-native-memory-bridge-policy.v1"
 # v2 (bumped from v1 without a version change at the time -- independent
 # Codex sol/xhigh review, 2026-08-17, round 3, P2-R3-COMPAT): round 3 added
@@ -46,6 +98,32 @@ LOCAL_HOMES_ROOT = SSD_ROOT / "Orca/local-homes"
 RUNTIME_BASE = LOCAL_HOMES_ROOT / ".shared-runtime/claude-codex-memory-bridge"
 PENDING_PATH = RUNTIME_BASE / "pending-install.json"
 SOURCE_SCRIPT = Path(__file__).with_name("claude_memory_hook.py")
+# Sibling source for the `install-write-trigger` CLI action (see that function and
+# make_release()'s `write_trigger` parameter) -- same directory as this file and
+# claude_memory_hook.py, resolved through the same resolve_ssd_path()/validate_owned_file()
+# hash-pinning path SOURCE_SCRIPT already uses, not a parallel mechanism.
+WRITE_TRIGGER_SOURCE_SCRIPT = Path(__file__).with_name("write_candidate_capture.py")
+# The exact, and ONLY, identity write_candidate_capture.py's SessionEnd handler is ever registered
+# under (write_candidate_capture.MODULE_ID) -- hardcoded here as a plain literal, NOT imported,
+# specifically so this file's base-only paths (plain install/uninstall/recover/verify, and the
+# untracked-owned-handler safety scan) never depend on that sibling module being importable at all.
+# A regression test (test_write_trigger_bridge_id_constant_matches_write_candidate_capture_module_id)
+# asserts this constant equals write_candidate_capture.MODULE_ID, so the two can never silently
+# drift apart without a test failure calling it out.
+#
+# This is also, as of the fix below, the ONLY value make_release()'s write_trigger["bridge_id"] may
+# ever hold -- see _validate_write_trigger_argument() (P1 fix, converged independent Claude opus/max
+# + Codex gpt-5.6-sol/max review, 2026-08-21). Before this fix, ANY non-empty string was accepted
+# there, so a caller-chosen bridge_id different from this constant installed a real, permanently
+# live SessionEnd handler that this file's own untracked-owned-handler safety scan and verify()
+# (both of which only ever scanned/checked this one well-known identity) could never detect or
+# report on -- a real registered handler, indistinguishable from a healthy one by `ok: true`, that
+# in fact silently produced zero output on every session forever. Locking the argument to this one
+# exact value is safe precisely because no real caller has ever used, or had any supported way to
+# use, any other value: the only real producer of a write_trigger argument
+# (_load_write_trigger_config(), the install-write-trigger CLI action's own request construction)
+# has always hardcoded this same identity via write_candidate_capture.MODULE_ID.
+WRITE_TRIGGER_BRIDGE_ID = "orca-claude-codex-memory-write-trigger-v1"
 MAX_MANAGED_FILE_BYTES = 4 * 1024 * 1024
 DEFAULT_LIMITS = {
     "max_files": 32,
@@ -54,6 +132,10 @@ DEFAULT_LIMITS = {
     "max_blocks": 4,
     "max_output_bytes": 7_000,
 }
+# make_handler()'s default "statusMessage" -- unchanged from the value every UserPromptSubmit
+# handler this tool has ever installed has always used. The `install-write-trigger` action passes
+# a different, accurate message for the SessionEnd handler it registers (see that function).
+DEFAULT_STATUS_MESSAGE = "Loading Claude memory from verified SSD"
 
 
 class InstallError(Exception):
@@ -111,6 +193,20 @@ def is_relative_to(path: Path, root: Path) -> bool:
 
 
 def volume_uuid(ssd_root: Path = SSD_ROOT) -> str:
+    # Flake investigation (2026-08-20): the previous `timeout=3` was measured against this
+    # exact `diskutil info -plist` invocation on this exact machine -- a shared, often
+    # heavily-loaded dev box (load averages 25-35 observed) -- and empirically exceeded
+    # even with NO artificial contention: 15/15 sequential calls with a 10s timeout ranged
+    # 0.10s-3.74s, with several individual calls landing above both this function's old 3s
+    # bound and write_candidate_capture's old 2s bound (see claude_memory_hook.py's
+    # `_disk_volume_uuid`, the same command against the same path). Reproduced directly via
+    # `tests/test_install_bridge.py`'s `InstallWriteTriggerRealCommandEndToEndTests`, which
+    # runs the real, unmocked `diskutil` call: 20 isolated re-runs on a busy moment of this
+    # machine produced 6 `InstallError: unable to verify Extreme SSD` failures, every single
+    # one a `subprocess.TimeoutExpired` on this exact call (confirmed with temporary timing
+    # instrumentation, not guessed) -- not a parsing bug, not a race in make_release() or
+    # atomic_write(). 15s gives >4x headroom over the worst latency actually observed here,
+    # while still bounding a genuinely hung/unresponsive diskutil rather than hanging forever.
     try:
         result = subprocess.run(
             ["/usr/sbin/diskutil", "info", "-plist", os.fspath(ssd_root)],
@@ -118,7 +214,7 @@ def volume_uuid(ssd_root: Path = SSD_ROOT) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             check=True,
-            timeout=3,
+            timeout=15,
         )
         payload = plistlib.loads(result.stdout)
     except (OSError, subprocess.SubprocessError, plistlib.InvalidFileException) as exc:
@@ -356,10 +452,102 @@ def discover_hook_configs() -> list[Path]:
     return unique
 
 
-def owned_handler(handler: Any) -> bool:
-    # Structural match against the exact `--bridge-id <BRIDGE_ID>` argv pair
+def _validate_bridge_id(bridge_id: Any) -> None:
+    # Shared by every entry point that accepts a caller-supplied bridge_id identity --
+    # update_hook_config(), owned_handler(), _find_untracked_owned_configs() -- not scoped to
+    # update_hook_config() alone (AUTO-LEARN-TRIGGER-DESIGN-2026-08-19.md section 19.3 item 4 /
+    # section 26.1 -- an earlier round's own §18.2 mischaracterized update_hook_config() as "the
+    # one public API boundary" needing this check). Without it, bridge_id=None was silently
+    # accepted by owned_handler() (compared against every token, never matching -- a silent
+    # no-op, not a crash) and bridge_id="" would structurally match essentially any command
+    # containing the bare `--bridge-id ` marker text at all, since `--bridge-id` is one of the
+    # tokens shlex.split() itself already always produces around it -- neither is what any real
+    # caller intends.
+    if not isinstance(bridge_id, str) or not bridge_id:
+        raise InstallError(f"bridge_id must be a non-empty string, got {bridge_id!r}")
+
+
+def _validate_hook_event(event: Any) -> None:
+    # Sibling of _validate_bridge_id(), same rationale. Every real Codex hook event name
+    # (UserPromptSubmit, SessionStart, SessionEnd, ...) is a bare CamelCase identifier, so this
+    # rejects the obviously malformed/empty cases without validating against Codex's full
+    # hook-event enum -- this file has no authoritative list of every event Codex might ever add,
+    # and hardcoding one here would make a legitimate future event name a spurious rejection
+    # instead of Codex's own problem to reject.
+    if not isinstance(event, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", event):
+        raise InstallError(f"event must look like a Codex hook event name, got {event!r}")
+
+
+def _import_write_candidate_capture() -> Any:
+    # Lazily imports write_candidate_capture.py -- the module that owns the real, authoritative
+    # write_trigger schema (MODULE_ID, _parse_write_trigger_block()) this file's own write_trigger
+    # handling must stay in sync with. Shared by every caller in this file that needs it
+    # (_load_write_trigger_config(), make_release()'s write_trigger validation via
+    # _validate_write_trigger_argument(), and _untracked_owned_including_write_trigger()'s safety-net
+    # scan) instead of three independent copies of the same sys.path-seeding + import (P2-1/P2-2 fix,
+    # independent Claude opus5/max + Codex review, 2026-08-21).
+    #
+    # Deliberately still a function-local, lazy import -- never hoisted to module level -- for the
+    # same reason _load_write_trigger_config() originally did it this way: the low-level detection/
+    # rewrite chain (owned_handler(), _find_untracked_owned_configs(), update_hook_config(), and
+    # friends) must stay free of this import and take bridge_id as a plain string instead (BRIDGE_ID's
+    # own comment / section 13.3), and importing write_candidate_capture unconditionally at module
+    # level here would make every plain, base-only action in this file -- which has nothing to do with
+    # the write-trigger feature -- depend on that module being importable too. sys.path is seeded the
+    # same way write_candidate_capture.py itself seeds it to import claude_memory_hook, so this import
+    # resolves whether install_bridge.py was imported as a module (tests) or run as a script directly.
+    #
+    # Deduplicated (P2 fix, independent Claude opus5/max review, 2026-08-21): this function can be
+    # called many times across one process's lifetime (uninstall()/recover_pending_install() each
+    # call it, indirectly, once per action, and a long-lived caller may invoke this module's actions
+    # repeatedly) -- an unconditional `sys.path.insert(0, ...)` grew sys.path by one entry per call,
+    # unboundedly, all pointing at the identical directory. Checking membership first keeps this
+    # idempotent instead.
+    _module_dir = os.fspath(Path(__file__).resolve().parent)
+    if _module_dir not in sys.path:
+        sys.path.insert(0, _module_dir)
+    import write_candidate_capture as _wtc
+
+    return _wtc
+
+
+def _wrap_write_candidate_capture_import_error(exc: BaseException, context: str) -> InstallError:
+    # Shared message construction for every call site that wraps _import_write_candidate_capture()
+    # in a try/except (round-54 fix, independent Claude opus5/max GO + Codex gpt-5.6-sol/max NO-GO
+    # dual review, 2026-08-21, issues 1-3) -- avoids three divergent copies of this branching. Three
+    # distinct failure shapes, distinguished here:
+    #
+    #   - `exc` is a ModuleNotFoundError/ImportError with `exc.name == "write_candidate_capture"`:
+    #     the module itself is genuinely missing (e.g. an untracked file lost to `git clean`/a fresh
+    #     clone). Reports the original, already-tested wording.
+    #   - `exc` is a ModuleNotFoundError/ImportError with a DIFFERENT `exc.name`: write_candidate_
+    #     capture.py exists and was found, but ITS OWN `import claude_memory_hook` (or any other
+    #     transitive dependency) failed. The unconditional "write_candidate_capture module
+    #     unavailable" wording used before this fix was misleading here -- it always named
+    #     write_candidate_capture as the missing piece even when the real gap was one of its own
+    #     imports, with the actual name visible only inside the parenthetical `(exc)` suffix.
+    #   - `exc` is a SyntaxError (no `.name` attribute at all, unlike ImportError): a corrupted or
+    #     half-written write_candidate_capture.py (an interrupted copy, a bad merge) fails to parse,
+    #     not to be found.
+    if isinstance(exc, SyntaxError):
+        return InstallError(f"{context}: write_candidate_capture module exists but failed to import: {exc}")
+    name = getattr(exc, "name", None)
+    if name is None or name == "write_candidate_capture":
+        return InstallError(f"{context}: write_candidate_capture module unavailable ({exc})")
+    return InstallError(
+        f"{context}: write_candidate_capture.py exists but failed to import because its own "
+        f"dependency {name!r} is unavailable ({exc})"
+    )
+
+
+def owned_handler(handler: Any, *, bridge_id: str = BRIDGE_ID) -> bool:
+    # Public-named (no leading underscore) and reachable independently of update_hook_config() --
+    # verify()/plan() call it directly, and any external caller of this module can too -- so its
+    # own bridge_id must be validated here, not only assumed already-valid by an upstream caller.
+    _validate_bridge_id(bridge_id)
+    # Structural match against the exact `--bridge-id <bridge_id>` argv pair
     # make_release() generates, not a raw substring search over the whole
-    # command string. A substring check treats BRIDGE_ID appearing *anywhere*
+    # command string. A substring check treats bridge_id appearing *anywhere*
     # in an unrelated hook's command -- inside a comment, a log message, an
     # unrelated flag's value, or another bridge's command that merely mentions
     # this one -- as "owned by this installer", and update_hook_config()
@@ -368,9 +556,12 @@ def owned_handler(handler: Any) -> bool:
     # full-audit Workflow, 2026-08-17, deferred at the time because
     # install_bridge.py had never been run; now in scope ahead of an actual
     # install). Parsing the command the way a shell would and requiring
-    # BRIDGE_ID to be the exact token immediately following an exact
-    # `--bridge-id` token closes that: BRIDGE_ID showing up as a substring of
+    # bridge_id to be the exact token immediately following an exact
+    # `--bridge-id` token closes that: bridge_id showing up as a substring of
     # some other token, or without the adjacent flag, no longer matches.
+    # `bridge_id` defaults to this module's own BRIDGE_ID -- see BRIDGE_ID's
+    # own comment for why this is parameterized (a future SessionEnd caller
+    # for write_candidate_capture.py owns a different bridge_id, MODULE_ID).
     if not isinstance(handler, dict):
         return False
     hooks = handler.get("hooks")
@@ -395,9 +586,38 @@ def owned_handler(handler: Any) -> bool:
         except ValueError:
             continue
         for index, token in enumerate(tokens):
-            if token == "--bridge-id" and index + 1 < len(tokens) and tokens[index + 1] == BRIDGE_ID:
+            if token == "--bridge-id" and index + 1 < len(tokens) and tokens[index + 1] == bridge_id:
                 return True
     return False
+
+
+def _owned_handler_command(handler: Any, *, bridge_id: str = BRIDGE_ID) -> str | None:
+    # Sibling of owned_handler() above, same structural match (deliberately not deduplicated into
+    # one function returning both -- owned_handler() is the hot, allocation-free path Layer 0's
+    # per-handler shape check runs for every handler in every hooks.json this file ever inspects;
+    # this one is reached only from verify()'s independent write-trigger liveness detection, which
+    # needs the actual live command TEXT (to parse its own --policy/--expected-*-sha256 arguments
+    # out of it), not merely a yes/no answer. Returns the first matching hook's raw "command" string,
+    # or None if `handler` does not structurally contain one under `bridge_id` at all.
+    if not isinstance(handler, dict):
+        return None
+    hooks = handler.get("hooks")
+    if not isinstance(hooks, list):
+        return None
+    for hook in hooks:
+        if not isinstance(hook, dict):
+            continue
+        command = hook.get("command")
+        if not isinstance(command, str):
+            continue
+        try:
+            tokens = shlex.split(command, comments=True)
+        except ValueError:
+            continue
+        for index, token in enumerate(tokens):
+            if token == "--bridge-id" and index + 1 < len(tokens) and tokens[index + 1] == bridge_id:
+                return command
+    return None
 
 
 _NOT_PARSED = object()  # sentinel: "this attempt did not yield a JSON value" (None is a real JSON value)
@@ -421,7 +641,7 @@ _DETECTION_ENCODINGS: tuple[str, ...] = (
 )
 
 # Every hooks.json this tool has ever written, and every realistic third-party tool's hooks.json,
-# is a handful of UserPromptSubmit handler entries -- a few KB at most. Both of the expensive
+# is a handful of DEFAULT_HOOK_EVENT handler entries -- a few KB at most. Both of the expensive
 # per-file operations below -- Layer 1's multi-encoding decode/parse, AND Layer 0's own
 # per-handler owned_handler() shape check, which is NOT free either (each call runs
 # shlex.split() on that handler's command string) -- are only ever needed at that size. Bounding
@@ -510,43 +730,259 @@ def _lenient_parse_last_key_wins(text: str) -> Any:
     return value
 
 
-def _owned_shape_match(payload: Any) -> bool | None:
+def _owned_shape_match(payload: Any, *, event: str = DEFAULT_HOOK_EVENT, bridge_id: str = BRIDGE_ID) -> bool | None:
     # The single decision point both parse layers funnel every successfully-parsed payload
     # through. None means `payload` is not recognizable as one of our hooks.json documents at
-    # all (dict -> "hooks":dict -> "UserPromptSubmit":list) -- genuinely ambiguous, the caller
+    # all (dict -> "hooks":dict -> "<event>":list) -- genuinely ambiguous, the caller
     # should keep looking under a different encoding/strategy. True or False means `payload`
     # unambiguously IS shaped like one of our configs, definitively containing (True) or not
-    # containing (False) an owned handler -- final for that parse attempt.
+    # containing (False) an owned handler -- final for that parse attempt. `event`/`bridge_id`
+    # default to DEFAULT_HOOK_EVENT/BRIDGE_ID; every caller in this file today relies on both
+    # defaults, so this stays byte-for-byte identical to the previous hardcoded-"UserPromptSubmit"/
+    # BRIDGE_ID behavior unless a caller explicitly passes a different event/bridge_id.
     if not isinstance(payload, dict):
         return None
     hooks = payload.get("hooks")
     if not isinstance(hooks, dict):
         return None
-    handlers = hooks.get("UserPromptSubmit")
+    handlers = hooks.get(event)
     if not isinstance(handlers, list):
         return None
-    return any(owned_handler(handler) for handler in handlers)
+    return any(owned_handler(handler, bridge_id=bridge_id) for handler in handlers)
 
 
-def _raw_bytes_contain_bridge_marker(raw: bytes) -> bool:
-    # Layer 2's final, genuine-ambiguity-only fallback: a pure byte-substring search for the
-    # literal `--bridge-id <BRIDGE_ID>` marker under every byte width this file's own detection
-    # encodings could plausibly render it in. ASCII/UTF-8/Latin-1 all encode this marker's
-    # characters identically as single bytes, so one "utf-8" pattern covers all three; UTF-16 and
-    # UTF-32, little- and big-endian, each need their own pattern. Deliberately NOT a decode of
-    # the whole buffer under each codec -- `bytes.__contains__` is a fast, size-independent C-level
-    # substring search, so this stays cheap even for a multi-megabyte file, unlike Layer 1's
-    # structural parse. Only ever reached when no encoding produced a structurally recognizable
-    # payload (or the file was too large to attempt one), so a hit here is ambiguous evidence, not
-    # proof -- the caller fails closed on it rather than trusting it as a positive detection.
-    marker_text = f"--bridge-id {BRIDGE_ID}"
-    for encoding in ("utf-8", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
-        if marker_text.encode(encoding) in raw:
-            return True
-    return False
+# One-or-more of these characters is exactly the whitespace run shlex.split() (owned_handler()'s
+# structural detector, Stage 1) already treats as an ordinary token separator between
+# `--bridge-id` and its value -- shlex.whitespace's own default set. Both raw-bytes fallback
+# scanners below tolerate the same run (bounded by _BRIDGE_ID_MARKER_MAX_WHITESPACE_RUN) so they
+# recognize the same command shapes Stage 1 does, instead of only a single literal space
+# (independent review finding, 2026-08-21, P2-2: `--bridge-id  <id>` with a double space, or
+# `--bridge-id\t<id>` with a tab, were structurally recognized as owned but invisible to both
+# raw-bytes scanners).
+_BRIDGE_ID_MARKER_WHITESPACE_CHARS = (" ", "\t", "\r", "\n")
+# Space is the only one of the 4 chars above JSON allows to appear literally inside a string --
+# tab/CR/LF are control characters (U+0000-U+001F) RFC 8259 requires a JSON encoder to escape, so
+# json.dumps() (and this file's own canonical_json()) always renders them as the two literal
+# characters `\t`/`\r`/`\n` (backslash + letter) in the on-disk bytes, never as the raw control
+# byte -- the exact same root cause as the double-quote form in _bridge_id_marker_value_forms()
+# (P2-1), just for whitespace instead of the quote character. `_json_string_body(" ")` is `" "`
+# unchanged, so this one helper covers both cases without a special case for space.
+# A bound, not an attempt to match shlex.split()'s literally-unbounded whitespace tolerance:
+# _stream_scan_oversized_for_bridge_marker() needs a fixed maximum marker span to size its
+# chunk-boundary overlap window (see that function's own comment) -- unbounded tolerance would
+# mean an unbounded window. 8 whitespace characters is far beyond the double-space/tab cases this
+# fix targets, while keeping that window small.
+_BRIDGE_ID_MARKER_MAX_WHITESPACE_RUN = 8
+# Every byte width _raw_bytes_contain_bridge_marker() and _stream_scan_oversized_for_bridge_marker()
+# have always covered: ASCII/UTF-8/Latin-1 all encode this marker's characters identically as
+# single bytes, so one "utf-8" pattern covers all three; UTF-16 and UTF-32, little- and
+# big-endian, each need their own pattern.
+_BRIDGE_MARKER_ENCODINGS: tuple[str, ...] = ("utf-8", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
 
 
-def _attempt_structural_detection(raw: bytes, *, max_bytes: int) -> bool | None:
+def _json_string_body(text: str) -> str:
+    # The literal text a JSON-encoded string value renders `text` as, without the surrounding
+    # quotes json.dumps() would add -- e.g. a tab (U+0009) becomes the two literal characters `\t`
+    # (JSON requires control characters to be escaped), and a `"` becomes the two literal
+    # characters `\"`, while a plain space or letter is unchanged. Both raw-bytes marker scanners
+    # search real on-disk hooks.json bytes -- JSON-serialized text, not decoded string content --
+    # so both _bridge_id_marker_patterns()'s whitespace-run matching (P2-2) and
+    # _bridge_id_marker_value_forms()'s quoted-value matching (P2-1/P2-3) use this one function to
+    # look for what a byte sequence actually looks like on disk, not its raw/decoded form.
+    #
+    # This is only ONE of the RFC 8259-legal ways to render an escaped character, though --
+    # section 7 permits any character to instead be written as a `\uXXXX` numeric escape, and
+    # json.dumps() choosing its own shorthand (`\"`, `\t`, ...) over that is Python's choice, not a
+    # universal one. A hooks.json byte sequence produced by a different encoder can legitimately
+    # use `\uXXXX` for the very same characters instead -- see _json_string_body_u_escaped()'s own
+    # comment for the concrete encoder this was found against and the fix this is one half of (P2-A,
+    # independent Claude opus5/max review, 2026-08-21).
+    return json.dumps(text)[1:-1]
+
+
+# The specific characters this file's own marker text can ever need to search for in escaped form:
+# the two whitespace control characters JSON requires escaping (tab, CR -- LF is also required but
+# handled the same way), the quote characters `_bridge_id_marker_value_forms()`'s quoted shapes and
+# shlex.quote()'s own embedded-quote rendering can introduce (`"`, `'`), and the backslash that
+# quoting form also introduces literally. NOT a blanket "escape every character" list -- an ordinary
+# encoder never `\uXXXX`-escapes plain ASCII letters/digits, so escaping characters outside this set
+# would search for byte sequences no real encoder produces.
+_BRIDGE_ID_U_ESCAPABLE_CHARS = ('"', "'", "\\", "\t", "\r", "\n")
+
+
+def _json_string_body_u_escaped(text: str, *, upper: bool = False) -> str:
+    # Sibling rendering to _json_string_body(): the same on-disk-bytes contract, but using the
+    # `\uXXXX` numeric-escape form RFC 8259 section 7 equally permits for
+    # _BRIDGE_ID_U_ESCAPABLE_CHARS, instead of json.dumps()'s own single-character shorthand. Real
+    # encoders other than Python's json.dumps() legitimately choose this form by default -- .NET's
+    # System.Text.Json is the reviewer's cited example: its default JavascriptEncoder escapes quote,
+    # backslash, and the control characters this way, PLUS single-quote (not JSON-required at all,
+    # but RFC-legal, and done by that encoder for HTML/JS-embedding safety) -- and the reviewer
+    # reproduced 6 of 8 legal-JSON variants this way diverging from what the raw-bytes scanners used
+    # to search for (P2-A fix, independent Claude opus5/max review, 2026-08-21). Traced to a real
+    # failure path: an oversized, relocated hooks.json written by such an alternate encoder (not by
+    # this tool itself -- Stage 2 exists precisely to scan files this tool did NOT write) carrying a
+    # genuine handler would make the streaming scanner return False even though the handler is
+    # genuinely present, and uninstall() would then delete the receipt while the handler stays live
+    # -- reproducing the exact harm shape R11-P1-B already fixed for a different cause.
+    #
+    # `upper` picks the hex-digit case (e.g. backslash-u-005c vs backslash-u-005C for a backslash
+    # character) -- JSON parsing itself is case-insensitive for numeric-escape hex digits, but
+    # these raw-bytes scanners match literal bytes, not parsed values, so both cases a real encoder
+    # could choose must be searched for explicitly; see _bridge_id_marker_value_forms()'s and
+    # _bridge_id_marker_patterns()'s own comments for where both are generated. Characters outside
+    # _BRIDGE_ID_U_ESCAPABLE_CHARS pass through unchanged -- this is not a blanket per-character
+    # escape (see that constant's own comment for why).
+    hex_format = "04X" if upper else "04x"
+    return "".join(
+        f"\\u{ord(ch):{hex_format}}" if ch in _BRIDGE_ID_U_ESCAPABLE_CHARS else ch for ch in text
+    )
+
+
+def _bridge_id_command_fragment(bridge_id: str) -> str:
+    # The exact `--bridge-id <value>` text a real command line embeds for this bridge_id --
+    # shlex.quote() renders the value bare when it needs no escaping, single-quoted when it
+    # contains something like a space, or a `'...'"'"'...'`-style embedded form when the value
+    # itself contains a single quote. make_release() (the sole real producer of this fragment, for
+    # both the base and install-write-trigger commands) and _bridge_id_marker_value_forms() below
+    # (which must recognize whatever make_release() actually emits) both call this exact function
+    # instead of each independently re-deriving the same quoting, so a future change to either side
+    # cannot silently desynchronize them (P2-3 fix, independent review 2026-08-21). Previously
+    # make_release() built this fragment inline via its own shlex.quote() call, coincidentally
+    # compatible with the marker helper's separately hand-rolled bare/single-quote forms for a
+    # typical value, but with nothing enforcing or testing that coupling -- a bridge_id containing
+    # a literal single quote produces shlex.quote()'s embedded-quote form, which neither hand-rolled
+    # form could ever match.
+    return f"--bridge-id {shlex.quote(bridge_id)}"
+
+
+def _bridge_id_marker_value_forms(bridge_id: str) -> tuple[str, ...]:
+    # Every textual rendering of a `--bridge-id` flag's VALUE this file's own detection or
+    # construction logic could plausibly produce or need to recognize -- the single source of
+    # truth both _bridge_id_marker_patterns() (the raw-bytes scanners' actual matching, below) and
+    # make_release() (via _bridge_id_command_fragment(), the sole real producer of a command line)
+    # draw from. Three base shapes:
+    #   - bare/unquoted: the common case, and what make_release() emits for any bridge_id needing
+    #     no shell escaping (this module's own BRIDGE_ID and write_candidate_capture.MODULE_ID
+    #     both qualify today).
+    #   - double-quoted: `"<id>"`.
+    #   - single-quoted: `'<id>'`, structurally equivalent to the bare form under shlex.split()
+    #     (owned_handler()'s own match).
+    #   - whatever shlex.quote() actually renders for THIS value: covers every value shlex.quote()
+    #     cannot express as a plain bare or single-quoted form -- concretely, a bridge_id
+    #     containing a literal single quote, which shlex.quote() escapes as
+    #     `'<part>'"'"'<part>'`, a form neither of the two hand-rolled quoted forms above can ever
+    #     match (P2-3 fix).
+    # Each base shape is then paired with every JSON-legal escaped rendering this file recognizes,
+    # alongside its raw literal form: any `"` a shape contains -- from the double-quoted form
+    # itself, or from a single-quote-containing bridge_id's shlex.quote() embedding, which uses a
+    # literal `"` to splice segments -- is escaped in real hooks.json's on-disk bytes, either as
+    # json.dumps()'s own shorthand `\"` (via _json_string_body()) or, equally legally under RFC 8259
+    # section 7, as the numeric escape `\uXXXX` in either hex-digit case (via
+    # _json_string_body_u_escaped()) -- a rendering json.dumps() itself never produces but other
+    # encoders (e.g. .NET's System.Text.Json) legitimately do by default (P2-1 fix, independent
+    # review 2026-08-21, for the json.dumps()-shorthand half: the unescaped literal-`"` forms this
+    # used to search for can never match real hooks.json content byte-for-byte -- confirmed against
+    # real json.dumps()-serialized fixtures, including a shlex.quote()-embedded-quote one, in this
+    # file's test suite; P2-A fix, independent Claude opus5/max review, 2026-08-21, for the
+    # \uXXXX-escaped half -- see _json_string_body_u_escaped()'s own comment for the concrete
+    # divergence and failure path this closes). The raw literal form is kept alongside every escaped
+    # one for the same reason Stage 2 exists at all: it may be scanning content that never parsed as
+    # valid JSON in the first place, where JSON's escaping rules do not necessarily hold.
+    # Deduplicated so a shape needing no escaping (the common case) does not produce duplicate
+    # patterns.
+    base_shapes = (bridge_id, f'"{bridge_id}"', f"'{bridge_id}'", shlex.quote(bridge_id))
+    forms: list[str] = []
+    seen: set[str] = set()
+    for shape in base_shapes:
+        for text in (
+            shape,
+            _json_string_body(shape),
+            _json_string_body_u_escaped(shape, upper=False),
+            _json_string_body_u_escaped(shape, upper=True),
+        ):
+            if text not in seen:
+                seen.add(text)
+                forms.append(text)
+    return tuple(forms)
+
+
+def _bridge_id_marker_patterns(bridge_id: str) -> tuple[tuple[re.Pattern[bytes], int], ...]:
+    # Compiled `--bridge-id<whitespace-run><value>` byte regexes, one per (marker value form) x
+    # (byte width) pair, paired with that pattern's own fixed maximum match length in bytes.
+    # _raw_bytes_contain_bridge_marker() and _stream_scan_oversized_for_bridge_marker() both call
+    # this one function and run its patterns against their own bytes, instead of each
+    # independently re-deriving marker text AND re-implementing the match (P2-2 fix, independent
+    # review 2026-08-21) -- before this, each scanner separately joined "--bridge-id" and a value
+    # form with a single literal space, missing the whitespace-run variants Stage 1 already treats
+    # as the same logical pair. Each whitespace position in the run is searched for under both its
+    # raw literal byte(s) (what a non-JSON, e.g. malformed or ambiguous, candidate could contain
+    # directly), its json.dumps()-style escaped rendering (what a real, valid hooks.json's on-disk
+    # bytes actually contain for tab/CR/LF -- see _BRIDGE_ID_MARKER_WHITESPACE_CHARS's own comment),
+    # AND its `\uXXXX`-style escaped rendering in both hex-digit cases (P2-A fix, independent Claude
+    # opus5/max review, 2026-08-21 -- see _json_string_body_u_escaped()'s own comment; a real
+    # hooks.json's on-disk tab/CR/LF bytes can legally take this form instead of json.dumps()'s
+    # shorthand, and previously only the shorthand form was searched for). The
+    # max-length half of each pair is exact (prefix length + the widest single whitespace
+    # variant's encoded width * the whitespace-run bound + suffix length), not an estimate -- the
+    # streaming scanner depends on it being a true upper bound, not just a typical one, to size its
+    # chunk-boundary overlap window correctly.
+    patterns: list[tuple[re.Pattern[bytes], int]] = []
+    max_run = _BRIDGE_ID_MARKER_MAX_WHITESPACE_RUN
+    for value_form in _bridge_id_marker_value_forms(bridge_id):
+        for encoding in _BRIDGE_MARKER_ENCODINGS:
+            prefix = "--bridge-id".encode(encoding)
+            suffix = value_form.encode(encoding)
+            whitespace_bytes = sorted(
+                {
+                    char.encode(encoding)
+                    for char in _BRIDGE_ID_MARKER_WHITESPACE_CHARS
+                }
+                | {
+                    _json_string_body(char).encode(encoding)
+                    for char in _BRIDGE_ID_MARKER_WHITESPACE_CHARS
+                }
+                | {
+                    _json_string_body_u_escaped(char, upper=upper).encode(encoding)
+                    for char in _BRIDGE_ID_MARKER_WHITESPACE_CHARS
+                    for upper in (False, True)
+                }
+            )
+            widest_whitespace = max(len(chunk) for chunk in whitespace_bytes)
+            whitespace_alternation = b"|".join(re.escape(chunk) for chunk in whitespace_bytes)
+            pattern = re.compile(
+                re.escape(prefix)
+                + b"(?:"
+                + whitespace_alternation
+                + b"){1,"
+                + str(max_run).encode()
+                + b"}"
+                + re.escape(suffix)
+            )
+            max_len = len(prefix) + widest_whitespace * max_run + len(suffix)
+            patterns.append((pattern, max_len))
+    return tuple(patterns)
+
+
+def _raw_bytes_contain_bridge_marker(raw: bytes, *, bridge_id: str = BRIDGE_ID) -> bool:
+    # Layer 2's final, genuine-ambiguity-only fallback: a whitespace-tolerant byte-pattern search
+    # for the `--bridge-id <bridge_id>` marker (see _bridge_id_marker_patterns()) under every byte
+    # width this file's own detection encodings could plausibly render it in. A compiled regex
+    # search is not quite as cheap as the plain `bytes.__contains__` substring search this used to
+    # be, but stays a single linear pass per pattern -- still independent of handler count and
+    # cheap relative to Layer 1's structural parse, unlike Layer 1 which this file's own bound
+    # (_STRUCTURAL_DETECTION_MAX_BYTES) exists specifically to keep away from large files. Only
+    # ever reached when no encoding produced a structurally recognizable payload (or the file was
+    # too large to attempt one), so a hit here is ambiguous evidence, not proof -- the caller fails
+    # closed on it rather than trusting it as a positive detection. `bridge_id` defaults to
+    # BRIDGE_ID -- see BRIDGE_ID's own comment; threaded through from _contains_owned_handler() so
+    # Stage 2 searches for the same marker Stage 0/1 would have.
+    return any(pattern.search(raw) is not None for pattern, _ in _bridge_id_marker_patterns(bridge_id))
+
+
+def _attempt_structural_detection(
+    raw: bytes, *, max_bytes: int, event: str = DEFAULT_HOOK_EVENT, bridge_id: str = BRIDGE_ID
+) -> bool | None:
     # Layers 0+1 combined: the expensive structural parse-and-shape-check path (real JSON
     # parsing, plus -- on any successful parse -- owned_handler()'s per-handler shlex.split()
     # calls), attempted only when `raw` is within `max_bytes` (the caller picks the bound --
@@ -579,18 +1015,24 @@ def _attempt_structural_detection(raw: bytes, *, max_bytes: int) -> bool | None:
         return None
     payload = _safe_parse_strict_utf8(raw)
     if payload is not _NOT_PARSED:
-        return bool(_owned_shape_match(payload))
+        return bool(_owned_shape_match(payload, event=event, bridge_id=bridge_id))
     for text in _lenient_decode_candidates(raw):
         payload = _lenient_parse_last_key_wins(text)
         if payload is _NOT_PARSED:
             continue
-        match = _owned_shape_match(payload)
+        match = _owned_shape_match(payload, event=event, bridge_id=bridge_id)
         if match is not None:
             return match
     return None
 
 
-def _contains_owned_handler(raw: bytes, *, structural_max_bytes: int = _STRUCTURAL_DETECTION_MAX_BYTES) -> bool:
+def _contains_owned_handler(
+    raw: bytes,
+    *,
+    structural_max_bytes: int = _STRUCTURAL_DETECTION_MAX_BYTES,
+    event: str = DEFAULT_HOOK_EVENT,
+    bridge_id: str = BRIDGE_ID,
+) -> bool:
     # Used only to inspect content this tool did NOT write (the
     # untracked-owned-handler safety scan below) -- unlike install()'s own
     # use of owned_handler() (always preceded by update_hook_config()'s
@@ -662,12 +1104,14 @@ def _contains_owned_handler(raw: bytes, *, structural_max_bytes: int = _STRUCTUR
     #   function's original conservative default for content nothing here
     #   can identify as ours.
     try:
-        result = _attempt_structural_detection(raw, max_bytes=structural_max_bytes)
+        result = _attempt_structural_detection(
+            raw, max_bytes=structural_max_bytes, event=event, bridge_id=bridge_id
+        )
     except Exception:
         result = None
     if result is not None:
         return result
-    if _raw_bytes_contain_bridge_marker(raw):
+    if _raw_bytes_contain_bridge_marker(raw, bridge_id=bridge_id):
         raise InstallError(
             "cannot rule out an owned hook handler: content matches the bridge marker but does "
             "not parse as a recognizable hooks.json under any supported encoding"
@@ -675,7 +1119,7 @@ def _contains_owned_handler(raw: bytes, *, structural_max_bytes: int = _STRUCTUR
     return False
 
 
-def _stream_scan_oversized_for_bridge_marker(path: Path) -> bool:
+def _stream_scan_oversized_for_bridge_marker(path: Path, *, bridge_id: str = BRIDGE_ID) -> bool:
     # Bounded, constant-memory alternative to _raw_bytes_contain_bridge_marker()
     # for a regular, readable file that only failed _read_for_detection()'s
     # check for exceeding MAX_MANAGED_FILE_BYTES -- reading the whole thing
@@ -696,11 +1140,20 @@ def _stream_scan_oversized_for_bridge_marker(path: Path) -> bool:
     # Only ever called on a candidate _find_untracked_owned_configs() has
     # already confirmed is a regular file under RUNTIME_BASE too large for
     # _read_for_detection(); does not re-derive that condition itself.
-    marker_variants = [
-        f"--bridge-id {BRIDGE_ID}".encode(encoding)
-        for encoding in ("utf-8", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
-    ]
-    overlap_len = max(len(variant) for variant in marker_variants) - 1
+    # `bridge_id` defaults to BRIDGE_ID and is threaded through from
+    # _find_untracked_owned_configs() -- see BRIDGE_ID's own comment and this file's header
+    # comment. A fix round (2026-08-20) parameterized every other function in the detection chain
+    # but missed this one and its caller, so an oversized hooks.json carrying a real handler under
+    # any bridge_id OTHER than the module default silently returned False here even though the
+    # same content, if it had fit under MAX_MANAGED_FILE_BYTES, was already correctly found by the
+    # (already-parameterized) whole-file-read path -- converged independent Claude opus/max and
+    # Codex gpt-5.6-sol/max review, 2026-08-20. As of 2026-08-21 (P2-2) the marker match itself is
+    # whitespace-tolerant, shared with _raw_bytes_contain_bridge_marker() via
+    # _bridge_id_marker_patterns() rather than each scanner hand-rolling its own literal-space-only
+    # variant list -- see that function's own comment for the max-match-length bound this overlap
+    # window relies on.
+    patterns = _bridge_id_marker_patterns(bridge_id)
+    overlap_len = max(max_len for _, max_len in patterns) - 1
     chunk_size = 1_048_576  # 1 MiB
     descriptor = -1
     try:
@@ -717,7 +1170,7 @@ def _stream_scan_oversized_for_bridge_marker(path: Path) -> bool:
             if not chunk:
                 return False
             window = tail + chunk
-            if any(variant in window for variant in marker_variants):
+            if any(pattern.search(window) is not None for pattern, _ in patterns):
                 return True
             tail = window[-overlap_len:] if overlap_len else b""
     except OSError as exc:
@@ -727,7 +1180,74 @@ def _stream_scan_oversized_for_bridge_marker(path: Path) -> bool:
             os.close(descriptor)
 
 
-def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
+def _find_untracked_owned_configs(
+    receipt_paths: set[str], *, bridge_id: str = BRIDGE_ID, event: str = DEFAULT_HOOK_EVENT
+) -> list[str]:
+    # Effectively public (called by uninstall()'s and recover_pending_install()'s own already-
+    # validated paths today, but reachable independently by any external caller of this module, and
+    # a future SessionEnd-wiring caller passes externally-influenced values here directly) --
+    # validated the same way update_hook_config() validates its own bridge_id/event, via the shared
+    # helpers, not assumed already-valid by an upstream caller (AUTO-LEARN-TRIGGER-DESIGN-
+    # 2026-08-19.md section 19.3 item 4 / section 26.1). This also protects the whole internal
+    # detection chain this function alone drives -- _contains_owned_handler(),
+    # _attempt_structural_detection(), _owned_shape_match(), _raw_bytes_contain_bridge_marker(),
+    # _stream_scan_oversized_for_bridge_marker() -- none of which has any other call site in this
+    # file, so validating once here at the entry point covers all of them.
+    _validate_bridge_id(bridge_id)
+    _validate_hook_event(event)
+    # `bridge_id` defaults to BRIDGE_ID and is forwarded, unchanged, to both detection calls this
+    # loop makes below (_stream_scan_oversized_for_bridge_marker() for an oversized candidate under
+    # RUNTIME_BASE, _contains_owned_handler() for every other candidate) -- see BRIDGE_ID's own
+    # comment and this file's header comment for why. `event` defaults to DEFAULT_HOOK_EVENT and is
+    # forwarded only to the _contains_owned_handler() call below -- _stream_scan_oversized_for_bridge_
+    # marker()'s Stage-2-only raw-marker scan is event-agnostic by construction (it never inspects
+    # which event key a handler lives under), so there is nothing to forward it into there. install()
+    # itself never calls this function at all (it only writes handlers, via update_hook_config(), never
+    # scans for untracked ones), so it is not a source of either override.
+    #
+    # As of the P2-D fix (independent Claude opus5/max review, 2026-08-21), this function IS actually
+    # called a second (and, as of the P2-2 fix below, sometimes third) time with
+    # bridge_id=<write-trigger identity>, event="SessionEnd" -- by
+    # _untracked_owned_including_write_trigger(), the shared helper uninstall() and
+    # recover_pending_install() both now call instead of this function directly. This corrects an
+    # earlier version of this comment, which described a hypothetical "future SessionEnd-wiring caller"
+    # passing these overrides as if it already existed; an independent review (2026-08-21) checked and
+    # confirmed no such caller was reachable anywhere in the file at the time -- install() only ever
+    # writes the base and write-trigger handlers together in one pass, never incrementally via a
+    # separate untracked-scan-then-register step, and no call site passed remove=True for the
+    # write-trigger identity, so the described caller was not just future work but a real,
+    # defense-in-depth gap: the untracked-owned-handler safety net was never actually exercised for the
+    # write-trigger identity in any reachable code path. That gap is now closed for uninstall()'s and
+    # recover_pending_install()'s own safety scans (both call sites _find_untracked_owned_configs() has
+    # today); a hypothetical incremental register-only-write-trigger flow, if one is ever added, would
+    # still need its own explicit call here, not something this fix retroactively provides.
+    #
+    # P2-D's own first version gated the write-trigger-identity call entirely on
+    # `receipt.get("write_trigger_bridge_id") is not None` -- a real, reproduced gap (P2-2 fix,
+    # independent Claude opus5/max review, 2026-08-21): an ordinary, unrelated LATER plain install()
+    # (no write_trigger= argument -- e.g. redeploying just a claude_memory_hook.py fix) overwrites
+    # latest-receipt.json with a receipt that has no write_trigger_bridge_id field at all (install()'s
+    # own write_trigger_receipt_fields is `{}` for that call), even though nothing about a plain
+    # install() removes an already-registered SessionEnd handler a PRIOR install-write-trigger call
+    # added (update_hook_config()'s layering is additive per-event, not a full reset) -- so the very
+    # next uninstall()/recover_pending_install() silently stopped checking the write-trigger identity
+    # at exactly the moment a genuinely live, possibly-orphaned write-trigger handler could still be
+    # sitting at an untracked path, reintroducing the exact harm P2-D closed. See
+    # _untracked_owned_including_write_trigger()'s own comment for the fix: it now always additionally
+    # scans under the well-known write_candidate_capture.MODULE_ID identity (checked against real,
+    # live hooks.json content, not derived from this one call's own receipt), regardless of what the
+    # CURRENT receipt happens to record -- correct for every install-call ordering, not just the one
+    # the reviewer reproduced.
+    #
+    # `event` threading itself (fix round, 2026-08-20: this parameter was missing entirely -- unlike
+    # bridge_id, which a prior round in the same series threaded through both calls below -- so Stage 1
+    # (_attempt_structural_detection(), reached via _contains_owned_handler()) always checked the
+    # candidate's DEFAULT_HOOK_EVENT handler list even when the real handler being searched for lived
+    # under a different event, definitively returning False/None-collapsed-to-False for an
+    # ordinary-sized hooks.json containing both an existing UserPromptSubmit handler and a real
+    # non-default-event handler, so Stage 2's marker-based fallback never even ran -- the same shape of
+    # gap as the bridge_id one just closed, reachable at any file size, not just oversized ones).
+    #
     # Broader-than-discovery safety scan for uninstall()'s /
     # recover_pending_install()'s untracked-owned-handler check (see their
     # comments): a directory move that relocates a managed account outside
@@ -916,7 +1436,7 @@ def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
             # because this raise used to be blanket-tolerated the same way
             # EACCES/identity-changed are.
             try:
-                marker_found = _stream_scan_oversized_for_bridge_marker(resolved)
+                marker_found = _stream_scan_oversized_for_bridge_marker(resolved, bridge_id=bridge_id)
             except Exception:
                 # The scan itself failing (EACCES, EIO, the file vanishing or
                 # being replaced mid-scan) IS genuine absence of evidence --
@@ -956,7 +1476,9 @@ def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
         # for a genuine relocated account rather than routine.
         structural_max_bytes = MAX_MANAGED_FILE_BYTES if _is_under_runtime_root(resolved) else _STRUCTURAL_DETECTION_MAX_BYTES
         try:
-            owned = _contains_owned_handler(candidate_raw, structural_max_bytes=structural_max_bytes)
+            owned = _contains_owned_handler(
+                candidate_raw, structural_max_bytes=structural_max_bytes, event=event, bridge_id=bridge_id
+            )
         except Exception as exc:
             raise InstallError(f"{exc} (at {candidate_str})") from exc
         if owned:
@@ -964,30 +1486,178 @@ def _find_untracked_owned_configs(receipt_paths: set[str]) -> list[str]:
     return sorted(dict.fromkeys(untracked_owned))
 
 
-def make_handler(command: str) -> dict[str, Any]:
-    return {
-        "hooks": [
-            {
-                "type": "command",
-                "command": command,
-                "timeout": 5,
-                "statusMessage": "Loading Claude memory from verified SSD",
-            }
-        ]
+def _untracked_owned_including_write_trigger(receipt: dict[str, Any], receipt_paths: set[str]) -> list[str]:
+    # Shared by uninstall() and recover_pending_install() -- the only two callers of the
+    # untracked-owned-handler safety scan -- so both run it under the base identity (BRIDGE_ID,
+    # DEFAULT_HOOK_EVENT, this function's own defaults) AND under the write-trigger identity too
+    # (event "SessionEnd" -- the same event every real write-trigger handler is actually registered
+    # under; see install()'s own update_hook_config() call for that handler).
+    #
+    # Closes a real, previously-open defense-in-depth gap (P2-D fix, independent Claude opus5/max
+    # review, 2026-08-21): before this, the untracked-owned-handler safety net -- the check that is
+    # supposed to refuse an uninstall/recovery that would abandon a live, owned handler at a
+    # receipt-untracked path -- never actually ran under the write-trigger identity anywhere in this
+    # file, even though nothing in the scan's own design prevented it; only the base identity was
+    # ever checked. Not yet exploitable when this was found (install() only ever writes the base and
+    # write-trigger handlers together in one pass, and no call site passed remove=True for the
+    # write-trigger identity alone), but a write-trigger handler relocated to an untracked path the
+    # same way R8-P1-B already covers for the base handler would have been silently abandoned by
+    # uninstall()/recover_pending_install() exactly like the base identity used to be. See
+    # _find_untracked_owned_configs()'s own comment (the corrected version of the comment this fix
+    # also fixes -- it used to describe this as a hypothetical future caller instead of a gap to
+    # close now).
+    #
+    # P2-D's first version decided whether to run the write-trigger-identity scan at all by checking
+    # `receipt.get("write_trigger_bridge_id") is not None` -- gating it on a field of the ONE receipt
+    # this particular call happens to be looking at. Opus reproduced a real, second-most-realistic
+    # operational sequence this breaks (P2-2 fix, independent Claude opus5/max review, 2026-08-21):
+    # install WITH write_trigger (receipt now records write_trigger_bridge_id, safety net correctly
+    # covers it) -> a LATER, entirely ordinary plain install() with no write_trigger= argument (e.g.
+    # redeploying just a claude_memory_hook.py fix, independent of any write-trigger decision) writes
+    # a NEW receipt whose write_trigger_receipt_fields is `{}` (install()'s own logic for a call with
+    # no write_trigger=) -- even though nothing about that plain install touches the write-trigger's
+    # SessionEnd handler at all (update_hook_config()'s per-event layering is additive, not a full
+    # reset, so a handler a PRIOR install-write-trigger call registered is still genuinely live). The
+    # pre-fix guard above then saw no write_trigger_bridge_id on this NEW receipt and silently stopped
+    # checking that identity from that point on -- even though a write-trigger handler could still be
+    # sitting, live, at a path this receipt does not track. The very next uninstall() would then
+    # succeed and delete the receipt while that handler stayed orphaned -- silently reintroducing the
+    # exact harm P2-D was supposed to close.
+    #
+    # Fixed by not deriving the decision from any one receipt's own field at all: this now
+    # unconditionally ALSO scans under the well-known WRITE_TRIGGER_BRIDGE_ID identity -- the one
+    # real value the one real producer (_load_write_trigger_config(), see its own comment) has ever
+    # used, and (as of the P1 fix on _validate_write_trigger_argument()) the ONLY value make_release()
+    # will ever accept -- checked directly against real, live hooks.json content via
+    # _find_untracked_owned_configs() itself, exactly the same way the base identity is always
+    # unconditionally checked. A write-trigger handler that is not actually present anywhere simply
+    # yields an empty scan result, same as before; a genuinely orphaned one is now caught regardless
+    # of what any specific call's own receipt happens to record, correct for every install-call
+    # ordering (write-trigger-then-plain, plain-then-write-trigger, write-trigger-then-write-trigger-
+    # again, ...), not just the one sequence the reviewer reproduced. `receipt`'s own
+    # `write_trigger_bridge_id`, when present, is still ALSO scanned (defense in depth: a receipt
+    # written by a hypothetical older/corrupted producer that ever recorded a different identity is
+    # still covered, not silently dropped) -- simply no longer the sole basis for whether the
+    # write-trigger identity is checked at all.
+    #
+    # Deliberately uses the hardcoded WRITE_TRIGGER_BRIDGE_ID constant here instead of
+    # _import_write_candidate_capture()/`_wtc.MODULE_ID` (round-52 fix, converged independent Claude
+    # opus/max + Codex gpt-5.6-sol/max review, 2026-08-21): this function is called from uninstall()'s
+    # and recover_pending_install()'s own safety scans, which must both keep working even when
+    # write_candidate_capture.py -- a currently-untracked file in this repo's own git history -- is
+    # genuinely absent from disk (e.g. after `git checkout`/`git clean`/a fresh clone that does not
+    # preserve untracked files). Before this fix, the unconditional import here meant a plain,
+    # no-write-trigger uninstall()/recover_pending_install() call raised an uncaught
+    # ModuleNotFoundError straight past main()'s own `except InstallError` handler -- a total
+    # lockout, including of the emergency-recovery path itself. See WRITE_TRIGGER_BRIDGE_ID's own
+    # comment for why this constant can never silently drift from the real module's MODULE_ID.
+    #
+    # Returns the combined, deduplicated list of untracked paths found under any identity: a single
+    # path found under more than one identity is still just one path an operator needs to go
+    # investigate, not a duplicated entry reporting the same fact twice.
+    untracked = set(_find_untracked_owned_configs(receipt_paths))
+    write_trigger_identities = {WRITE_TRIGGER_BRIDGE_ID}
+    receipt_write_trigger_bridge_id = receipt.get("write_trigger_bridge_id")
+    if receipt_write_trigger_bridge_id is not None:
+        write_trigger_identities.add(receipt_write_trigger_bridge_id)
+    for bridge_id in sorted(write_trigger_identities):
+        untracked |= set(_find_untracked_owned_configs(receipt_paths, bridge_id=bridge_id, event="SessionEnd"))
+    return sorted(untracked)
+
+
+def make_handler(
+    command: str, *, timeout: int | None = DEFAULT_HOOK_TIMEOUT, status_message: str = DEFAULT_STATUS_MESSAGE
+) -> dict[str, Any]:
+    # `timeout=None` omits the "timeout" key entirely rather than writing a null/0 -- required for
+    # a SessionEnd handler (write_candidate_capture.py:2330-2336's own documented wiring): that
+    # module's scan has unbounded latency by design (it is the entire reason SessionEnd, not
+    # UserPromptSubmit, is the right event -- Codex's hook schema has no output contract for
+    # SessionEnd, so nothing downstream reads or times out on this handler's return), and a
+    # "timeout": 5 key would directly contradict that. The default (DEFAULT_HOOK_TIMEOUT, i.e. 5)
+    # is unchanged for every existing/default call, so the live UserPromptSubmit handler's shape
+    # stays byte-for-byte identical to before this parameter existed (independent Claude opus5/max
+    # whole-candidate acceptance review, 2026-08-20).
+    #
+    # `timeout`'s two "no timeout key value" spellings are NOT the same and are easy to confuse:
+    # `None` means "omit the key" (Codex's hook runner treats a handler with no "timeout" key as
+    # having no limit at all -- this is what a SessionEnd handler needs, per the comment above).
+    # `0` is a different, legal value that is NOT special-cased here -- it is written literally as
+    # `"timeout": 0`, and a hook runner reading that would reasonably interpret it as "expire
+    # immediately" (the opposite of "no limit"). Nothing in this file ever passes `timeout=0`
+    # today; a future caller must not assume it means "no timeout" -- pass `None` for that.
+    hook: dict[str, Any] = {
+        "type": "command",
+        "command": command,
+        "statusMessage": status_message,
     }
+    if timeout is not None:
+        hook["timeout"] = timeout
+    return {"hooks": [hook]}
 
 
-def update_hook_config(raw: bytes, command: str, *, remove: bool = False) -> bytes:
+def update_hook_config(
+    raw: bytes,
+    command: str,
+    *,
+    event: str = DEFAULT_HOOK_EVENT,
+    bridge_id: str = BRIDGE_ID,
+    timeout: int | None = DEFAULT_HOOK_TIMEOUT,
+    status_message: str = DEFAULT_STATUS_MESSAGE,
+    remove: bool = False,
+) -> bytes:
+    # Guard clauses for the two identity-shaped parameters added across the last two rounds
+    # (independent Claude opus/max + Codex gpt-5.6-sol/max review, 2026-08-20): before this, a
+    # `bridge_id` that was `None` (contradicting the `str` annotation), or an empty string, was
+    # silently accepted and produced confusing downstream behavior -- registration not staying
+    # idempotent, detection unconditionally returning False -- rather than a clear rejection at the
+    # point the bad value entered this API. Delegated to the shared _validate_bridge_id()/
+    # _validate_hook_event() (2026-08-21) so the same class of check also protects the other
+    # effectively-public entry points that accept these identities -- owned_handler() and
+    # _find_untracked_owned_configs() -- rather than only this function; see those helpers' own
+    # comments and AUTO-LEARN-TRIGGER-DESIGN-2026-08-19.md section 19.3 item 4 / section 26.1.
+    _validate_bridge_id(bridge_id)
+    _validate_hook_event(event)
     payload = strict_json(raw)
     if not isinstance(payload, dict) or set(payload) != {"hooks"} or not isinstance(payload["hooks"], dict):
         raise InstallError("unexpected hooks.json structure")
-    event_handlers = payload["hooks"].get("UserPromptSubmit")
-    if not isinstance(event_handlers, list):
-        raise InstallError("missing UserPromptSubmit hook list")
-    retained = [handler for handler in event_handlers if not owned_handler(handler)]
+    hooks = payload["hooks"]
+    if event in hooks:
+        # Present-but-wrong-shape is real corruption (or a foreign tool's incompatible use of
+        # this same key) and must still fail closed exactly as before -- only a genuinely absent
+        # key is treated as "nothing registered under this event yet" (below).
+        event_handlers = hooks[event]
+        if not isinstance(event_handlers, list):
+            raise InstallError(f"malformed {event} hook list")
+    elif event != DEFAULT_HOOK_EVENT:
+        # A genuinely new, non-default event (e.g. "SessionEnd") legitimately has no key yet on
+        # an otherwise-correct hooks.json -- initialize an empty list to register into, instead of
+        # refusing to install under an event this file did not previously know about (AUTO-LEARN-
+        # TRIGGER-DESIGN-2026-08-19.md section 4.2).
+        event_handlers = []
+    else:
+        # DEFAULT_HOOK_EVENT ("UserPromptSubmit") missing entirely must still fail closed exactly
+        # as before the SessionEnd capability above was added (independent dual review,
+        # 2026-08-20, fail-closed regression). install()/plan() call this function with zero
+        # non-default args, and _enumerate_hook_configs() includes every
+        # codex-accounts/*/home/hooks.json unconditionally -- a freshly-discovered account config
+        # can genuinely have no "UserPromptSubmit" key yet (e.g. only a SessionStart hook so far).
+        # The `else` branch above's prior claim that a missing key was "unreachable... on any
+        # already-bridged or freshly-discovered live config" was correct for every OTHER event but
+        # wrong for exactly this one, which is the one every real install()/plan() call actually
+        # uses; without this branch, that case silently created the key and proceeded instead of
+        # raising as it always did before the SessionEnd change.
+        raise InstallError(f"missing {event} hook list")
+    # `bridge_id` (ownership detection/removal) and `timeout` (the handler this call installs)
+    # default to BRIDGE_ID/DEFAULT_HOOK_TIMEOUT -- every call site in this file today passes
+    # neither, so the live UserPromptSubmit path is unaffected. Threading `timeout` through here
+    # (not just make_handler() itself) is what makes make_handler()'s `timeout=None` behavior
+    # actually reachable through this, the only real config-writing entry point (independent
+    # Claude opus5/max whole-candidate acceptance review, 2026-08-20: previously `timeout` was
+    # exercisable only by calling make_handler() directly, never through update_hook_config()).
+    retained = [handler for handler in event_handlers if not owned_handler(handler, bridge_id=bridge_id)]
     if not remove:
-        retained.append(make_handler(command))
-    payload["hooks"]["UserPromptSubmit"] = retained
+        retained.append(make_handler(command, timeout=timeout, status_message=status_message))
+    hooks[event] = retained
     return canonical_json(payload)
 
 
@@ -1042,7 +1712,150 @@ def atomic_write(path: Path, raw: bytes, mode: int = 0o600) -> None:
         raise
 
 
-def make_release() -> dict[str, Any]:
+def _validate_write_trigger_argument(write_trigger: Any) -> None:
+    # Full-shape validation of make_release()'s optional `write_trigger` argument -- see that
+    # function's own comment for the argument's shape ({"bridge_id": str, "max_candidates_per_project":
+    # int, "max_candidate_bytes": int}). The prior round (P2-C) only validated `bridge_id` here
+    # (a bare _validate_bridge_id() call, accepting any non-empty string); the round after that
+    # (P2-1) added full-shape validation for the two sibling limit fields, but two gaps remained
+    # (round-52 dual review, independent Claude opus/max + Codex gpt-5.6-sol/max, 2026-08-21,
+    # converging on the same root cause: receipt/argument-field-based identity tracking is fragile):
+    #
+    #   1. [P1] `bridge_id` was checked only for being a non-empty string, never for being the ONE
+    #      real, well-known identity (WRITE_TRIGGER_BRIDGE_ID) every real caller has ever used. A
+    #      caller-supplied custom bridge_id installed a real, permanently live SessionEnd handler
+    #      that this file's own untracked-owned-handler safety scan and verify() -- both of which
+    #      only ever look for the well-known identity -- could never detect: `ok: true` forever,
+    #      zero real output forever (Codex, reproduced end to end). Fixed below by requiring exact
+    #      equality against WRITE_TRIGGER_BRIDGE_ID (see that constant's own comment) instead of
+    #      merely "any non-empty string". Since the only real producer of this argument
+    #      (_load_write_trigger_config()) has always hardcoded exactly this value, and there is no
+    #      supported way to register under any other identity through the real CLI, this closes the
+    #      gap without narrowing any real, reachable use.
+    #
+    #   2. [P2, opus + Codex, same finding] The prior round's own "full dict shape validation" claim
+    #      did not actually hold: the synthetic dict this function builds for
+    #      _parse_write_trigger_block() below is assembled key-by-key from write_trigger, so any
+    #      EXTRA/unexpected key on the caller's original dict was silently dropped before it ever
+    #      reached that validator -- and the ORIGINAL dict (not the synthetic one) is what
+    #      make_release() later feeds straight into canonical_json() for the release-key computation
+    #      (see that function), so an extra key holding a non-JSON-serializable value (a `set`,
+    #      `Path`, `bytes`, arbitrary object) or a non-string key still produced a bare, uncaught
+    #      TypeError -- the exact failure class this validation exists to eliminate. Fixed below by
+    #      requiring write_trigger's key set to be EXACTLY {"bridge_id", "max_candidates_per_project",
+    #      "max_candidate_bytes"} -- no more, no fewer -- checked FIRST, before any field is consumed
+    #      or reaches canonical_json() at all.
+    #
+    #      This also resolves the reviewers' related "`enabled` hardcoded True regardless of caller
+    #      intent" observation, investigated rather than assumed: `enabled` was never part of this
+    #      argument's own contract to begin with -- _load_write_trigger_config(), the only real
+    #      producer, never includes it (its return statement's dict has exactly the 3 keys required
+    #      here), and the whole reason a caller passes write_trigger to make_release()/install() at
+    #      all is to mean "install this release WITH the write-trigger handler enabled" -- non-None
+    #      write_trigger IS the enable signal at this call boundary, not a field inside it. With the
+    #      exact-key-set check above, a caller who does pass `enabled` (True, False, or any other
+    #      value) now gets a clean, immediate InstallError for an unexpected key, rather than that
+    #      value being silently ignored -- there is no scenario left where a caller's `enabled` value
+    #      is accepted and then not honored.
+    #
+    # Fixed by reusing write_candidate_capture._parse_write_trigger_block() itself -- the actual
+    # runtime validator this data has to satisfy -- rather than reimplementing a second, potentially-
+    # divergent validator here, the same reuse discipline _load_write_trigger_config() already
+    # established for the on-disk policy.json shape (see that function's own comment, and
+    # _import_write_candidate_capture()'s). The two schemas are siblings, not identical: the
+    # *argument* to make_release() carries `bridge_id` (this release's own command-construction
+    # value, validated separately below -- it is not part of the on-disk schema at all); the
+    # *on-disk* policy["write_trigger"] block make_release() itself later writes (further down in
+    # that function) carries `enabled` (always hardcoded True there) in bridge_id's place instead.
+    # This function builds the synthetic, on-disk-shaped dict _parse_write_trigger_block() actually
+    # expects out of write_trigger's own two limit fields, so the pre-flight check here and the real
+    # runtime check can never silently diverge on what values those two fields may take -- exactly
+    # the same divergence risk several earlier rounds already closed for bridge_id/event validation
+    # (see _validate_bridge_id()'s own comment).
+    #
+    # Reuse was feasible here without any structural obstacle: _parse_write_trigger_block() is a
+    # pure function of a plain dict (no I/O, no other module state), and this file already imports
+    # write_candidate_capture lazily elsewhere for the identical reason
+    # (_import_write_candidate_capture()), so there is no risk of a second, divergent validator ever
+    # being needed.
+    if not isinstance(write_trigger, dict):
+        raise InstallError(f"write_trigger must be a dict, got {write_trigger!r}")
+    expected_keys = {"bridge_id", "max_candidates_per_project", "max_candidate_bytes"}
+    actual_keys = set(write_trigger)
+    if actual_keys != expected_keys:
+        raise InstallError(
+            "write_trigger must have exactly these keys: "
+            f"{sorted(expected_keys)}, got {sorted(repr(key) for key in actual_keys)}"
+        )
+    if write_trigger["bridge_id"] != WRITE_TRIGGER_BRIDGE_ID:
+        raise InstallError(
+            f"write_trigger['bridge_id'] must be {WRITE_TRIGGER_BRIDGE_ID!r} (the only identity "
+            "the install-write-trigger action ever registers a handler under -- see "
+            f"WRITE_TRIGGER_BRIDGE_ID's own comment), got {write_trigger['bridge_id']!r}"
+        )
+    # Guarded the same way as _load_write_trigger_config()'s and verify()'s own
+    # _import_write_candidate_capture() calls (round-54 fix, independent Claude opus5/max GO +
+    # Codex gpt-5.6-sol/max NO-GO dual review, 2026-08-21, issue 2): unguarded here, a genuinely
+    # missing write_candidate_capture.py raised a raw, uncaught ModuleNotFoundError past main()'s
+    # own `except InstallError` handler -- reachable via make_release(write_trigger=...) called
+    # directly (this function's own docstring notes it has no leading underscore and is reachable
+    # by any library caller), independently of whichever call site imported the module first.
+    try:
+        _wtc = _import_write_candidate_capture()
+    except (ModuleNotFoundError, SyntaxError, ImportError) as exc:
+        raise _wrap_write_candidate_capture_import_error(exc, "cannot validate write_trigger argument") from exc
+    synthetic_policy_block = {
+        "enabled": True,
+        "max_candidates_per_project": write_trigger["max_candidates_per_project"],
+        "max_candidate_bytes": write_trigger["max_candidate_bytes"],
+    }
+    try:
+        _wtc._parse_write_trigger_block(synthetic_policy_block)
+    except _wtc.WriteCaptureError as exc:
+        raise InstallError(f"invalid write_trigger: {exc}") from exc
+
+
+def make_release(*, write_trigger: dict[str, Any] | None = None) -> dict[str, Any]:
+    # `write_trigger`, when given, is a plain dict {"bridge_id": str, "max_candidates_per_project":
+    # int, "max_candidate_bytes": int} -- already validated and already confirmed `enabled: true` by
+    # the ONE real CLI caller today (see _load_write_trigger_config(), the only real producer of
+    # this shape via install_write_trigger()). That upstream validation is not a structural
+    # guarantee this function itself can rely on, though: make_release() is a module-level function
+    # with no leading underscore, reachable directly by any library caller of this module (via
+    # make_release() itself or install_write_trigger()'s own Python API) with an arbitrary dict --
+    # the CLI path hardcodes the correct MODULE_ID value and so isn't exposed to arbitrary input
+    # today, but that is a property of the one caller, not of this function's own contract (P2-C
+    # fix, independent Claude opus5/max review, 2026-08-21). This function's own top-level code stays
+    # free of any write_candidate_capture import, exactly like the rest of this file's low-level
+    # detection/rewrite chain (BRIDGE_ID's own comment, section 13.3): it only ever sees plain
+    # string/int values pulled out of `write_trigger` here, the same way `command`/`event`/`bridge_id`
+    # already work throughout this file. The one exception is the full-shape validation immediately
+    # below, which deliberately DOES reach into write_candidate_capture (via
+    # _validate_write_trigger_argument() -> _import_write_candidate_capture(), both lazy, function-
+    # local imports) specifically to reuse its authoritative schema rather than reimplementing a
+    # second copy of it here -- see _validate_write_trigger_argument()'s own comment (P2-1 fix,
+    # independent Claude opus5/max + Codex review, 2026-08-21). `None` (every call site today except
+    # install-write-trigger) reproduces this function's exact pre-existing behavior -- every line
+    # below this comment's own `if write_trigger is not None:` blocks is new, additive code that a
+    # default call never reaches.
+    if write_trigger is not None:
+        # Validated HERE, at the earliest point write_trigger is known to be present, before any
+        # file I/O or other work below, and before ANY of its fields -- not just `bridge_id` -- are
+        # consumed: _validate_write_trigger_argument() checks the full dict shape (bridge_id AND the
+        # two limit fields, max_candidates_per_project/max_candidate_bytes) in one call. This matters
+        # critically for `bridge_id` specifically because it is the first field to reach a consuming
+        # call (_bridge_id_command_fragment()'s shlex.quote(), further down) -- this function runs
+        # BEFORE update_hook_config() in both install()'s and plan()'s call sequences, so that
+        # function's own _validate_bridge_id() call is not a guard this function can lean on. See
+        # _validate_write_trigger_argument()'s own comment for the full reproduced failure-mode list
+        # (P2-1 fix, independent Claude opus5/max + Codex review, 2026-08-21) -- it now covers every
+        # field this function actually consumes below, not `bridge_id` alone (P2-C's original, now
+        # incomplete, single-field fix).
+        _validate_write_trigger_argument(write_trigger)
+        # write_trigger carries no caller-supplied hook-event value (the write-trigger handler's
+        # event is always the hardcoded "SessionEnd" literal at its own registration call site,
+        # never taken from this dict -- see install_write_trigger()'s own comment), so there is no
+        # analogous _validate_hook_event() call needed here.
     source_script = resolve_ssd_path(SOURCE_SCRIPT)
     script_raw = validate_owned_file(source_script)
     script_sha = sha256_bytes(script_raw)
@@ -1051,14 +1864,30 @@ def make_release() -> dict[str, Any]:
     expected_claude_projects = resolve_ssd_path(LOCAL_HOMES_ROOT / ".claude/projects")
     if claude_projects != expected_claude_projects:
         raise InstallError("Claude projects do not resolve to the canonical SSD home")
-    release_key = canonical_json(
-        {
-            "script_sha256": script_sha,
-            "volume_uuid": expected_uuid,
-            "source_root": os.fspath(claude_projects),
-            "limits": DEFAULT_LIMITS,
-        }
-    )
+
+    write_trigger_script_raw: bytes | None = None
+    write_trigger_script_sha: str | None = None
+    if write_trigger is not None:
+        write_trigger_source = resolve_ssd_path(WRITE_TRIGGER_SOURCE_SCRIPT)
+        write_trigger_script_raw = validate_owned_file(write_trigger_source)
+        write_trigger_script_sha = sha256_bytes(write_trigger_script_raw)
+
+    # release_id/release_dir are content-addressed: including write_trigger's own script hash and
+    # config values here (rather than only when writing policy.json below) is what keeps a
+    # write-trigger release from ever colliding with a base-only release, or with a
+    # differently-configured write-trigger release, at the SAME release_dir path -- write_runtime()'s
+    # immutable-collision check assumes any two releases sharing a release_id are byte-identical, and
+    # policy.json's own bytes (below) vary with write_trigger, so the key must too.
+    release_key_fields: dict[str, Any] = {
+        "script_sha256": script_sha,
+        "volume_uuid": expected_uuid,
+        "source_root": os.fspath(claude_projects),
+        "limits": DEFAULT_LIMITS,
+    }
+    if write_trigger is not None:
+        release_key_fields["write_trigger_script_sha256"] = write_trigger_script_sha
+        release_key_fields["write_trigger"] = write_trigger
+    release_key = canonical_json(release_key_fields)
     release_id = sha256_bytes(release_key)
     release_dir = RUNTIME_BASE / "releases" / release_id
     policy = {
@@ -1072,24 +1901,45 @@ def make_release() -> dict[str, Any]:
         "runtime_root": os.fspath(release_dir),
         "limits": DEFAULT_LIMITS,
     }
+    if write_trigger is not None:
+        # write_candidate_capture.load_policy_for_write_trigger() reads this same policy.json and
+        # strips this one key before delegating base-field validation to hook.validate_policy() --
+        # design doc section 2.2. Only `enabled`/the two numeric limits are ever written here;
+        # `write_trigger["bridge_id"]` is this release's OWN command-construction value (below), not
+        # part of the on-disk policy schema.
+        policy["write_trigger"] = {
+            "enabled": True,
+            "max_candidates_per_project": write_trigger["max_candidates_per_project"],
+            "max_candidate_bytes": write_trigger["max_candidate_bytes"],
+        }
     policy_raw = canonical_json(policy)
     policy_sha = sha256_bytes(policy_raw)
     installed_script = release_dir / "claude_memory_hook.py"
     installed_policy = release_dir / "policy.json"
-    command_parts = [
-        "/usr/bin/python3",
-        os.fspath(installed_script),
-        "--bridge-id",
-        BRIDGE_ID,
-        "--policy",
-        os.fspath(installed_policy),
-        "--expected-policy-sha256",
-        policy_sha,
-        "--expected-script-sha256",
-        script_sha,
-    ]
-    command = " ".join(shlex.quote(part) for part in command_parts)
-    return {
+    # The `--bridge-id <value>` fragment is built via _bridge_id_command_fragment() -- the same
+    # shared helper _bridge_id_marker_value_forms() (and so this file's own raw-bytes marker
+    # scanners) draws from -- rather than shlex.quote()-ing BRIDGE_ID inline as just another list
+    # element, so this command's actual quoting and what the marker scanners search for can never
+    # silently drift apart (P2-3 fix, independent review 2026-08-21; see
+    # _bridge_id_command_fragment()'s own comment).
+    command = " ".join(
+        [
+            *(shlex.quote(part) for part in ("/usr/bin/python3", os.fspath(installed_script))),
+            _bridge_id_command_fragment(BRIDGE_ID),
+            *(
+                shlex.quote(part)
+                for part in (
+                    "--policy",
+                    os.fspath(installed_policy),
+                    "--expected-policy-sha256",
+                    policy_sha,
+                    "--expected-script-sha256",
+                    script_sha,
+                )
+            ),
+        ]
+    )
+    result = {
         "release_id": release_id,
         "release_dir": release_dir,
         "script_path": installed_script,
@@ -1102,6 +1952,62 @@ def make_release() -> dict[str, Any]:
         "command": command,
         "hook_configs": discover_hook_configs(),
     }
+    if write_trigger is not None:
+        installed_write_trigger_script = release_dir / "write_candidate_capture.py"
+        # Mirrors write_candidate_capture.py's own "NOT WIRED IN. Example only" wiring comment
+        # (write_candidate_capture.py:2626-2654): `scan` subcommand, same four flags in the same
+        # order as claude_memory_hook.py's own command above, `--bridge-id` set to this release's
+        # write_trigger bridge id (write_candidate_capture.MODULE_ID in real use -- see
+        # _load_write_trigger_config()), and pointed at the SAME installed_policy/policy_sha this
+        # release already computed for claude_memory_hook.py -- one shared, hash-pinned policy.json
+        # per release, not two.
+        #
+        # P0 fix: a 5th flag, `--write-candidates-root <resolved path>`, is now baked in here too.
+        # The release directory this command actually runs from (release_dir, above) contains only
+        # write_candidate_capture.py + policy.json -- never this file -- so
+        # write_candidate_capture.default_write_candidates_root()'s lazy `import install_bridge`
+        # (its only way to derive this path on its own) always raised ModuleNotFoundError when the
+        # REGISTERED command ran for real, silently swallowed by that module's fail-closed
+        # `except Exception: return None` in scan(): exit 0, no output, write-candidates/ never
+        # created, forever, with nothing ever surfacing the failure (real end-to-end repro:
+        # tests/test_install_bridge.py's InstallWriteTriggerRealCommandEndToEndTests). This process
+        # -- running as the installer itself, not from inside that constrained release directory --
+        # already has the one module-level constant default_write_candidates_root() derives from
+        # (`RUNTIME_BASE`, install_bridge.py:92) directly in scope, so it resolves the same path
+        # (`RUNTIME_BASE / "write-candidates"`) itself and passes it explicitly, exactly like
+        # `--policy`/`--expected-policy-sha256`/`--expected-script-sha256`/`--bridge-id` already are
+        # -- never re-derived lazily, at each invocation, from inside the release payload.
+        # write_candidate_capture.py's own `_main_scan` (write_candidate_capture.py:2535) accepts
+        # this as an optional 5th `--flag value` pair for exactly this reason.
+        # Same shared _bridge_id_command_fragment() helper as the base command above -- see its
+        # own comment (P2-3 fix).
+        result["write_trigger_script_path"] = installed_write_trigger_script
+        result["write_trigger_script_raw"] = write_trigger_script_raw
+        result["write_trigger_script_sha256"] = write_trigger_script_sha
+        result["write_trigger_bridge_id"] = write_trigger["bridge_id"]
+        result["write_trigger_command"] = " ".join(
+            [
+                *(
+                    shlex.quote(part)
+                    for part in ("/usr/bin/python3", os.fspath(installed_write_trigger_script), "scan")
+                ),
+                _bridge_id_command_fragment(write_trigger["bridge_id"]),
+                *(
+                    shlex.quote(part)
+                    for part in (
+                        "--policy",
+                        os.fspath(installed_policy),
+                        "--expected-policy-sha256",
+                        policy_sha,
+                        "--expected-script-sha256",
+                        write_trigger_script_sha,
+                        "--write-candidates-root",
+                        os.fspath(RUNTIME_BASE / "write-candidates"),
+                    )
+                ),
+            ]
+        )
+    return result
 
 
 def write_runtime(release: dict[str, Any]) -> None:
@@ -1111,10 +2017,13 @@ def write_runtime(release: dict[str, Any]) -> None:
     ensure_private_dir(RUNTIME_BASE)
     ensure_private_dir(RUNTIME_BASE / "releases")
     ensure_private_dir(release_dir)
-    for path_key, raw_key, digest_key in (
+    triples = [
         ("script_path", "script_raw", "script_sha256"),
         ("policy_path", "policy_raw", "policy_sha256"),
-    ):
+    ]
+    if "write_trigger_script_path" in release:
+        triples.append(("write_trigger_script_path", "write_trigger_script_raw", "write_trigger_script_sha256"))
+    for path_key, raw_key, digest_key in triples:
         path: Path = release[path_key]
         expected_raw: bytes = release[raw_key]
         if path.exists():
@@ -1169,6 +2078,23 @@ def _validate_receipt_shape(receipt: Any) -> dict[str, Any]:
         or not isinstance(receipt.get("policy_sha256"), str)
         or re.fullmatch(r"[0-9a-f]{64}", receipt.get("policy_sha256", "")) is None
         or not isinstance(receipt.get("volume_uuid"), str)
+        # `write_trigger_script_sha256`/`write_trigger_bridge_id` (install_write_trigger() only):
+        # absent-on-both-keys is a normal base-only receipt, valid exactly as before this pair
+        # existed. Present on only one, or present-but-malformed, is a receipt no real writer of
+        # this file ever produces -- treated as corruption like every other malformed field above,
+        # not silently tolerated (verify() unconditionally trusts both once this function returns).
+        or (
+            ("write_trigger_script_sha256" in receipt) != ("write_trigger_bridge_id" in receipt)
+        )
+        or (
+            "write_trigger_script_sha256" in receipt
+            and (
+                not isinstance(receipt.get("write_trigger_script_sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", receipt.get("write_trigger_script_sha256", "")) is None
+                or not isinstance(receipt.get("write_trigger_bridge_id"), str)
+                or not receipt.get("write_trigger_bridge_id")
+            )
+        )
     ):
         raise InstallError("invalid receipt")
     raw_rows = receipt.get("configs")
@@ -1406,7 +2332,7 @@ def recover_pending_install() -> dict[str, Any]:
     # shared by both branches, is what round 8's own report called out as
     # the better fix over duplicating the scan per branch.
     receipt_paths = {row["path"] for row in receipt["configs"]}
-    untracked_owned = _find_untracked_owned_configs(receipt_paths)
+    untracked_owned = _untracked_owned_including_write_trigger(receipt, receipt_paths)
     if untracked_owned:
         raise InstallError(
             "refusing to finish pending install/uninstall: found an owned hook handler at a path the "
@@ -1508,9 +2434,14 @@ def recover_pending_install() -> dict[str, Any]:
     return {"ok": True, "state": "uninstalled", "install_id": receipt["install_id"]}
 
 
-def install() -> dict[str, Any]:
+def install(*, write_trigger: dict[str, Any] | None = None) -> dict[str, Any]:
+    # `write_trigger` (see make_release()'s own comment for its shape) is forwarded straight into
+    # make_release() and, below, layered onto each config's SessionEnd handler list via a second
+    # update_hook_config() call -- every other line in this function is completely unchanged from
+    # before this parameter existed, and every real call site except install_write_trigger() still
+    # passes nothing, reproducing this function's exact pre-existing behavior.
     recover_pending_install()
-    release = make_release()
+    release = make_release(write_trigger=write_trigger)
     configs: list[Path] = release["hook_configs"]
 
     # If this bridge was already installed (a latest-receipt.json exists),
@@ -1613,7 +2544,23 @@ def install() -> dict[str, Any]:
         current_mode = _mode_bits(path)
         originals[path] = raw
         original_modes[path] = current_mode
-        updated[path] = update_hook_config(raw, release["command"])
+        after = update_hook_config(raw, release["command"])
+        if write_trigger is not None:
+            # Layered onto the SAME payload the line above already produced, not a second
+            # independent update_hook_config() call against `raw` -- both handlers must land in one
+            # write to `updated[path]`, so uninstall()'s single before_sha256 backup/restore removes
+            # both at once (see AUTO-LEARN-TRIGGER-DESIGN-2026-08-19.md's install-write-trigger
+            # section for why this is what makes the existing uninstall/recover machinery a genuine
+            # rollback path for this capability, not just for the base UserPromptSubmit handler).
+            after = update_hook_config(
+                after,
+                release["write_trigger_command"],
+                event="SessionEnd",
+                bridge_id=write_trigger["bridge_id"],
+                timeout=None,
+                status_message="Scanning session for durable memory candidates",
+            )
+        updated[path] = after
 
         previous_row = previous_rows_by_path.get(os.fspath(path))
         if previous_row is None:
@@ -1658,7 +2605,7 @@ def install() -> dict[str, Any]:
             # remediation that always works without depending on that scan.
             existing_payload = strict_json(raw)
             existing_handlers = (
-                existing_payload.get("hooks", {}).get("UserPromptSubmit", [])
+                existing_payload.get("hooks", {}).get(DEFAULT_HOOK_EVENT, [])
                 if isinstance(existing_payload, dict)
                 else []
             )
@@ -1730,6 +2677,19 @@ def install() -> dict[str, Any]:
         prev_backups[path] = (
             backup_path if prev_backup_source[path] is None else prev_backup_source[path]
         )
+    # Additive, optional receipt fields -- absent entirely (not null) for every install that does
+    # not pass write_trigger=, so _validate_receipt_shape() (which only checks specific keys it
+    # knows about, never an exact key set) and every existing receipt-shape assertion in the test
+    # suite are unaffected. verify() reads these to also hash-pin write_candidate_capture.py and
+    # count its SessionEnd handler (see that function).
+    write_trigger_receipt_fields: dict[str, Any] = (
+        {
+            "write_trigger_script_sha256": release["write_trigger_script_sha256"],
+            "write_trigger_bridge_id": release["write_trigger_bridge_id"],
+        }
+        if write_trigger is not None
+        else {}
+    )
     receipt = {
         "schema": RECEIPT_SCHEMA,
         "bridge_id": BRIDGE_ID,
@@ -1741,6 +2701,7 @@ def install() -> dict[str, Any]:
         "policy_sha256": release["policy_sha256"],
         "volume_uuid": release["volume_uuid"],
         "command": release["command"],
+        **write_trigger_receipt_fields,
         "configs": [
             {
                 "path": os.fspath(path),
@@ -1833,6 +2794,26 @@ def verify() -> dict[str, Any]:
         raise InstallError("installed policy digest mismatch")
     checked: list[str] = []
     unreachable: list[str] = []
+    # Write-trigger liveness is now determined independently per config row, below, from real, live
+    # hooks.json content under the well-known identity -- NOT from receipt.get("write_trigger_*")
+    # (round-52 fix, converged independent Claude opus/max + Codex gpt-5.6-sol/max review,
+    # 2026-08-21). The prior design gated the whole write-trigger check on those two receipt fields,
+    # which an ordinary, unrelated LATER plain install() (no write_trigger= argument -- e.g.
+    # redeploying just a claude_memory_hook.py fix) resets to entirely absent on the NEW receipt,
+    # even though update_hook_config()'s per-event layering is additive, not a full reset, so a
+    # SessionEnd handler a PRIOR install-write-trigger call registered is genuinely still live and
+    # untouched. verify() then silently stopped checking BOTH the handler count and the installed
+    # script's hash -- Codex proved this goes as far as not detecting a tampered/swapped script the
+    # still-live handler points at, reporting `ok: true` regardless. Also, after such a plain
+    # reinstall, receipt["release_dir"] is a DIFFERENT, newer release directory than the one the
+    # live write-trigger handler was actually deployed into (release_id is content-addressed and a
+    # plain install's release-key omits every write_trigger_* field -- see make_release()), so even
+    # an unconditional version of the old release_dir-relative check would have looked in the wrong
+    # place. The fix below derives everything it needs from the live handler's own command line
+    # instead -- the same self-declared `--policy`/`--expected-policy-sha256`/`--expected-script-
+    # sha256` arguments make_release() always bakes in -- which is correct regardless of which
+    # release directory produced it or what the CURRENT receipt happens to say.
+    write_trigger_commands_by_path: dict[str, str] = {}
     for row in receipt["configs"]:
         if not isinstance(row, dict) or not isinstance(row.get("path"), str):
             raise InstallError("invalid receipt config row")
@@ -1856,12 +2837,160 @@ def verify() -> dict[str, Any]:
         if sha256_bytes(raw) != row.get("after_sha256"):
             raise InstallError(f"hook config drift: {path}")
         payload = strict_json(raw)
-        handlers = payload.get("hooks", {}).get("UserPromptSubmit", []) if isinstance(payload, dict) else []
+        handlers = payload.get("hooks", {}).get(DEFAULT_HOOK_EVENT, []) if isinstance(payload, dict) else []
         matches = [handler for handler in handlers if owned_handler(handler)]
         if len(matches) != 1:
             raise InstallError(f"owned hook count mismatch: {path}")
+        # `SessionEnd` here is a PRE-EXISTING key this tool may not own or have ever written --
+        # install() never inspects/normalizes it on a plain (non-write-trigger) install, only the
+        # event actually being registered (DEFAULT_HOOK_EVENT, above) gets that treatment -- so a
+        # user's own hooks.json is free to carry an arbitrary other tool's SessionEnd value verbatim,
+        # legitimately, including a non-list JSON scalar (`null`, `0`, `true`, a bare string, ...).
+        # This local isinstance guard exists BECAUSE SessionEnd carries no such guarantee here --
+        # unlike this file's other two reads of a hooks.json event-array (round-54 comment fix,
+        # independent Claude opus5/max GO + Codex gpt-5.6-sol/max NO-GO dual review, 2026-08-21: a
+        # prior version of this comment claimed those two are "guarded the same way", which isn't
+        # literally true -- neither has a local isinstance check either). Instead, each of those two
+        # is protected upstream, by a DIFFERENT mechanism: the DEFAULT_HOOK_EVENT read at ~2608
+        # (inside the `if previous_row is None:` branch) is safe because update_hook_config(raw, ...)
+        # is called against this exact same `raw` moments earlier and already raises
+        # `"malformed {event} hook list"` for anything but a list -- so this function never reaches
+        # that read at all with a malformed shape. The DEFAULT_HOOK_EVENT read at ~2840 is safe
+        # because it runs only after `sha256_bytes(raw) != row.get("after_sha256")` has already
+        # confirmed `raw` is byte-identical to content update_hook_config() itself previously wrote
+        # (always list-shaped). SessionEnd has neither guarantee -- it can be arbitrary content some
+        # OTHER tool wrote -- so it needs a guard of its own (round-53 fix, independent Claude
+        # opus/max review, 2026-08-21, P2-A): the unguarded version iterated `session_end_handlers`
+        # directly, so a plain install (no write_trigger argument at all) against any such config
+        # raised an uncaught TypeError from verify() -- a regression this round introduced, since the
+        # pre-existing verify() returned ok=True in all these cases. A non-list value is treated the
+        # same as "key absent": no write-trigger handlers present here.
+        raw_session_end_handlers = payload.get("hooks", {}).get("SessionEnd", []) if isinstance(payload, dict) else []
+        session_end_handlers = raw_session_end_handlers if isinstance(raw_session_end_handlers, list) else []
+        write_trigger_matches = [
+            handler for handler in session_end_handlers if owned_handler(handler, bridge_id=WRITE_TRIGGER_BRIDGE_ID)
+        ]
+        if len(write_trigger_matches) > 1:
+            raise InstallError(f"owned write-trigger hook count mismatch: {path}")
+        if write_trigger_matches:
+            command = _owned_handler_command(write_trigger_matches[0], bridge_id=WRITE_TRIGGER_BRIDGE_ID)
+            if command is None:
+                raise InstallError(f"owned write-trigger hook has no command: {path}")
+            write_trigger_commands_by_path[os.fspath(path)] = command
         checked.append(os.fspath(path))
-    return {
+
+    write_trigger_script_sha256: str | None = None
+    if write_trigger_commands_by_path:
+        # A write-trigger handler was found live on at least one reachable config -- require it
+        # present on EVERY reachable config (matching the old design's equivalent strictness: it
+        # required exactly one match per row whenever the receipt-based flag was set at all) and
+        # require every one of them to carry the exact same command (this tool always writes the
+        # identical command to every managed config in one release; a config carrying a DIFFERENT
+        # write-trigger command than its siblings cannot be this tool's own doing).
+        missing = [path for path in checked if path not in write_trigger_commands_by_path]
+        if missing:
+            # This state is real and worth hard-failing on (round-53 fix, independent Claude opus/max
+            # review, 2026-08-21, P2-B) -- but it is also an EXPECTED consequence of a perfectly
+            # ordinary sequence: install-write-trigger ran earlier against some configs, then a NEW
+            # Codex account config appeared (this machine legitimately runs multiple pooled Codex
+            # account homes), and an ordinary plain install() (no write_trigger argument) correctly
+            # registered only the base UserPromptSubmit handler on it -- plain install must never
+            # silently also add a SessionEnd handler a caller did not ask for. The message must say so:
+            # a bare "hook is missing" with no further context left an operator with no idea whether
+            # this was expected or how to fix it.
+            raise InstallError(
+                "owned write-trigger hook is missing from a config where the base hook is present: "
+                + ", ".join(missing)
+                + ". This config has the base UserPromptSubmit hook installed but not the "
+                "write-trigger SessionEnd hook that this tool's other managed configs carry. This is "
+                "expected after a plain `install` (no write-trigger) picks up a config -- e.g. a newly "
+                "added Codex account home -- that an earlier `install-write-trigger` run never covered. "
+                "To fix: re-run `install-write-trigger` (the install_write_trigger() action) with the "
+                "same write-trigger policy so this config's write-trigger hook is brought back in sync "
+                "with the others."
+            )
+        distinct_commands = set(write_trigger_commands_by_path.values())
+        if len(distinct_commands) != 1:
+            raise InstallError("owned write-trigger hook command differs across configs")
+        command = next(iter(distinct_commands))
+        try:
+            tokens = shlex.split(command, comments=True)
+        except ValueError as exc:
+            raise InstallError("cannot parse the live write-trigger hook command") from exc
+        script_path_str = tokens[1] if len(tokens) > 1 else None
+        policy_path_str: str | None = None
+        expected_script_sha256: str | None = None
+        expected_policy_sha256: str | None = None
+        for index, token in enumerate(tokens):
+            if index + 1 >= len(tokens):
+                continue
+            if token == "--expected-script-sha256":
+                expected_script_sha256 = tokens[index + 1]
+            elif token == "--policy":
+                policy_path_str = tokens[index + 1]
+            elif token == "--expected-policy-sha256":
+                expected_policy_sha256 = tokens[index + 1]
+        if not script_path_str or not policy_path_str or not expected_script_sha256 or not expected_policy_sha256:
+            raise InstallError("live write-trigger hook command is missing expected arguments")
+        # Script hash: the actual deployed file at the path the live handler itself references must
+        # match what that SAME command line asserts it should be -- this is what catches a
+        # tampered/swapped script regardless of which release directory it lives under or whether
+        # the current receipt still remembers this release at all.
+        live_script_raw = validate_owned_file(resolve_ssd_path(Path(script_path_str)), private=True)
+        if sha256_bytes(live_script_raw) != expected_script_sha256:
+            raise InstallError("installed write-trigger script digest mismatch")
+        # Policy: same self-consistency check for the policy.json the live handler points at, PLUS
+        # (unlike the script check) re-validating its write_trigger block against the real,
+        # authoritative schema -- reusing _parse_write_trigger_block() rather than a second,
+        # potentially-divergent copy (see _validate_write_trigger_argument()'s own comment for the
+        # same reuse discipline). This is the one part of this function that needs
+        # write_candidate_capture importable -- unlike the untracked-owned-handler safety scan and the
+        # base script/policy checks above -- but that reach is only exercised when a live write-trigger
+        # handler was actually found (this whole branch is behind `if write_trigger_commands_by_path:`
+        # above), so a plain, no-write-trigger verify() call never imports write_candidate_capture at
+        # all and is unaffected either way.
+        #
+        # The write_candidate_capture import further below (past the policy digest re-check and
+        # strict_json parse immediately following this comment) is explicitly guarded (round-53
+        # fix, independent Claude opus/max review, 2026-08-21, P1): a prior version of this comment
+        # claimed a missing write_candidate_capture.py here "surfaces as a clean InstallError from
+        # verify() alone, not a lockout of install()/uninstall()/recover()" -- false, since the
+        # import itself was unguarded. Reproduced end-to-end: install a live write-trigger handler,
+        # then delete write_candidate_capture.py (genuinely untracked in this repo's own git
+        # history) and call verify() -- it raised an uncaught ModuleNotFoundError straight past
+        # main()'s own `except InstallError` handler: empty stdout, rc=1, and a raw Python traceback
+        # on stderr, unlike every other failure mode in this function. Fixed by catching the import
+        # error and re-raising it as an InstallError identifying the real cause, matching this
+        # function's own error-reporting contract everywhere else.
+        #
+        # Round-54 fix (independent Claude opus5/max GO + Codex gpt-5.6-sol/max NO-GO dual review,
+        # 2026-08-21): this guard was verify()-only -- _load_write_trigger_config() and
+        # _validate_write_trigger_argument() made the identical unguarded _import_write_candidate_
+        # capture() call, so `install-write-trigger` (dry-run and real) still raised a raw
+        # ModuleNotFoundError traceback. Both now guard the same way. The except clause here also
+        # widened from bare ModuleNotFoundError to (ModuleNotFoundError, SyntaxError, ImportError):
+        # a corrupted/half-written write_candidate_capture.py raises SyntaxError at import time, not
+        # ModuleNotFoundError, and was uncaught before. Message construction -- naming
+        # write_candidate_capture itself vs. one of ITS OWN transitive imports as the actual missing
+        # piece, or reporting a syntax error -- is now shared across all 3 guarded call sites by
+        # _wrap_write_candidate_capture_import_error() instead of divergent copies.
+        live_policy_raw = validate_owned_file(resolve_ssd_path(Path(policy_path_str)), private=True)
+        if sha256_bytes(live_policy_raw) != expected_policy_sha256:
+            raise InstallError("installed write-trigger policy digest mismatch")
+        live_policy_payload = strict_json(live_policy_raw)
+        try:
+            _wtc = _import_write_candidate_capture()
+        except (ModuleNotFoundError, SyntaxError, ImportError) as exc:
+            raise _wrap_write_candidate_capture_import_error(exc, "cannot verify write-trigger liveness") from exc
+        try:
+            _wtc._parse_write_trigger_block(
+                live_policy_payload.get("write_trigger") if isinstance(live_policy_payload, dict) else None
+            )
+        except _wtc.WriteCaptureError as exc:
+            raise InstallError(f"live write-trigger policy is invalid: {exc}") from exc
+        write_trigger_script_sha256 = expected_script_sha256
+
+    result = {
         "ok": True,
         "release_id": receipt["release_id"],
         "script_sha256": receipt["script_sha256"],
@@ -1870,6 +2999,9 @@ def verify() -> dict[str, Any]:
         "configs": checked,
         "unreachable": unreachable,
     }
+    if write_trigger_script_sha256 is not None:
+        result["write_trigger_script_sha256"] = write_trigger_script_sha256
+    return result
 
 
 def uninstall() -> dict[str, Any]:
@@ -1905,20 +3037,25 @@ def uninstall() -> dict[str, Any]:
     # directly while a managed path is still renamed -- exactly what this
     # file's own R6-P1-A fix's error message used to recommend as the
     # first thing to try. Scan for any owned handler at a path the receipt
-    # does not track (_find_untracked_owned_configs() -- a walk of the
-    # whole local-homes tree, wider than the one-level-deep shape
-    # _enumerate_hook_configs() understands, so a relocation is caught
-    # regardless of where under local-homes it landed; see that function's
-    # own comment and R8-P1-B); if any is found, refuse before writing the
-    # pending journal or touching anything, so the receipt and every
-    # config stay exactly as they were and the always-safe remediation --
-    # restore the path to where the receipt expects it -- remains
-    # available. recover_pending_install() runs the identical scan before
-    # finishing an interrupted uninstall, since that commit path can also
-    # delete the receipt and does not go through this function at all
+    # does not track (_untracked_owned_including_write_trigger(), wrapping
+    # _find_untracked_owned_configs() -- a walk of the whole local-homes
+    # tree, wider than the one-level-deep shape _enumerate_hook_configs()
+    # understands, so a relocation is caught regardless of where under
+    # local-homes it landed; see that function's own comment and R8-P1-B),
+    # under the base identity AND, unconditionally, the write-trigger identity too (P2-D fix,
+    # independent Claude opus5/max review, 2026-08-21; no longer gated on this one receipt's own
+    # write_trigger_bridge_id field -- P2-2 fix, independent Claude opus5/max review, 2026-08-21 --
+    # see _untracked_owned_including_write_trigger()'s own comment for why); if any is found under
+    # either identity, refuse before
+    # writing the pending journal or touching anything, so the receipt and
+    # every config stay exactly as they were and the always-safe
+    # remediation -- restore the path to where the receipt expects it --
+    # remains available. recover_pending_install() runs the identical scan
+    # before finishing an interrupted uninstall, since that commit path can
+    # also delete the receipt and does not go through this function at all
     # (R8-P1-A).
     receipt_paths = {row["path"] for row in receipt["configs"]}
-    untracked_owned = _find_untracked_owned_configs(receipt_paths)
+    untracked_owned = _untracked_owned_including_write_trigger(receipt, receipt_paths)
     if untracked_owned:
         raise InstallError(
             "refusing uninstall: found an owned hook handler at a path the current receipt does not "
@@ -2008,13 +3145,25 @@ def uninstall() -> dict[str, Any]:
     }
 
 
-def plan() -> dict[str, Any]:
-    release = make_release()
+def plan(*, write_trigger: dict[str, Any] | None = None) -> dict[str, Any]:
+    # `write_trigger`'s read-only twin of install()'s own second update_hook_config() call (see that
+    # function's comment) -- this is install_write_trigger()'s --dry-run path, and (via `write_trigger
+    # =None`, every real call site today) still the exact plan() the `plan` CLI action has always run.
+    release = make_release(write_trigger=write_trigger)
     pending = PENDING_PATH.exists() or PENDING_PATH.is_symlink()
     configs = []
     for path in release["hook_configs"]:
         raw = validate_owned_file(path)
         after = update_hook_config(raw, release["command"])
+        if write_trigger is not None:
+            after = update_hook_config(
+                after,
+                release["write_trigger_command"],
+                event="SessionEnd",
+                bridge_id=write_trigger["bridge_id"],
+                timeout=None,
+                status_message="Scanning session for durable memory candidates",
+            )
         configs.append(
             {
                 "path": os.fspath(path),
@@ -2023,7 +3172,7 @@ def plan() -> dict[str, Any]:
                 "will_change": raw != after or _mode_bits(path) != 0o600,
             }
         )
-    return {
+    result = {
         "ok": not pending,
         "action": "plan",
         "release_id": release["release_id"],
@@ -2035,6 +3184,78 @@ def plan() -> dict[str, Any]:
         "pending_transaction": pending,
         "configs": configs,
     }
+    if write_trigger is not None:
+        result["write_trigger_script_sha256"] = release["write_trigger_script_sha256"]
+    return result
+
+
+def _load_write_trigger_config(policy_path: Path) -> dict[str, Any]:
+    # Fail-closed boundary for install_write_trigger(): the supplied file must be a policy.json-
+    # shaped JSON object whose "write_trigger" block (design doc section 2.2) has enabled: true.
+    # Anything else -- unreadable file, malformed JSON, a missing/disabled/malformed write_trigger
+    # block -- refuses here, before install()/plan() ever run, so this action can never silently
+    # register a SessionEnd handler that scans nothing (write_candidate_capture.scan() itself is a
+    # no-op whenever its own policy's write_trigger.enabled is false -- registering the hook without
+    # enabling it would just waste a Codex SessionEnd cycle on every session for no effect).
+    try:
+        raw = Path(policy_path).read_bytes()
+    except OSError as exc:
+        raise InstallError(f"cannot read write-trigger policy: {policy_path}") from exc
+    parsed = strict_json(raw)
+    if not isinstance(parsed, dict):
+        raise InstallError(f"write-trigger policy must be a JSON object: {policy_path}")
+    # Uses _import_write_candidate_capture() (shared, as of the P2-1/P2-2 fix round, 2026-08-21, with
+    # make_release()'s own write_trigger validation and _untracked_owned_including_write_trigger()'s
+    # safety-net scan -- see that helper's own comment): install_write_trigger()'s own task explicitly
+    # calls for importing write_candidate_capture.MODULE_ID directly rather than re-deriving it,
+    # unlike the low-level detection/rewrite chain (owned_handler() and friends), which deliberately
+    # stays free of this import -- see BRIDGE_ID's own comment / section 13.3/17.1 for why those
+    # functions instead take bridge_id as a plain string. Reusing
+    # write_candidate_capture._parse_write_trigger_block() directly (rather than re-implementing its
+    # validation here) is also deliberate -- this file must not grow a second, less-reviewed
+    # write_trigger schema validator that could drift out of sync with the real one.
+    #
+    # Guarded (round-54 fix, independent Claude opus5/max GO + Codex gpt-5.6-sol/max NO-GO dual
+    # review, 2026-08-21, issue 2): unguarded here, this is install_write_trigger()'s FIRST call
+    # (before install()/plan() run), so a genuinely missing write_candidate_capture.py made the
+    # `install-write-trigger` CLI action -- dry-run and real alike -- raise a raw, uncaught
+    # ModuleNotFoundError past main()'s own `except InstallError` handler: empty stdout, rc=1, a raw
+    # traceback on stderr, the same failure shape round-53 fixed for verify() but never propagated
+    # to this call site.
+    try:
+        _wtc = _import_write_candidate_capture()
+    except (ModuleNotFoundError, SyntaxError, ImportError) as exc:
+        raise _wrap_write_candidate_capture_import_error(exc, "cannot load write-trigger policy") from exc
+
+    try:
+        config = _wtc._parse_write_trigger_block(parsed.get("write_trigger"))
+    except _wtc.WriteCaptureError as exc:
+        raise InstallError(f"invalid write_trigger policy block: {exc}") from exc
+    if not config.enabled:
+        raise InstallError(
+            "write_trigger.enabled must be true in the supplied policy to install the write-trigger hook"
+        )
+    return {
+        "bridge_id": _wtc.MODULE_ID,
+        "max_candidates_per_project": config.max_candidates_per_project,
+        "max_candidate_bytes": config.max_candidate_bytes,
+    }
+
+
+def install_write_trigger(policy_path: Path, *, dry_run: bool = False) -> dict[str, Any]:
+    # The `install-write-trigger` CLI action. A thin, additive wrapper: all it does beyond the
+    # fail-closed policy validation above is call this file's own, already-transactional install()/
+    # plan() with a validated `write_trigger` dict -- the same atomic-write/receipt/backup/pending-
+    # journal/recover machinery, and the same uninstall()/recover_pending_install() rollback path,
+    # every other action already reuses (AUTO-LEARN-TRIGGER-DESIGN-2026-08-19.md, install-write-
+    # trigger section). Deliberately narrow, not a generic "register any command under any event"
+    # action: event ("SessionEnd"), bridge_id (write_candidate_capture.MODULE_ID, from
+    # _load_write_trigger_config()), and timeout (None, forced by install()'s own second
+    # update_hook_config() call) are never caller-controlled here.
+    write_trigger = _load_write_trigger_config(policy_path)
+    if dry_run:
+        return plan(write_trigger=write_trigger)
+    return install(write_trigger=write_trigger)
 
 
 def _acquire_exclusive_lock() -> int:
@@ -2091,11 +3312,23 @@ def _acquire_exclusive_lock() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("plan", "install", "verify", "uninstall", "recover"))
+    parser.add_argument(
+        "action", choices=("plan", "install", "verify", "uninstall", "recover", "install-write-trigger")
+    )
+    # Only meaningful for install-write-trigger; unused (and untouched-by-any-other-action) otherwise.
+    parser.add_argument("--write-trigger-policy", default=None)
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     lock_descriptor = -1
     try:
-        if args.action in ("install", "uninstall", "recover"):
+        # install-write-trigger writes through the exact same transactional machinery install()
+        # already uses (see that function), so it needs the same exclusive lock -- but only when it
+        # will actually write; --dry-run calls plan(), which (like the plain `plan` action) never
+        # acquires this lock.
+        writes = args.action in ("install", "uninstall", "recover") or (
+            args.action == "install-write-trigger" and not args.dry_run
+        )
+        if writes:
             lock_descriptor = _acquire_exclusive_lock()
         if args.action == "plan":
             result = plan()
@@ -2105,8 +3338,12 @@ def main() -> int:
             result = verify()
         elif args.action == "uninstall":
             result = uninstall()
-        else:
+        elif args.action == "recover":
             result = recover_pending_install()
+        else:
+            if not args.write_trigger_policy:
+                raise InstallError("install-write-trigger requires --write-trigger-policy")
+            result = install_write_trigger(Path(args.write_trigger_policy), dry_run=args.dry_run)
     except InstallError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
         return 1

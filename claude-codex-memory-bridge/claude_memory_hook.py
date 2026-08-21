@@ -186,7 +186,15 @@ def validate_policy(policy: dict[str, Any]) -> Limits:
         "runtime_root",
         "limits",
     }
-    if set(policy) != expected_keys:
+    # Round 2 (write_candidate_capture.py P1-5 fix): `write_trigger` is an
+    # additive, optional block a policy.json may carry for the new WRITE-side
+    # module (see write_candidate_capture.py's own `_parse_write_trigger_block`,
+    # which validates its actual shape) -- this function only needs to not
+    # reject it as an unrecognized key. Every other key remains mandatory and
+    # no other key is newly tolerated: a base v1 policy with no
+    # `write_trigger` block still validates byte-for-byte the same as before.
+    optional_keys = {"write_trigger"}
+    if not (expected_keys <= set(policy) <= expected_keys | optional_keys):
         raise BridgeError("unexpected policy keys")
     if policy.get("schema") != POLICY_SCHEMA:
         raise BridgeError("unsupported policy schema")
@@ -213,7 +221,61 @@ def _is_relative_to(path: Path, root: Path) -> bool:
         return False
 
 
-def _disk_volume_uuid(ssd_root: Path) -> str:
+# Per-caller timeout split (round fix, 2026-08-20), replacing one shared constant.
+#
+# Independent review of the flake investigation below found a real regression it introduced:
+# `_disk_volume_uuid` is a SHARED primitive, called both by the genuinely unbounded-latency
+# SessionEnd/write-trigger path (`write_candidate_capture.scan()`, via `verify_write_candidates_
+# storage()` -> `verify_storage()`) AND by the ALREADY-LIVE UserPromptSubmit path (`run()`, via
+# `verify_storage()` directly) -- and the real, currently-installed `~/.codex/hooks.json` wraps
+# that UserPromptSubmit hook in its own outer `"timeout": 5` at the Codex-hook level, a cap this
+# component does not control and cannot see. Before the flake investigation's fix, a slow
+# `diskutil` call on the UserPromptSubmit path exited cleanly on its own terms at the old 2s
+# internal bound -- no memory context that turn, but a clean exit well under the outer 5s cap.
+# Raising the internal bound to 15s for both callers fixed the SessionEnd path but made the
+# UserPromptSubmit path strictly worse for any call landing in the 5-15s range: instead of
+# exiting cleanly at 2s, it now runs past the outer 5s cap and gets hard-killed by Codex's own
+# enforcement instead of this function's own except-block -- genuinely better for the common
+# 2-5s slow case (which used to fail and now succeeds), genuinely worse for the rarer >5s case
+# (which used to fail cleanly and now gets hard-killed instead).
+#
+# The reviewer also independently re-measured the actual root cause of the slowness the flake
+# investigation observed: not general machine load, but *concurrent* `diskutil` invocations
+# specifically -- 3.05s median / 5.12s max latency measured at 48-way concurrency -- which is
+# what actually justifies a bound well past 2s for the caller that can afford it.
+#
+# UserPromptSubmit: leaves real headroom under the live outer 5s Codex-hook-level cap, long
+# enough that the common 2-5s slow case (median 3.05s, per the concurrency measurement above)
+# now succeeds instead of failing, while still exiting on this function's own terms -- not the
+# outer cap's -- for anything slower, rather than being hard-killed at 5s.
+_DISKUTIL_TIMEOUT_USER_PROMPT_SUBMIT = 4
+# SessionEnd/write-trigger: no outer hook-level cap exists on this path (design doc section
+# 17.2, "nothing downstream depends on the handler returning quickly"), so this keeps the flake
+# investigation's own 15s bound -- see that investigation's measurements below.
+_DISKUTIL_TIMEOUT_SESSION_END = 15
+
+
+def _disk_volume_uuid(ssd_root: Path, *, timeout: int) -> str:
+    # Flake investigation (2026-08-20): this function's `timeout=2` was the tighter of the two
+    # `diskutil info -plist` timeouts in this project (see install_bridge.py's `volume_uuid`,
+    # same command, same path, `timeout=3`) and the one actually hit by
+    # `write_candidate_capture.scan()`'s own real, registered SessionEnd subprocess -- its
+    # `except Exception: return None` fail-closed boundary (by design: a SessionEnd hook must
+    # never break a session) silently swallowed the resulting `BridgeError` on every hit, so a
+    # transient diskutil timeout looked identical to "nothing to capture", exit 0, no output.
+    # Reproduced directly and repeatedly via `tests/test_install_bridge.py`'s
+    # `InstallWriteTriggerRealCommandEndToEndTests` on this shared, often heavily-loaded dev
+    # machine (load averages 25-35 observed): 20 isolated re-runs produced 6
+    # `AssertionError: ... must actually create write-candidates/` failures, every single one a
+    # `subprocess.TimeoutExpired` on this exact call (confirmed with temporary timing
+    # instrumentation) -- not a race in atomic_write's fsync/replace sequence, not test-order
+    # pollution. AUTO-LEARN-TRIGGER-DESIGN-2026-08-19.md section 17.2 already documents this
+    # handler's SessionEnd scan as deliberately unbounded-latency at the Codex-hook level
+    # ("nothing downstream depends on the handler returning quickly") -- a 2s internal diskutil
+    # bound directly contradicted that stated intent. 15s (matching volume_uuid's new bound)
+    # gives >4x headroom over the worst latency actually observed here, while still bounding a
+    # genuinely hung/unresponsive diskutil rather than hanging forever. `timeout` is no longer a
+    # hardcoded constant in this function -- see the per-caller split immediately above.
     try:
         result = subprocess.run(
             ["/usr/sbin/diskutil", "info", "-plist", os.fspath(ssd_root)],
@@ -221,7 +283,7 @@ def _disk_volume_uuid(ssd_root: Path) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             check=True,
-            timeout=2,
+            timeout=timeout,
         )
         payload = plistlib.loads(result.stdout)
     except (OSError, subprocess.SubprocessError, plistlib.InvalidFileException) as exc:
@@ -232,11 +294,33 @@ def _disk_volume_uuid(ssd_root: Path) -> str:
     return value.upper()
 
 
+def _disk_volume_uuid_user_prompt_submit(ssd_root: Path) -> str:
+    """Default `volume_uuid_reader` for the UserPromptSubmit path: `run()`'s own default
+    parameter, and `verify_storage()`'s own fallback default (dead in practice today -- `run()`
+    always forwards a value explicitly -- but kept correct for any future direct caller). Matches
+    `Callable[[Path], str]` exactly (a named function, not `functools.partial`, so there is no
+    partial-application typing ambiguity at either default-parameter site), bound to
+    `_DISKUTIL_TIMEOUT_USER_PROMPT_SUBMIT`.
+    """
+    return _disk_volume_uuid(ssd_root, timeout=_DISKUTIL_TIMEOUT_USER_PROMPT_SUBMIT)
+
+
+def _disk_volume_uuid_session_end(ssd_root: Path) -> str:
+    """Default `volume_uuid_reader` for the SessionEnd/write-trigger path:
+    `write_candidate_capture.py`'s `scan()` own default parameter (the one that actually governs
+    the real, registered SessionEnd command -- `_main_scan()` calls `scan()` with no override),
+    and `verify_write_candidates_storage()`'s own fallback default (dead in practice today for
+    the same reason as `verify_storage()`'s above). Matches `Callable[[Path], str]` exactly,
+    bound to `_DISKUTIL_TIMEOUT_SESSION_END`.
+    """
+    return _disk_volume_uuid(ssd_root, timeout=_DISKUTIL_TIMEOUT_SESSION_END)
+
+
 def verify_storage(
     policy: dict[str, Any],
     policy_path: Path,
     script_path: Path,
-    volume_uuid_reader: Callable[[Path], str] = _disk_volume_uuid,
+    volume_uuid_reader: Callable[[Path], str] = _disk_volume_uuid_user_prompt_submit,
 ) -> tuple[Path, Path]:
     try:
         ssd_root = Path(policy["ssd_root"]).resolve(strict=True)
@@ -847,10 +931,82 @@ _PEM_RE = re.compile(
     r"-----BEGIN [^-\n]*(?:PRIVATE KEY|OPENSSH KEY)[^-\n]*-----.*?-----END [^-\n]*-----",
     re.IGNORECASE | re.DOTALL,
 )
-_URL_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@")
-_BEARER_RE = re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
+# All four of `_URL_USERINFO_RE`, `_BEARER_RE`, `_TOKEN_RE`, and `_JWT_RE` below anchor with
+# plain `\b`, which is Unicode-aware by default -- Python's `\w` treats CJK ideographs as word
+# characters, so a credential glued directly onto CJK text with no separating whitespace has no
+# word/non-word transition at the CJK-adjacent edge, and the boundary check silently fails to
+# match, leaking the credential in full (independent dual review, 2026-08-20 -- the same root
+# cause already found and fixed for `_EMAIL_RE` below and for
+# `_CURRENT_TASK_PLAN_RE`/`_AFFIRMATION_RE` in write_candidate_capture.py, but still live here for
+# four patterns carrying higher-value credentials than an email address). Fixed the same way this
+# file already fixes it elsewhere (`_LONG_BLOB_RE`, `_MAC_ADDRESS_RE`, `_ASSIGNMENT_RE`'s
+# `(?<![A-Za-z0-9])`-style lookbehind): an explicit `(?<![A-Za-z0-9_])`/`(?![A-Za-z0-9_])`
+# lookaround in place of `\b`. `[A-Za-z0-9_]` is the exact ASCII-only definition of `\w` these
+# patterns need -- it makes CJK (and every other non-ASCII "word" character) count as non-word on
+# both sides, so a boundary always exists at an ASCII/CJK transition. Deliberately scoped to just
+# the lookaround, not `re.ASCII` on the whole compiled pattern (see `_EMAIL_RE` below for why that
+# distinction matters).
+#
+# NOT byte-for-byte identical to `\b` on pure-ASCII input, and that's fine: `\b` is a two-sided
+# transition test, this lookaround is one-sided, so they diverge whenever the match's own edge is a
+# non-word ASCII character its content class would also consume (e.g. a leading `-` before an email,
+# or a trailing `-` after a token) -- independent dual review, 2026-08-20, confirmed by fuzzing.
+# Every observed divergence widens the match (redacts a little more, never a little less), which is
+# the safe direction for a redaction function; verified empirically across 120,000+ containment-fuzz
+# cases with zero narrowing instances, not just asserted here.
+#
+# `_URL_USERINFO_RE` also carries `(?i)`, which taints the lookbehind's `[A-Za-z0-9_]` the same
+# way described for `_BEARER_RE` immediately below -- its own leading content class (`[a-z]`,
+# also IGNORECASE-tainted) happens to absorb a homoglyph glued onto the scheme instead of needing
+# the boundary check to pass, so this particular pattern's boundary bug is not independently
+# observable through `redact()` today. Fixed with the same `(?<!(?-i:[A-Za-z0-9_]))` idiom as
+# `_BEARER_RE` anyway, for consistency: the "accidentally immune" property is a coincidence of this
+# pattern's shape, not something a future edit to it (or a copy of it) can rely on.
+_URL_USERINFO_RE = re.compile(r"(?i)(?<!(?-i:[A-Za-z0-9_]))([a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@")
+# `_BEARER_RE`'s CJK-adjacency fix above (`(?<![A-Za-z0-9_])` in place of `\b`) has its own,
+# narrower bug: this pattern also carries `(?i)`, and IGNORECASE applies to *every* character
+# class in the compiled pattern, including the lookbehind's -- not just the literal "Bearer" text
+# it was meant for. Four specific non-ASCII code points case-fold to an ASCII letter under
+# Python's default (Unicode) IGNORECASE table: U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE, U+0131
+# LATIN SMALL LETTER DOTLESS I, U+017F LATIN SMALL LETTER LONG S, and U+212A KELVIN SIGN (confirmed
+# empirically against all of Python's IGNORECASE-tainted classes, not assumed). So `[A-Za-z0-9_]`
+# under `(?i)` also matches those four -- a Bearer token directly preceded by one of them (no
+# separating space) still reads as "preceded by a word character", the lookbehind fails, and the
+# whole match -- and the credential -- leaks in full (independent dual review, 2026-08-20, P2-1).
+#
+# CORRECTED, 2026-08-20 (this round): the fix is to scope IGNORECASE *off* again just for the
+# lookbehind's character class -- `(?<!(?-i:[A-Za-z0-9_]))` -- which *does* work correctly in this
+# project's pinned interpreter (CPython 3.9.6). A prior round shipped a comment here claiming this
+# idiom "does not work" and that a local flag group's negation "does not reliably propagate into a
+# lookaround's compiled state" -- that claim was false. Two independent, from-scratch reviews
+# (Claude opus + Codex, no coordination) each wrote their own repro and both confirmed the idiom
+# blocks all four homoglyphs at the boundary while correctly leaving every ASCII/CJK boundary
+# decision unchanged. The likely cause of the prior round's false negative: its verification script
+# probably embedded the literal Unicode test characters (rather than constructing them via
+# `chr(0x212A)` / `\uXXXX` escapes), and at least one such embedding path can silently coerce
+# U+212A KELVIN SIGN to plain ASCII "K" before Python ever receives it -- which would make a
+# correctly-blocking lookaround look like it "still leaks" when the character actually under test
+# was never the intended one. Unconfirmed as the exact mechanism (the prior round's script no
+# longer exists to inspect), but every regex claim in this file must now be verified with explicit
+# codepoint construction (`chr(...)`/`\uXXXX`), never a pasted literal character in a shell heredoc
+# or source file, given this exact failure mode already produced one false "confirmed not to work"
+# conclusion.
+#
+# The prior round instead worked around its false conclusion by dropping this pattern's global
+# `(?i)` entirely and scoping `(?i:...)` narrowly around only the literal "Bearer" text. That
+# avoided the boundary taint, but broke something else: the token-body class
+# (`[A-Za-z0-9._~+/=-]{8,}`) also loses IGNORECASE's incidental taint-match of the four homoglyphs
+# once the global flag is gone, so a real token whose value happens to *contain* one of them at a
+# position where fewer than 8 ASCII characters precede it fails the `{8,}` quantifier entirely and
+# the whole match -- keyword, separator, and value -- silently fails to start, leaking the
+# credential completely unredacted (found independently this round; see the regression test below).
+# Restoring the global `(?i)` and scoping only the boundary lookaround closes the original P2-1 leak
+# without reintroducing this one: the token-body class regains its (harmless, superset-only) taint
+# match, and the lookaround's `(?-i:...)` keeps the boundary check itself ASCII-literal.
+_BEARER_RE = re.compile(r"(?i)(?<!(?-i:[A-Za-z0-9_]))(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
 _TOKEN_RE = re.compile(
-    r"\b(?:sk-(?:proj-)?|gh[opusr]_|github_pat_|xox[baprs]-|AKIA|ASIA)[A-Za-z0-9_-]{8,}\b"
+    r"(?<![A-Za-z0-9_])(?:sk-(?:proj-)?|gh[opusr]_|github_pat_|xox[baprs]-|AKIA|ASIA)"
+    r"[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_])"
 )
 # A JWT (header.payload.signature) has no recognizable fixed prefix the way
 # sk-/ghp_/AKIA-style tokens do, so it needs its own shape-based pattern
@@ -861,7 +1017,11 @@ _TOKEN_RE = re.compile(
 # vaguely token-shaped. Previously nothing caught a standalone JWT with no
 # "Bearer " prefix and no recognized key=/key: context (independent
 # finding, 2026-08-17, via a dedicated full-audit Workflow, confirmed_real).
-_JWT_RE = re.compile(r"\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
+# `\b` on both ends has the same CJK-adjacency gap as `_URL_USERINFO_RE`/`_BEARER_RE`/`_TOKEN_RE`
+# above -- fixed the same way, with explicit ASCII-only boundary lookarounds.
+_JWT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?![A-Za-z0-9_])"
+)
 # Matches a credential-shaped identifier immediately before a ':'/'=' and
 # redacts only the following value, preserving JSON/YAML-style quoting.
 #
@@ -895,15 +1055,86 @@ _JWT_RE = re.compile(r"\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]
 # recognized key's value inside a query string or curl command doesn't
 # swallow the following '&key=value' pairs into the redacted span and
 # delete them (independent finding, same audit, P2).
+# Dogfood scan finding (2026-08-20): `password`/`secret`/`token` are matched
+# generically (any prefix/suffix compound works, e.g. `access_token`,
+# `AWS_SECRET_ACCESS_KEY`), but `key` was only ever recognized as part of
+# two specifically-named compounds, `api_key`/`private_key` -- a real
+# service-prefixed key variable (`soga_key=<...>`) that isn't one of those
+# two names isn't `password`/`secret`/`token` either, so it matched no
+# alternative at all and leaked completely unredacted. Added a generic
+# `<word>_key`/`<word>-key` alternative so any underscore/hyphen-joined
+# `*_key` compound redacts the same way `*_token`/`*_secret` already do.
+# Deliberately requires a `_`/`-` immediately before "key" rather than
+# matching "key" as a bare substring: "turkey", "monkey", "hockey" etc. all
+# contain the letters "key" with no separator and must NOT redact ordinary
+# prose/identifiers that merely happen to end in those letters. (Known,
+# accepted tradeoff, same as the existing `secret`/`token` alternatives:
+# non-secret compounds that happen to be separator-joined and end in `key`
+# -- e.g. a database `primary_key=`/`sort_key=` field -- redact too. This
+# mirrors the file's existing bias toward not missing a real secret over
+# avoiding occasional collateral redaction of a non-secret value.)
+#
+# Exhaustive-audit finding (independent dual review, 2026-08-20, following on P2-1 above): this
+# pattern has the identical `(?i)` + ASCII-lookbehind combination as `_BEARER_RE`, and was not one
+# of the patterns that review named -- found only by auditing every compiled pattern in this file,
+# not just the ones already flagged. Confirmed empirically: a keyword directly preceded (no
+# separator) by U+0130, U+0131, U+017F, or U+212A -- the same four IGNORECASE-tainted homoglyphs --
+# fails the lookbehind and leaks the value in full, e.g. "İpassword=hunter2value" never redacts.
+# Fixed the same way as `_BEARER_RE` -- see that pattern's comment above for the corrected idiom
+# (`(?<!(?-i:[A-Za-z0-9]))`, global `(?i)` restored) and why the interim "drop global `(?i)`, scope
+# `(?i:...)` around just the keyword" fix was wrong: dropping the global flag here caused the
+# identical regression as `_BEARER_RE` -- a keyword-suffix segment containing one of the four
+# homoglyphs (e.g. `password_b<DOTLESS_I>lg<DOTLESS_I>=...`) lost the class's incidental taint-match, so
+# `(?:[_-][A-Za-z0-9]+)*` could not consume it, the mandatory separator never lined up next, and the
+# whole assignment -- keyword and value both -- silently failed to match at all.
+# Dogfood dual-review finding (independent Claude opus + Codex, 2026-08-22, round 2, item 8):
+# a Chinese-IME user typing an ASCII config label routinely follows it with a full-width colon
+# or equals sign ("："/"＝") instead of the half-width ASCII forms this pattern originally
+# recognized -- e.g. "password：hunter2value" (label ASCII, separator full-width) leaked in
+# full even though the equivalent half-width "password: hunter2value" already redacted
+# correctly. Adding U+FF1A/U+FF1D to the separator class is a one-character-class widening
+# that doesn't touch the lookbehind/IGNORECASE machinery above at all -- verified empirically
+# that every previously-matching half-width case still matches identically.
+#
+# Round-4 dual-review finding (independent Claude opus + Codex, 2026-08-22, retry round, item 9):
+# `_QUERY_SECRET_RE` below already treats "signature" and bare "key" as sensitive
+# (`[?&](?:...|key|...|signature|...)=`), but this pattern's own keyword list omitted both, so
+# a standalone config-style line -- "signature: <value>", "key：<value>" -- leaked completely
+# even though the equivalent query-string form already redacted. Added both words here (and, to
+# keep the "reused verbatim" invariant this pattern's own comment states, to
+# `_ASCII_SECRET_KEYWORD_CORE` below too) so the same label is recognized in every shape this
+# file handles, not just query strings. A bare "key" carries the same accepted collateral-redaction
+# tradeoff already documented below for the generic `*_key` compound alternative (a non-secret
+# `key: value` mapping entry redacts too) -- consistent with this file's stated bias toward not
+# missing a real secret over avoiding occasional over-redaction of a non-secret value.
+#
+# Referenced by the value class immediately below (round-5 fix, see that comment) before the CJK
+# value classes further down the file also need it -- defined once, here, rather than twice.
+_REDACTED_PLACEHOLDER_PATTERN = r"\[REDACTED[A-Z_]*\]"
+# Round-5 dual-review finding (independent Claude opus + Codex, 2026-08-22, retry round, item 11):
+# the value class excluded '['/']'/'{'/'}' as part of the original structural-JSON/array
+# exclusion set (see the P2 comment above) -- but unlike the JSON/array delimiters that exclusion
+# was actually meant to protect (a value sitting inside a `[...]`/`{...}` literal it must not
+# swallow past), a real secret that merely *contains* one of those four characters (a generated
+# password with a bracket in it, e.g. `password=Aa7[BB8N`) matched only up to the bracket and left
+# the remainder exposed right next to a "[REDACTED]" marker that made the output look fully
+# handled -- the identical failure mode already fixed for the CJK value classes in rounds 3/4 (see
+# `_CJK_VALUE_CHAR_CLASS_INLINE`/`_CJK_VALUE_CHAR_CLASS_TABLE`'s own comment). Fixed the same way:
+# '['/']'/'{'/'}' are now ordinary value characters, and the value's repeated-character group is
+# individually gated by the same tempered-greedy-token guard against this file's own
+# `[REDACTED...]` placeholder shape, so `redact(redact(x)) == redact(x)` continues to hold and a
+# real bracket-bearing secret can never grow an extra `[[REDACTED]]` wrapper. ','/';'/'"'/'&' stay
+# excluded -- those four are the ones the P2 comment above actually depends on (JSON/array
+# delimiters and the query-string '&key=value' boundary), and are unaffected by this change.
 _ASSIGNMENT_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9])"
+    r"(?i)(?<!(?-i:[A-Za-z0-9]))"
     r"(?P<keyword_run>(?:[A-Za-z][A-Za-z0-9]*[_-])*"
-    r"(?:password|passwd|pwd|secret|token|api[_-]?key|private[_-]?key)"
+    r"(?:password|passwd|pwd|secret|token|signature|key|api[_-]?key|private[_-]?key|[A-Za-z0-9]+[_-]key)"
     r"(?:[_-][A-Za-z0-9]+)*)"
     r'(?P<preq>"?)'
-    r"(?P<sep>\s*[:=]\s*)"
+    r"(?P<sep>\s*[:：=＝]\s*)"
     r'(?P<preval>"?)'
-    r'(?P<value>[^\s,;\]\[}\{"&]{3,})'
+    r'(?P<value>(?:(?!' + _REDACTED_PLACEHOLDER_PATTERN + r')[^\s,;"&]){3,})'
     r'(?P<postval>"?)'
 )
 
@@ -913,6 +1144,577 @@ def _redact_assignment(match: re.Match[str]) -> str:
         f"{match.group('keyword_run')}{match.group('preq')}{match.group('sep')}"
         f"{match.group('preval')}[REDACTED]{match.group('postval')}"
     )
+
+
+# Dogfood dual-review finding (independent Claude opus + Codex, 2026-08-22, same 130-item
+# real-world sample, both agreeing on which items): `_ASSIGNMENT_RE` above anchors on ASCII
+# assignment syntax only -- an ASCII '='/half-width ':' immediately followed by the value -- and
+# its whole keyword vocabulary (password/secret/token/*-key) is ASCII-only, so it never even
+# reaches the separator check for a Chinese-labeled secret. Three real shapes this missed
+# (synthetic secret-shaped values built for this fix, never the real ones the review found, which
+# are already known to the user and are not reproduced here):
+#   (a) a full-width Chinese colon "：" used as a label separator inside flowing prose, e.g.
+#       "密码：Xk9$mQ2vR8pL" with no whitespace, embedded mid-sentence -- not a
+#       standalone config line;
+#   (b) a markdown two-cell table row, label and value in separate pipe-delimited cells, e.g.
+#       "| 员工登录密码 | Xy9!aBcDeF12 |" -- never joined by "="/":" on
+#       that visual "line" the way `_ASSIGNMENT_RE` expects;
+#   (c) an inline prose mention, sometimes with a half-width colon and sometimes with none, e.g.
+#       "root密码是Xk9$mQ2vR8pL" or "密码 Xk9$mQ2vR8pL 就是这个".
+#
+# Handled as dedicated patterns/helpers below rather than widening `_ASSIGNMENT_RE` itself:
+# `_ASSIGNMENT_RE` has been through 18 rounds of adversarial review and every change to it risks
+# reopening one of those findings, while these CJK shapes share nothing structural with it (forms
+# (b)/(c) have no "="/":" at all) -- a clean, separate set of patterns is both simpler and
+# lower-risk than bolting a fourth separator shape and a second keyword vocabulary onto an already
+# dense, heavily-scrutinized pattern.
+#
+# None of the patterns below need the file's `(?<!(?-i:[A-Za-z0-9_]))` CJK-safe-boundary idiom or
+# an `(?i)` flag: all anchor on literal CJK keywords, and a CJK codepoint has no ASCII case fold,
+# so there is no IGNORECASE-taint surface to guard against in the first place. CJK adjacency on the
+# *keyword's* own leading edge is also deliberately left unguarded -- unlike an ASCII keyword glued
+# into a longer identifier (the reason `_ASSIGNMENT_RE` excludes an immediately-preceding
+# ASCII/digit), "root密码" unambiguously means "root's password"; there is no equivalent
+# CJK+CJK compounding risk. Verified empirically each round: `.flags` on every compiled pattern
+# below is exactly `re.UNICODE` (32, no `re.IGNORECASE` bit set), and none of their pattern
+# strings contain a bare `\b`.
+#
+# Round-2 dual-review findings (independent Claude opus + Codex, 2026-08-22, on the round-1
+# attempt above): every item below was found against the *previous* version of this block and is
+# fixed in the patterns/helpers that follow.
+#   1. P1 narrowing regression: the round-1 patterns ran in `redact()` *before* `_IPV4_RE`/
+#      `_IPV6_CANDIDATE_RE`/`_MAC_ADDRESS_RE`/`_EMAIL_RE`/`_LONG_BLOB_RE`. Their value class
+#      excluded ':', so a keyword glued directly (no separator) to a longer run that was itself a
+#      MAC/IPv6 address truncated the ASCII prefix off that run and left the remaining
+#      ":"-joined tail too short to satisfy the network pattern's own shape -- e.g.
+#      `redact('令牌hO9il6bkYaa:bb:cc:dd:ee:ff')` went from fully-redacted
+#      ('令牌hO9il6bkY[REDACTED_IP]') to a 5-of-6-octet leak
+#      ('令牌[REDACTED]:bb:cc:dd:ee:ff'). Fixed by moving every CJK-secret pass in `redact()` to
+#      run *last*, after all the network/email/blob/assignment/query patterns: those patterns get
+#      first crack at any ASCII run, and the CJK patterns can then only add further redaction on
+#      top of what is left (their value class stops at '['/']' the way it already stopped at
+#      other punctuation), never remove or shrink an existing match. Confirmed empirically: with
+#      the new ordering, the repro above now produces
+#      '令牌[REDACTED][REDACTED_IP]' -- both halves redacted, neither exposed.
+#   2. P1 false positives on real mixed CJK/ASCII prose: the round-1 connector's whitespace was
+#      plain `\s*` (crosses `\n`) and fully optional, so "<keyword> ... <any ASCII word>" matched
+#      across headings, blank lines, and ordinary same-line English technical words with no
+#      separator at all ("密码 bcrypt 加盐存储更安全", "| 密码策略 | bcrypt |", etc. all
+#      misfired). Fixed two ways: the connector's whitespace is now `[^\S\n]*` (never crosses a
+#      newline), and every value pattern below requires the matched span to contain at least one
+#      character that couldn't just be prose -- specifically, whenever no explicit separator
+#      token (a colon/equals or a connector word) was present, the value must contain an ASCII
+#      digit (see `_CJK_SECRET_VALUE_STRICT` below); a real password/token/device code almost
+#      always has one, an ordinary dictionary word almost never does.
+#   3. P2 leak: the round-1 connector accepted at most one token, so "是："/"为:"/"就是＝"-style
+#      combinations (a connector word immediately followed by a colon/equals) matched nothing at
+#      all, and common verb-phrase connectors ("设置为"/"改为"/"改成"/"更新为") weren't
+#      recognized either. Fixed by widening the connector's separator-token alternation (see
+#      `_CJK_CONNECTOR_SEP_TOK` below) and adding the full-width equals sign "＝" (U+FF1D)
+#      alongside the already-handled full-width colon.
+#   4. P2 leak: the round-1 value class required the first character to be alnum, so a
+#      backtick/quote-fenced value (`` `secret` ``, `"secret"`, full-width "secret", `**secret**`)
+#      or a value that legitimately starts with a symbol (a strong-password policy's leading "!")
+#      never matched, and the minimum length (6) was too high for a short PIN/OTP. Fixed by
+#      allowing an optional leading/trailing wrapper (`_CJK_VALUE_WRAP` below, consumed into the
+#      redacted span so the fence characters don't survive alongside a still-visible value) and
+#      letting the value body itself lead with any of its own allowed symbol characters, and by
+#      lowering the minimum length to 4.
+#   5 & 6. P2 leaks in the table shapes: (5) a real credentials table commonly puts the label in a
+#      *header* row and the value in a *separate data row, same column* (e.g. an admin/staff
+#      pair), which no single-row regex can see; (6) even the single-row "| label | value |" shape
+#      leaked whenever the value cell had a trailing note, had no closing pipe (valid GFM), or the
+#      row held more than one label/value pair (the shared '|' was consumed as the first match's
+#      trailing boundary and so wasn't available to start the second). Fixed by adding a dedicated
+#      column-tracking pass, `_redact_cjk_secret_table_columns` below, for the header/data-row
+#      shape, and by dropping `_TABLE_CJK_SECRET_RE`'s old trailing-pipe requirement entirely for
+#      the single-row shape -- the value's own character class already stops at the next '|'/CJK
+#      character on its own, so nothing needs to consume that boundary, which also frees the
+#      shared '|' for a second match to start on.
+#   7. P2 leak: the keyword vocabulary omitted 验证码 (the label the review's own "OAuth-style
+#      device code" dogfood item most directly uses) along with several other common
+#      password/key/code synonyms and their Traditional-Chinese forms. Vocabulary widened in
+#      `_CJK_SECRET_KEYWORD` below.
+_CJK_SECRET_KEYWORD = (
+    r"(?:密码|密碼|口令|密钥|密鑰|金鑰|秘钥|私钥|令牌|授权码|授權碼|验证码|驗證碼|"
+    r"凭证|憑證|凭据|憑據|激活码|激活碼|邀请码|邀請碼|动态码|動態碼|设备码|設備碼|"
+    r"用户码|用戶碼|助记词|助記詞|恢复码|恢復碼|备份码|備份碼|签名|簽名|(?i:pin)码)"
+)
+_CJK_SECRET_KEYWORD_RE = re.compile(_CJK_SECRET_KEYWORD)
+
+# Round-3 dual-review finding (independent Claude opus + Codex, 2026-08-22, retry round, item 6):
+# the vocabulary above omitted several other common Chinese secret labels seen in real
+# transcripts -- 助记词/恢复码/备份码 (seed-phrase/recovery/backup codes), 签名 (signature), and
+# PIN码 -- all now added (simplified + traditional forms, plus a locally-scoped case-insensitive
+# "pin" for the mixed-script "PIN码"/"pin码"/"Pin码" -- `(?i:...)` is a *scoped* inline flag, so
+# unlike a bare `(?i)` it cannot taint any lookaround elsewhere in a combined pattern; nothing here
+# needs that idiom's workaround because nothing here mixes a global IGNORECASE flag with an
+# unscoped ASCII lookaround in the first place).
+#
+# Round-3 finding (items 2, 5(3), 5(4), 13): every table-context matcher below previously searched
+# for the keyword as a bare substring anywhere in a cell, with no check on what followed it. That
+# let a *compound* CJK word that merely contains the keyword as a prefix -- "密码学"
+# ("cryptography"), "密码策略" ("password policy"), "令牌有效期" ("token validity period") -- be
+# treated as a real secret-column header exactly like a genuine label ("密码", "员工登录密码").
+# Two consequences: (a) a digit-bearing but non-secret value in that column (a policy name, a
+# duration in seconds) leaked, since the digit-guard alone doesn't know the column is about
+# metadata rather than a value; (b) naively switching the table value class to the permissive,
+# digit-not-required class (needed to catch a real digitless password -- see the value-class
+# comment below) would have made that *worse*, over-redacting the pinned
+# `test_cjk_secret_redaction_does_not_flag_english_words_after_keyword` case
+# (`"| 密码策略 | bcrypt |"`) instead of just leaking a duration.
+# Fixed with a single structural rule, applied only to the table matchers: a CJK-labeled cell only
+# counts as a genuine standalone secret label when the keyword is not immediately followed by
+# another CJK ideograph within the same cell -- every real label in this file's own test suite
+# puts the keyword at the *end* of the cell ("员工登录密码", "root密码", bare "密码"), while every
+# false-positive compound above continues straight into more CJK content right after it. This is
+# deliberately NOT applied to the inline-prose pattern below: that pattern's own connector
+# alternation ("是"/"为"/"就是"/...) is itself CJK content immediately following the keyword, so a
+# "no CJK right after the keyword" rule would break real inline matches there. Inline prose keeps
+# its existing, unrelated protection (the digit-guard on a bare-whitespace mention, an explicit
+# separator token otherwise) unchanged from round 2.
+# Round-5 dual-review finding (independent Claude opus + Codex, 2026-08-22, retry round, item 12):
+# the "not immediately followed by another CJK ideograph" rule above only guards against a
+# CJK-continuing compound ("密码策略") -- it says nothing about an ASCII-continuing one. A cell
+# reading "密码policy" (a CJK label glued to an English qualifier, e.g. a bilingual documentation
+# table's "password-policy" column written half in Chinese) still counted as a genuine standalone
+# label, since "p" is not a CJK ideograph either. Widened the negative lookahead to also reject an
+# immediately-following ASCII letter/digit/underscore/hyphen -- the identical compounding signal
+# the ASCII sibling below already needs for its own analogous gap.
+_CJK_IDEOGRAPH_CLASS = r"[㐀-䶿一-鿿]"
+_CJK_SECRET_KEYWORD_STANDALONE = (
+    _CJK_SECRET_KEYWORD + r"(?!" + _CJK_IDEOGRAPH_CLASS + r"|[A-Za-z0-9_-])"
+)
+
+# Round-3 finding (item 12): `_ASSIGNMENT_RE`'s ASCII keyword vocabulary
+# (password/passwd/pwd/secret/token/*_key) has the identical table-cell and inline-"is"-prose gap
+# the CJK vocabulary had before this round -- `redact("| password | <value> |")` and
+# `redact("root password is <value>")` both leaked completely, because every CJK-secret pattern in
+# this block only ever recognized CJK keywords, and `_ASSIGNMENT_RE` only ever recognizes an
+# explicit "="/":" separator, not a table cell or an "is"-joined sentence. The keyword alternation
+# below is reused verbatim from `_ASSIGNMENT_RE`'s own core (not re-invented), so the two
+# vocabularies cannot drift apart. Its boundary lookarounds use plain, explicitly two-case
+# `[A-Za-z0-9]` classes rather than a global `(?i)` flag -- so, unlike `_ASSIGNMENT_RE`/
+# `_BEARER_RE`/`_EMAIL_RE` above, there is no IGNORECASE-taint surface here to guard against in the
+# first place: only the scoped `(?i:...)` group around the keyword alternatives themselves needs
+# case-folding, and a scoped flag group never leaks out to affect a lookaround outside it.
+# Round-4 finding (item 9): kept textually identical to `_ASSIGNMENT_RE`'s own keyword
+# alternation (see that pattern's comment) -- "signature" and bare "key" added there too, same
+# round, same reason.
+# Round-5 dual-review finding (independent Claude opus + Codex, 2026-08-22, retry round, item 12):
+# the trailing lookahead only rejected an immediately-following alnum character, not `_`/`-`, so a
+# compound identifier the keyword vocabulary itself has no alternative for -- "password_policy",
+# "api_key_format" -- still matched up through the bare "password"/"api_key" alternative and passed
+# the standalone check (the next character, '_', is not `[A-Za-z0-9]`), arming an entire markdown
+# documentation-table column that was never a secret column at all: `redact('| password_policy |
+# min-12-chars |')` redacted the whole "min-12-chars" cell. Widened to also reject `_`/`-`, the
+# same compounding signal already used to *extend* a match onto real named compounds elsewhere in
+# this file (`_ASSIGNMENT_RE`'s own `(?:[_-][A-Za-z0-9]+)*` suffix, the generic `[A-Za-z0-9]+[_-]key`
+# alternative) -- here used in the opposite direction, to refuse to treat a partial match as
+# standalone when more of the same compound continues right after it. A real bare keyword (no
+# compounding at all -- "key", "signature", "password" followed by whitespace/punctuation/end of
+# cell) is completely unaffected: the character immediately after it is never alnum/`_`/`-` in that
+# case, so the existing `test_ascii_secret_vocabulary_now_recognizes_signature_and_bare_key` cases
+# keep matching exactly as before.
+_ASCII_SECRET_KEYWORD_CORE = (
+    r"(?:password|passwd|pwd|secret|token|signature|key|api[_-]?key|private[_-]?key|[A-Za-z0-9]+[_-]key)"
+)
+_ASCII_SECRET_KEYWORD_STANDALONE = (
+    r"(?<![A-Za-z0-9])(?i:" + _ASCII_SECRET_KEYWORD_CORE + r")(?![A-Za-z0-9_-])"
+)
+_SECRET_LABEL_KEYWORD = (
+    r"(?:" + _CJK_SECRET_KEYWORD_STANDALONE + r"|" + _ASCII_SECRET_KEYWORD_STANDALONE + r")"
+)
+_SECRET_LABEL_KEYWORD_RE = re.compile(_SECRET_LABEL_KEYWORD)
+
+# The shape shared by every CJK-secret value below. `_CJK_VALUE_WRAP` is an optional
+# backtick/quote/bold-marker fence that may sit on either side of the value and is consumed into
+# the redacted span (item 4 above). The "*_PERMISSIVE*" flavors are used wherever the surrounding
+# context is already a strong signal that a labeled value follows (an explicit separator token, or
+# a table cell structurally paired with a keyword cell/column) -- they only additionally require
+# *some* alnum character in the body, so a pure-punctuation placeholder like "----" or "****"
+# still doesn't match. The "*_STRICT*" flavor is used wherever that structural signal is absent (a
+# bare "<keyword> <whitespace> <value>" mention with no separator at all) and additionally
+# requires an ASCII digit somewhere in the body (item 2 above).
+# Round-3 finding (items 1 & 10): the value body below was a hand-picked whitelist missing 17
+# ASCII punctuation characters real password generators routinely emit -- parens, brackets,
+# braces, pipe, semicolon, colon, comma, angle brackets, '?', backslash, quotes, backtick. E.g.
+# `redact('密码：Qz7(tW4mNe1R')` returned the input completely unchanged -- a full plaintext leak
+# -- while the *identical* secret under an ASCII label already redacted correctly through
+# `_ASSIGNMENT_RE`'s much more permissive blocklist-style value class
+# (`[^\s,;\]\[}\{"&]{3,}`). 14 of those 17 were added that round; '|', '[', ']' stayed excluded.
+#
+# Round-4 dual-review finding (independent Claude opus + Codex, 2026-08-22, retry round, items
+# 1/2/8/12): that exclusion traded one bug for a worse pair of them.
+#   - [P1, items 2 & 8] A real secret containing '['/']'/'|' now matched only up to that
+#     character and the rest leaked in the clear right next to a "[REDACTED]" marker that made
+#     the output *look* fully handled -- e.g. `redact('密码：Tq49]zW7pNe2Vs')` produced
+#     `'密码：[REDACTED]]zW7pNe2Vs'`, 9 of 14 characters still exposed. Below the {4,} floor
+#     (fewer than 4 chars before the excluded character) nothing redacted at all.
+#   - [Blocking, items 1 & 12] Conversely, excluding '['/']' from the body was the *reason* the
+#     per-cell scan in `_redact_cjk_secret_table_columns` could re-match its own prior output:
+#     "REDACTED"/"REDACTED_IP" is itself a run of allowed body characters (letters + '_'), so an
+#     unanchored `.sub()` over an already-redacted cell matched that bare word *inside* the
+#     brackets (skipping the literal '[' entirely) and wrapped it again --
+#     `'[REDACTED]'` -> `'[[REDACTED]]'`, growing by one bracket pair every further `redact()`
+#     call, and downgrading a typed `'[REDACTED_IP]'` to the generic `'[[REDACTED]]'` in the
+#     process. This falsified `write_candidate_capture.py`'s explicit assumption that redacting an
+#     already-redacted sample again is a no-op (it reloads and re-redacts stored samples on every
+#     checkpoint cycle).
+#
+# Fixed together, in two parts:
+#   1. '[' and ']' are now part of the value body (so a real bracket-bearing secret redacts in
+#      full, closing items 2/8) -- but every character is individually gated by a negative
+#      lookahead for this file's own placeholder shape (`_REDACTED_PLACEHOLDER_PATTERN`): the
+#      "tempered greedy token" idiom `(?:(?!PLACEHOLDER)CHARCLASS)`, which matches one character
+#      at a time and re-checks the guard at every position. A run of body characters simply stops
+#      right before it would start consuming an actual `[REDACTED...]` marker, instead of
+#      partially matching into or through it. Since every value's position in
+#      `_TABLE_CJK_SECRET_RE`/`_INLINE_CJK_SECRET_RE`/`_INLINE_ASCII_SECRET_RE` is fixed
+#      immediately after the keyword/label match (not an independent unanchored scan), this alone
+#      is sufficient there: if the value would have to start exactly on a real placeholder, the
+#      guard makes it fail to match at all (0 repetitions never reaches the `{4,}` floor), so the
+#      whole surrounding pattern correctly doesn't match and the placeholder is left untouched --
+#      it can never be *re-wrapped*, because these three patterns' redaction callables always
+#      just append the literal `"[REDACTED]"` string, so any match on top of a placeholder would
+#      itself be a downgrade regardless of what the value text was.
+#   2. The column-scan helper's per-cell substitution is different: its `.sub()` call has no
+#      preceding keyword to fix the value's start position, so it scans *every* position in the
+#      cell -- including one that starts partway *inside* an existing placeholder (right after its
+#      '['), where guard 1 above does not apply (the guard only blocks starting to match text that
+#      itself looks like the start of a placeholder, not matching a substring that merely sits
+#      inside one). That call site instead uses an explicit `PLACEHOLDER|VALUE` alternation
+#      (`_CJK_TABLE_CELL_VALUE_OR_PLACEHOLDER_RE` below) with a callable that passes a placeholder
+#      match through unchanged: at a real placeholder's '[', the placeholder alternative is tried
+#      first and consumes the *whole* bracketed span in one match, so `.sub()`'s left-to-right,
+#      non-overlapping scan can never land a later match starting mid-placeholder. Verified
+#      empirically: `redact(redact(x)) == redact(x)` now holds for every table-shaped repro above,
+#      including a table cell that legitimately contains a typed placeholder from an earlier pass
+#      in the *same* `redact()` call (e.g. an IPv6 address inside a column already marked secret).
+#
+# '|' stays excluded, but now only where a value must still stop at a cell boundary: the table
+# flavor below (`_CJK_VALUE_CHAR_CLASS_TABLE`, used by `_TABLE_CJK_SECRET_RE` and the column-scan
+# helper) keeps excluding '|' as a hard stop, so a value still can't bleed across a markdown table
+# cell or swallow a second label/value pair sharing one row (see
+# `test_cjk_secret_redaction_handles_same_row_table_shape_gaps`). The inline flavor
+# (`_CJK_VALUE_CHAR_CLASS_INLINE`, used by `_INLINE_CJK_SECRET_RE`/`_INLINE_ASCII_SECRET_RE`) has
+# no such cell boundary to protect, so '|' is now an ordinary allowed value character there too --
+# a pipe inside a real inline-prose password is plausible and was previously truncating it the
+# same way brackets were.
+# (`_REDACTED_PLACEHOLDER_PATTERN` itself is defined once, above `_ASSIGNMENT_RE`, and reused here
+# -- see that definition's own comment.)
+#
+# Round-5 dual-review finding (independent Claude opus + Codex, 2026-08-22, retry round, item 8):
+# the value body below is a positive ASCII-only whitelist, so a secret containing one of the four
+# IGNORECASE-tainted homoglyphs this file's own boundary lookarounds already have to guard against
+# elsewhere (U+0130/U+0131/U+017F/U+212A -- see `_BEARER_RE`/`_ASSIGNMENT_RE`/`_EMAIL_RE`'s
+# comments) matched only up to that character and left the remainder completely unredacted below
+# the `{4,}` floor -- e.g. `redact('密码：Qw7İzP2mLv8Ke')` returned the input unchanged, while
+# the byte-identical secret under `_ASSIGNMENT_RE`'s ASCII "=" path (a blacklist, not a whitelist)
+# already redacted it in full. Rather than broadening the value class to arbitrary Unicode letters
+# (which would reopen the CJK-adjacency boundary this class is deliberately narrow to protect --
+# see `test_cjk_secret_redaction_does_not_flag_english_words_after_keyword` and the trailing-prose
+# tests above), the same four specific homoglyphs this file already treats as a named, closed set
+# are added to the whitelist explicitly.
+_CJK_VALUE_HOMOGLYPH_CHARS = "İıſK"
+_CJK_VALUE_NEW_PUNCT_CHARS = ("(", ")", "{", "}", ";", ":", ",", "<", ">", "?", "\\", "'", '"', "`")
+_CJK_VALUE_CHARS_COMMON = (
+    r"A-Za-z0-9~!@#$%^&*+/=_."
+    + "".join(re.escape(_c) for _c in _CJK_VALUE_NEW_PUNCT_CHARS)
+    + re.escape(_CJK_VALUE_HOMOGLYPH_CHARS)
+    + r"\-"
+)
+_CJK_VALUE_CHAR_CLASS_INLINE = "[" + _CJK_VALUE_CHARS_COMMON + r"\[\]|" + "]"
+_CJK_VALUE_CHAR_CLASS_TABLE = "[" + _CJK_VALUE_CHARS_COMMON + r"\[\]" + "]"
+_CJK_VALUE_BODY_INLINE = rf"(?:(?!{_REDACTED_PLACEHOLDER_PATTERN}){_CJK_VALUE_CHAR_CLASS_INLINE})"
+# Round-5 dual-review finding (independent Claude opus + Codex, 2026-08-22, retry round, item 9):
+# a real markdown table cell can legitimately contain a backslash-escaped pipe (`\|`, CommonMark's
+# way of putting a literal '|' inside a cell without it reading as a delimiter) -- but the table
+# value class (unlike the cell splitter, which is a separate, simpler line-oriented pass) excludes
+# '|' unconditionally, so it read the escaped pipe's own '|' as a hard stop and left the rest of
+# the value exposed, e.g. `redact('| 密码 | Qx9\\|Lm2N7 |')` produced
+# `'| 密码 | [REDACTED]|Lm2N7 |'` -- 6 of 10 characters still in the clear. Fixed by recognizing a
+# literal `\|` as one atomic two-character value token (tried before the ordinary single-character
+# class, same tempered-token style as the placeholder guard) so the value run continues straight
+# through it instead of stopping; an *unescaped* '|' still isn't in the single-character class and
+# still stops the value exactly as before -- this only teaches the matcher to treat the escaped
+# form as literal value content, not to treat every '|' as one. Scoped to
+# `_TABLE_CJK_SECRET_RE` (the single-line, same-row pattern that owns this exact repro); the
+# header/data-row column-scan's own cell boundaries come from `_split_table_row_cells`'s separate,
+# still-escape-unaware `line.split('|')` pass, which this value-class change does not reach --
+# left as a known, narrower, documented residual gap rather than fixed here, because making the
+# cell splitter itself escape-aware is a structurally different change (touching every caller of
+# `_split_table_row_cells`/`_replace_table_cell`, not just a value's character class) with its own,
+# separate risk of reopening the column-tracking findings above.
+_CJK_VALUE_BODY_TABLE = (
+    rf"(?:\\\||(?:(?!{_REDACTED_PLACEHOLDER_PATTERN}){_CJK_VALUE_CHAR_CLASS_TABLE}))"
+)
+_CJK_VALUE_WRAP = r"(?:\*\*|[`\"'‘’“”])"
+
+
+def _cjk_value_pattern(body: str, *, require_digit: bool) -> str:
+    guard = "[0-9]" if require_digit else "[A-Za-z0-9]"
+    return rf"{_CJK_VALUE_WRAP}?(?=(?:{body})*{guard}){body}{{4,}}{_CJK_VALUE_WRAP}?"
+
+
+_CJK_SECRET_VALUE_PERMISSIVE_INLINE = _cjk_value_pattern(_CJK_VALUE_BODY_INLINE, require_digit=False)
+_CJK_SECRET_VALUE_STRICT_INLINE = _cjk_value_pattern(_CJK_VALUE_BODY_INLINE, require_digit=True)
+_CJK_SECRET_VALUE_PERMISSIVE_TABLE = _cjk_value_pattern(_CJK_VALUE_BODY_TABLE, require_digit=False)
+_CJK_SECRET_VALUE_PERMISSIVE_TABLE_RE = re.compile(_CJK_SECRET_VALUE_PERMISSIVE_TABLE)
+# Placeholder-first alternation for the column-scan helper's unanchored per-cell scan (part 2 of
+# the fix above) -- tried in this order so a real `[REDACTED...]` marker is always matched (and
+# passed through) as one whole token before the generic value alternative gets a chance to start
+# partway inside it.
+_CJK_TABLE_CELL_VALUE_OR_PLACEHOLDER_RE = re.compile(
+    _REDACTED_PLACEHOLDER_PATTERN + r"|" + _CJK_SECRET_VALUE_PERMISSIVE_TABLE
+)
+
+
+def _redact_table_cell_value_or_placeholder(match: re.Match[str]) -> str:
+    token = match.group(0)
+    return token if token.startswith("[") else "[REDACTED]"
+
+# "就是" ("is precisely") must precede "是" ("is") in this alternation: both are valid
+# connectors and "就是" contains "是" as its second character, so trying the shorter
+# alternative first would consume only "是" out of "就是", leave the leading "就"
+# unconsumed, and fail the match entirely (the value's leading-char class cannot start on "就").
+# Each word alternative may optionally be followed by a colon/equals (item 3 above: "是："/
+# "为:"/"就是＝" etc. are all common combinations no single earlier alternative covered), and a
+# bare colon/equals with no word at all remains its own alternative.
+# Round-5 dual-review finding (independent Claude opus + Codex, 2026-08-22, retry round, item 3):
+# "即" ("namely"/"which is") is a common connector this vocabulary omitted --
+# `redact('服务器密码，即Xk9$mQ2vR8pL')` (a label, a Chinese comma, then "即") left the value
+# completely unredacted. Added alongside the existing word alternatives; the leading Chinese comma
+# itself is handled separately, by `_CJK_CONNECTOR_LEAD_PUNCT` below.
+_CJK_CONNECTOR_SEP_TOK = (
+    r"(?:就是|设置为|更新为|改成|改为|即|是|为)(?:[^\S\n]*[:：=＝])?|[:：=＝]"
+)
+# `sep_tok` participates in the match only when one of the alternatives above actually matched --
+# there is no empty-string alternative in `_CJK_CONNECTOR_SEP_TOK`, so "participated" (what
+# Python's `(?(id)...)` conditional below checks) really does mean "an explicit separator was
+# present", which is what selects the permissive value class over the strict one.
+#
+# Round-5 finding (item 3, continued): a Chinese pause comma commonly sits between the keyword and
+# a connector word ("密码，即...", "密码、也就是...") but was not itself part of any alternative
+# above and is not whitespace, so the connector's `[^\S\n]*` groups couldn't skip past it either --
+# the whole connector failed to match at all. A single optional comma/enumeration-comma, tried
+# after the keyword and before the separator-token alternation, closes this without weakening the
+# separator-token check itself (still required exactly as before; this only skips punctuation that
+# may precede it).
+_CJK_CONNECTOR_LEAD_PUNCT = r"[,，、]?"
+# Round-5 finding (item 3, continued): a label routinely carries a bracketed qualifier before its
+# real separator -- an environment/scope note in Chinese or ASCII parens, or Chinese "【】" lozenge
+# brackets ("密码（生产）：...", "密码(prod)：...", "密码【prod】：...") -- but the connector had no
+# way to skip over it, so the value-matching attempt started right on the qualifier's own opening
+# bracket instead of the real separator/value, and (since none of the qualifier's characters are
+# CJK-value-class members and the bracket characters alone can't satisfy the `{4,}`-length floor
+# with a digit) the whole match failed silently, leaking the value completely --
+# `redact('密码（生产）：Xk9$mQ2vR8pL')` left it untouched. A single optional qualifier, matched
+# and folded into the (verbatim-preserved) `connector` group before the separator-token check, lets
+# the real separator/value be found right after it. Length-capped (24 chars) and newline-excluded
+# so it cannot run away across unrelated text if a label is simply followed by an unmatched opening
+# bracket somewhere later in the document.
+_CJK_LABEL_QUALIFIER = (
+    r"(?:\([^()\n]{0,24}\)|（[^（）\n]{0,24}）|【[^【】\n]{0,24}】)"
+)
+#
+# Round-4 dual-review finding (independent Claude opus + Codex, 2026-08-22, retry round, item 3):
+# KNOWN, ACCEPTED RESIDUAL GAP, not a regression -- the connector's whitespace class
+# (`[^\S\n]*` just below) deliberately never crosses a newline (round-2 P1 false-positive guard,
+# see that finding above), so a label alone on one line with its value on the very next line --
+# `"密码\nTq4zW7pNe2Vs"` -- still doesn't redact; this was true before this round too. Closing it
+# would mean letting the connector span a newline, which directly reopens the round-2 false
+# positive this exact guard exists to prevent (a heading followed by an unrelated paragraph, e.g.
+# `"## 密码\nbcrypt 是当前推荐的哈希算法"`, misread as a labeled value). Left as a documented
+# tradeoff rather than "fixed" -- a wrapped-line credentials paste is a real transcript shape this
+# does not catch.
+_INLINE_CJK_SECRET_RE = re.compile(
+    r"(?P<keyword>" + _CJK_SECRET_KEYWORD + r")"
+    r"(?P<connector>[^\S\n]*(?:" + _CJK_LABEL_QUALIFIER + r"[^\S\n]*)?"
+    r"" + _CJK_CONNECTOR_LEAD_PUNCT + r"[^\S\n]*(?P<sep_tok>" + _CJK_CONNECTOR_SEP_TOK + r")?[^\S\n]*)"
+    r"(?P<value>(?(sep_tok)"
+    + _CJK_SECRET_VALUE_PERMISSIVE_INLINE
+    + r"|"
+    + _CJK_SECRET_VALUE_STRICT_INLINE
+    + r"))"
+)
+# Same combined keyword vocabulary (CJK + ASCII siblings, item 12), shaped for a single markdown
+# "| label | value |" row: the label cell may contain the keyword anywhere inside it (e.g.
+# "员工登录密码"), and the very next cell must itself look like a bare secret value. No
+# trailing-pipe requirement is consumed after the value (item 6 above) -- the value's own character
+# class already can't cross a '|' or a CJK character, so nothing needs to additionally confirm the
+# cell boundary, and leaving it unconsumed is what lets a second label/value pair later in the same
+# row start its own match on the shared '|'.
+#
+# Round-3 finding (item 2): the value class here is now `_CJK_SECRET_VALUE_PERMISSIVE` (was
+# `_CJK_SECRET_VALUE_STRICT`), so a real digitless password in a table -- "Adminadmin",
+# "letmeinplease" -- redacts instead of leaking. This is safe specifically *because* the keyword
+# above is now the standalone-only alternation (`_SECRET_LABEL_KEYWORD`): a compound label like
+# "密码策略" no longer matches as a label at all (see that pattern's own comment), so the case the
+# permissive class would otherwise have over-redacted -- `"| 密码策略 | bcrypt |"` -- never reaches
+# the value check in the first place. A naive swap to permissive without that keyword fix would
+# have reopened exactly that pinned false positive.
+_TABLE_CJK_SECRET_RE = re.compile(
+    r"(?P<label_cell>\|[^|\n]*?" + _SECRET_LABEL_KEYWORD + r"[^|\n]*?\|\s*)"
+    r"(?P<value>" + _CJK_SECRET_VALUE_PERMISSIVE_TABLE + r")"
+)
+
+
+def _redact_inline_cjk_secret(match: re.Match[str]) -> str:
+    return f"{match.group('keyword')}{match.group('connector')}[REDACTED]"
+
+
+# Round-3 finding (item 12): the ASCII-keyword half of the inline-prose gap -- "root password is
+# <value>" leaked in full, since `_ASSIGNMENT_RE` only recognizes an explicit "="/":" separator and
+# every CJK-secret pattern above only recognizes a CJK keyword. Deliberately narrower than
+# `_INLINE_CJK_SECRET_RE`: only the single literal connector word "is" is recognized (no
+# bare-whitespace-only fallback), and the value is *always* `_CJK_SECRET_VALUE_STRICT` (digit
+# required) regardless of whether "is" matched. Both restrictions exist because "is" is an
+# extremely common English copula with none of "是"'s tight, low-ambiguity grammatical role in
+# this pattern's Chinese counterpart -- "the password is important/required/temporary" is ordinary
+# prose, not a leak, and a permissive class would have redacted "important"/"required" outright.
+# The digit-guard plus the {4,}-character floor on the value already shared with every other
+# CJK-secret value class keeps ordinary English sentences safe (verified empirically: none of
+# "is important", "is required", "is temporary", "is out", "is 42" match) while still catching a
+# realistic generated secret, which almost always contains a digit.
+_INLINE_ASCII_SECRET_RE = re.compile(
+    r"(?P<keyword>" + _ASCII_SECRET_KEYWORD_STANDALONE + r")"
+    r"(?P<connector>[^\S\n]+(?i:is)[^\S\n]+)"
+    r"(?P<value>" + _CJK_SECRET_VALUE_STRICT_INLINE + r")"
+)
+
+
+def _redact_inline_ascii_secret(match: re.Match[str]) -> str:
+    return f"{match.group('keyword')}{match.group('connector')}[REDACTED]"
+
+
+def _redact_table_cjk_secret(match: re.Match[str]) -> str:
+    return f"{match.group('label_cell')}[REDACTED]"
+
+
+# Item 5 above: a real credentials table commonly separates the label (header row) from the value
+# (a later data row, same column) rather than pairing them within one row -- no single-line regex
+# can see across rows, so this is a small line-based scanner instead of another compiled pattern.
+# It uses `_CJK_TABLE_CELL_VALUE_OR_PLACEHOLDER_RE` for the per-cell value check (round-3, item 2 --
+# see `_TABLE_CJK_SECRET_RE`'s comment above for why permissive is safe here; round-4, items 1/12 --
+# see the value-body comment above for why this call site specifically needs the placeholder-first
+# alternation and not just the guarded body class) and never rewrites a line it didn't find a
+# change in, so untouched rows -- including the header/separator rows themselves -- are re-emitted
+# byte-for-byte.
+#
+# Round-3 finding (item 5(5)): a line was previously considered a "table row" as soon as it
+# contained a single bare '|' anywhere -- so ordinary prose with an incidental pipe character
+# ("运行 foo | bar1234 命令") was misread as a continuing data row of whatever table preceded it in
+# the document, and a value in that unrelated line got redacted. Real table rows in every fixture
+# this file cares about -- and in the GFM convention generally -- start with '|'; requiring that
+# (after stripping surrounding whitespace) is what a plain prose line with one incidental pipe will
+# essentially never satisfy, while it costs nothing for genuine rows.
+#
+# Round-5 dual-review finding (independent Claude opus + Codex, 2026-08-22, retry round, items 1 &
+# 2): the round-3 fix above also required the stripped line to *end* with '|' -- but GFM does not
+# require a table row's trailing pipe, and a row typed or pasted without one (very common outside a
+# Markdown editor, and already the exact shape `test_cjk_secret_redaction_handles_same_row_table_shape_gaps`
+# pins as valid for the single-row pattern) was not recognized as a table row *at all* here: not
+# only did its own value never get redacted, but treating it as "not a table" reset `secret_cols`
+# to empty for every row after it, so a second, later data row in the same still-real table also
+# leaked. `redact('| 用户 | 密码 |\n|---|---|\n| root | Qw7#zP2mLv8Ke')` (no trailing pipe on the
+# last line) previously returned the password completely unredacted. The trailing-pipe requirement
+# is provably unnecessary for the one false positive it was added to prevent -- "运行 foo |
+# bar1234 命令" is already rejected by the *leading*-pipe check alone, since the line starts with
+# "运行", not "|" -- so dropping it only widens what counts as a row, never narrows the guard that
+# actually matters. Second, independent bug in the same function: `len(parts) >= 2` treated any
+# single-cell row ("| 密码 |", a bare note row inside an otherwise two-column table) as "not a
+# table" too, which (a) reset `secret_cols` the same way a genuinely non-table line does -- a
+# harmless single-cell note row sitting between two real data rows silently disarmed column
+# tracking for every row after it -- and (b) made a single-column credentials table
+# ("| 密码 |\n|---|\n| Qw7#zP2mLv8Ke |") invisible to this scanner entirely, since neither its
+# header nor its data row ever had 2+ cells. Relaxed to `len(parts) >= 1`: a one-cell row is a
+# perfectly ordinary (if narrow) table row -- it simply has nothing to redact if it isn't a
+# keyword-labeled column, or is treated exactly like any other row's single column if it is.
+def _split_table_row_cells(line: str) -> list[str] | None:
+    stripped = line.strip()
+    if not stripped.startswith("|"):
+        return None
+    parts = line.split("|")
+    if parts and parts[0].strip() == "":
+        parts = parts[1:]
+    if parts and parts[-1].strip() == "":
+        parts = parts[:-1]
+    return parts if len(parts) >= 1 else None
+
+
+def _replace_table_cell(line: str, cell_index: int, new_cell: str) -> str:
+    raw_parts = line.split("|")
+    offset = 1 if raw_parts and raw_parts[0].strip() == "" else 0
+    target = cell_index + offset
+    if target >= len(raw_parts):
+        return line
+    raw_parts[target] = new_cell
+    return "|".join(raw_parts)
+
+
+# Round-3 findings (items 3 & 4): the previous version only armed `secret_cols` when a row was
+# immediately followed by a GFM alignment-dash row (`|---|---|`), and did so via an `i += 2` step
+# that skipped straight over that pair -- two bugs from the same design:
+#   - item 3: a genuine data row that happened to be immediately followed by *another*
+#     separator-shaped row (a malformed/pasted-transcript artifact) was itself misread as a new
+#     header and skipped via that `i += 2` *without ever being redacted* -- its secret leaked in
+#     full even though `secret_cols` was already correctly established for it.
+#   - item 4: a pasted pseudo-table with no alignment-dash row at all (very common outside a
+#     Markdown editor) never armed `secret_cols` in the first place, so its data row was invisible
+#     to this pass no matter what.
+# Both are fixed by dropping the "peek at the next row" design entirely: every row is (a) first
+# redacted using whatever `secret_cols` is already active (so a row is never consumed/skipped
+# without being checked -- item 3), and only *then* (b) used to (re)compute `secret_cols` for the
+# rows that follow, based on which of *this* row's own cells contain a standalone secret keyword
+# (`_SECRET_LABEL_KEYWORD_RE`) -- with no requirement that a dash row follow it (item 4). A row
+# with no keyword cells (an alignment-dash row, an ordinary data row, a second data row in the same
+# column) leaves `secret_cols` exactly as it was, so it keeps applying to every subsequent row in
+# the table; a genuinely non-table line resets it, same as before.
+#
+# Round-4 dual-review finding (independent Claude opus + Codex, 2026-08-22, retry round, items
+# 4 & 10): KNOWN, ACCEPTED TRADEOFF, not a leak -- the "no keyword cells leaves `secret_cols`
+# unchanged" rule above means a second, unrelated table immediately adjacent to a secret-bearing
+# one (no blank/non-table line between them) can inherit the first table's `secret_cols` if its
+# own header row happens not to contain a keyword cell, e.g.
+# `redact('| 用户 | 密码 |\n| root | Sec9retVal |\n| 项目 | 版本 |\n| orca | v1.2.3 |')` also
+# redacts the unrelated `v1.2.3` in the second table. This is over-redaction (the safe direction
+# this file has consistently biased toward, per every `*_key`/permissive-value comment above), not
+# an exposure, and distinguishing "still the same table" from "a new table started with a
+# non-keyword header" without a reliable delimiter (most real adjacent tables in the wild are
+# reliably separated by a blank line or prose) was judged not worth the risk of reopening items
+# 3/4 above for a purely cosmetic false positive. Left as a documented limitation.
+def _redact_cjk_secret_table_columns(text: str) -> str:
+    lines = text.split("\n")
+    secret_cols: set[int] = set()
+    for i, line in enumerate(lines):
+        cells = _split_table_row_cells(line)
+        if cells is None:
+            secret_cols = set()
+            continue
+        if secret_cols:
+            new_line = line
+            for idx in secret_cols:
+                if idx >= len(cells):
+                    continue
+                cell = cells[idx]
+                redacted_cell = _CJK_TABLE_CELL_VALUE_OR_PLACEHOLDER_RE.sub(
+                    _redact_table_cell_value_or_placeholder, cell
+                )
+                if redacted_cell != cell:
+                    new_line = _replace_table_cell(new_line, idx, redacted_cell)
+            if new_line != line:
+                lines[i] = new_line
+                line = new_line
+                cells = _split_table_row_cells(line)
+        row_secret_cols = {
+            idx for idx, cell in enumerate(cells) if _SECRET_LABEL_KEYWORD_RE.search(cell)
+        }
+        if row_secret_cols:
+            secret_cols = row_secret_cols
+    return "\n".join(lines)
+
+
 _QUERY_SECRET_RE = re.compile(
     r"(?i)([?&](?:access_token|api_key|key|password|secret|signature|token)=)[^&#\s]+"
 )
@@ -931,9 +1733,32 @@ _QUERY_SECRET_RE = re.compile(
 # "not immediately followed by a dot that is itself followed by a digit"
 # distinguishes the two cases; the same fix applies to _IPV6_CANDIDATE_RE
 # below for the identical reason.
+#
+# Exhaustive-audit finding (independent dual review, 2026-08-20, P2-2): every `\d` above -- in the
+# boundary lookarounds *and* in the three octet alternatives themselves -- is Python's default
+# Unicode-aware `\d`, which matches decimal digits from many non-ASCII scripts (Arabic-Indic,
+# Devanagari, Bengali, Ol Chiki, Thai, fullwidth, mathematical bold, ...), not just ASCII 0-9.
+# Confirmed empirically across 8 non-ASCII digit scripts, in both directions:
+#   - False negative (security-relevant): a real ASCII IPv4 address directly preceded by one of
+#     these non-ASCII digits (no separating space, e.g. "٥192.168.0.1") fails the leading
+#     `(?<![\d.])` lookbehind -- the engine treats the address as a continuation of a longer digit
+#     run -- and the whole address leaks completely unredacted, for all 8 scripts tested.
+#   - False positive (lower priority, still fixed since the fix is the same either way): a
+#     fullwidth-digit "version number" embedded in CJK prose with ordinary ASCII dots (e.g.
+#     "版本号是５６.６８.１２.３４") is *itself* matched by the octet alternatives' bare `\d` (up to two
+#     digits per octet needs no literal ASCII "1"/"2" prefix) and gets redacted as if it were a
+#     real IP address, corrupting unrelated text.
+# Both directions share one root cause -- `\d` reaching past ASCII -- and one fix: every `\d` in
+# this pattern (lookarounds and octet bodies alike) is replaced with an explicit `[0-9]` class,
+# which behaves identically to `\d` for ASCII digits under any flags but never matches a non-ASCII
+# one. No `(?i)`/IGNORECASE is present on this pattern, so unlike `_BEARER_RE`/`_ASSIGNMENT_RE`
+# above there is no separate case-folding taint to account for here. Re-verified this round
+# (2026-08-20) alongside the `_BEARER_RE`/`_ASSIGNMENT_RE`/`_URL_USERINFO_RE`/`_EMAIL_RE` taint fix:
+# confirmed via `re.IGNORECASE & _IPV4_RE.flags == 0` and by re-running all 8 non-ASCII-digit
+# vectors plus the fullwidth false-positive case that this pattern needed no change.
 _IPV4_RE = re.compile(
-    r"(?<![\d.])(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\."
-    r"(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?!\d)(?!\.\d)"
+    r"(?<![0-9.])(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])(?:\."
+    r"(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])){3}(?![0-9])(?!\.[0-9])"
 )
 # A hand-rolled "N groups of hex separated by ':'" pattern (the previous
 # implementation) only matches IPv6's fully-expanded form and misses the
@@ -1033,7 +1858,59 @@ _IPV6_CANDIDATE_RE = re.compile(
 _MAC_ADDRESS_RE = re.compile(
     r"(?<![0-9A-Fa-f:-])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f:-])"
 )
-_EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+# `\b` is Unicode-aware by default, and Python's Unicode `\w` treats CJK
+# ideographs as word characters -- so an email glued directly onto CJK text
+# with no separating whitespace (e.g. "资料user@example.com学习", found via an
+# offline dogfood scan of real transcripts, 2026-08-20) has no word/non-word
+# transition at either edge, and both boundary checks silently fail to
+# match, leaking the email in full. Same root cause already fixed for
+# `_CURRENT_TASK_PLAN_RE`/`_AFFIRMATION_RE` in write_candidate_capture.py,
+# but those are literal-phrase alternations where the CJK branch could just
+# be pulled outside the `\b...\b` wrapper; `_EMAIL_RE` matches an arbitrary
+# ASCII shape instead.
+#
+# This was first fixed with `re.ASCII` on the compile flags, which scopes
+# `\b`'s word-char classification to ASCII only and does close the
+# CJK-adjacency gap -- but `re.ASCII` also narrows `IGNORECASE`'s casefolding
+# to ASCII-only, which this file's own `redact()` contract does not want:
+# `IGNORECASE` is meant to catch case variation in the address, not to
+# silently stop catching non-ASCII case variation it caught before. Concrete
+# regression (independent dual review, 2026-08-20): U+212A KELVIN SIGN
+# ("K") case-folds to ASCII "k" under Python's default Unicode casefolding
+# but not under `re.ASCII`'s restricted table, so a homoglyph domain like
+# "user@example.uK" (with U+212A standing in for the ASCII "K") matched and
+# redacted before the `re.ASCII` fix (an accidental but real property of
+# plain `IGNORECASE`) and stopped matching once `re.ASCII` was added --
+# a real leak the `\b` fix itself introduced.
+#
+# Retrofitted to the same idiom already used for `_LONG_BLOB_RE`/
+# `_MAC_ADDRESS_RE`/`_ASSIGNMENT_RE` (and now `_URL_USERINFO_RE`/
+# `_BEARER_RE`/`_TOKEN_RE`/`_JWT_RE` above): explicit
+# `(?<![A-Za-z0-9_])`/`(?![A-Za-z0-9_])` lookarounds in place of bare `\b`,
+# with `re.ASCII` removed from the compile flags so `IGNORECASE` regains its
+# full default Unicode casefolding. This closes the CJK-adjacency gap (the
+# lookaround itself is unaffected by IGNORECASE or the ASCII flag) without
+# reintroducing the homoglyph regression -- confirmed empirically: with
+# `re.ASCII` removed, "user@example.uK" (U+212A) is redacted again, every
+# CJK-adjacent case above still redacts, and every pure-ASCII case is equivalent
+# or wider (never narrower) than both the original `\b` pattern and the interim
+# `re.ASCII` pattern -- see the equivalent note near `_BEARER_RE` above for why
+# "byte-identical" is not quite the right claim (a one-sided lookaround and a
+# two-sided `\b` diverge at a shared-edge ASCII character); confirmed by the
+# same fuzzing, not just asserted here.
+#
+# That retrofit, however, left both lookarounds *unscoped* under the restored `IGNORECASE`
+# (`(?<![A-Za-z0-9_])`/`(?![A-Za-z0-9_])`, no `(?-i:...)`) -- the same taint shape as `_BEARER_RE`'s
+# P2-1 bug. Unlike `_URL_USERINFO_RE`, this pattern is not always accidentally immune: found this
+# round (independent Codex review) that a homoglyph placed immediately after the TLD and directly
+# followed by another word character -- e.g. `user@example.com<I_DOT_ABOVE>_` -- gets absorbed into the greedy
+# `[A-Z]{2,}` TLD class by the same taint that makes the trailing lookaround fail on it too, so
+# *every* possible match boundary fails and the whole address leaks unredacted. Fixed with the same
+# `(?<!(?-i:[A-Za-z0-9_]))`/`(?!(?-i:[A-Za-z0-9_]))` idiom as `_BEARER_RE`, moving `IGNORECASE` to an
+# inline `(?i)` so it can be locally negated at the two boundary points.
+_EMAIL_RE = re.compile(
+    r"(?i)(?<!(?-i:[A-Za-z0-9_]))[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?!(?-i:[A-Za-z0-9_]))"
+)
 _LONG_BLOB_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9+/=_-]{48,}(?![A-Za-z0-9])")
 _HOME_RE = re.compile(r"/Users/[^/\s]+")
 
@@ -1065,6 +1942,22 @@ def redact(text: str) -> str:
     text = _MAC_ADDRESS_RE.sub("[REDACTED_IP]", text)
     text = _EMAIL_RE.sub("[REDACTED_EMAIL]", text)
     text = _LONG_BLOB_RE.sub("[REDACTED_BLOB]", text)
+    # CJK-secret passes run last (round-2 dual-review finding, 2026-08-22, item 1): every pattern
+    # above already gets first crack at any ASCII run in the text, so these three passes can only
+    # add further redaction on top of what's left -- never truncate an ASCII run that one of the
+    # network/email/blob/assignment/query patterns above would otherwise have matched in full. See
+    # the CJK-secret block's own comment for the concrete MAC/IPv6-truncation regression this
+    # ordering fixes. Column-tracking before same-row before inline: a matched table cell's value
+    # becomes "[REDACTED]" (which cannot itself satisfy any later CJK-secret value class, strict or
+    # permissive), so running the more structurally-specific passes first means a later, more
+    # generic pass can never re-match inside content an earlier pass already handled.
+    text = _redact_cjk_secret_table_columns(text)
+    text = _TABLE_CJK_SECRET_RE.sub(_redact_table_cjk_secret, text)
+    text = _INLINE_CJK_SECRET_RE.sub(_redact_inline_cjk_secret, text)
+    # Round-3 finding (item 12): the ASCII-keyword sibling of the inline-prose gap ("root password
+    # is <value>"). Runs last for the same placeholder-safety reason as the CJK passes above --
+    # see `_INLINE_ASCII_SECRET_RE`'s own comment.
+    text = _INLINE_ASCII_SECRET_RE.sub(_redact_inline_ascii_secret, text)
     return _HOME_RE.sub("$USER_HOME", text)
 
 
@@ -1257,7 +2150,7 @@ def run(
     expected_script_sha256: str,
     stdin: bytes,
     script_path: Path | None = None,
-    volume_uuid_reader: Callable[[Path], str] = _disk_volume_uuid,
+    volume_uuid_reader: Callable[[Path], str] = _disk_volume_uuid_user_prompt_submit,
 ) -> str:
     script_path = script_path or Path(__file__)
     verify_script(script_path, expected_script_sha256)
