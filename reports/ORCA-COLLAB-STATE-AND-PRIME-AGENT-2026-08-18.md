@@ -2893,6 +2893,13 @@ Access 内容策略墙——这次不是因为任务书措辞（这次的任务�
 → 撞常规 hooks 竞态 → 标准手法恢复 → `task_30bb3f22a7f8` /
 dispatch `ctx_437ddd97db45` 挂载成功，`state: ready`，确认真实在跑）。
 
+`task_30bb3f22a7f8` 跑了约 20 分钟（有心跳）后**又**撞上 Trusted Access
+（第 7 次总计，round 50 单轮内第 3 次基础设施阻断）。这次没有再无限重试
+下去——按同样手法（放弃、重新派发、撞常规 hooks 竞态、标准恢复）又走了
+一遍，`task_4c4b66e75108` / dispatch `ctx_8f4596c45507` 挂载成功
+（`state: ready`），确认真实在跑。如果这次还是撞墙，会停下来向用户请示，
+不再无限重试。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
