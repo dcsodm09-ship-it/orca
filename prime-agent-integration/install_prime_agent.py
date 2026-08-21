@@ -106,11 +106,25 @@ GENERATED_LOCK_PACKAGE_COUNT = 200
 # independently) caught this constant wrong on arrival once already: it had
 # been set to the constant-author's own local calendar date, not the actual
 # re-pin commit's date -- see generated_lock_pin_age_days()'s clamp for the
-# other half of that fix. Kept in mind updating it again here, for the
-# round-56 re-pin above: this value is GENERATED_LOCK_SHA256's own commit
-# date, not whatever date any later, unrelated change to this file happens
-# to land on.
-GENERATED_LOCK_PINNED_AT = "2026-08-22"
+# other half of that fix.
+#
+# Round-56 re-review (2026-08-22, Claude opus/max) caught the IDENTICAL
+# mistake a second time, on this exact constant, one round later: this
+# value was set to "2026-08-22" (the author's own local calendar date
+# while writing the round-56 commit) instead of the commit's real UTC
+# date. `git log -1 --format=%ad --date=iso-strict` for the commit that
+# actually introduced this round's GENERATED_LOCK_SHA256 value reads
+# `2026-08-22T04:04:58+08:00`, which is `2026-08-21T20:04:58Z` -- one
+# calendar day earlier in UTC, because the commit landed late at night in
+# a UTC+8 zone. The generated_lock_pin_age_days() clamp keeps this from
+# ever showing a negative number, but a clamp only hides the SYMPTOM; two
+# rounds in a row getting the underlying value wrong is worth a stronger
+# note than the round-54 comment alone turned out to be: **always compute
+# this from `git log -1 --format=%ad --date=iso-strict <commit>` converted
+# to UTC calendar date, never from "what day it feels like" while writing
+# the commit**, especially near a UTC day boundary on this machine's local
+# timezone.
+GENERATED_LOCK_PINNED_AT = "2026-08-21"
 ASSETS = {
     "prime-agent-0.7.2.tgz": "bc5471f2a626d727b88a45eb745fff93b10c554a3c4fc5912f25d8c64b987f5e",
     "prime-agent-ai-0.7.2.tgz": "0777108abbe12ffcd3efdbf063e1f321ff2a1b16c08a81867d9a6c0addcd1f8d",
@@ -8587,21 +8601,35 @@ def _install_locked_within_release_dir(
     # RELEASE_DIR that are recorded in tree_digest()'s overall
     # release_tree_sha256 (so tampering them still shows up as detected
     # "release tree drifted" DRIFT) but are NOT individually pinned --
-    # package.json, package-lock.json, LICENSE, and
-    # upstream-package-lock.json. A same-UID racer who tampers one of
-    # these in the same install-time window has that tampered content
+    # LICENSE and upstream-package-lock.json. A same-UID racer who tampers
+    # either in the same install-time window has that tampered content
     # silently adopted as part of the recorded tree_digest() baseline,
     # exactly as the pinned paths' pre-round-29 behavior was -- but nothing
     # in this installer or its generated scripts ever reads or executes
-    # any of these four files' content again after install, so the
-    # practical consequence of winning that race is inert recorded drift
-    # (a receipt field that silently reflects attacker-chosen bytes
-    # nothing acts on), not code execution. Closing this residual too is
-    # straightforward given the mechanism now built (add each path's
-    # already-known-correct digest -- e.g. LICENSE_SHA256, the generated
-    # lock's own hash -- to the same map) but is intentionally out of THIS
-    # round's required scope.
+    # either file's content again after install, so the practical
+    # consequence of winning that race is inert recorded drift (a receipt
+    # field that silently reflects attacker-chosen bytes nothing acts on),
+    # not code execution. Closing this residual too is straightforward
+    # given the mechanism now built (add each path's already-known-correct
+    # digest -- e.g. LICENSE_SHA256 -- to the same map) but is
+    # intentionally out of THIS round's required scope.
     #
+    # Round 56, 2026-08-22 (independent Codex sol/max round-55 re-review,
+    # P1/blocker): this paragraph, through round 55, named FOUR files here
+    # -- package.json and package-lock.json were listed alongside LICENSE
+    # and upstream-package-lock.json under the same "nothing ever reads
+    # these again, so tampering is inert" reasoning. That was true when
+    # round 34 first wrote it and stayed true for years of subsequent
+    # rounds, but round 54's new `audit` action broke it for exactly those
+    # two files (it runs real `npm audit` with `cwd=release`, genuinely
+    # reading both again) -- leaving this paragraph unchanged would have
+    # been the exact "over-claiming by omission" bug class this same
+    # paragraph's own history (rounds 25/27/29/32, cited below) already
+    # flagged in itself once before. package.json and package-lock.json
+    # are now individually pinned instead (see
+    # release_relative_pinned_digests' own round-56 comment) and removed
+    # from this list; only LICENSE and upstream-package-lock.json remain
+    # genuinely unpinned-but-inert.
     # Round 36, 2026-08-20 (independent Claude opus/max round-35 review,
     # P1-1): the paragraph above, through round 34, separately noted that
     # "the ~196 third-party registry dependency packages' own file content
@@ -8631,9 +8659,11 @@ def _install_locked_within_release_dir(
     # `declared_registry_package_lock_rows()`'s own registry_pinned_digests
     # construction the same way assert_materialized_node_modules_matches_lock()
     # already tolerates the identical gap for its own structural check; (b)
-    # the four bookkeeping files named at the start of this paragraph
-    # (package.json, package-lock.json, LICENSE, upstream-package-lock.json)
-    # -- unrelated to this round's fix, unchanged from round 34; and (c) the
+    # the two bookkeeping files named at the start of this paragraph
+    # (LICENSE, upstream-package-lock.json) -- unrelated to this round's
+    # fix, unchanged from round 34 (package.json and package-lock.json
+    # were also on this list through round 55; see this paragraph's own
+    # round-56 note above for why they no longer are); and (c) the
     # same microsecond-scale in-process lstat/open gap described in the
     # paragraph just below, which applies identically to every pinned path
     # regardless of which mechanism derived its expected digest.

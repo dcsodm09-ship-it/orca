@@ -358,6 +358,42 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             installer.generated_lock_pin_age_days(pinned - timedelta(days=1)), 0
         )
 
+    def test_generated_lock_pinned_at_is_not_in_the_future(self) -> None:
+        # Round-56 dual review (2026-08-22, Claude opus/max): the SAME
+        # mistake round-54's dual review already caught once
+        # (GENERATED_LOCK_PINNED_AT set to the constant-author's own local
+        # calendar date instead of the re-pin commit's actual UTC date --
+        # both times because the commit landed late at night in a UTC+8
+        # zone) happened again, on the very next re-pin, one round later.
+        # generated_lock_pin_age_days()'s clamp (see the test above) hides
+        # the SYMPTOM (a negative age) but does nothing to catch the
+        # underlying wrong constant -- opus's review explicitly named this
+        # gap: "no mechanized test can verify the constant itself is
+        # right." This is that test. It cannot single-handedly prove the
+        # date is the CORRECT one (that still requires checking `git log`
+        # against the exact commit), but it robustly catches the exact
+        # failure mode both real incidents shared: this specific off-by-
+        # one-day mistake always lands the constant one calendar day in
+        # the FUTURE relative to the commit's true UTC date, in this
+        # project's own UTC+8 development timezone -- so a real, live
+        # "is this date in the future, right now, for real" check (no
+        # frozen/mocked clock) would have failed this test both times.
+        from datetime import datetime, timezone
+
+        pinned = datetime.strptime(
+            installer.GENERATED_LOCK_PINNED_AT, "%Y-%m-%d"
+        ).replace(tzinfo=timezone.utc)
+        self.assertLessEqual(
+            pinned,
+            datetime.now(timezone.utc),
+            "GENERATED_LOCK_PINNED_AT is dated in the future -- almost "
+            "certainly the author's own local calendar date at commit "
+            "time, not the commit's actual UTC date (see git log -1 "
+            "--format=%ad --date=iso-strict for the exact commit that "
+            "introduced the current GENERATED_LOCK_SHA256 value, and "
+            "convert to its UTC calendar date).",
+        )
+
     def test_leaf_advisory_records_dedupes_propagated_string_entries(self) -> None:
         # The exact shape a real `npm audit --omit=dev --json` run produced
         # against this installer's own generated production lock,

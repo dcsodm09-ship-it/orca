@@ -271,8 +271,10 @@ above) -- worth naming plainly: this section exists specifically to leave
 an accurate paper trail, and it twice needed correcting by later rounds
 after inheriting a manual arithmetic slip forward from an earlier one.
 
-That same round-55 re-review, independently and in parallel (both Claude
-opus/max and Codex sol/max), also found one more real defect: the `audit`
+The parallel Codex sol/max leg of that same round-55 re-review -- run
+independently alongside the opus/max leg above, not jointly with it --
+rated its own review NO-GO and found one more real defect the opus/max
+leg's own P2-only list above did not: the `audit`
 action reads `package.json`/`package-lock.json`, but neither file had ever
 been individually pinned (an accepted residual dating back to before `audit`
 existed, when nothing read either file again after install) -- so a
