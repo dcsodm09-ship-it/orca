@@ -466,6 +466,18 @@ agent 用隔离 worktree 对照修复前提交跑出了完全相同的哈希，�
 仍然是独立于代码安全复核之外、需要人工
 判断的信任决定，本轮未处理。**已派发 round 50 双复核。**
 
+**round 50 结果**：opus/max 是 GO（0 P0/P1，2 P2/5 P3，含本轮修复自己引入的
+FIFO DoS 新回归 P2、既有 JSON 解析 P2）。Codex 一路连续 3 次撞 Trusted Access
+墙（round 50 QA 任务书本身涉及字节级校验绕过手法，中性措辞这次没能像 round 48
+那样奏效），没能跑完整份清单，但第一次尝试撞墙前已发来实质性 escalation，和
+opus/max 独立复现出的同一个 TOCTOU 完全对上——两路对技术事实无分歧，只是严重度
+标签不同（opus/max 判 P3：check-then-act 对持续持有写权限的同 UID 攻击者本身
+无法彻底关闭，属固有局限，但认可 docstring 说得有点满；Codex 倾向 P1：按
+docstring 自己的承诺去对照）。用户授权后不再等 Codex 跑完整清单，直接基于已有
+证据综合判断：**已派发 round 51**，范围是三项两路证据都支持、且有明确可执行
+修法的项目（FIFO DoS 修复、docstring 诚实度修正、既有 JSON 解析异常逃逸修复），
+不包含"继续尝试关闭结构性 TOCTOU"——两路都没有证据表明那个还有实际可收紧空间。
+
 ## 8. 桌面 / 浏览器（2 项）
 
 `desktop-mcp`、`ego-capability-fixture`：均 `BLOCKED_HUMAN_DECISION`（peer 认证机制未设计 / ship-or-discard 未决策）。

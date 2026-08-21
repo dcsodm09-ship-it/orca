@@ -2900,6 +2900,68 @@ dispatch `ctx_437ddd97db45` 挂载成功，`state: ready`，确认真实在跑�
 （`state: ready`），确认真实在跑。如果这次还是撞墙，会停下来向用户请示，
 不再无限重试。
 
+`task_4c4b66e75108` 20 分钟后**第三次**撞上 Trusted Access（总计第 8
+次）——round 50 这份 QA 任务书本身（内容深入到字节级校验被绕过的具体
+手法）连续 3 次单独撞墙，已经不像偶发，说明中性化措辞这次没能像 round
+48 那次一样奏效。这次按之前说好的，没有再无限重试，直接向用户请示。
+用户回复"根据已有证据直接综合判断，派 round 51"。
+
+### Round 50 最终综合判断：不再等 Codex 跑完整份清单，直接基于已有证据综合两路——两路对技术事实无分歧，只是严重度标签不同；已派发 round 51
+
+Codex 那一路虽然三次都没能跑完整份 QA 清单，但**第一次尝试撞墙前已经
+发来一条实质性的 escalation**，内容是："Independent real-function
+repro: immediate and pre-open symlink swaps fail closed, but an
+append injected after the verified fstat/size check and a same-inode
+overwrite injected after byte comparison but before fchmod both
+return success with corrupt on-disk content."——这和 opus/max 那一路
+独立复现出的 P3-1（内容校验和最终 `fchmod` 之间的 TOCTOU）、P3-2（没有
+像 `read_private_file()` 那样读完后再 `fstat` 一次，"校验之后又被追加
+内容"检测不出来）**是完全同一个技术发现**，两路各自独立复现、结论
+一致，没有任何事实分歧。真正的分歧只在严重度标签：
+
+- **opus/max 判 P3**：这是"针对一个持续拥有写权限的同 UID 攻击者做
+  检查后动作"这类模式本身固有的极限——攻击者随时可以在函数返回后的
+  下一纳秒再写一次，任何 check-then-act 都防不住，不是这次修复的编码
+  缺陷；但认可 round 49 的 docstring 里"重读内容排除这种情况"这句话
+  确实说得有点满，应该改成更克制的表述。
+- **Codex escalation 倾向 P1**：按 docstring 自己给出的"内容校验保证"
+  这个承诺去对照，承诺和实际不符就是缺陷，不接受"结构性做不到"作为
+  减轻理由。
+
+**综合判断**：两路都不主张、也没有证据表明这个结构性 TOCTOU 本身还有
+真正可以进一步收紧的修法（不像 round 47/48/49 那几次，每次"P1"背后
+都有一个具体、此前被漏掉的加固点）——分歧完全落在"该不该把一个双方
+都认为无法彻底关闭的固有局限标记成阻断级别"这一点上。既然 opus/max
+也同意 docstring 目前的表述确实过度声称了，**这次不派"继续想办法关闭
+TOCTOU"这类修复，而是把 docstring 改成如实描述残留风险**（不再说
+"排除"，改成明确写清楚"仍然存在一个更晚时机的、结构上无法彻底关闭的
+窗口"）——这本身就同时回应了 opus/max 的 P3 意见和 Codex escalation
+指出的"承诺与实现不符"问题，不是回避分歧，是把两边共同认可的那部分
+（文档诚实度）先做对。
+
+**已派发 round 51**，范围包含三项、全部是"两路证据都支持、且有明确
+可执行修法"的项目，不包含"继续尝试关闭结构性 TOCTOU"这种没有实际
+新增修法空间的项：
+
+1. **opus/max 的 P2-1（本轮修复自己引入的新回归，最高优先级）**：
+   `atomic_write()` 里 `O_NOFOLLOW` 重新打开如果碰到 `path` 位置被换成
+   FIFO 会无限期阻塞，且发生在还持有 `exclusive_lifecycle_lock` 的
+   时候，连 `recover` 本身都会被卡住——真实拒绝服务面。修法明确：照抄
+   同文件 `read_private_file()` 已经在用的写法，`open()` 之前先
+   `lstat` 一次判断 `S_ISREG`，不是常规文件直接拒绝。
+2. **`atomic_write()` docstring 的诚实度修正**：去掉"重读内容排除这种
+   情况"这句过度声称，改成如实说明这个校验只能防住 Codex 复现出的
+   那类"立即/预先"替换，防不住校验读完之后到 `fchmod` 之间这个更晚
+   时机的窗口——这是结构性限制，不是这次能修好的编码缺陷。
+3. **opus/max 的 P2-2（既有缺陷，与 round 49 改动无关，但严重度足够
+   高值得一起排）**：被投毒的 recovery manifest（比如塞进一个孤立
+   代理项）会让 `canonical_json()` 抛出未捕获的 `UnicodeEncodeError`，
+   `install`/`recover` 两条主要自救路径同时永久卡死在裸 traceback。
+   修法方向：`strict_json()` 明确拒绝非 RFC 严格 JSON 值（`NaN`/
+   `Infinity`/孤立代理项），`main()` 的异常捕获范围也需要覆盖到这类
+   逃逸的标准库异常，保持这个工具自己一直坚持的 `{"ok": false,
+   "error": ...}` 契约。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
