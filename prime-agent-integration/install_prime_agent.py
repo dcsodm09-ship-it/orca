@@ -299,6 +299,46 @@ def canonical_json(payload: Any) -> bytes:
     return (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
 
 
+def _reject_unencodable_strings(value: Any) -> None:
+    """Recursively reject any JSON string that cannot round-trip through a
+    strict UTF-8 encode -- in practice, a lone (unpaired) UTF-16 surrogate
+    code point (U+D800-U+DFFF) embedded in the source JSON via a `\\uXXXX`
+    escape. RFC 8259 requires surrogates to appear only as a valid pair,
+    but the stdlib decoder does not enforce that, so json.loads() accepts
+    one without complaint and hands back a Python str containing the lone
+    surrogate. canonical_json()'s later `.encode("utf-8")` call then raises
+    an uncaught UnicodeEncodeError for exactly that content -- a same-UID
+    actor who plants one into a recovery manifest (or any other file this
+    installer reads via strict_json() and later re-serializes) could use
+    that to permanently wedge every command that reaches the re-serialize
+    path. Rejecting here, at parse time, closes it with this tool's own
+    error type instead of leaving it to surface however far downstream
+    canonical_json() happens to be called.
+
+    Checked via an actual encode attempt -- not a hand-rolled surrogate
+    range scan -- so this rejects precisely the strings that would break
+    canonical_json() and nothing else: it cannot introduce a new false
+    positive against legitimate, fully-encodable Unicode content (a valid
+    surrogate PAIR is already combined by json.loads() into the single
+    supplementary code point it denotes, which encodes to UTF-8 fine and is
+    never rejected here).
+    """
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise PrimeInstallError(
+                "invalid JSON: string contains an unpaired UTF-16 surrogate"
+            ) from exc
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _reject_unencodable_strings(key)
+            _reject_unencodable_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            _reject_unencodable_strings(item)
+
+
 def strict_json(raw: bytes) -> Any:
     def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -308,10 +348,42 @@ def strict_json(raw: bytes) -> Any:
             out[key] = value
         return out
 
+    def reject_constant(token: str) -> Any:
+        # json.loads() calls parse_constant() specifically (and only) for
+        # the three non-RFC-8259 tokens it otherwise accepts by default:
+        # NaN, Infinity, -Infinity. A same-UID actor planting one of these
+        # into a file this installer reads via strict_json() used to parse
+        # through silently even though this tool has no legitimate use for
+        # a non-finite JSON number anywhere. Wiring parse_constant to raise
+        # closes that at parse time, with this tool's own error type,
+        # rather than letting a non-RFC-strict token flow through into
+        # later logic that assumes ordinary JSON values.
+        raise PrimeInstallError(f"invalid JSON: non-finite numeric token {token!r}")
+
     try:
-        return json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicates)
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=reject_duplicates,
+            parse_constant=reject_constant,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PrimeInstallError("invalid JSON") from exc
+    except RecursionError as exc:
+        # Sufficiently deep nesting can make json.loads() itself raise
+        # RecursionError rather than json.JSONDecodeError (confirmed
+        # empirically). Left uncaught, this escaped strict_json() -- and,
+        # before the main() widening elsewhere in this file, the whole CLI
+        # -- as a raw Python traceback instead of this tool's own
+        # {"ok": false, "error": ...} contract.
+        raise PrimeInstallError("invalid JSON: nesting too deep") from exc
+    try:
+        _reject_unencodable_strings(value)
+    except RecursionError as exc:
+        # Walking the already-parsed structure recurses to the same depth
+        # json.loads() itself just accepted; guard it the same way in case
+        # that walk is what actually exhausts the recursion limit first.
+        raise PrimeInstallError("invalid JSON: nesting too deep") from exc
+    return value
 
 
 def is_relative_to(path: Path, root: Path) -> bool:
@@ -513,13 +585,54 @@ def atomic_write(path: Path, raw: bytes, mode: int = 0o600) -> None:
 
     Content is also re-read from that same verified descriptor and
     compared against `raw` byte-for-byte. Identity alone already catches a
-    symlink swap (the common case Codex reproduced), but a same-UID
-    attacker who instead raced a write into the exact published inode
-    (e.g. a lingering open fd to it, opened before this function ever ran)
-    rather than swapping the path would pass an identity check while still
-    corrupting the published bytes; these are small, already-in-memory
-    manifests, so re-reading them in full to rule that out is cheap and
-    matches atomic_create_private_file()'s own rigor.
+    symlink swap (the common case Codex reproduced); a same-UID attacker
+    who instead raced a write into the exact published inode (e.g. a
+    lingering open fd to it, opened before this function ever ran) rather
+    than swapping the path would pass an identity check while still
+    corrupting the published bytes, so this content re-read closes that
+    timing too -- both are real, reproduced-end-to-end timings this
+    function now demonstrably catches (see
+    test_atomic_write_fails_closed_on_symlink_swap_after_replace and
+    test_atomic_write_fails_closed_on_same_inode_content_corruption).
+
+    What the content re-read does NOT and cannot do -- corrected here in
+    round 51 after two independent reviews (Claude opus/max and Codex
+    sol/max, both with real reproductions) found the previous wording
+    overclaimed this -- is rule out a same-UID attacker corrupting the
+    published bytes altogether. There is a genuine, structural TOCTOU
+    between this content verification completing and the os.fchmod() call
+    a few lines below: a persistent-write attacker who writes to the same
+    already-open, already-identity-verified descriptor (or otherwise
+    mutates the underlying inode) in that exact window still gets
+    corrupted content published while this function reports success. This
+    is not a coding defect fixable by adding yet another verification
+    step -- the same attacker can just as well act one instant after
+    THAT step too, all the way up to and including one instant after this
+    function has already returned, at which point the file is, from the
+    filesystem's perspective, exactly as legitimate a target for the same
+    same-UID adversary as it always was. Every check-then-act pattern has
+    this limit against a persistent-write same-UID adversary; it is not
+    something re-reading, re-hashing, or re-checking more can structurally
+    close. See validate_exec_target()'s and reassert_exec_target_identity()'s
+    docstrings for this file's other examples of documenting an
+    acknowledged residual of this same shape honestly rather than
+    overclaiming a full close.
+
+    Round 51 also narrows (without closing) a smaller, related gap the
+    same reviews raised: unlike read_private_file(), which re-fstats after
+    reading and compares (st_dev, st_ino, st_size, st_mtime_ns) against
+    the pre-read stat, the content re-read above used to only compare the
+    bytes read against `raw` and the size seen at open time -- it never
+    re-confirmed, AFTER finishing the read, that the file had not changed
+    again in the meantime. A same-UID attacker APPENDING bytes past what
+    the bounded read loop consumes (that loop stops the instant it has
+    read len(raw) bytes) would go undetected by content/size comparisons
+    alone. A second os.fstat(), taken immediately after the read loop and
+    compared against the fstat taken right after opening, now catches
+    that case too -- cheap, and it shrinks the window a little further --
+    but it is still bounded by the exact same structural limit described
+    above: it cannot see a write that lands after ITS OWN check completes
+    either, including the same fchmod-timing gap.
 
     Unlike atomic_create_private_file(), this function does not attempt
     rollback on a failed post-publication check: its callers use it to
@@ -546,6 +659,33 @@ def atomic_write(path: Path, raw: bytes, mode: int = 0o600) -> None:
             published_identity = (info.st_dev, info.st_ino)
         os.replace(temp_path, path)
         try:
+            # Round 51 fix (independent review, P2-1 -- a real DoS
+            # regression introduced by the O_NOFOLLOW reopen above):
+            # lstat `path` and confirm it is still a regular file BEFORE
+            # ever calling open() on it, exactly like read_private_file()
+            # already does for its own analogous open. Without this, a
+            # same-UID racer who swaps `path` for a FIFO (named pipe) in
+            # this exact window makes the O_NOFOLLOW open() below BLOCK
+            # INDEFINITELY -- confirmed empirically: opening a FIFO for
+            # O_RDONLY blocks until some other process opens it for
+            # writing, and this function's caller is still holding
+            # exclusive_lifecycle_lock the whole time, wedging every
+            # lifecycle operation, including recover() itself (SIGINT-
+            # recoverable for an interactive human, but a real
+            # denial-of-service surface for a non-interactive/automated
+            # run). A FIFO -- or a socket, device, or directory -- could
+            # never legitimately be the file atomic_write() just
+            # published: os.replace() only ever lands a regular file
+            # created by tempfile.mkstemp(). Refusing immediately, before
+            # open(), is therefore not a weakening of the identity/content
+            # guarantees below; it turns an indefinite hang into the same
+            # fast, clean PrimeInstallError every other verification
+            # failure in this function already produces.
+            swap_check = os.lstat(path)
+            if not stat.S_ISREG(swap_check.st_mode):
+                raise PrimeInstallError(
+                    f"managed file replaced with a non-regular file during publication: {path}"
+                )
             # O_NOFOLLOW here is load-bearing, not defense in depth: if a
             # same-UID racer has swapped `path` to a symlink since
             # os.replace() returned, this open() must fail closed (ELOOP)
@@ -578,6 +718,28 @@ def atomic_write(path: Path, raw: bytes, mode: int = 0o600) -> None:
                 if b"".join(chunks) != raw:
                     raise PrimeInstallError(
                         f"managed file content changed during publication: {path}"
+                    )
+                # Round 51 fix (independent review, related gap): re-fstat
+                # immediately after finishing the read and compare against
+                # the fstat taken right after opening -- mirrors
+                # read_private_file()'s own post-read (st_dev, st_ino,
+                # st_size, st_mtime_ns) comparison. Without this, a
+                # same-UID attacker APPENDING bytes past what the bounded
+                # read loop above consumes went undetected: that loop
+                # stops the instant it has read len(raw) bytes and never
+                # notices the file grew longer in the meantime. This
+                # narrows the window further but does not close it -- see
+                # this function's docstring for why no check-then-act step
+                # here ever fully can.
+                post_read = os.fstat(verified_descriptor)
+                if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (
+                    post_read.st_dev,
+                    post_read.st_ino,
+                    post_read.st_size,
+                    post_read.st_mtime_ns,
+                ):
+                    raise PrimeInstallError(
+                        f"managed file changed while re-reading during publication: {path}"
                     )
                 # fchmod() on this already-open, already identity-verified
                 # descriptor, NEVER os.chmod(path, mode) by name again --
@@ -9093,6 +9255,40 @@ def main() -> int:
             result = recover()
     except PrimeInstallError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        return 1
+    except Exception as exc:
+        # Round 51 fix (independent review, P2-2, pre-existing and
+        # unrelated to round 49): PrimeInstallError is this tool's own,
+        # deliberately-raised failure type, but it was never the only
+        # exception a poisoned input could make an action dispatch raise
+        # -- e.g. a same-UID-poisoned recovery manifest reaching
+        # canonical_json()'s .encode("utf-8") with an unpaired surrogate,
+        # or any other stdlib exception this file does not explicitly
+        # anticipate (strict_json() now rejects that specific case at
+        # parse time too, see its own docstring, but this widening stands
+        # on its own as defense in depth for whatever this file's authors
+        # did not foresee). Previously any such exception propagated all
+        # the way out as a raw Python traceback and a non-zero exit from
+        # the interpreter itself, instead of this tool's own
+        # {"ok": false, "error": ...} JSON contract that every other
+        # failure path here honors -- both install() and recover() reach
+        # code that reads and re-serializes recovery-manifest content, so
+        # a single poisoned byte sequence could permanently wedge BOTH
+        # remediation commands an operator would reach for.
+        #
+        # Deliberately `except Exception`, never `except BaseException`:
+        # SystemExit and KeyboardInterrupt are not Exception subclasses,
+        # so Ctrl-C and sys.exit() keep propagating exactly as before,
+        # unaffected by this handler. The exception's type name is
+        # included (not a full traceback) so a genuine bug during
+        # development is still diagnosable from the JSON alone, without
+        # printing implementation detail beyond that to stdout.
+        print(
+            json.dumps(
+                {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                ensure_ascii=False,
+            )
+        )
         return 1
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
     return 0

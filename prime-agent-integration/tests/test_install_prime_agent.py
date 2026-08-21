@@ -14,6 +14,7 @@ import subprocess
 import tarfile
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -1336,6 +1337,18 @@ class PrimeAgentInstallerTests(unittest.TestCase):
         # symlink_swap above, run against the real, fixed atomic_write()
         # itself: the swap must now be caught and reported as a failure,
         # not silently followed.
+        #
+        # Round 51 fix (independent review, P2-1: the FIFO DoS
+        # regression): atomic_write() now lstat()s `path` and confirms it
+        # is still a regular file BEFORE ever calling open() on it -- a
+        # symlink fails that check too (lstat() never follows the final
+        # component, so a symlink is never S_ISREG), so this swap is now
+        # caught there, one step earlier and faster than round 49's
+        # O_NOFOLLOW-open-then-ELOOP path this test originally exercised.
+        # The message changed accordingly ("replaced with a non-regular
+        # file..." instead of "could not be verified after
+        # publication..."); every substantive fail-closed assertion below
+        # is unchanged and still fully exercised.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             os.chmod(root, 0o700)
@@ -1358,7 +1371,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             with mock.patch.object(os, "replace", side_effect=swap_after_replace):
                 with self.assertRaisesRegex(
                     installer.PrimeInstallError,
-                    "could not be verified after publication",
+                    "replaced with a non-regular file during publication",
                 ):
                     installer.atomic_write(path, b'{"schema":"legit"}', 0o600)
 
@@ -1420,6 +1433,225 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             # them -- atomic_write() must not have silently republished or
             # otherwise "fixed" what it could not verify, only refused to
             # report success for it.
+            self.assertEqual(path.read_bytes(), corrupted)
+
+    def test_pre_fix_o_nofollow_reopen_blocks_indefinitely_on_a_planted_fifo(
+        self,
+    ) -> None:
+        # Regression for independent review round 51's P2-1 finding: round
+        # 49's fix (see the two tests above) reopens `path` with
+        # os.open(path, os.O_RDONLY | os.O_NOFOLLOW) after os.replace() to
+        # verify identity before fchmod()'ing it. That reopen alone -- with
+        # no lstat+S_ISREG guard in front of it -- BLOCKS INDEFINITELY if a
+        # same-UID racer has swapped `path` for a FIFO (named pipe) in that
+        # window: opening a FIFO for O_RDONLY blocks until some other
+        # process opens it for writing, and O_NOFOLLOW does nothing to
+        # prevent that (a FIFO is not a symlink). This is a standalone
+        # reproduction of exactly that pre-round-51 shape -- never called
+        # by production code -- run under a hard SIGALRM cutoff so this
+        # test cannot itself hang forever if the blocking claim is wrong;
+        # a real, unbounded hang would instead wedge the caller's
+        # exclusive_lifecycle_lock, wedging even recover() itself.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            os.chmod(root, 0o700)
+            path = root / "manifest.json"
+            os.mkfifo(path, 0o600)
+
+            import signal
+
+            def alarm_handler(signum: int, frame: object) -> None:
+                raise TimeoutError("still blocked on the FIFO open after 3s")
+
+            previous_handler = signal.signal(signal.SIGALRM, alarm_handler)
+            signal.alarm(3)
+            start = time.monotonic()
+            try:
+                with self.assertRaises(TimeoutError):
+                    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                    os.close(fd)  # pragma: no cover -- only reached if not blocked
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, previous_handler)
+            elapsed = time.monotonic() - start
+            self.assertGreaterEqual(
+                elapsed,
+                3.0,
+                "the pre-fix reopen returned before the alarm fired -- it "
+                "did not actually block on the FIFO the way this test "
+                "assumes",
+            )
+
+    def test_atomic_write_fails_fast_on_fifo_swap_after_replace_instead_of_hanging(
+        self,
+    ) -> None:
+        # The real round-51 fix, exercised through atomic_write() itself
+        # (not the standalone pre-fix reproduction above): a same-UID
+        # racer swaps `path` for a FIFO in the exact same timing window
+        # test_atomic_write_fails_closed_on_symlink_swap_after_replace
+        # uses for its symlink swap. atomic_write() must now fail fast --
+        # well under a second, confirmed via a wall-clock measurement, not
+        # merely "eventually" -- with a clean PrimeInstallError, instead
+        # of blocking on the O_NOFOLLOW reopen the way the test above
+        # proves the pre-fix shape does.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            os.chmod(root, 0o700)
+            path = root / "manifest.json"
+
+            real_replace = os.replace
+            swapped = False
+
+            def swap_to_fifo_after_replace(source: Path, destination: Path) -> None:
+                nonlocal swapped
+                real_replace(source, destination)
+                if not swapped and Path(destination) == path:
+                    swapped = True
+                    Path(destination).unlink()
+                    os.mkfifo(destination, 0o600)
+
+            # Safety valve, not part of the assertion: if the fix ever
+            # regresses and atomic_write() genuinely blocks on the FIFO
+            # open, open it for writing after a few seconds so this test
+            # fails on the elapsed-time assertion below (or the
+            # assertRaisesRegex context never exits and the test times
+            # out under the suite's own runner) instead of hanging the
+            # whole suite forever with no diagnostic.
+            def safety_valve_writer() -> None:
+                time.sleep(3.0)
+                try:
+                    valve_fd = os.open(path, os.O_WRONLY)
+                    os.close(valve_fd)
+                except OSError:
+                    pass
+
+            valve = threading.Thread(target=safety_valve_writer, daemon=True)
+            valve.start()
+            try:
+                with mock.patch.object(
+                    os, "replace", side_effect=swap_to_fifo_after_replace
+                ):
+                    start = time.monotonic()
+                    with self.assertRaisesRegex(
+                        installer.PrimeInstallError,
+                        "replaced with a non-regular file during publication",
+                    ):
+                        installer.atomic_write(path, b'{"schema":"legit"}', 0o600)
+                    elapsed = time.monotonic() - start
+            finally:
+                valve.join(timeout=5.0)
+
+            self.assertTrue(swapped, "swap hook never fired")
+            self.assertLess(
+                elapsed,
+                1.0,
+                f"atomic_write() took {elapsed:.3f}s -- looks like it "
+                "blocked on the FIFO open instead of failing fast",
+            )
+            # Fails closed: the FIFO is left exactly as the attacker made
+            # it -- atomic_write() must never have touched it (no fchmod,
+            # no read) and must not have reported success.
+            self.assertTrue(stat.S_ISFIFO(path.lstat().st_mode))
+
+    def test_atomic_write_catches_content_appended_after_the_bounded_read_loop(
+        self,
+    ) -> None:
+        # Round 51 fix, related gap: unlike read_private_file(), the
+        # content re-read used to only compare the bytes actually read
+        # against `raw` and the size seen at open time -- it never
+        # re-confirmed, AFTER finishing the read, that the file had not
+        # grown in the meantime. The bounded read loop stops the instant
+        # it has read len(raw) bytes, so a same-UID attacker who appends
+        # extra bytes via a separate fd to the same inode, timed to land
+        # after the loop's one-and-only os.read() call returns, went
+        # undetected before round 51. The new post-read os.fstat()
+        # comparison must now catch it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            os.chmod(root, 0o700)
+            path = root / "manifest.json"
+            raw = b'{"schema":"legit-manifest-payload"}'
+
+            real_read = os.read
+            appended_once = False
+
+            def read_then_append(fd: int, n: int) -> bytes:
+                nonlocal appended_once
+                data = real_read(fd, n)
+                if not appended_once:
+                    appended_once = True
+                    extra_fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+                    try:
+                        os.write(extra_fd, b"EXTRA-ATTACKER-BYTES")
+                    finally:
+                        os.close(extra_fd)
+                return data
+
+            with mock.patch.object(os, "read", side_effect=read_then_append):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "changed while re-reading during publication",
+                ):
+                    installer.atomic_write(path, raw, 0o600)
+
+            self.assertTrue(appended_once, "append hook never fired")
+            self.assertEqual(
+                path.read_bytes(), raw + b"EXTRA-ATTACKER-BYTES"
+            )
+
+    def test_atomic_write_structural_residual_write_after_verification_before_fchmod_still_publishes(
+        self,
+    ) -> None:
+        # Confirms, with a real reproduction, that the docstring's honestly
+        # -described residual is genuine and not merely prose: a same-UID
+        # attacker who writes into the already-published, already-
+        # identity-and-content-verified inode in the exact gap between
+        # that verification completing and the final os.fchmod() call
+        # still gets corrupted content published while atomic_write()
+        # reports success. This is exactly the structural TOCTOU the
+        # round-51 docstring documents as NOT closed (and not closable by
+        # a check-then-act pattern) -- this test exists so that claim has
+        # real, reproduced coverage instead of only being asserted in a
+        # comment. This must NOT raise: it is the acknowledged residual,
+        # not a regression this round claims to fix.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            os.chmod(root, 0o700)
+            path = root / "manifest.json"
+            raw = b'{"schema":"legit-manifest-payload"}'
+            corrupted = raw[:-1] + bytes([raw[-1] ^ 0x01])
+            self.assertEqual(len(raw), len(corrupted))
+
+            real_fchmod = os.fchmod
+            call_count = 0
+
+            def fchmod_with_late_attacker_write(fd: int, mode: int) -> None:
+                nonlocal call_count
+                call_count += 1
+                if call_count == 2:
+                    # atomic_write()'s FINAL fchmod call, on the already
+                    # identity-and-content-verified descriptor -- exactly
+                    # the edge of the window the docstring documents as
+                    # unclosed. Simulate a same-UID attacker with a
+                    # separate, independent path-based fd to the SAME
+                    # inode, writing to it one instant before fchmod()
+                    # actually runs.
+                    attacker_fd = os.open(path, os.O_WRONLY)
+                    try:
+                        os.write(attacker_fd, corrupted)
+                    finally:
+                        os.close(attacker_fd)
+                real_fchmod(fd, mode)
+
+            with mock.patch.object(
+                os, "fchmod", side_effect=fchmod_with_late_attacker_write
+            ):
+                installer.atomic_write(path, raw, 0o600)
+
+            self.assertEqual(call_count, 2)
+            # The corrupted bytes made it to disk even though
+            # atomic_write() reported success -- the residual is real, not
+            # merely theoretical.
             self.assertEqual(path.read_bytes(), corrupted)
 
     def test_quarantine_partial_release_never_reports_quarantined_for_a_swapped_manifest(
@@ -15497,6 +15729,216 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             self.assertFalse(
                 (tool_root / "receipts" / f"v{installer.VERSION}.json").exists()
             )
+
+    def test_strict_json_rejects_nan_infinity_tokens(self) -> None:
+        # Round 51 fix (independent review, P2-2): json.loads() accepts
+        # NaN/Infinity/-Infinity by default even though none of them is
+        # valid per RFC 8259 -- proven below via a plain json.loads() call
+        # before proving strict_json() now refuses each one via
+        # parse_constant.
+        for token in (b"NaN", b"Infinity", b"-Infinity"):
+            with self.subTest(token=token):
+                raw = b'{"value": ' + token + b"}"
+                accepted = json.loads(raw)
+                self.assertIn("value", accepted)
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "non-finite numeric token"
+                ):
+                    installer.strict_json(raw)
+
+    def test_strict_json_rejects_lone_surrogate_in_a_string_value(self) -> None:
+        # Round 51 fix (independent review, P2-2): a `\ud800` escape
+        # decodes, via plain json.loads(), to a Python str containing a
+        # lone (unpaired) UTF-16 surrogate code point -- accepted without
+        # complaint, proven below -- which later cannot be UTF-8 encoded
+        # (also proven below), which is exactly what made
+        # canonical_json()'s `.encode("utf-8")` call raise an uncaught
+        # UnicodeEncodeError for this content pre-fix. strict_json() must
+        # now reject it directly, at parse time.
+        raw = b'{"note": "\\ud800"}'
+        accepted = json.loads(raw)
+        self.assertEqual(accepted["note"], "\ud800")
+        with self.assertRaises(UnicodeEncodeError):
+            accepted["note"].encode("utf-8")
+        with self.assertRaisesRegex(
+            installer.PrimeInstallError, "unpaired UTF-16 surrogate"
+        ):
+            installer.strict_json(raw)
+
+    def test_strict_json_rejects_lone_surrogate_in_an_object_key(self) -> None:
+        # The same rejection must also apply to a lone surrogate embedded
+        # in a JSON object KEY, not only a value -- _reject_unencodable_
+        # strings() walks both.
+        raw = b'{"\\ud800": "value"}'
+        with self.assertRaisesRegex(
+            installer.PrimeInstallError, "unpaired UTF-16 surrogate"
+        ):
+            installer.strict_json(raw)
+
+    def test_strict_json_rejects_lone_surrogate_nested_inside_a_list(self) -> None:
+        raw = b'{"items": ["fine", "\\ud800"]}'
+        with self.assertRaisesRegex(
+            installer.PrimeInstallError, "unpaired UTF-16 surrogate"
+        ):
+            installer.strict_json(raw)
+
+    def test_strict_json_still_accepts_a_legitimate_surrogate_pair(self) -> None:
+        # No new false positive: a WELL-FORMED surrogate pair (here,
+        # U+1F600 GRINNING FACE, written as the standard high+low
+        # surrogate pair \ud83d\ude00) is combined by json.loads() into
+        # the single supplementary code point it denotes, which encodes
+        # to UTF-8 just fine -- this must NOT be rejected. Confirms the
+        # encode-based check rejects precisely lone surrogates, not
+        # surrogate escapes in general.
+        raw = b'{"emoji": "\\ud83d\\ude00"}'
+        value = installer.strict_json(raw)
+        self.assertEqual(value["emoji"], "\U0001F600")
+        self.assertEqual(
+            value["emoji"].encode("utf-8"), "\U0001F600".encode("utf-8")
+        )
+
+    def test_strict_json_preserves_pre_existing_behavior(self) -> None:
+        # Duplicate-key rejection and invalid-UTF-8 rejection are
+        # pre-existing behavior that must survive this round's changes
+        # unchanged, and ordinary well-formed JSON must still parse.
+        with self.assertRaisesRegex(
+            installer.PrimeInstallError, "duplicate JSON key"
+        ):
+            installer.strict_json(b'{"a": 1, "a": 2}')
+        with self.assertRaisesRegex(installer.PrimeInstallError, "invalid JSON"):
+            installer.strict_json(b"\xff\xfe not utf-8")
+        self.assertEqual(
+            installer.strict_json(b'{"a": 1, "b": [1, 2, 3]}'),
+            {"a": 1, "b": [1, 2, 3]},
+        )
+
+    def test_canonical_json_raises_uncaught_for_a_lone_surrogate_bypassing_strict_json(
+        self,
+    ) -> None:
+        # Documents WHY strict_json()'s new rejection matters: a lone
+        # surrogate that reaches canonical_json() by any path OTHER than
+        # strict_json() (e.g. constructed directly in memory, as here)
+        # still raises an uncaught UnicodeEncodeError from
+        # canonical_json()'s own `.encode("utf-8")` call --
+        # canonical_json() itself is deliberately unchanged by this round;
+        # the fix is to never let such a value reach it via strict_json()
+        # in the first place.
+        with self.assertRaises(UnicodeEncodeError):
+            installer.canonical_json({"note": "\ud800"})
+
+    def test_poisoned_recovery_manifest_with_a_lone_surrogate_is_rejected_cleanly(
+        self,
+    ) -> None:
+        # The real scenario from the round-51 brief: a same-UID actor
+        # plants a lone surrogate into a real, on-disk, recovery-manifest
+        # -shaped JSON file. Before this round, read_recovery_manifests()
+        # -> strict_json() would have parsed it without complaint, and the
+        # poisoned value could later reach canonical_json() via
+        # recovery_manifest_conflicts()/plan() or resume_incomplete_
+        # quarantine()/recover() (both re-serialize recovery-manifest
+        # content) and raise an uncaught UnicodeEncodeError -- permanently
+        # wedging both remediation commands an operator would reach for.
+        # Confirms strict_json() now rejects this cleanly, as a
+        # PrimeInstallError, reached through the real on-disk read path
+        # (not a direct strict_json() call).
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tool_root = root / "tool"
+            recovery_root = tool_root / "recovery"
+            destination = recovery_root / "partial-unresolved"
+            destination.mkdir(parents=True, mode=0o700)
+            for path in (tool_root, recovery_root, destination):
+                os.chmod(path, 0o700)
+            manifest_path = destination / "manifest.json"
+            # Hand-crafted raw bytes -- NOT installer.canonical_json(),
+            # which would itself raise UnicodeEncodeError trying to
+            # construct this payload, since the escape below decodes to
+            # an actual lone surrogate code point only once parsed by
+            # json.loads(), the same way strict_json() will parse it.
+            manifest_raw = (
+                b"{\n"
+                b'  "schema": "orca.prime-agent-partial-recovery.v1",\n'
+                b'  "version": "' + installer.VERSION.encode("ascii") + b'",\n'
+                b'  "status": "rollback_failed",\n'
+                b'  "items": ["release"],\n'
+                b'  "poisoned_note": "\\ud800"\n'
+                b"}\n"
+            )
+            installer.atomic_write(manifest_path, manifest_raw, 0o600)
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "unpaired UTF-16 surrogate"
+                ):
+                    installer.recovery_manifest_conflicts()
+
+    def test_main_reports_ok_false_json_contract_for_a_non_primeinstallerror_exception(
+        self,
+    ) -> None:
+        # Round 51 fix (independent review, P2-2): PrimeInstallError was
+        # previously the ONLY exception type main()'s action dispatch
+        # caught -- any other exception (e.g. a UnicodeEncodeError
+        # escaping canonical_json() for content that slipped past an
+        # earlier strict_json() call, or any other stdlib exception this
+        # file does not explicitly anticipate) propagated all the way out
+        # as a raw Python traceback and a non-zero exit from the
+        # interpreter itself, instead of this tool's own
+        # {"ok": false, "error": ...} JSON contract. This isolates that
+        # widening from strict_json()'s own new rejection (see the
+        # poisoned-recovery-manifest test above) by making the dispatched
+        # action itself raise a non-PrimeInstallError exception directly.
+        boom = UnicodeEncodeError(
+            "utf-8", "\ud800", 0, 1, "surrogates not allowed"
+        )
+        with (
+            mock.patch.object(sys, "argv", ["install_prime_agent.py", "plan"]),
+            mock.patch.object(installer, "plan", side_effect=boom),
+        ):
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = installer.main()
+        self.assertEqual(exit_code, 1)
+        payload = json.loads(buffer.getvalue())
+        self.assertEqual(payload["ok"], False)
+        self.assertIn("UnicodeEncodeError", payload["error"])
+        self.assertIn("surrogates not allowed", payload["error"])
+
+    def test_main_preserves_the_existing_primeinstallerror_contract(self) -> None:
+        # The pre-existing PrimeInstallError path must be completely
+        # unchanged by the round-51 widening: same JSON shape, same exit
+        # code, message unwrapped exactly the way it always was (no
+        # exception-type prefix -- that is new only for the generic
+        # Exception branch tested above).
+        with (
+            mock.patch.object(sys, "argv", ["install_prime_agent.py", "plan"]),
+            mock.patch.object(
+                installer, "plan", side_effect=installer.PrimeInstallError("boom")
+            ),
+        ):
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = installer.main()
+        self.assertEqual(exit_code, 1)
+        payload = json.loads(buffer.getvalue())
+        self.assertEqual(payload, {"ok": False, "error": "boom"})
+
+    def test_main_does_not_swallow_system_exit_or_keyboard_interrupt(self) -> None:
+        # The round-51 widening deliberately uses `except Exception`, not
+        # `except BaseException`: SystemExit and KeyboardInterrupt are not
+        # Exception subclasses in Python, so Ctrl-C and sys.exit() must
+        # keep propagating out of main() completely undisturbed.
+        for exc in (SystemExit(2), KeyboardInterrupt()):
+            with self.subTest(exc=type(exc).__name__):
+                with (
+                    mock.patch.object(
+                        sys, "argv", ["install_prime_agent.py", "plan"]
+                    ),
+                    mock.patch.object(installer, "plan", side_effect=exc),
+                ):
+                    with self.assertRaises(type(exc)):
+                        installer.main()
 
 
 if __name__ == "__main__":
