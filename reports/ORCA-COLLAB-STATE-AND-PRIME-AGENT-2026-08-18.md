@@ -3083,6 +3083,60 @@ dispatch `ctx_20be8cbd0913` 确认真实在跑。
 dispatch `ctx_6d9917f117ed` 确认真实在跑（能看到真实工具调用输出，
 读了 orca-cli skill 文档）。
 
+### 里程碑：round 52 Codex 一路在被要求"先停掉"的同时其实已经跑完并给出 GO——这是本条复核线索第一次真正的双 GO
+
+用户在这轮重试还在跑的时候发来指示："今天 Codex 反复撞墙，先只停掉手上
+这几个正在重试的 Codex 终端，全局规则先不改"。去执行"停掉"动作、准备
+`orca terminal close` 时，先查了一眼这个终端的当前状态——发现它其实已经
+在 `14:47:51` **真正跑完**了，dispatch 状态是 `completed`/`succeeded`，
+自己被 Orca 编排层正常关闭（`exitCause: operator_close`，是完成后的正常
+收尾，不是被我或用户手动切断的）。结果消息本来在 `orca orchestration
+check --run <id>` 里没查到，换成 `--all`（不带 run 过滤）才找到——记一笔
+这个查询细节，以防以后再遇到"dispatch 显示 completed 但过滤后的 check
+查不到消息"这种情况。
+
+**Codex 这一路的完整结论是 ready（GO），而且直接用真实测试核实了我和
+opus/max 都标出来的那个 lstat-then-open 残留**：单独起了一个真实的
+独立进程做 FIFO churn racer，对着真正的 `atomic_write()` 打了
+**20000 次**调用（7249 次成功、12751 次干净地 `PrimeInstallError`、
+**0 次超时**，每次以 250ms 为上限），**没有复现出那个窄窗口**——结论
+和 opus/max 的判断完全一致："it remains theoretically possible but
+materially far narrower than pre-fix"。其余逐项核实：`atomic_write()`
+的 `lstat`→`O_NOFOLLOW open`→`S_ISREG` 顺序、`OSError`→
+`PrimeInstallError` 转换、描述符必然关闭；追加字节触发读后 `fstat`
+校验；蓄意在 `fchmod` 前的同 inode 晚时机写入确实会成功发布、确实
+留下损坏字节——和文档记录的结构性残留精确吻合，不是意外；`strict_json`
+逐项拒绝 `NaN`/`Infinity`/`-Infinity`/孤立代理项（值、键、列表三种
+位置都测了）、正确接受合法的 U+1F600 代理对（没有误伤）、干净拒绝
+投毒 manifest；确认真正顶层 `main()` 在第 9237 行（生成脚本模板里的
+那个在 6407 行，两者没有混淆）；`UnicodeEncodeError` 之类的通用异常
+正确产出 `ok:false` 契约，`SystemExit`/`KeyboardInterrupt` 正常穿透。
+"这轮要格外广"的部分：生命周期锁竞态重申、`NODE_OPTIONS`/TLS/
+compile-cache 白名单、祖先与全局 `node_modules` RCE 检测、exec 前
+CLI 身份复核，8 项测试全过，没有新阻断。206/206 测试双解释器各两次
+全过（verbatim: `/usr/bin/python3` 43.561s/41.006s，Homebrew
+38.799s/43.064s，均 `OK`），`py_compile` 两个解释器都干净。真实
+`sandbox_e2e.py` 跑了 4 次，其中 3 次完整捕获，全部 `exit 2`、
+同一个已知的、和本轮代码无关的上游锁定哈希漂移，明确判定"not a
+round-51 defect"。
+
+**综合两路：Claude opus/max GO（0 P0/P1，2 P2，1 P3）+ Codex GO
+（0 P0/P1，未报告任何 P2/P3，明确说"no candidate defect was
+found"）——两路都是 0 P0/P1，这是这整条 prime-agent 复核线索从第 1 轮
+算起，第一次真正意义上的双 GO。** 按用户自己 CLAUDE.md 的规则，这个
+安全修复候选现在满足"可以完成"的条件了。
+
+**但这不等于可以真正执行 `install`**——从第 1 轮开始就独立标注、round
+49 修复过程中又重新确认且已经恶化的上游锁定哈希漂移问题依然存在且
+未处理：`GENERATED_LOCK_SHA256` 需要人工对照最新上游证据（当前 npm
+registry 实际状态）重新采集、核对、钉一次，这是一个独立于代码安全
+复核之外的信任判断，本报告全程未擅自处理。同时用户这一刻明确要求
+"先停掉手上正在重试的 Codex 终端"——这个双 GO 是这次重试已经在完成
+边缘的、意外收尾的结果，**不代表用户已经授权继续派新的 Codex 任务**，
+之后如果还需要新一轮双复核（比如上游证据重新核对之后有代码要改），
+仍然要按用户当时的意愿来，不能把这次的巧合当成"可以继续随便派 Codex"
+的许可。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max

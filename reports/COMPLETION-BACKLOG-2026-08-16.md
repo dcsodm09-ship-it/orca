@@ -491,6 +491,17 @@ docstring 改成如实描述"内容重读挡得住已复现的两种时机，但
 独立复核 OK，`py_compile` 干净，`sandbox_e2e.py` 两次都稳定复现已知的、与本轮
 无关的上游漂移。**已派发 round 52 双复核。**
 
+**round 52 结果：本条复核线索第 1 轮以来第一次真正的双 GO。** opus/max
+GO（0 P0/P1，2 P2 含已判定不阻断的 `lstat`-then-`open` 残留、1 P3）。
+Codex 一路（用户要求"先停掉手上正在重试的终端"时，发现它其实已经在
+14:47:51 跑完）GO（0 P0/P1，用真实 20000 次 FIFO racer 调用复核了那个
+残留——0 次超时，结论和 opus/max 一致："理论上仍可能、但比修复前的窗口
+窄得多"，未报告任何 P2/P3）。两路 0 P0/P1，按用户规则这个候选现在满足
+"可以完成"的安全复核条件。**但仍不能真正 `install`**——上游锁定哈希
+漂移（`GENERATED_LOCK_SHA256` 需要人工对照最新 registry 证据重新钉）
+依然独立未处理。用户同一时刻明确要求"暂停 Codex"，这个双 GO 是重试
+恰好在完成边缘收尾的结果，不代表已授权继续派新 Codex 任务。
+
 ## 8. 桌面 / 浏览器（2 项）
 
 `desktop-mcp`、`ego-capability-fixture`：均 `BLOCKED_HUMAN_DECISION`（peer 认证机制未设计 / ship-or-discard 未决策）。
