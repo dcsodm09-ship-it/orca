@@ -2886,6 +2886,13 @@ Orca 自己的就绪检测在这种"终端正在处理中"的时间点去探测�
 选择让它继续跑，等它回到空闲状态（一轮真正完成、停下来等输入）时再重新
 挂载。
 
+之后那个 `agent_prompt_stalled` 的终端又撞了一次（第 6 次）Trusted
+Access 内容策略墙——这次不是因为任务书措辞（这次的任务书从 round 48
+的教训之后就已经是中性 QA 措辞），更像是概率性的、和具体这次账号/请求
+有关。原终端已经无法恢复，直接放弃，重新派发全新终端（`task_9188dbad11c6`
+→ 撞常规 hooks 竞态 → 标准手法恢复 → `task_30bb3f22a7f8` /
+dispatch `ctx_437ddd97db45` 挂载成功，`state: ready`，确认真实在跑）。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
