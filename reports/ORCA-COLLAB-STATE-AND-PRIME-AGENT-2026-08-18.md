@@ -3137,6 +3137,55 @@ registry 实际状态）重新采集、核对、钉一次，这是一个独立�
 仍然要按用户当时的意愿来，不能把这次的巧合当成"可以继续随便派 Codex"
 的许可。
 
+### 里程碑：上游锁定哈希重新钉好了，真实端到端生命周期回放第一次完整跑通
+
+用户明确要求"用 Workflow 重新采集/核对上游证据、钉一次哈希"。派了一个
+4 agent 的 Workflow：两路完全独立、真实的隔离 `npm install
+--package-lock-only` 重放（一路复用 `tests/sandbox_e2e.py` 的 fixture，
+另一路从零单独搭建、自己的沙箱根目录、独立验证零污染）——**两次真实
+重放位到了同一个哈希**：`fe4402ae740cc0d2f326baf58f80543ecf8e9668e22
+f6434f0941bed43c732f5`；另一路对新生成锁闭包里全部 196 行 registry 依赖
+做了穷举（不是抽样）的 provenance 核查，比 2026-08-19 那次刷新做得更
+彻底——不仅查了 npm registry 的 `_npmUser`/`trustedPublisher` 元数据，
+还真的把 `@smithy/core@3.33.3` 的 attestation bundle 拉下来看了，确认
+里面真的有 Sigstore 签名的 npm publish attestation 和 SLSA v1
+provenance attestation，不是只信任元数据字段。结论：196 行里只有 3 行
+变了（1.5%），全部是已经被信任过的 `@smithy/*` 家族内的严格 patch
+版本升级（`core` 3.33.2→3.33.3、`node-http-handler` 4.11.2→4.11.3、
+`signature-v4` 5.7.2→5.7.3），同一个已知维护者（`smithy-team`/
+`aws-sdk-bot`，都是 `@amazon.com`）通过 npm 的 GitHub Actions OIDC
+可信发布机制、在约 2 分钟窗口内一起发布——和 2026-08-19 那次一模一样
+的模式，没有新包、没有维护者变更、没有 major/minor 跳跃、没有任何
+供应链异常。
+
+四份证据汇总后判断"证据支持继续钉哈希，没有阻断项"，草案先给用户看过
+（README 新章节草案 + `install_prime_agent.py` 的具体 diff），用户确认
+"写入 + 现在就派双复核"后才真正落盘：`GENERATED_LOCK_SHA256` 从
+`d6da1eea7d...` 改成 `fe4402ae74...`（`GENERATED_LOCK_PACKAGE_COUNT`
+不变，还是 200），README 新增一段和现有条目同等严谨度的
+"Re-verified 2026-08-21"记录。206/206 测试双解释器全过，`py_compile`
+干净。
+
+**真实（非 mock）`sandbox_e2e.py` 完整生命周期回放（install → verify
+→ enable → verify → disable/uninstall → verify → recover）第一次
+`ok:true`**——这条复核线索从第 1 轮到现在，每一次真实运行都因为哈希
+不对提前失败退出，这是第一次真正跑完整个流程：
+
+```json
+{"command_default_enabled": false, "enable_verify_disable_recover": "passed",
+"license_sha256": "b288615fb31dc504623582fb790a28e6d86bc2f5c1396845af555e43386da5a0",
+"node_compile_cache_disabled": true, "ok": true,
+"production_lock_sha256": "fe4402ae740cc0d2f326baf58f80543ecf8e9668e22f6434f0941bed43c732f5",
+"real_user_state_changed": false, "release_tree_entries": 26914,
+"sessions_on_ssd": true, "version": "0.7.2"}
+```
+
+已提交 `bafce01bf5`。`release_tree_entries` 从此前几轮常见的 26911 变成
+26914——这是 `@smithy/*` 补丁版本升级带来的 npm 包内文件数量微小变化，
+预期之内，不是问题。**已派发 round 53 双复核**（Claude opus+max 与
+Codex sol+max，对 `bafce01bf5`）——用户明确同意这次要含 Codex，之前的
+"暂停"仅针对当时那几个卡住的重试终端。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max

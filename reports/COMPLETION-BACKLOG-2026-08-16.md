@@ -502,6 +502,18 @@ Codex 一路（用户要求"先停掉手上正在重试的终端"时，发现它
 依然独立未处理。用户同一时刻明确要求"暂停 Codex"，这个双 GO 是重试
 恰好在完成边缘收尾的结果，不代表已授权继续派新 Codex 任务。
 
+**上游锁定哈希已重新钉好（已提交 `bafce01bf5`）**：用 Workflow 走了一遍比
+2026-08-19 那次更严谨的证据链——两路完全独立的真实隔离 npm 重放位到同一
+哈希 `fe4402ae74...`，196 行 registry 依赖穷举查 provenance（不是抽样），
+还真的拉了 `@smithy/core@3.33.3` 的 Sigstore/SLSA attestation 下来验证，
+不只信任 registry 元数据。结论：3 行变化全是已信任的 `@smithy/*` 家族
+patch 升级，模式和上次一致，没有异常。草案先给用户看过、确认后才写入。
+**真实 `sandbox_e2e.py` 完整生命周期回放第一次 `ok:true`**——这条线索
+从第 1 轮起每次真实运行都因为哈希不对提前失败，这是第一次真正跑通。
+`GENERATED_LOCK_SHA256` 更新，`GENERATED_LOCK_PACKAGE_COUNT` 不变
+（200），README 新增同等严谨度的记录段落。**已派发 round 53 双复核**
+（含 Codex，用户已同意）。
+
 ## 8. 桌面 / 浏览器（2 项）
 
 `desktop-mcp`、`ego-capability-fixture`：均 `BLOCKED_HUMAN_DECISION`（peer 认证机制未设计 / ship-or-discard 未决策）。
