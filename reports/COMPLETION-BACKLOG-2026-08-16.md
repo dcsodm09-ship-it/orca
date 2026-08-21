@@ -478,6 +478,19 @@ docstring 自己的承诺去对照）。用户授权后不再等 Codex 跑完整
 修法的项目（FIFO DoS 修复、docstring 诚实度修正、既有 JSON 解析异常逃逸修复），
 不包含"继续尝试关闭结构性 TOCTOU"——两路都没有证据表明那个还有实际可收紧空间。
 
+**round 51 结果（已提交 `fc9f43ddca`）**：三项全部修完。FIFO 拒绝服务照抄
+`read_private_file()` 的 `lstat`+`S_ISREG` 预检修好（真实测量：修复前 5 秒截止
+仍阻塞，修复后 0.0004s fail-closed；独立复核时注意到新加的 `lstat`+`open` 本身
+还是两次调用、留了一个极窄同类残留，标给 round 52 核实是否值得进一步收紧）。
+docstring 改成如实描述"内容重读挡得住已复现的两种时机，但结构上排除不了校验后
+到 `fchmod` 之间那个窗口"，不再过度声称；顺带加了读完后再 `fstat` 一次的比对，
+收紧（不是关闭）"追加内容检测不出来"这个小缺口。投毒 manifest 崩溃修好：
+`strict_json()` 拒绝非 RFC JSON 值和孤立代理项，顶层 `main()`（不是生成脚本
+模板里那个同名的）加宽异常捕获保持 `{"ok": false, "error": ...}` 契约、不吞
+`SystemExit`/`KeyboardInterrupt`。206/206 测试（比 round 50 多 15 条）双解释器
+独立复核 OK，`py_compile` 干净，`sandbox_e2e.py` 两次都稳定复现已知的、与本轮
+无关的上游漂移。**已派发 round 52 双复核。**
+
 ## 8. 桌面 / 浏览器（2 项）
 
 `desktop-mcp`、`ego-capability-fixture`：均 `BLOCKED_HUMAN_DECISION`（peer 认证机制未设计 / ship-or-discard 未决策）。

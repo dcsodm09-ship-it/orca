@@ -2962,6 +2962,53 @@ TOCTOU"这类修复，而是把 docstring 改成如实描述残留风险**（不
    逃逸的标准库异常，保持这个工具自己一直坚持的 `{"ok": false,
    "error": ...}` 契约。
 
+### Round 51 结果：三项全部修完，已提交 `fc9f43ddca`
+
+- **FIFO 拒绝服务**：照抄 `read_private_file()` 已有的写法，在
+  `O_NOFOLLOW` 重新打开之前先 `lstat` 一次判断 `S_ISREG`，不是常规
+  文件直接拒绝、不去 `open()`。真实测量：修复前形状的裸 `open()` 在
+  硬 `SIGALRM` 5 秒截止下确认仍然阻塞（5.0048s）；修复后同样的注入
+  时机 0.0004s 内就 fail-closed。**我自己复核时注意到一个值得下一轮
+  留意、但不构成阻断的残留**：新加的 `lstat` 和随后的 `open()` 是
+  两次独立的系统调用，理论上同一个同 UID 攻击者如果能精确命中这两次
+  调用之间那个极窄的窗口，仍有可能让 FIFO 换入成功——这和已经写进
+  docstring 的内容校验 TOCTOU 是同一类"check-then-act 对持续攻击者
+  无法彻底关闭"的结构性残留，只是这次是新引入的，值得 round 52 双
+  复核专门核实一下是否值得进一步收紧（比如换成 `O_NONBLOCK` 探测）
+  还是按同样纪律接受为已文档化残留。
+- **docstring 诚实度**：删掉"重读内容排除这种情况"这句过度声称，
+  改写成和 `validate_exec_target()`/`reassert_exec_target_identity()`
+  一致的"如实描述、不夸大"口吻——明确写清楚内容重读能挡住已复现的
+  两种时机（立即替换、重新打开前的同 inode 篡改），但结构上无法排除
+  "校验完成到 `fchmod` 之间"这个窗口，任何 check-then-act 都防不住
+  持续持有写权限的同 UID 攻击者。顺带把两路都提到的一个小缺口也
+  收紧了（不是彻底关闭）：读完之后再 `fstat` 一次比对
+  `(st_dev, st_ino, st_size, st_mtime_ns)`，能抓住"读循环读够
+  `len(raw)` 字节就停、之后又被追加内容"这种此前测不出来的情况。
+- **投毒 manifest 崩溃**：`strict_json()` 的 `parse_constant` 现在会
+  拒绝 `NaN`/`Infinity`/`-Infinity`；新增的递归检查用真实的
+  UTF-8 编码尝试（不是手写代理区间扫描，这样只会拒绝真正会让
+  `canonical_json()` 出错的字符串，合法的代理对——`json.loads()` 早就
+  把它合并成一个正常码点了——不会被误伤）去挡孤立代理项；`json.loads()`
+  和新的递归检查都单独兜住了 `RecursionError`。真正的顶层 `main()`
+  （确认过是文件末尾那个 `if __name__ == "__main__":` 对应的那个，
+  不是生成的 launch guard 字符串模板里另一个同名的）在原有
+  `except PrimeInstallError` 之后加了 `except Exception`（刻意不用
+  `except BaseException`，`SystemExit`/`KeyboardInterrupt` 照常穿透），
+  保持 `{"ok": false, "error": ...}` 契约，错误信息里带上异常类型名
+  方便排查、但不打印完整 traceback。
+
+206/206 测试全过（比 round 50 的 191 条又多了 15 条，提交前我自己独立
+双解释器各跑一遍确认，不只采信 agent 说法），`py_compile` 干净；新增
+回归测试里有一条专门证明"结构性残留是真的"——校验和 `fchmod` 之间注入
+一次攻击者写入，故意断言**不**抛异常（这就是被如实记录、而不是被悄悄
+掩盖的那个残留）。`sandbox_e2e.py` 两次真实运行都稳定复现已知的、和
+本轮无关的上游锁定哈希漂移，沙箱自身的"真实托管路径是否被污染"检查两次
+都没有触发。
+
+**已派发 round 52 双复核**（Claude opus+max 与 Codex sol+max，对
+`fc9f43ddca`）。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
