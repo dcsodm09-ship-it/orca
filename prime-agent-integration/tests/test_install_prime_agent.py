@@ -275,6 +275,22 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             installer.generated_lock_pin_age_days(pinned + timedelta(days=5, hours=2)), 5
         )
 
+    def test_generated_lock_pin_age_days_clamps_a_pin_dated_in_the_future(self) -> None:
+        # Round-54 dual review (2026-08-22): GENERATED_LOCK_PINNED_AT was
+        # itself briefly wrong by one day, which made this report -1 --
+        # defeating a staleness indicator by reading as "not stale" in
+        # exactly the case that most needs a human to notice. The prior
+        # version of this test only exercised `now >= pinned` and could
+        # never have caught that.
+        from datetime import datetime, timedelta, timezone
+
+        pinned = datetime.strptime(
+            installer.GENERATED_LOCK_PINNED_AT, "%Y-%m-%d"
+        ).replace(tzinfo=timezone.utc)
+        self.assertEqual(
+            installer.generated_lock_pin_age_days(pinned - timedelta(days=1)), 0
+        )
+
     def test_leaf_advisory_records_dedupes_propagated_string_entries(self) -> None:
         # The exact shape a real `npm audit --omit=dev --json` run produced
         # against this installer's own generated production lock,
@@ -313,20 +329,36 @@ class PrimeAgentInstallerTests(unittest.TestCase):
         with self.assertRaisesRegex(installer.PrimeInstallError, "unexpected shape"):
             installer._leaf_advisory_records({"pkg": "not-a-dict"})
 
+    def test_advisory_ghsa_id_extracts_from_a_real_shaped_url(self) -> None:
+        record = {"url": "https://github.com/advisories/GHSA-jmr9-qjv8-65gv"}
+        self.assertEqual(installer._advisory_ghsa_id(record), "GHSA-jmr9-qjv8-65gv")
+
+    def test_advisory_ghsa_id_fails_closed_on_missing_or_malformed_url(self) -> None:
+        for record in ({}, {"url": None}, {"url": "https://example.invalid/not-a-ghsa-id"}):
+            with self.subTest(record=record):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "no recognizable GHSA id"
+                ):
+                    installer._advisory_ghsa_id(record)
+
     def test_audit_installed_lock_passes_on_allowlisted_advisory_only(self) -> None:
         receipt = {
             "release_dir": "/tmp/does-not-matter",
             "node_target": "/tmp/node",
             "npm_target": "/tmp/npm-cli.js",
-            "node_sha256": "n" * 64,
-            "npm_cli_sha256": "n" * 64,
         }
         audit_report = {
             "auditReportVersion": 2,
             "vulnerabilities": {
                 "extract-zip": {
                     "name": "extract-zip",
-                    "via": [{"name": "extract-zip", "severity": "high"}],
+                    "via": [
+                        {
+                            "name": "extract-zip",
+                            "severity": "high",
+                            "url": "https://github.com/advisories/GHSA-jmr9-qjv8-65gv",
+                        }
+                    ],
                 },
                 "prime-agent": {"name": "prime-agent", "via": ["extract-zip"]},
             },
@@ -335,10 +367,10 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             args=["npm", "audit"], returncode=1, stdout=json.dumps(audit_report), stderr=""
         )
         with (
+            mock.patch.object(installer, "verify", return_value={"ok": True}) as verify_mock,
             mock.patch.object(installer, "load_receipt", return_value=receipt),
             mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
             mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
-            mock.patch.object(installer, "sha256_file_verified", return_value="n" * 64),
             mock.patch.object(
                 installer,
                 "managed_npm_environment",
@@ -347,25 +379,34 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             mock.patch.object(subprocess, "run", return_value=completed) as run_mock,
         ):
             result = installer.audit_installed_lock()
+        verify_mock.assert_called_once_with()
         self.assertTrue(result["ok"])
         self.assertEqual([entry["name"] for entry in result["accepted_advisories"]], ["extract-zip"])
+        self.assertEqual(
+            [entry["ghsa_id"] for entry in result["accepted_advisories"]],
+            ["GHSA-jmr9-qjv8-65gv"],
+        )
         # The one deliberate override of the blanket npm_config_audit=false.
         self.assertEqual(run_mock.call_args.kwargs["env"]["npm_config_audit"], "true")
 
-    def test_audit_installed_lock_fails_closed_on_unlisted_advisory(self) -> None:
+    def test_audit_installed_lock_fails_closed_on_unlisted_package(self) -> None:
         receipt = {
             "release_dir": "/tmp/does-not-matter",
             "node_target": "/tmp/node",
             "npm_target": "/tmp/npm-cli.js",
-            "node_sha256": "n" * 64,
-            "npm_cli_sha256": "n" * 64,
         }
         audit_report = {
             "auditReportVersion": 2,
             "vulnerabilities": {
                 "some-other-package": {
                     "name": "some-other-package",
-                    "via": [{"name": "some-other-package", "severity": "critical"}],
+                    "via": [
+                        {
+                            "name": "some-other-package",
+                            "severity": "critical",
+                            "url": "https://github.com/advisories/GHSA-aaaa-bbbb-cccc",
+                        }
+                    ],
                 },
             },
         }
@@ -373,10 +414,10 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             args=["npm", "audit"], returncode=1, stdout=json.dumps(audit_report), stderr=""
         )
         with (
+            mock.patch.object(installer, "verify", return_value={"ok": True}),
             mock.patch.object(installer, "load_receipt", return_value=receipt),
             mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
             mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
-            mock.patch.object(installer, "sha256_file_verified", return_value="n" * 64),
             mock.patch.object(
                 installer,
                 "managed_npm_environment",
@@ -387,22 +428,74 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             with self.assertRaisesRegex(installer.PrimeInstallError, "some-other-package"):
                 installer.audit_installed_lock()
 
-    def test_audit_installed_lock_rejects_tampered_toolchain(self) -> None:
+    def test_audit_installed_lock_fails_closed_on_a_new_advisory_for_an_allowlisted_package(
+        self,
+    ) -> None:
+        # Round-54 dual review (2026-08-22, P1/blocker, both reviewers): the
+        # original allowlist matched by package name alone, so a brand-new
+        # extract-zip advisory (a real, plausible future event -- npm audit
+        # reported 17 distinct advisories under one package name in one of
+        # the reviewers' own real test runs) would have been silently
+        # accepted just because "extract-zip" was already on the list. This
+        # is the regression test for that exact fix: same package name,
+        # different GHSA id, must still fail closed.
         receipt = {
             "release_dir": "/tmp/does-not-matter",
             "node_target": "/tmp/node",
             "npm_target": "/tmp/npm-cli.js",
-            "node_sha256": "n" * 64,
-            "npm_cli_sha256": "m" * 64,
         }
+        audit_report = {
+            "auditReportVersion": 2,
+            "vulnerabilities": {
+                "extract-zip": {
+                    "name": "extract-zip",
+                    "via": [
+                        {
+                            "name": "extract-zip",
+                            "severity": "critical",
+                            "url": "https://github.com/advisories/GHSA-new1-new2-new3",
+                        }
+                    ],
+                },
+            },
+        }
+        completed = subprocess.CompletedProcess(
+            args=["npm", "audit"], returncode=1, stdout=json.dumps(audit_report), stderr=""
+        )
         with (
+            mock.patch.object(installer, "verify", return_value={"ok": True}),
             mock.patch.object(installer, "load_receipt", return_value=receipt),
             mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
             mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
-            mock.patch.object(installer, "sha256_file_verified", return_value="0" * 64),
+            mock.patch.object(
+                installer,
+                "managed_npm_environment",
+                return_value={"npm_config_audit": "false"},
+            ),
+            mock.patch.object(subprocess, "run", return_value=completed),
         ):
-            with self.assertRaisesRegex(installer.PrimeInstallError, "does not match"):
+            with self.assertRaisesRegex(
+                installer.PrimeInstallError, "extract-zip/GHSA-new1-new2-new3"
+            ):
                 installer.audit_installed_lock()
+
+    def test_audit_installed_lock_binds_to_verify_first(self) -> None:
+        # Round-54 dual review (2026-08-22, P1/blocker, both reviewers): the
+        # original version only re-verified the node/npm binaries -- never
+        # package-lock.json, the release tree, or the rest of the npm
+        # runtime -- before running npm audit. Now it calls verify() (the
+        # SAME full trust chain the standalone `verify` action uses) first.
+        # This proves that binding: if verify() itself fails, npm audit
+        # must never even be attempted.
+        with (
+            mock.patch.object(
+                installer, "verify", side_effect=installer.PrimeInstallError("release tree drifted")
+            ),
+            mock.patch.object(subprocess, "run") as run_mock,
+        ):
+            with self.assertRaisesRegex(installer.PrimeInstallError, "release tree drifted"):
+                installer.audit_installed_lock()
+        run_mock.assert_not_called()
 
     def test_exact_dependency_versions_uses_top_level_release_choice(self) -> None:
         manifest = {"dependencies": {"chalk": "^5", "@earendil-works/pi-ai": "remote"}}

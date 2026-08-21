@@ -96,7 +96,18 @@ GENERATED_LOCK_PACKAGE_COUNT = 200
 # actually wrong today, and turning wall-clock age into a hard failure
 # would make every install eventually stop working on its own even when
 # nothing upstream has changed.
-GENERATED_LOCK_PINNED_AT = "2026-08-22"
+#
+# Round-54 dual review (2026-08-22, both Claude opus/max and Codex sol/max
+# independently) caught this constant wrong on arrival: GENERATED_LOCK_SHA256
+# was actually re-pinned by commit bafce01bf5, authored 2026-08-21T23:58:36
+# +08:00 = 2026-08-21T15:58:36Z -- not 2026-08-22 (that was this constant's
+# own author's LOCAL calendar date while writing the round-54 follow-up
+# commit, a different thing). The wrong value made plan()'s
+# generated_lock_pin_age_days report -1 on this file's own re-verification
+# run, for the first several hours of every day this constant is ever
+# updated on a UTC+ timezone machine -- see that function's own clamp for
+# the other half of this fix.
+GENERATED_LOCK_PINNED_AT = "2026-08-21"
 ASSETS = {
     "prime-agent-0.7.2.tgz": "bc5471f2a626d727b88a45eb745fff93b10c554a3c4fc5912f25d8c64b987f5e",
     "prime-agent-ai-0.7.2.tgz": "0777108abbe12ffcd3efdbf063e1f321ff2a1b16c08a81867d9a6c0addcd1f8d",
@@ -2824,25 +2835,62 @@ def generated_lock_pin_age_days(now: datetime | None = None) -> int:
     deliberately never a hard gate) -- read by plan() so a human deciding
     whether to re-verify has the number in front of them without needing
     to check README.md or git blame by hand first.
+
+    Clamped to 0 rather than returning a negative value: round-54 dual
+    review (2026-08-22) reproduced GENERATED_LOCK_PINNED_AT itself being
+    momentarily wrong by one day (see that constant's own comment) and
+    this then silently reporting -1, defeating a staleness indicator by
+    making it read as "not stale" in the one case that most needs a human
+    to notice something is off. A clock genuinely running behind the
+    pinned date (not just the one historical mistake above) hits the same
+    clamp and is equally not this function's business to diagnose --
+    "somehow not stale yet" is the safe direction to fail toward for a
+    purely informational field.
     """
     pinned_at = datetime.strptime(GENERATED_LOCK_PINNED_AT, "%Y-%m-%d").replace(
         tzinfo=timezone.utc
     )
     current = now if now is not None else datetime.now(timezone.utc)
-    return (current - pinned_at).days
+    return max(0, (current - pinned_at).days)
 
 
 def _registry_resolved_versions_by_name(packages: dict[str, Any]) -> dict[str, set[str]]:
+    """Round-54 dual review (2026-08-22, both Claude opus/max and Codex
+    sol/max independently) reproduced this originally requiring an
+    explicit `resolved` field starting with the registry URL prefix,
+    which silently dropped 122 of 184 comparable names from the real
+    pinned upstream source lock -- a real npm lockfile-v3 property, not a
+    malformed input: 242 of its 463 rows are genuine registry packages
+    recorded with only `version` (no `resolved`/`integrity` at all).
+    Verified empirically against that exact lock which of the three real
+    row shapes each marker distinguishes: a `link: true` row (npm
+    workspace member, e.g. `@earendil-works/pi-ai`) always pairs with a
+    `resolved` value that is a plain relative path (`packages/...`), never
+    absent and never a registry URL; every other row either carries a
+    real `https://registry.npmjs.org/...` `resolved` value, a local
+    `file:...` value (the four locally patched packages' own generated-
+    lock rows), or nothing at all -- there is no observed case of a
+    `link: true` row with a missing `resolved`. So a row is accepted here
+    when `resolved` is a registry URL OR entirely absent, and rejected
+    only when `resolved` is present and is something else (`file:`, a
+    relative workspace path, or `link: true` as an explicit second,
+    defense-in-depth check in case some other npm version ever omits
+    `resolved` on a link row).
+    """
     by_name: dict[str, set[str]] = {}
     for lock_path, row in packages.items():
         if not isinstance(lock_path, str) or not isinstance(row, dict) or not lock_path:
             continue
+        if row.get("link") is True:
+            continue
         resolved = row.get("resolved")
-        version = row.get("version")
-        if not isinstance(resolved, str) or not resolved.startswith(
+        if isinstance(resolved, str) and not resolved.startswith(
             "https://registry.npmjs.org/"
         ):
             continue
+        if resolved is not None and not isinstance(resolved, str):
+            continue
+        version = row.get("version")
         if not isinstance(version, str) or not version:
             continue
         name = package_name_from_lock_path(lock_path, row)
@@ -9224,17 +9272,45 @@ def verify(expected_lock_identity: tuple[int, int] | None = None) -> dict[str, A
 # Re-review this entry (and consider tightening it to a specific id, or
 # removing it) whenever `npm audit` reports something new against a
 # package already on this list.
-ACCEPTED_ADVISORY_PACKAGES = {
-    "extract-zip": (
-        "GHSA-jmr9-qjv8-65gv, extract-zip <=2.0.1, unvalidated symlink path "
-        "traversal, no upstream fix released. Reachable only via its ZIP-"
-        "extraction code path; this installer's supported darwin-arm64 "
-        "target downloads .tar.gz assets (fd/rg) and extracts them with the "
-        "system `tar`, never extract-zip's ZIP branch. Re-review if a "
-        "future asset or platform target ever downloads a .zip file. "
+# Round-54 dual review (2026-08-22, both Claude opus/max and Codex sol/max
+# independently, rated P1/blocker): this was originally keyed by bare
+# package name alone, which silently accepts EVERY current and future
+# advisory against a listed package -- Codex's own real npm-source reading
+# (@npmcli/arborist's vuln.js/audit-report.js) and both reviewers' real
+# `npm audit` runs confirmed every advisory record reliably carries its own
+# GHSA id inside `url` (`https://github.com/advisories/GHSA-xxxx-...`), so
+# there was never a real reason to accept less-specific identity. Now keyed
+# by the exact (package name, GHSA id) tuple actually reviewed --
+# `audit_installed_lock()` fails closed if a record's `url` doesn't parse to
+# a GHSA id at all (an unrecognized advisory-id scheme is exactly the "this
+# file doesn't understand what it's looking at" case this file's fail-
+# closed convention treats as unsafe, not as "probably fine").
+ACCEPTED_ADVISORIES = {
+    ("extract-zip", "GHSA-jmr9-qjv8-65gv"): (
+        "extract-zip <=2.0.1, unvalidated symlink path traversal, no "
+        "upstream fix released. Reachable only via its ZIP-extraction code "
+        "path; this installer's supported darwin-arm64 target downloads "
+        ".tar.gz assets (fd/rg) and extracts them with the system `tar`, "
+        "never extract-zip's ZIP branch. Re-review if a future asset or "
+        "platform target ever downloads a .zip file, or if a NEW extract-"
+        "zip advisory appears (this entry does not cover one -- it is "
+        "pinned to this exact GHSA id, not to the package as a whole).  "
         "Verified by independent round-53 QA, 2026-08-22."
     ),
 }
+
+_GHSA_ID_PATTERN = re.compile(r"GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$")
+
+
+def _advisory_ghsa_id(record: dict[str, Any]) -> str:
+    url = record.get("url")
+    if isinstance(url, str):
+        match = _GHSA_ID_PATTERN.search(url)
+        if match:
+            return match.group(0)
+    raise PrimeInstallError(
+        "npm audit advisory record has no recognizable GHSA id in its url"
+    )
 
 
 def _leaf_advisory_records(vulnerabilities: dict[str, Any]) -> list[dict[str, Any]]:
@@ -9254,7 +9330,7 @@ def _leaf_advisory_records(vulnerabilities: dict[str, Any]) -> list[dict[str, An
     the vulnerable package). Only the dict-shaped records carry real
     advisory identity and are returned here; string entries are the
     reason this exists at all -- naively checking every top-level key
-    against ACCEPTED_ADVISORY_PACKAGES would wrongly flag "prime-agent"
+    against ACCEPTED_ADVISORIES would wrongly flag "prime-agent"
     itself as an unreviewed package on every single audit run.
     """
     records: list[dict[str, Any]] = []
@@ -9284,23 +9360,35 @@ def audit_installed_lock() -> dict[str, Any]:
     re-verifying trust (e.g. before a re-pin, or on whatever cadence a
     human decides), not as part of every plan/install/verify/enable.
     Requires live network access to the npm registry; does not modify
-    anything on disk.
+    managed install state (npm audit does write ordinary cache entries
+    under the managed npm cache directory, the same as every other npm
+    invocation in this file -- it does not touch RELEASE_DIR or any
+    release-state file).
+
+    Round-54 dual review (2026-08-22, both Claude opus/max and Codex
+    sol/max independently, rated P1/blocker): the original version of
+    this function only re-verified the Node.js and npm CLI binaries
+    themselves before running `npm audit` -- never `package-lock.json`
+    (the actual input the audit result is about), never the rest of the
+    materialized release tree, never the rest of toolchain/lib/
+    node_modules/npm/ that npm-cli.js loads and executes. Under this
+    file's own established same-UID-racer threat model (defended against
+    everywhere else at real, measured cost), a tampered lock or a planted
+    RELEASE_DIR/.npmrc could have produced a false-clean audit result.
+    Call verify() first, exactly the way the standalone `verify` CLI
+    action already does (no lifecycle lock held, `expected_lock_identity`
+    left at its default None) -- this reuses the SAME full, already-
+    reviewed trust chain (tree_digest() against receipt['release_tree_
+    sha256'], every pinned binary/generated-file digest, orca_support,
+    the managed runtime state, and more) rather than re-deriving a
+    weaker, partial subset of it here. Only once that has raised nothing
+    does this proceed to actually run npm audit.
     """
+    verify()
     receipt = load_receipt()
     release = verify_private_ssd_dir(Path(receipt["release_dir"]))
     node = resolve_ssd(Path(receipt["node_target"]))
     npm_cli = resolve_ssd(Path(receipt["npm_target"]))
-    for label, path, field in (
-        ("Node.js runtime", node, "node_sha256"),
-        ("npm CLI", npm_cli, "npm_cli_sha256"),
-    ):
-        expected = receipt.get(field)
-        if not isinstance(expected, str) or not expected:
-            raise PrimeInstallError(f"managed receipt is missing a pinned {label} digest")
-        if sha256_file_verified(path) != expected:
-            raise PrimeInstallError(
-                f"managed {label} content does not match the pinned installed digest"
-            )
     cache = verify_private_ssd_dir(TOOL_ROOT / "npm-cache")
     install_home = verify_private_ssd_dir(TOOL_ROOT / "install-home")
     install_tmp = verify_private_ssd_dir(TOOL_ROOT / "install-tmp")
@@ -9323,9 +9411,9 @@ def audit_installed_lock() -> dict[str, Any]:
     except (OSError, subprocess.SubprocessError) as exc:
         raise PrimeInstallError("cannot run npm audit") from exc
     # `npm audit` exits non-zero whenever it finds any vulnerability at
-    # all, including ones already on ACCEPTED_ADVISORY_PACKAGES -- exit
-    # code is deliberately not treated as pass/fail here; the allowlist
-    # comparison below is.
+    # all, including ones already on ACCEPTED_ADVISORIES -- exit code is
+    # deliberately not treated as pass/fail here; the allowlist comparison
+    # below is.
     try:
         report = strict_json(result.stdout.encode("utf-8"))
     except PrimeInstallError as exc:
@@ -9341,17 +9429,25 @@ def audit_installed_lock() -> dict[str, Any]:
         name = record.get("name")
         if not isinstance(name, str) or not name:
             raise PrimeInstallError("npm audit returned an unexpected shape")
+        # Fails closed (raises) if this record's own identity cannot be
+        # determined -- deliberately BEFORE the allowlist check, so an
+        # advisory this file cannot even identify is never silently
+        # treated as accepted just because its package name happens to
+        # match one on the list.
+        ghsa_id = _advisory_ghsa_id(record)
         info = {
             "name": name,
+            "ghsa_id": ghsa_id,
             "severity": record.get("severity"),
             "url": record.get("url"),
             "title": record.get("title"),
         }
-        (accepted if name in ACCEPTED_ADVISORY_PACKAGES else unexpected).append(info)
+        key = (name, ghsa_id)
+        (accepted if key in ACCEPTED_ADVISORIES else unexpected).append(info)
     if unexpected:
+        unexpected_ids = sorted({f"{item['name']}/{item['ghsa_id']}" for item in unexpected})
         raise PrimeInstallError(
-            "npm audit found advisories for packages not on the reviewed "
-            f"allowlist: {sorted({item['name'] for item in unexpected})}"
+            f"npm audit found advisories not on the reviewed allowlist: {unexpected_ids}"
         )
     return {
         "ok": True,

@@ -181,43 +181,50 @@ non-blocking follow-ups, addressed as part of this same 2026-08-22 change:
    but flagged that disabling `npm audit` during hermetic lock generation
    means a separate, explicit audit gate/cadence is needed rather than
    relying on someone remembering to check by hand. Added: `python3
-   install_prime_agent.py audit` (`audit_installed_lock()`), a read-only,
-   explicitly opt-in command that runs a real `npm audit` against an
-   already-installed release's lock and fails closed on any advisory for
-   a package not on a small, reviewed, documented allowlist
-   (`ACCEPTED_ADVISORY_PACKAGES` -- currently just `extract-zip`, with
-   the reasoning above recorded inline). Deliberately NOT part of
+   install_prime_agent.py audit` (`audit_installed_lock()`, see "Operator
+   commands" above), a read-only, explicitly opt-in command that first
+   runs the complete `verify` gate (so a tampered lock or release tree is
+   caught before anything about it is trusted), then runs a real `npm
+   audit` against the installed production lock and fails closed on any
+   advisory for a package/GHSA-id pair not on a small, reviewed,
+   documented allowlist (`ACCEPTED_ADVISORIES` -- currently just
+   `extract-zip`'s exact reviewed GHSA id, with the reasoning above
+   recorded inline; a *different* future extract-zip advisory is not
+   covered by this entry and fails closed too). Deliberately NOT part of
    plan/install/verify/enable, which stay fully offline and hermetic.
 2. **Generated-registry-lock drift versus the pinned upstream *source*
    lock** (not versus the prior generated-lock pin -- a different,
-   stronger baseline): roughly 36 version differences across the
+   stronger baseline): roughly 37 version differences across the
    registry-resolved closure (e.g. `zod` 3.25.76->4.4.3,
    `@types/node` 22->26), confirming the four Prime Agent tarballs are
    byte-pinned but the full 196-package runtime closure is not claimed to
    be identical to the exact tree reviewed at the v0.7.2 source commit.
    The report's own "even stronger architectural option" -- seed the
    production lock directly from the pinned upstream source lock instead
-   of a fresh floating resolution -- was attempted and empirically
-   disproven this same round: seeding `npm install --package-lock-only`
-   with upstream-pinned versions for the 63 overlapping-by-name packages
-   found only 10 of 200 final rows actually differed from an unseeded
-   floating resolution, and several of those differences were themselves
-   immediately re-resolved forward again by npm regardless of the seed
-   (`npm install`, unlike `npm ci`, treats an existing lock as an
-   optimization hint, not a hard constraint, absent an exact version
-   pinned directly in a manifest it reads). Reliably forcing the full
-   tree to the exact upstream-pinned versions would require reimplementing
-   npm's own dependency resolution against the source lock by hand --
-   assessed as materially riskier, for a security-critical installer,
-   than the drift this is meant to reduce. Implemented instead, as the
+   of a fresh floating resolution -- was attempted this same round: seeding
+   `npm install --package-lock-only` with upstream-pinned versions for the
+   63 overlapping-by-name packages found only 10 of 200 final rows
+   actually differed from an unseeded floating resolution, and several of
+   those differences were themselves immediately re-resolved forward again
+   by npm regardless of the seed. Round-54's own dual review (below)
+   correctly pushed back on over-claiming this as proof that lock-seeding
+   is *inherently* unreliable: the more likely explanation is that this
+   particular seed's root package (a synthetic single `file:` dependency)
+   was structurally incompatible with the seed lock's own very different
+   shape (the whole upstream monorepo, workspaces and all), not that npm
+   treats an existing lock as a mere hint -- and npm's `overrides` field is
+   a documented, unused, first-class mechanism for forcing exact
+   transitive versions that a future round should actually try before
+   concluding seeding is infeasible. What IS implemented now, as the
    report's own concretely-actionable recommendation #1 ("persist
    generated-lock evidence and full tuple diffs"): `compute_lock_drift()`
-   now runs automatically on every real install, recording every
-   registry package resolved to a version different from the pinned
-   upstream source lock directly in that install's receipt
-   (`lock_drift_from_upstream_source`) -- durable, automatic evidence
-   in place of a hand-reconstructed one-off diff every future review
-   round.
+   runs automatically on every real install, recording every registry
+   package resolved to a version different from the pinned upstream source
+   lock directly in that install's receipt (`lock_drift_from_upstream_
+   source`) -- durable, automatic evidence in place of a hand-reconstructed
+   one-off diff every future review round, though still name/version-only
+   telemetry, not a full path/resolved/integrity tuple diff and not itself
+   a drift-elimination mechanism.
 3. **GitHub release API metadata correction**: the release currently
    reports `"immutable": false`, contradicting this document's prior,
    more categorical wording (corrected above). The byte-level SHA-256
@@ -226,6 +233,27 @@ non-blocking follow-ups, addressed as part of this same 2026-08-22 change:
 4. **Pin-staleness cadence**: added `GENERATED_LOCK_PINNED_AT` (the date
    `GENERATED_LOCK_SHA256` was last re-pinned) and
    `generated_lock_pin_age_days()`, surfaced in `plan()`'s evidence.
+
+Round-54's own dual review (Claude opus/max + Codex sol/max, both
+independent, 2026-08-22) then found real defects in this same change before
+it was allowed to stand: `compute_lock_drift()`'s registry-row filter
+silently ignored 122 of 184 comparable upstream package names (a genuine
+npm lockfile-v3 property -- many real registry rows carry no `resolved`
+field at all), undercounting drift by 16% (31 reported vs. 37 real);
+`GENERATED_LOCK_PINNED_AT` was itself off by one day (`bafce01bf5`, the
+commit that actually re-pinned `GENERATED_LOCK_SHA256`, is dated
+2026-08-21, not 2026-08-22), which made `plan()` briefly report a negative
+pin age; and, most seriously (**P1/blocker, both reviewers independently**),
+the new `audit` action verified only the Node/npm binaries before running
+`npm audit` -- never the lock file it was actually auditing, nor the rest
+of the release tree -- and its advisory allowlist matched by bare package
+name only, silently accepting any *future* advisory against `extract-zip`
+alongside the one actually reviewed. All four are fixed: `audit` now calls
+`verify()`'s complete gate first; the allowlist is keyed by the exact
+`(package, GHSA id)` pair; the drift filter now also accepts registry rows
+with no `resolved` field (rejecting only `file:`/workspace-link rows);
+`GENERATED_LOCK_PINNED_AT` corrected to `2026-08-21` with a
+`max(0, ...)` clamp against ever reporting a negative age again.
    Deliberately informational only, never a hard gate -- a stale pin is a
    prompt to re-verify, not proof anything is wrong today.
 
@@ -329,6 +357,22 @@ conflicts. `install` downloads and stages the verified runtime, creates the
 SSD-backed state link, and commits a receipt, but does not expose the
 `prime-agent` command. `enable` first runs the complete verification gate and
 then creates `~/.local/bin/prime-agent`.
+
+A separate, explicitly opt-in advisory audit exists too:
+
+```sh
+/usr/bin/python3 install_prime_agent.py audit
+```
+
+`audit` requires an existing install and live network access. It first runs
+the same complete verification gate `verify` does (so a tampered lock or
+release tree is caught before anything about it is trusted), then runs a real
+`npm audit` against the installed production lock and fails closed on any
+advisory for a package/GHSA-id pair not on the small, reviewed allowlist in
+`ACCEPTED_ADVISORIES`. It is deliberately never run as part of
+`plan`/`install`/`verify`/`enable`, which stay fully offline and hermetic --
+run it whenever re-verifying trust (e.g. before a re-pin), on whatever
+cadence a human decides.
 
 Durable disable and recovery are separate:
 
