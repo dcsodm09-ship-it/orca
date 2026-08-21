@@ -3073,6 +3073,11 @@ Codex 一路重新派发后连续撞了 2 次 Trusted Access（总计第 9、第
 `gpt-5.6-terra/high` 后确认真实在跑（`task_3f280591fe79` /
 dispatch `ctx_48cdcd27cec2`）。
 
+`task_3f280591fe79` 这次真的干了约 12 分钟活（有心跳）后又撞上
+Trusted Access（总计第 11 次）——不是每次都秒撞，说明确实是概率性的。
+用同一个模型（`gpt-5.6-terra/high`）直接重试，`task_dea13d0324e7` /
+dispatch `ctx_20be8cbd0913` 确认真实在跑。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
