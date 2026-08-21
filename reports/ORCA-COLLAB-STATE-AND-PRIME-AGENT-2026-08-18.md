@@ -3186,6 +3186,12 @@ provenance attestation，不是只信任元数据字段。结论：196 行里只
 Codex sol+max，对 `bafce01bf5`）——用户明确同意这次要含 Codex，之前的
 "暂停"仅针对当时那几个卡住的重试终端。
 
+Codex 一路这次没撞 hooks 竞态，但撞上了另一种已知模式：任务文本贴上去
+之后composer 没有自动提交，发一次空 Enter 补提交后确认真的在跑；随后
+想挂载真实追踪时报了 `agent_prompt_stalled`（终端当时正忙着干活，就绪
+探测和"正在处理中"撞了时机，不是真故障）。没有为了强行挂载去打断它，
+让它继续跑，等空闲了再重新挂载。opus/max 一路已并行派出。
+
 ## 0b. 里程碑：17 轮之后，安全修复候选双路复核终于都是 GO 了
 
 `commit fd6a683a4a`（round 16 状态）：**Codex sol/max PASS + Claude opus/max
