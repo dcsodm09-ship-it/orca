@@ -49,6 +49,13 @@ STUB_UPSTREAM_LOCK_SHA256 = installer.sha256_bytes(
 
 
 class PrimeAgentInstallerTests(unittest.TestCase):
+    # Minimal stand-in for os.stat_result, used only by the
+    # audit_installed_lock() unit tests below (which mock the filesystem
+    # away entirely rather than using a real tempdir) -- just needs the
+    # two attributes that function's own manifest_path.lstat()/
+    # lock_path.lstat() calls actually read.
+    _FAKE_STAT = type("FakeStat", (), {"st_dev": 1, "st_ino": 1})()
+
     def fake_extract_node_toolchain(
         self, asset: Path, destination: Path, expected_sha256: str
     ) -> tuple[Path, Path, str, str, dict[Path, str]]:
@@ -475,6 +482,13 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
             mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
             mock.patch.object(
+                installer, "read_private_ssd_file", side_effect=lambda p: b"stub-content"
+            ),
+            mock.patch.object(Path, "lstat", return_value=self._FAKE_STAT),
+            mock.patch.object(
+                installer, "verify_unchanged_private_ssd_file", return_value=None
+            ) as unchanged_mock,
+            mock.patch.object(
                 installer,
                 "managed_npm_environment",
                 return_value={"npm_config_audit": "false"},
@@ -483,6 +497,9 @@ class PrimeAgentInstallerTests(unittest.TestCase):
         ):
             result = installer.audit_installed_lock()
         verify_mock.assert_called_once_with()
+        # Both files re-checked once before and once after the subprocess
+        # call -- see audit_installed_lock()'s own round-58 docstring.
+        self.assertEqual(unchanged_mock.call_count, 4)
         self.assertTrue(result["ok"])
         self.assertEqual([entry["name"] for entry in result["accepted_advisories"]], ["extract-zip"])
         self.assertEqual(
@@ -521,6 +538,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             mock.patch.object(installer, "load_receipt", return_value=receipt),
             mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
             mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
+            mock.patch.object(
+                installer, "read_private_ssd_file", side_effect=lambda p: b"stub-content"
+            ),
+            mock.patch.object(Path, "lstat", return_value=self._FAKE_STAT),
+            mock.patch.object(installer, "verify_unchanged_private_ssd_file", return_value=None),
             mock.patch.object(
                 installer,
                 "managed_npm_environment",
@@ -571,6 +593,11 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
             mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
             mock.patch.object(
+                installer, "read_private_ssd_file", side_effect=lambda p: b"stub-content"
+            ),
+            mock.patch.object(Path, "lstat", return_value=self._FAKE_STAT),
+            mock.patch.object(installer, "verify_unchanged_private_ssd_file", return_value=None),
+            mock.patch.object(
                 installer,
                 "managed_npm_environment",
                 return_value={"npm_config_audit": "false"},
@@ -599,6 +626,75 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             with self.assertRaisesRegex(installer.PrimeInstallError, "release tree drifted"):
                 installer.audit_installed_lock()
         run_mock.assert_not_called()
+
+    def test_audit_installed_lock_detects_lock_swap_during_npm_audit_window(self) -> None:
+        # Regression for independent Codex sol/max round-57 re-review,
+        # 2026-08-22, P1/blocker: verify() closes the DURABLE tampering
+        # case, but its own whole-tree walk never bound the specific bytes
+        # it saw for package-lock.json to the specific bytes the `npm
+        # audit` subprocess actually reads moments later -- a same-UID
+        # racer who swaps the file's content DURING that subprocess's own
+        # window would previously have gotten a false-clean result, for
+        # exactly the file this action exists to audit.
+        #
+        # This test uses the REAL read_private_ssd_file()/
+        # verify_unchanged_private_ssd_file() (not mocked away, unlike the
+        # tests above) against real files on disk, and simulates the
+        # attack as a side effect of the mocked `subprocess.run` call
+        # itself -- the same technique
+        # _round56_tamper_manifest_or_lock_during_npm_ci_window_harness()
+        # uses to reproduce the sibling install-time attack, applied here
+        # to the audit-time window instead.
+        with tempfile.TemporaryDirectory() as directory:
+            release = Path(directory).resolve()
+            os.chmod(release, 0o700)
+            manifest_path = release / "package.json"
+            lock_path = release / "package-lock.json"
+            manifest_path.write_bytes(b'{"genuine": "manifest"}\n')
+            os.chmod(manifest_path, 0o600)
+            lock_path.write_bytes(b'{"genuine": "lock"}\n')
+            os.chmod(lock_path, 0o600)
+
+            receipt = {
+                "release_dir": os.fspath(release),
+                "node_target": "/tmp/node",
+                "npm_target": "/tmp/npm-cli.js",
+            }
+            clean_report = {"auditReportVersion": 2, "vulnerabilities": {}}
+
+            def fake_run_with_swap(*args, **kwargs):
+                # The attack: same-UID racer overwrites the ALREADY-
+                # verified lock file's content IN PLACE (same inode) as a
+                # side effect of npm audit's own subprocess window --
+                # exactly modeling a real racer who wins that window,
+                # without needing real concurrency to reproduce it.
+                with open(lock_path, "r+b") as handle:
+                    handle.seek(0)
+                    handle.write(b'{"ATTACKER":"swapped during npm audit window"}\n')
+                    handle.truncate()
+                return subprocess.CompletedProcess(
+                    args=list(args[0]) if args else [],
+                    returncode=0,
+                    stdout=json.dumps(clean_report),
+                    stderr="",
+                )
+
+            with (
+                mock.patch.object(installer, "verify", return_value={"ok": True}),
+                mock.patch.object(installer, "load_receipt", return_value=receipt),
+                mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
+                mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
+                mock.patch.object(
+                    installer,
+                    "managed_npm_environment",
+                    return_value={"npm_config_audit": "false"},
+                ),
+                mock.patch.object(subprocess, "run", side_effect=fake_run_with_swap),
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "changed before use"
+                ):
+                    installer.audit_installed_lock()
 
     def test_exact_dependency_versions_uses_top_level_release_choice(self) -> None:
         manifest = {"dependencies": {"chalk": "^5", "@earendil-works/pi-ai": "remote"}}

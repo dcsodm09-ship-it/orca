@@ -75,9 +75,12 @@ LICENSE_SHA256 = "b288615fb31dc504623582fb790a28e6d86bc2f5c1396845af555e43386da5
 # The normalized hash retains the complete registry dependency graph, URLs, and
 # integrity digests while canonicalizing only path-dependent managed file assets.
 # npm ci is not allowed to run until that exact closure is reproduced. Re-pinned
-# 2026-08-22 (round 56) after real sandbox_e2e.py runs -- both this project's own
-# and an independent Codex sol/max round-55 re-review's -- found the 2026-08-21
-# value stale within roughly a day: 17 of 200 registry rows changed, all
+# by round 56 (dated 2026-08-21, the re-pin commit's real UTC date -- see
+# GENERATED_LOCK_PINNED_AT's own comment for why this is not "2026-08-22",
+# the date it felt like while writing that round) after real sandbox_e2e.py
+# runs -- both this project's own and an independent Codex sol/max round-55
+# re-review's -- found the round-54/55 value stale within roughly a day: 17
+# of 200 registry rows changed, all
 # @aws-sdk/* patch bumps (one nested copy a minor bump within the same pinned
 # major line) published by the same official aws-sdk-bot automation account;
 # no publisher-identity change, no new dependency or lifecycle script on any
@@ -8614,22 +8617,22 @@ def _install_locked_within_release_dir(
     # digest -- e.g. LICENSE_SHA256 -- to the same map) but is
     # intentionally out of THIS round's required scope.
     #
-    # Round 56, 2026-08-22 (independent Codex sol/max round-55 re-review,
-    # P1/blocker): this paragraph, through round 55, named FOUR files here
-    # -- package.json and package-lock.json were listed alongside LICENSE
-    # and upstream-package-lock.json under the same "nothing ever reads
-    # these again, so tampering is inert" reasoning. That was true when
-    # round 34 first wrote it and stayed true for years of subsequent
-    # rounds, but round 54's new `audit` action broke it for exactly those
-    # two files (it runs real `npm audit` with `cwd=release`, genuinely
-    # reading both again) -- leaving this paragraph unchanged would have
-    # been the exact "over-claiming by omission" bug class this same
-    # paragraph's own history (rounds 25/27/29/32, cited below) already
-    # flagged in itself once before. package.json and package-lock.json
-    # are now individually pinned instead (see
-    # release_relative_pinned_digests' own round-56 comment) and removed
-    # from this list; only LICENSE and upstream-package-lock.json remain
-    # genuinely unpinned-but-inert.
+    # Round 57, 2026-08-22 (independent Claude opus/max round-56
+    # re-review, P2-2): this paragraph, through round 56, still named FOUR
+    # files here -- package.json and package-lock.json were listed
+    # alongside LICENSE and upstream-package-lock.json under the same
+    # "nothing ever reads these again, so tampering is inert" reasoning.
+    # That was true when round 34 first wrote it and stayed true for years
+    # of subsequent rounds, but round 54's new `audit` action broke it for
+    # exactly those two files (it runs real `npm audit` with
+    # `cwd=release`, genuinely reading both again) -- round 56 pinned both
+    # instead (see release_relative_pinned_digests' own round-56 comment)
+    # but left THIS paragraph unchanged, which would have been the exact
+    # "over-claiming by omission" bug class this same paragraph's own
+    # history (rounds 25/27/29/32, cited below) already flagged in itself
+    # once before. Trimmed here, one round later: package.json and
+    # package-lock.json are removed from this list; only LICENSE and
+    # upstream-package-lock.json remain genuinely unpinned-but-inert.
     # Round 36, 2026-08-20 (independent Claude opus/max round-35 review,
     # P1-1): the paragraph above, through round 34, separately noted that
     # "the ~196 third-party registry dependency packages' own file content
@@ -9471,12 +9474,53 @@ def audit_installed_lock() -> dict[str, Any]:
     the managed runtime state, and more) rather than re-deriving a
     weaker, partial subset of it here. Only once that has raised nothing
     does this proceed to actually run npm audit.
+
+    Round-58 dual review (2026-08-22, Codex sol/max, P1/blocker): calling
+    verify() first closes the DURABLE tampering case (anything wrong
+    before this function was ever invoked), but verify()'s own tree_
+    digest() walk covers the ENTIRE release tree (order 27,000 entries)
+    and returns a pass/fail verdict with no per-file evidence threaded
+    back to this caller -- so the specific bytes verify() confirmed for
+    package.json/package-lock.json, at whatever moment during its walk it
+    reached them, were never bound to the specific bytes the `npm audit`
+    subprocess below actually reads moments later. A same-UID racer who
+    wins that window (however narrow) still gets a false-clean result,
+    for exactly the two files this action exists to audit. Closed the
+    same way every other verify-then-exec gap in this file already is
+    (see e.g. the node/npm-cli re-checks bracketing `npm ci` in
+    _install_locked_within_release_dir()): capture both files' content
+    and identity as this function's own, narrower trust anchor
+    immediately after verify() returns, re-verify both are still
+    unchanged immediately before the subprocess call (shrinking verify()'s
+    whole-tree-walk-sized window down to this function's own few
+    intervening lines), and re-verify both AGAIN immediately after the
+    subprocess returns (closing the window during `npm audit`'s own
+    runtime, the same way node/npm-cli are re-checked after `npm ci`).
+    Any mismatch at either checkpoint means this function no longer knows
+    what `npm audit` actually read, and fails closed rather than trusting
+    a report about content that can no longer be shown to be what was
+    reported on.
     """
     verify()
     receipt = load_receipt()
     release = verify_private_ssd_dir(Path(receipt["release_dir"]))
     node = resolve_ssd(Path(receipt["node_target"]))
     npm_cli = resolve_ssd(Path(receipt["npm_target"]))
+    # This function's own narrower trust anchor -- see the round-58
+    # docstring paragraph above for why capturing this here, right after
+    # verify() returns, and re-checking it twice more below (immediately
+    # before and immediately after the actual audit subprocess) is what
+    # actually binds "the bytes verify() confirmed" to "the bytes npm
+    # audit reads", rather than relying on verify()'s own, much coarser
+    # whole-tree pass/fail.
+    manifest_path = release / "package.json"
+    lock_path = release / "package-lock.json"
+    manifest_raw = read_private_ssd_file(manifest_path)
+    manifest_stat = manifest_path.lstat()
+    manifest_identity = (manifest_stat.st_dev, manifest_stat.st_ino)
+    lock_raw = read_private_ssd_file(lock_path)
+    lock_stat = lock_path.lstat()
+    lock_identity = (lock_stat.st_dev, lock_stat.st_ino)
     cache = verify_private_ssd_dir(TOOL_ROOT / "npm-cache")
     install_home = verify_private_ssd_dir(TOOL_ROOT / "install-home")
     install_tmp = verify_private_ssd_dir(TOOL_ROOT / "install-tmp")
@@ -9485,6 +9529,10 @@ def audit_installed_lock() -> dict[str, Any]:
     # `npm_config_audit=false` -- this function's entire purpose is to run
     # that check for real, on demand.
     environment["npm_config_audit"] = "true"
+    # Immediately before the subprocess that actually reads these two
+    # files -- see the round-58 docstring paragraph above.
+    verify_unchanged_private_ssd_file(manifest_path, manifest_raw, manifest_identity)
+    verify_unchanged_private_ssd_file(lock_path, lock_raw, lock_identity)
     try:
         result = subprocess.run(
             [os.fspath(node), os.fspath(npm_cli), "audit", "--omit=dev", "--json"],
@@ -9498,6 +9546,14 @@ def audit_installed_lock() -> dict[str, Any]:
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise PrimeInstallError("cannot run npm audit") from exc
+    # Immediately after: closes the window DURING the subprocess's own
+    # runtime, the same way node/npm-cli are re-checked after `npm ci`
+    # elsewhere in this file -- see the round-58 docstring paragraph
+    # above. If either file changed while `npm audit` was running, the
+    # report below describes content this function can no longer show
+    # was what was actually audited, and must not be trusted.
+    verify_unchanged_private_ssd_file(manifest_path, manifest_raw, manifest_identity)
+    verify_unchanged_private_ssd_file(lock_path, lock_raw, lock_identity)
     # `npm audit` exits non-zero whenever it finds any vulnerability at
     # all, including ones already on ACCEPTED_ADVISORIES -- exit code is
     # deliberately not treated as pass/fail here; the allowlist comparison

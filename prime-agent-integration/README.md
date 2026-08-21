@@ -290,9 +290,12 @@ swapped as a side effect of the real `npm ci` window, verified to make
 pre-fix `install()` complete successfully with the attacker's bytes baked
 into the trusted baseline, and to fail closed post-fix).
 
-Re-pinned 2026-08-22 (round 56; v0.7.2 remains current for every
-upstream-immutable item above; nothing upstream-immutable changed on
-re-check). The **generated production closure** changed again, for the
+Re-pinned 2026-08-21 (round 56 -- see `GENERATED_LOCK_PINNED_AT`'s own
+comment for why this is dated by the re-pin commit's real UTC date, not
+the local calendar date it felt like while writing round 56; v0.7.2
+remains current for every upstream-immutable item above; nothing
+upstream-immutable changed on re-check). The **generated production
+closure** changed again, for the
 same reason as every prior refresh: npm always resolves to the *highest
 currently-published* version satisfying each floating range, and this time
 the drift was caught live, mid-review -- both this project's own
