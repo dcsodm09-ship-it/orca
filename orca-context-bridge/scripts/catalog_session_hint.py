@@ -927,7 +927,18 @@ def spawn_rebuild() -> bool:
         return False
     try:
         subprocess.Popen(  # noqa: S603 - fixed argv, no shell, no user input
-            [sys.executable, str(script), "build", "--quiet"],
+            # -I for the same reason registration_entry() puts it on this
+            # hook's own invocation: this child inherits the parent's full
+            # environment (Popen does not sanitise it), so a project-set
+            # PYTHONPATH shadowing a stdlib module name would hijack the
+            # aggregator's own top-level imports exactly the same way.
+            # Reproduced: `PYTHONPATH=<dir with a fake argparse.py>
+            # build_cross_project_catalog.py build --quiet` raises during
+            # import before the aggregator's own error handling exists;
+            # -I neutralises it (sys.path[0], the script's own directory,
+            # is unaffected by -I, so the aggregator's sibling imports are
+            # untouched).
+            [sys.executable, "-I", str(script), "build", "--quiet"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

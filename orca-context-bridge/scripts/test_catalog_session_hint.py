@@ -1281,6 +1281,27 @@ class StalenessAndSpawnTests(unittest.TestCase):
         # /dev/null is a character device; the inherited payload pipe is a FIFO.
         self.assertEqual(self.marker.read_text(encoding="utf-8").strip(), "chr")
 
+    def test_the_rebuild_is_isolated_from_pythonpath(self) -> None:
+        """The child inherits the parent's full environment (Popen does not
+        sanitise it) -- a project-set PYTHONPATH shadowing a stdlib module
+        name would hijack the aggregator's own top-level imports exactly the
+        way it would this hook's, if the child were launched without -I.
+        Reproduced without -I during review: a real PYTHONPATH pointing at a
+        fake argparse.py raised during `build_cross_project_catalog.py`'s own
+        `import argparse`, before its own error handling exists."""
+        (self.tmp / "build_cross_project_catalog.py").write_text(
+            textwrap.dedent(f"""
+            import sys, pathlib
+            pathlib.Path({str(self.marker)!r}).write_text(
+                "isolated" if sys.flags.isolated else "not-isolated", encoding="utf-8")
+            """).strip() + "\n",
+            encoding="utf-8",
+        )
+        self._write_catalog("2020-01-01T00:00:00Z")
+        self._run()
+        self.assertTrue(self._wait_for_marker(10.0))
+        self.assertEqual(self.marker.read_text(encoding="utf-8").strip(), "isolated")
+
     def test_the_rebuild_cwd_is_the_scripts_own_directory(self) -> None:
         """Removes the failure mode where the session's cwd is being deleted
         (a worktree mid-archive) and Popen raises."""
