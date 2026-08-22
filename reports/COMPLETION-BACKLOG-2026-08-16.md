@@ -1107,3 +1107,93 @@ audit端到端，全部通过。
 P1-A 和round 62段落(g)的路径-vs-exec限制都是已知、经用户明确决策接受的限制；toolchain
 子树检查对未被逐文件保护的~1918个文件提供的保护级别（fail closed但非before-exec）
 也是本轮诚实记录的已知性质，不是待发现的新问题；两路都无可复现P0/P1才是真正双GO。
+
+## 21. Round 63 双复核：Claude腿完成，Codex腿撞session限额（非P0/P1）
+
+针对`94ba8c5536`的双复核只有Claude opus/max一路真正跑完：**GO，P0=0，P1=0**（排除
+三项既定接受项：(d)持久伪造、(g) path-vs-exec平台限制、本轮toolchain范围说明），
+另有**P2×2 / P3×6**均为非阻断项（详见下方round 64处理）。Codex sol/max一路和综合
+判断步骤**都**因命中`"You've hit your session limit · resets 4:10pm (Asia/Taipei)"`
+而失败——这是一种新的、此前未记录过的基础设施失败模式（会话级用量限额，不同于已
+记录的Trusted Access墙/`operator_close`/`consumer_fenced`），不是P0/P1发现。按既定
+规则，一路未完成不算双GO，不得当作通过处理。
+
+## 22. Round 64：修复round 63审查自己发现的P2/P3（测试覆盖+文档订正）
+
+没有直接对round 63的候选重派Codex（那一路本身没有内容问题，只是没跑完），而是先把
+round 63审查报告本身列出的、审查方推荐"合并前顺手修"的问题修完：
+
+- **P2-1**：`verify()`新增的toolchain树校验（round 63加的）零回归测试覆盖，但确实
+  承重——新增`test_verify_rejects_toolchain_tree_drift`，直接调用真实`verify()`
+  端到端（只mock掉无关前置条件），变异测试证实：删掉该if/raise后测试以裸
+  `KeyError`失败（证明检查确实是唯一挡住攻击者内容执行的东西）。
+- **P2-2**：round 63的重排序修复（两次整树遍历先跑、四个逐文件快检紧贴subprocess
+  之前）零回归测试覆盖——新增`test_audit_installed_lock_runs_tree_walks_before_
+  fast_per_file_checks`，用call-order spy锁定精确调用顺序，变异测试证实：把
+  toolchain检查挪回round 62的位置后测试报告清晰的列表顺序不匹配。
+- **P3-2/P3-3/P3-4**：docstring订正三处事实错误——字段计数"nine"→实为"eleven"
+  （round 63新增4个未固定字段而非2个）；范围说明"~1,918"→实为"~4,706"（原数字
+  其实是npm包子树自己的数字，不是toolchain全体减2）；段落(f)/(i)把round 62引入的
+  `toolchain_digest_early`代码及其排序bug错标成"round 61"——`git show`客观核实
+  round 61里该代码出现0次、round 62里出现3次，订正为round 62。这是本文件第5次以上
+  出现同一类"归因到错误轮次"的文档错误，每次都被下一轮独立复核抓到。
+
+234→236测试，双解释器全绿，py_compile干净，真实`sandbox_e2e.py`产线锁未变。
+提交`223ace9000`。
+
+## 23. Round 64双复核：真正的双GO（Codex一路这次真正跑完）
+
+针对`223ace9000`重新派发完整双复核（`[强制双复核]`标记，按CLAUDE.md规则4作为终审）：
+
+- **Claude opus/max**：GO，P0=0/P1=0/P2=0/P3=4（不阻断：本轮docstring编辑留下一处
+  括号不平衡；round 64修复的docstring段落之外、函数体内联注释里还残留3-4处同类
+  "round 61"误标；新测试1的变异信号是裸KeyError不够干净；新测试2只锁定了subprocess
+  调用**前**半段的顺序，后半段未锁）。
+- **Codex sol/max**（这次经真实Orca Run/Task/Dispatch真正跑完，`task_443e45aeae8b`，
+  完整报告见`/tmp/prime-agent-round64-qa.oCCua8/PRIME-AGENT-ROUND64-INDEPENDENT-QA.md`）：
+  GO，P0=0/P1=0/P2=0/P3=1——独立发现并确认了跟Claude P3-2**同一处**残留的"round 61"
+  内联注释误标（`:10074`/`:10077`）。两路各自独立完成了新鲜的变异测试（自建全新
+  scratch mutant，不复用旧文件）、真实非mock安装/文件计数、双解释器236测试套件，
+  结论一致收敛。
+
+**综合判断：真正双GO**（两路均独立完成、均P0=0/P1=0）。Workflow内部的Codex编排
+子agent这次虽然自己提前返回了一句不完整的"Waiting for the next monitor event..."
+占位文本（没有按指示持续轮询到位，另一个此前未见过的编排失败模式），但底层真实
+Codex worker本身确实在几分钟后正常完成了——直接从Orca任务记录里取回了完整、真实
+的verdict文本，而不是重派或采信这句占位文本。
+
+## 24. Round 65：清理两路都独立发现的残留问题 + 真实安装上线
+
+两路复核唯一重叠的真实发现（残留的"round 61"内联注释误标）加上Claude独有的括号
+不平衡和测试2覆盖面缺口一起，作为不需要重新终审的纯文本/测试扩展修复处理（按
+CLAUDE.md规则4，只有P0/P1才强制重新终审；round 64和本轮均为0 P0/P1）：
+
+- 修正`install_prime_agent.py:5118/:10003/:10074/:10077`四处内联注释的"round 61"
+  →"round 62"（另有`:9748`/`:9809`两处经核实其实指的是round 61自己的真实贡献，
+  保留不动）。
+- 修正docstring段落(h)的括号不平衡（round 64编辑时只闭合了嵌套括号，外层的
+  未闭合——用AST逐字符括号深度核实：round 64 HEAD结尾深度1，修复后深度0）。
+- 扩展`test_audit_installed_lock_runs_tree_walks_before_fast_per_file_checks`
+  也锁定subprocess调用**后**半段的顺序（此前完全没有测试覆盖）——新建变异体
+  （toolchain后检查挪到subprocess后、四个逐文件快检之前，镜像已有的"前半段"
+  变异体）证实新断言确实承重、且跟前半段的变异体互不重叠。
+
+236测试（本轮扩展既有测试而非新增），双解释器全绿，py_compile干净，真实
+`sandbox_e2e.py`再次确认产线锁未变。提交`bca0e35467`。
+
+**真实安装（用户既定授权"4项follow-up做完后，直接装进真实系统"，双GO达成后
+无需再次确认）**：
+
+```
+plan    -> ok:true, conflicts:[], pending_transaction:false
+install -> ok:true, production_lock_sha256=006d6d1493…929e092（与锁定值逐字符一致）
+verify  -> ok:true, 各字段与receipt自洽
+enable  -> ok:true, command_enabled:true
+audit   -> ok:true, 仅白名单内的extract-zip一条advisory
+```
+
+安装位置：`/Volumes/Extreme SSD/Orca/local-homes/.shared-tools/prime-agent/releases/v0.7.2/`；
+命令入口：`/Users/www1adwawd/.local/bin/prime-agent`（软链接，`enable`前处于
+disabled状态，`enable`后才创建）；状态目录软链接：`/Users/www1adwawd/.prime`。
+
+**rounds 58-65 全流程闭环，真实系统已上线，本项工作完成。**
