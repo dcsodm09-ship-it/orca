@@ -47,6 +47,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -461,6 +462,19 @@ class SummaryLineTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_sub_second_future_timestamp_stays_negative(self) -> None:
+        """The timestamp grammar only accepts whole-second precision, but
+        `now` (a real wall clock) has microseconds -- so a `verified_at`
+        exactly one whole second ahead of `now` can still produce a
+        FRACTIONAL age. int() truncates toward zero: -0.5 would become 0,
+        indistinguishable from "just verified" and NOT caught by
+        is_stale()'s `age_seconds < 0` branch. floor(-0.5) == -1, which is."""
+        now = datetime(2026, 1, 1, 0, 0, 0, 500000, tzinfo=timezone.utc)
+        catalog = make_catalog(verified_at="2026-01-01T00:00:01Z")
+        age = csh.catalog_age_seconds(catalog, now)
+        self.assertEqual(age, -1)
+        self.assertTrue(csh.is_stale(age, csh.DEFAULT_STALE_AFTER_HOURS * 3600.0))
 
     def test_counts_and_project_derivation(self) -> None:
         catalog = make_catalog(
@@ -1483,7 +1497,7 @@ class IndependenceTests(unittest.TestCase):
                     imported.add(node.module.split(".")[0])
         self.assertEqual(
             imported,
-            {"__future__", "argparse", "json", "os", "shlex", "signal", "stat",
+            {"__future__", "argparse", "json", "math", "os", "shlex", "signal", "stat",
              "subprocess", "sys", "time", "unicodedata", "datetime", "pathlib", "typing"},
             "catalog_session_hint.py's dependency surface changed",
         )
@@ -1662,7 +1676,19 @@ class NoWritePathTests(unittest.TestCase):
     def test_no_write_flag_is_ever_requested_at_runtime(self) -> None:
         """The behavioural half: an interceptor over os.open/builtins.open
         that fails the test if any write mode or flag is ever requested,
-        across a full run including the spawn decision."""
+        across a full run including the spawn decision.
+
+        `subprocess.Popen` is mocked too: `no_spawn=False` against a stale
+        fixture means `spawn_rebuild()` really does try to launch
+        `build_cross_project_catalog.py build --quiet` -- a real, detached,
+        fire-and-forget child process, unaffected by the os.open/builtins.open
+        mocks above (those only cover this process). Left unmocked, this test
+        actually spawned a real background rebuild of the SHARED production
+        `catalog.json` on every run (spawn_rebuild() never passes --catalog,
+        so the child always targets the real default path, independent of
+        the fixture path used here) -- a test silently mutating shared state
+        outside its own tmp dir on every run is a bug on its own, apart from
+        whatever the review this comment documents was actually checking."""
         real_os_open = os.open
         real_builtin_open = builtins.open
         write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
@@ -1678,8 +1704,10 @@ class NoWritePathTests(unittest.TestCase):
             return real_builtin_open(file, mode, *args, **kwargs)
 
         catalog = write_catalog(self.tmp / "catalog.json", make_catalog(verified_at="2020-01-01T00:00:00Z"))
-        with mock.patch("os.open", guarded_os_open), mock.patch.object(builtins, "open", guarded_builtin_open):
+        with mock.patch("os.open", guarded_os_open), mock.patch.object(builtins, "open", guarded_builtin_open), \
+             mock.patch("catalog_session_hint.subprocess.Popen") as popen:
             csh.build_hook_text(hook_args(catalog=str(catalog), no_spawn=False), time.monotonic(), now=NOW)
+        popen.assert_called_once()
 
     def test_print_registration_prints_and_never_writes(self) -> None:
         """Boundary #6 made structural: there is no settings.json writer in
@@ -1702,6 +1730,25 @@ class NoWritePathTests(unittest.TestCase):
         command = json.loads(out)["hooks"][0]["command"]
         self.assertIn("'/a b/c.py'", command)
         self.assertIn("--knowledge-root '/d e'", command)
+
+    def test_print_registration_quotes_a_python_path_with_spaces(self) -> None:
+        code, out, err = run_subprocess(["print-registration", "--python", "/a b/python3"])
+        command = json.loads(out)["hooks"][0]["command"]
+        self.assertIn("'/a b/python3'", command)
+
+    def test_print_registration_uses_isolated_mode(self) -> None:
+        """-I so a project's own PYTHONPATH cannot hijack this script's
+        top-level imports before its own exception handling exists (a real
+        RuntimeError-from-a-shadowed-stdlib-module was reproduced without
+        this flag during review)."""
+        code, out, err = run_subprocess(["print-registration"])
+        command = json.loads(out)["hooks"][0]["command"]
+        tokens = shlex.split(command)
+        self.assertIn("-I", tokens)
+        self.assertLess(
+            tokens.index("-I"), tokens.index("hook"),
+            "-I must be a Python interpreter flag, positioned before the script path and subcommand",
+        )
 
     def test_the_source_contains_no_settings_json_path(self) -> None:
         """Boundary #6 again, from the other side: the hook's docstrings

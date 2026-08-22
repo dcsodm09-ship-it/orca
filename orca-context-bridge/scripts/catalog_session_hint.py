@@ -84,13 +84,23 @@ catalog (see BACKGROUND REBUILD); that child writes, this parent does not.
 
 SILENCE IS THE ONLY FAILURE MODE
 --------------------------------
-Every failure -- catalog missing, corrupt, too large, a FIFO planted at the
-path, a permission error, an unknown project, a blown deadline -- produces
-the SAME well-formed envelope with an empty `additionalContext`, and exit 0.
-Never `{}`, never empty stdout, never a nonzero exit, and nothing on stderr
-on any path: a valid empty envelope can never be misread as a crash, and a
-hint that cannot be produced must not become the reason a session fails to
-start. No exception escapes this script.
+The envelope is always well-formed, exit is always 0, and nothing ever
+reaches stderr -- but "empty `additionalContext`" and "line 1 only" are two
+DIFFERENT degrees of that silence, not one:
+
+  * catalog missing, corrupt, too large, a FIFO planted at the path, a
+    permission error -- there is nothing truthful to say at all yet, so
+    `additionalContext` is fully empty.
+  * an unknown project, a blown deadline past that point, or any other
+    failure once the catalog has already been read -- line 1 (the catalog
+    summary) was already fully knowable, so it is kept; only line 2 (the
+    per-project reminder, which needs the project resolved) is dropped.
+
+Either way: never `{}`, never empty stdout, never a nonzero exit. A valid
+envelope -- empty or line-1-only -- can never be misread as a crash, and a
+hint that cannot be fully produced must not become the reason a session
+fails to start, or throw away the part of it that COULD be produced. No
+exception escapes this script.
 
 TIMING
 ------
@@ -149,6 +159,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shlex
 import signal
@@ -827,7 +838,12 @@ def catalog_age_seconds(catalog: "dict | None", now: datetime) -> "int | None":
     verified = _parse_utc_timestamp(catalog.get("verified_at"))
     if verified is None:
         return None
-    return int((now - verified).total_seconds())
+    # floor, not int(): int() truncates TOWARD ZERO, so a verified_at less
+    # than one second in the future (-0.5s) would round to 0 -- indistinguishable
+    # from "just verified" -- instead of staying negative and correctly
+    # tripping is_stale()'s "in the future counts as stale" rule below.
+    # floor(-0.5) == -1, which stays negative through that check.
+    return math.floor((now - verified).total_seconds())
 
 
 def is_stale(age_seconds: "int | None", stale_after_seconds: float) -> bool:
@@ -1183,8 +1199,20 @@ def cmd_hook(argv: list) -> int:
 
 
 def registration_entry(args: argparse.Namespace) -> dict:
+    # -I (isolated mode: implies -E and -s) so this hook -- registered to run
+    # on EVERY project's session start with whatever environment the harness
+    # happens to inherit -- cannot have its own import machinery hijacked by
+    # a project-set PYTHONPATH. Reproduced without -I: a PYTHONPATH pointing
+    # at a directory containing a same-named module (e.g. argparse.py) runs
+    # that module's top-level code during this script's own `import
+    # argparse`, before any of its exception handling exists -- arbitrary
+    # code execution, and a bare traceback instead of the documented "silence
+    # is the only failure mode" contract. -I does not affect HOME/expanduser
+    # or any argument this script reads; nothing here depends on user
+    # site-packages or PYTHONPATH.
     command_parts = [
-        args.python,
+        shlex.quote(args.python),
+        "-I",
         shlex.quote(str(Path(args.script_path))),
         "hook",
     ]
