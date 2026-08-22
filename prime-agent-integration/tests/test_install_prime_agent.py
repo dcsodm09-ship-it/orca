@@ -445,10 +445,17 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     installer._advisory_ghsa_id(record)
 
     def test_audit_installed_lock_passes_on_allowlisted_advisory_only(self) -> None:
+        # Round-61 dual-review regression (2026-08-22, Claude opus/max
+        # P1-C, Codex sol/max P1-1): node_sha256/npm_cli_sha256 must now
+        # be present and match sha256_file_verified()'s (mocked) return
+        # value -- see audit_installed_lock()'s own docstring paragraph
+        # (e) this round added.
         receipt = {
             "release_dir": "/tmp/does-not-matter",
             "node_target": "/tmp/node",
             "npm_target": "/tmp/npm-cli.js",
+            "node_sha256": "binhash",
+            "npm_cli_sha256": "binhash",
         }
         # Round-59 dual-review regression (2026-08-22, Claude opus/max,
         # P1-1): the whole-tree digest/entries this function trusts must
@@ -513,6 +520,9 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 installer, "tree_digest", return_value=("treehash", 5)
             ) as tree_digest_mock,
             mock.patch.object(
+                installer, "assert_no_release_npmrc"
+            ) as npmrc_mock,
+            mock.patch.object(
                 installer,
                 "managed_npm_environment",
                 return_value={"npm_config_audit": "false"},
@@ -521,17 +531,28 @@ class PrimeAgentInstallerTests(unittest.TestCase):
         ):
             result = installer.audit_installed_lock()
         verify_mock.assert_called_once_with()
-        # Whole-tree digest re-checked once before and once after the
-        # subprocess call, both against verify()'s own evidence -- see
-        # audit_installed_lock()'s own round-59 dual-review docstring
-        # paragraph (a).
-        self.assertEqual(tree_digest_mock.call_count, 2)
+        # tree_digest() called 5 times: 1 early toolchain-subtree capture
+        # (docstring paragraph (f)) + whole-tree check #1 + pre-subprocess
+        # toolchain recheck + post-subprocess toolchain recheck +
+        # whole-tree check #2.
+        self.assertEqual(tree_digest_mock.call_count, 5)
         # The narrower, earlier-anchored bracket (package.json and
         # package-lock.json byte-exact, node/npm-cli digest-based)
         # re-checked once before and once after the subprocess call too
         # -- see docstring paragraphs (b) and (c).
         self.assertEqual(verify_unchanged_mock.call_count, 4)
         self.assertEqual(verify_unchanged_asset_mock.call_count, 4)
+        # Round-61 dual-review regression (2026-08-22, Claude opus/max
+        # P2): assert_no_release_npmrc() -- as a former closure -- had NO
+        # regression coverage for its middle call site (the one
+        # immediately before the subprocess, the only one that actually
+        # matters); a mutant deleting just that call passed every
+        # existing test. Now promoted to a module-level function
+        # specifically so this call-count assertion can exist at all,
+        # matching tree_digest_mock/verify_unchanged_mock above. Called 3
+        # times: right after the early capture, immediately before the
+        # subprocess, and immediately after it returns.
+        self.assertEqual(npmrc_mock.call_count, 3)
         self.assertTrue(result["ok"])
         self.assertEqual([entry["name"] for entry in result["accepted_advisories"]], ["extract-zip"])
         self.assertEqual(
@@ -546,6 +567,8 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             "release_dir": "/tmp/does-not-matter",
             "node_target": "/tmp/node",
             "npm_target": "/tmp/npm-cli.js",
+            "node_sha256": "binhash",
+            "npm_cli_sha256": "binhash",
         }
         verify_result = {
             "ok": True,
@@ -614,6 +637,8 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             "release_dir": "/tmp/does-not-matter",
             "node_target": "/tmp/node",
             "npm_target": "/tmp/npm-cli.js",
+            "node_sha256": "binhash",
+            "npm_cli_sha256": "binhash",
         }
         verify_result = {
             "ok": True,
@@ -745,6 +770,25 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             npm_cli_path.parent.mkdir(mode=0o700, parents=True)
             npm_cli_path.write_bytes(b"// genuine npm-cli.js stub\n")
             os.chmod(npm_cli_path, 0o600)
+            # Python's Path.mkdir(mode=..., parents=True) only applies
+            # `mode` to the LEAF directory it creates -- every
+            # intermediate directory it creates along the way (toolchain/,
+            # toolchain/lib/, etc.) gets the process umask instead, which
+            # is NOT private. tree_digest()'s own first line calls
+            # verify_private_ssd_dir() on whatever root it's given (now
+            # including `release / "toolchain"` itself, per docstring
+            # paragraph (f) this round added), so every level must be
+            # explicitly re-chmod'd to 0o700, not just the two leaves
+            # above.
+            for private_dir in (
+                release / "toolchain",
+                release / "toolchain/bin",
+                release / "toolchain/lib",
+                release / "toolchain/lib/node_modules",
+                release / "toolchain/lib/node_modules/npm",
+                release / "toolchain/lib/node_modules/npm/bin",
+            ):
+                os.chmod(private_dir, 0o700)
             with mock.patch.object(installer, "SSD_ROOT", root):
                 clean_digest, clean_entries = installer.tree_digest(release)
 
@@ -760,6 +804,14 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 "release_dir": os.fspath(release),
                 "node_target": os.fspath(node_path),
                 "npm_target": os.fspath(npm_cli_path),
+                # Round-61 dual-review regression (2026-08-22, P1-C):
+                # honest, unforged digests of node/npm-cli -- this test
+                # is specifically about the WHOLE-TREE anchor being
+                # forged, not node/npm-cli, so these must be genuine to
+                # get past the (separate) docstring paragraph (e) check
+                # and reach the whole-tree check this test targets.
+                "node_sha256": installer.sha256_file_verified(node_path),
+                "npm_cli_sha256": installer.sha256_file_verified(npm_cli_path),
                 # Forged to match the ALREADY-tampered tree above -- not
                 # the true, pre-tamper baseline.
                 "release_tree_sha256": tampered_digest,
@@ -898,6 +950,25 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             npm_cli_path.parent.mkdir(mode=0o700, parents=True)
             npm_cli_path.write_bytes(b"// genuine npm-cli.js stub\n")
             os.chmod(npm_cli_path, 0o600)
+            # Python's Path.mkdir(mode=..., parents=True) only applies
+            # `mode` to the LEAF directory it creates -- every
+            # intermediate directory it creates along the way (toolchain/,
+            # toolchain/lib/, etc.) gets the process umask instead, which
+            # is NOT private. tree_digest()'s own first line calls
+            # verify_private_ssd_dir() on whatever root it's given (now
+            # including `release / "toolchain"` itself, per docstring
+            # paragraph (f) this round added), so every level must be
+            # explicitly re-chmod'd to 0o700, not just the two leaves
+            # above.
+            for private_dir in (
+                release / "toolchain",
+                release / "toolchain/bin",
+                release / "toolchain/lib",
+                release / "toolchain/lib/node_modules",
+                release / "toolchain/lib/node_modules/npm",
+                release / "toolchain/lib/node_modules/npm/bin",
+            ):
+                os.chmod(private_dir, 0o700)
             # tree_digest()/verify_private_ssd_dir()/resolve_ssd() all
             # require paths under SSD_ROOT -- mock it to this test's own
             # real temp root (matching the established pattern used by
@@ -911,6 +982,12 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 "release_dir": os.fspath(release),
                 "node_target": os.fspath(node_path),
                 "npm_target": os.fspath(npm_cli_path),
+                # Round-61 dual-review regression (2026-08-22, P1-C):
+                # honest digests -- this test tampers manifest.json only,
+                # so node/npm-cli must pass docstring paragraph (e)'s
+                # check to reach the whole-tree check this test targets.
+                "node_sha256": installer.sha256_file_verified(node_path),
+                "npm_cli_sha256": installer.sha256_file_verified(npm_cli_path),
                 "release_tree_sha256": digest,
                 "release_tree_entries": entries,
             }
@@ -1031,6 +1108,25 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             npm_cli_path.parent.mkdir(mode=0o700, parents=True)
             npm_cli_path.write_bytes(b"// genuine npm-cli.js stub\n")
             os.chmod(npm_cli_path, 0o600)
+            # Python's Path.mkdir(mode=..., parents=True) only applies
+            # `mode` to the LEAF directory it creates -- every
+            # intermediate directory it creates along the way (toolchain/,
+            # toolchain/lib/, etc.) gets the process umask instead, which
+            # is NOT private. tree_digest()'s own first line calls
+            # verify_private_ssd_dir() on whatever root it's given (now
+            # including `release / "toolchain"` itself, per docstring
+            # paragraph (f) this round added), so every level must be
+            # explicitly re-chmod'd to 0o700, not just the two leaves
+            # above.
+            for private_dir in (
+                release / "toolchain",
+                release / "toolchain/bin",
+                release / "toolchain/lib",
+                release / "toolchain/lib/node_modules",
+                release / "toolchain/lib/node_modules/npm",
+                release / "toolchain/lib/node_modules/npm/bin",
+            ):
+                os.chmod(private_dir, 0o700)
 
             with mock.patch.object(installer, "SSD_ROOT", root):
                 digest, entries = installer.tree_digest(release)
@@ -1039,6 +1135,12 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 "release_dir": os.fspath(release),
                 "node_target": os.fspath(node_path),
                 "npm_target": os.fspath(npm_cli_path),
+                # Round-61 dual-review regression (2026-08-22, P1-C):
+                # honest digests -- this test targets the toolchain
+                # subtree/whole-tree windows (paragraphs (a)/(f)), not
+                # node/npm-cli's own docstring paragraph (e) check.
+                "node_sha256": installer.sha256_file_verified(node_path),
+                "npm_cli_sha256": installer.sha256_file_verified(npm_cli_path),
             }
             verify_result = {
                 "ok": True,
@@ -1157,11 +1259,38 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             npm_cli_path.parent.mkdir(mode=0o700, parents=True)
             npm_cli_path.write_bytes(b"// genuine npm-cli.js stub\n")
             os.chmod(npm_cli_path, 0o600)
+            # Python's Path.mkdir(mode=..., parents=True) only applies
+            # `mode` to the LEAF directory it creates -- every
+            # intermediate directory it creates along the way (toolchain/,
+            # toolchain/lib/, etc.) gets the process umask instead, which
+            # is NOT private. tree_digest()'s own first line calls
+            # verify_private_ssd_dir() on whatever root it's given (now
+            # including `release / "toolchain"` itself, per docstring
+            # paragraph (f) this round added), so every level must be
+            # explicitly re-chmod'd to 0o700, not just the two leaves
+            # above.
+            for private_dir in (
+                release / "toolchain",
+                release / "toolchain/bin",
+                release / "toolchain/lib",
+                release / "toolchain/lib/node_modules",
+                release / "toolchain/lib/node_modules/npm",
+                release / "toolchain/lib/node_modules/npm/bin",
+            ):
+                os.chmod(private_dir, 0o700)
 
             receipt = {
                 "release_dir": os.fspath(release),
                 "node_target": os.fspath(node_path),
                 "npm_target": os.fspath(npm_cli_path),
+                # Round-61 dual-review regression (2026-08-22, P1-C):
+                # honest CLEAN digest, captured before the mocked
+                # tree_digest() below ever tampers node -- so this
+                # test's own early capture (docstring paragraph (e))
+                # passes cleanly, and the tamper is caught downstream by
+                # the per-file asset-digest recheck this test targets.
+                "node_sha256": installer.sha256_file_verified(node_path),
+                "npm_cli_sha256": installer.sha256_file_verified(npm_cli_path),
             }
             verify_result = {
                 "ok": True,
@@ -1170,10 +1299,14 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             }
 
             def fake_tree_digest(root_arg, **kwargs):
-                # Whole-tree check #1: tamper node right after "returning"
-                # the expected clean digest -- the racer wins the window
-                # between the early per-file capture (already done by the
-                # time this mock runs) and this function's own re-check
+                # tree_digest() is now called 5 times per run (early
+                # toolchain-subtree capture, whole-tree check #1,
+                # pre-/post-subprocess toolchain rechecks, whole-tree
+                # check #2) -- this fires on the FIRST of those (the
+                # early toolchain-subtree capture, which happens right
+                # after the early per-file capture above), tampering node
+                # right there: the racer wins the window between the
+                # early per-file capture and this function's own re-check
                 # of node, immediately before the subprocess.
                 with open(node_path, "r+b") as handle:
                     handle.seek(0)
@@ -1235,6 +1368,25 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             npm_cli_path.parent.mkdir(mode=0o700, parents=True)
             npm_cli_path.write_bytes(b"// genuine npm-cli.js stub\n")
             os.chmod(npm_cli_path, 0o600)
+            # Python's Path.mkdir(mode=..., parents=True) only applies
+            # `mode` to the LEAF directory it creates -- every
+            # intermediate directory it creates along the way (toolchain/,
+            # toolchain/lib/, etc.) gets the process umask instead, which
+            # is NOT private. tree_digest()'s own first line calls
+            # verify_private_ssd_dir() on whatever root it's given (now
+            # including `release / "toolchain"` itself, per docstring
+            # paragraph (f) this round added), so every level must be
+            # explicitly re-chmod'd to 0o700, not just the two leaves
+            # above.
+            for private_dir in (
+                release / "toolchain",
+                release / "toolchain/bin",
+                release / "toolchain/lib",
+                release / "toolchain/lib/node_modules",
+                release / "toolchain/lib/node_modules/npm",
+                release / "toolchain/lib/node_modules/npm/bin",
+            ):
+                os.chmod(private_dir, 0o700)
             # The attacker's own planted file -- present before this
             # function is ever invoked.
             (release / ".npmrc").write_bytes(
@@ -1245,6 +1397,8 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 "release_dir": os.fspath(release),
                 "node_target": os.fspath(node_path),
                 "npm_target": os.fspath(npm_cli_path),
+                "node_sha256": installer.sha256_file_verified(node_path),
+                "npm_cli_sha256": installer.sha256_file_verified(npm_cli_path),
             }
             verify_result = {
                 "ok": True,
@@ -1268,6 +1422,219 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     installer.PrimeInstallError,
                     "unexpected npm configuration present in release directory",
+                ):
+                    installer.audit_installed_lock()
+            run_mock.assert_not_called()
+
+    def test_audit_installed_lock_rejects_node_anchor_poisoned_before_capture(self) -> None:
+        # Regression for independent Claude opus/max round-61 re-review
+        # (P1-C) and Codex sol/max (P1-1), 2026-08-22, both reproduced
+        # with real fork/exec: the early node_sha256_early/
+        # npm_cli_sha256_early captures were only ever compared against
+        # THEMSELVES before/after the subprocess -- not against anything
+        # verify() had already durably confirmed via
+        # receipt['node_sha256']/['npm_cli_sha256'] a few lines into its
+        # own execution. A same-UID racer who tampers node in the real
+        # window between verify()'s own check and THIS function's own
+        # capture poisons the anchor before it's even captured -- the
+        # same mistake round 58's original fix made, recurring one level
+        # down.
+        #
+        # A real-tempdir, swap-then-restore harness (matching the
+        # sibling detects_lock_swap_within_the_tree_walks_own_window/
+        # detects_npm_lib_file_tamper_via_toolchain_subtree tests) turns
+        # out NOT to isolate this specific fix: a node tamper that stays
+        # in place all the way through to either whole-tree walk gets
+        # caught by THAT check regardless (both are bound to verify()'s
+        # own durable evidence, docstring paragraph (a)/(d)) --
+        # independent of whether this round's fix exists at all. This
+        # fix specifically closes the window between verify()'s own
+        # per-file check and this function's own capture -- BEFORE
+        # either whole-tree walk or per-file recheck ever runs -- so it
+        # is isolated here directly: mock sha256_file_verified() to
+        # simulate "already tampered by the time this function reads it"
+        # and confirm the receipt-bound comparison (not any later
+        # self-comparison) is what catches it.
+        receipt = {
+            "release_dir": "/tmp/does-not-matter",
+            "node_target": "/tmp/node",
+            "npm_target": "/tmp/npm-cli.js",
+            # The receipt's own durable value -- what verify() already
+            # confirmed before this function ever captured anything.
+            "node_sha256": "clean_hash",
+            "npm_cli_sha256": "clean_hash",
+        }
+        verify_result = {
+            "ok": True,
+            "release_tree_sha256": "treehash",
+            "release_tree_entries": 5,
+        }
+        fake_stat = os.stat_result((0o600, 111, 222, 1, 0, 0, 0, 0, 0, 0))
+        npmrc_path = Path("/tmp/does-not-matter/.npmrc")
+
+        def fake_lstat(path_self):
+            if path_self == npmrc_path:
+                raise FileNotFoundError(2, "No such file or directory", os.fspath(path_self))
+            return fake_stat
+
+        with (
+            mock.patch.object(installer, "verify", return_value=verify_result),
+            mock.patch.object(installer, "load_receipt", return_value=receipt),
+            mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
+            mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
+            mock.patch.object(installer, "read_private_ssd_file", return_value=b"{}"),
+            # The window this test targets: by the time this function
+            # captures node/npm-cli's digest, they are ALREADY tampered
+            # -- e.g. a racer who won the window between verify()'s own
+            # per-file check and this function's own capture (docstring
+            # paragraph (e)).
+            mock.patch.object(installer, "sha256_file_verified", return_value="tampered_hash"),
+            mock.patch.object(Path, "lstat", fake_lstat),
+            mock.patch.object(installer, "tree_digest", return_value=("treehash", 5)),
+            # Mocked as a no-op -- this test isolates the P1-C
+            # receipt-binding check specifically, not the (separately
+            # tested, in the sibling detects_node_tamper_before_subprocess
+            # test) per-file asset-digest recheck downstream of it.
+            mock.patch.object(installer, "verify_unchanged_private_ssd_asset_digest"),
+            mock.patch.object(
+                installer,
+                "managed_npm_environment",
+                return_value={"npm_config_audit": "false"},
+            ),
+            mock.patch.object(subprocess, "run") as run_mock,
+        ):
+            with self.assertRaisesRegex(
+                installer.PrimeInstallError,
+                "managed Node.js runtime content does not match the pinned "
+                "installed digest",
+            ):
+                installer.audit_installed_lock()
+        run_mock.assert_not_called()
+
+    def test_audit_installed_lock_detects_npm_lib_file_tamper_via_toolchain_subtree(
+        self,
+    ) -> None:
+        # Regression for independent Claude opus/max round-61 re-review,
+        # 2026-08-22, P1-D/blocker, real fork/exec reproduced: the
+        # per-file bracket digests `npm_cli` itself -- a 54-byte shim
+        # (`require('../lib/cli.js')(process)`) -- but not the ~1,920
+        # real implementation files under toolchain/lib/node_modules/npm/
+        # that npm-cli.js actually require()s and npm audit genuinely
+        # executes. Those were covered only by the whole-tree walk's own
+        # non-atomicity. This test tampers one such library file --
+        # neither node nor npm-cli.js, so neither per-file check above
+        # would ever see it -- and confirms the round-61 toolchain-
+        # subtree check (docstring paragraph (f)), specifically, is what
+        # catches it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "release"
+            release.mkdir(mode=0o700)
+            tool_root = root / "tool"
+            for name in ("npm-cache", "install-home", "install-tmp"):
+                (tool_root / name).mkdir(mode=0o700, parents=True)
+            manifest_path = release / "package.json"
+            lock_path = release / "package-lock.json"
+            manifest_path.write_bytes(b'{"genuine": "manifest"}\n')
+            os.chmod(manifest_path, 0o600)
+            lock_path.write_bytes(b'{"genuine": "lock"}\n')
+            os.chmod(lock_path, 0o600)
+            node_path = release / "toolchain/bin/node"
+            node_path.parent.mkdir(mode=0o700, parents=True)
+            node_path.write_bytes(b"#!/bin/sh\nexec /usr/bin/true\n")
+            os.chmod(node_path, 0o700)
+            npm_cli_path = release / "toolchain/lib/node_modules/npm/bin/npm-cli.js"
+            npm_cli_path.parent.mkdir(mode=0o700, parents=True)
+            npm_cli_path.write_bytes(b"// genuine npm-cli.js stub\n")
+            os.chmod(npm_cli_path, 0o600)
+            # A real npm library file, distinct from npm-cli.js itself --
+            # what npm-cli.js actually require()s and npm audit genuinely
+            # executes.
+            lib_path = release / "toolchain/lib/node_modules/npm/lib/cli.js"
+            lib_path.parent.mkdir(mode=0o700, parents=True)
+            lib_path.write_bytes(b"// genuine npm lib/cli.js stub\n")
+            os.chmod(lib_path, 0o600)
+            for private_dir in (
+                release / "toolchain",
+                release / "toolchain/bin",
+                release / "toolchain/lib",
+                release / "toolchain/lib/node_modules",
+                release / "toolchain/lib/node_modules/npm",
+                release / "toolchain/lib/node_modules/npm/bin",
+                release / "toolchain/lib/node_modules/npm/lib",
+            ):
+                os.chmod(private_dir, 0o700)
+
+            # tree_digest() is NOT mocked (real walk, matching the
+            # sibling detects_lock_swap_within_the_tree_walks_own_window
+            # test's technique) -- a call-numbering-based mock proved
+            # fragile under mutation (removing calls shifts which call
+            # number corresponds to which real check, silently breaking
+            # the intended injection point). Hooking sha256_file_verified
+            # keyed on the SPECIFIC target path instead is robust
+            # regardless of how many total tree_digest() calls a given
+            # mutant makes.
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                clean_tree_digest, clean_tree_entries = installer.tree_digest(release)
+
+            receipt = {
+                "release_dir": os.fspath(release),
+                "node_target": os.fspath(node_path),
+                "npm_target": os.fspath(npm_cli_path),
+                "node_sha256": installer.sha256_file_verified(node_path),
+                "npm_cli_sha256": installer.sha256_file_verified(npm_cli_path),
+            }
+            verify_result = {
+                "ok": True,
+                "release_tree_sha256": clean_tree_digest,
+                "release_tree_entries": clean_tree_entries,
+            }
+            real_sha256_file_verified = installer.sha256_file_verified
+            lib_calls = {"n": 0}
+
+            def fake_sha256_file_verified(path, **kwargs):
+                if path == lib_path:
+                    lib_calls["n"] += 1
+                    # The 1st time lib_path is hashed is the early
+                    # toolchain-subtree capture -- sees clean, untouched.
+                    # The 2nd time is whole-tree check #1's own walk
+                    # (release/ includes toolchain/): hash the
+                    # still-clean bytes normally (so check #1 itself
+                    # passes cleanly), THEN swap to attacker content --
+                    # modeling a racer who wins the window right after
+                    # check #1 examines it. No swap-back: this isolates
+                    # the toolchain-subtree pre-subprocess recheck
+                    # (docstring paragraph (f)) specifically as the next
+                    # thing to examine lib_path at all -- proving it,
+                    # not the whole-tree check, is what catches this.
+                    if lib_calls["n"] == 2:
+                        clean_digest = real_sha256_file_verified(path, **kwargs)
+                        with open(lib_path, "r+b") as handle:
+                            handle.seek(0)
+                            handle.write(b"// ATTACKER npm lib/cli.js\n")
+                            handle.truncate()
+                        return clean_digest
+                return real_sha256_file_verified(path, **kwargs)
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "verify", return_value=verify_result),
+                mock.patch.object(installer, "load_receipt", return_value=receipt),
+                mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
+                mock.patch.object(
+                    installer, "sha256_file_verified", side_effect=fake_sha256_file_verified
+                ),
+                mock.patch.object(
+                    installer,
+                    "managed_npm_environment",
+                    return_value={"npm_config_audit": "false"},
+                ),
+                mock.patch.object(subprocess, "run") as run_mock,
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "Prime Agent toolchain content changed before use",
                 ):
                     installer.audit_installed_lock()
             run_mock.assert_not_called()

@@ -966,3 +966,71 @@ node/npm-cli二进制被真实摘要）端到端跑通，`ok:true`，未引入�
 **待办**：针对 round 61 的候选重新派发 `prime-agent-dual-review` Workflow，明确告知
 P1-A 是本轮已知、经用户明确决策接受的限制（不是待发现的新问题），要求两路独立确认
 P1-B 修复本身、以及 docstring 措辞是否真的如实；两路都无可复现 P0/P1 才是真正双 GO。
+
+## 19. Round 61 双复核结果：两路各自独立发现同一根因的不同切面 + round 62 修复（2026-08-22）
+
+针对 `57585f2d29`（round 61）的双复核两路都真正跑完，都用**真实 fork/exec**复现，
+都确认 P1-B（round 61 自己修的）真正关闭：
+
+- **Claude opus/max**：NO-GO，P0=0，P1=2（不含已接受的 P1-A），P2=1，P3=2。
+  - **P1-C**：`node_sha256_early`/`npm_cli_sha256_early` 只跟自己（子进程前后）比较，
+    没有绑定到 `verify()` 自己已经确证过的 `receipt['node_sha256']`/`['npm_cli_sha256']`。
+    `verify()` 检查完 node/npm-cli 后还要再跑几个子进程版本探测才返回，之后这个函数
+    自己又做了 `load_receipt`/`verify_private_ssd_dir`/两次 `resolve_ssd` 才捕获——
+    中间是真实窗口。用真实后台 racer 线程复现：4/4、另一轮5/6，攻击者 node 真被
+    exec，返回 `ok:true`。
+  - **P1-D**：紧收的逐文件校验只摘要了 `npm_cli` 本身——一个54字节的shim
+    （`require('../lib/cli.js')(process)`）。npm-cli.js 真正 require 、npm audit
+    真正执行的约1920个实现文件全部只靠整树遍历（实测约2.26秒）非原子性兜底。真实
+    复现：替换的npm库文件真的被加载执行。
+  - **P2**：`assert_no_release_npmrc()` 作为闭包，其三处调用中唯一真正生效的中间那处
+    完全没有回归测试覆盖——删掉这一处的变异体10个既有测试全过，但真实复现显示
+    npm audit 会在攻击者的配置下真的跑完。
+  - **P3**：docstring段落(d)把实际7个字段写成"six"；`verify_unchanged_private_ssd_asset_digest`
+    对116MB node的"避免持有全量内存副本"措辞不够精确（功能没问题，每次71ms）。
+- **Codex sol/max**（前两次真实撞上 Trusted Access 墙，第三次切到 fallback
+  `gpt-5.6-terra`/`high` 干净跑完）：NO-GO，P0=0，P1=1（不含P1-A），P2=2，用自己独立
+  的真实 exec harness复现了同一个根因，但框架更根本：逐文件"子进程前最后一次检查"
+  永远追不上"subprocess.run()真正exec那一刻"——因为校验的是路径，subprocess.run()
+  是重新独立解析并打开这个路径来exec的，两者从未绑定在同一个文件描述符上。同时独立
+  发现了P1-C同类的"早锚点捕获时序"问题，以及同一处"six应为seven"的文档笔误（Codex
+  定级P2）。两路都明确确认round 61的P1-A文档描述诚实准确，没有新发现。
+
+**我自己先独立复核了P1-C和P1-D**（不直接采信任一路的说法）：确认`verify()`自己检查
+node/npm-cli后确实还要再跑几个子进程才返回；确认npm_cli的真实内容确实只是一个54字节
+的shim（查看了真实安装出来的release）。
+
+**用户决策**：Codex这个更深的"路径校验永远追不上真正exec那一刻"发现，我单独用
+AskUserQuestion向用户说明了这是一次独立的、比P1-A影响面更大的架构决策（真正堵死
+需要把这个文件里所有`subprocess.run([node_path, ...])`的地方——不只这个函数，还有
+`exact_tool_version()`、`run_version_probe()`、`_install_locked_within_release_dir()`
+里的npm ci/install调用等——全部换成基于文件描述符的open-校验-fexecve模式，
+`subprocess.run()`自己的API表达不了这个模式）。用户选择了跟P1-A同款处理：本轮先只
+诚实收窄文案，不做架构改动。
+
+**已修复（round 62）**：
+1. P1-C：node/npm-cli的早捕获立刻绑定到`receipt['node_sha256']`/`['npm_cli_sha256']`——
+   `verify()`自己已经检查过的持久值，不再只跟自己比。
+2. P1-D：早锚定整个`toolchain/`子树的摘要（`tree_digest(release / "toolchain")`）——
+   node二进制和npm整个包（含约1920个库文件）都已经在这一条路径下——子进程前后各
+   复核一次，与P1-C的逐文件检查互补而非替代。
+3. P2：把`assert_no_release_npmrc()`从闭包提升为模块级函数，专门为了能被mock和
+   call-count统计。
+4. P3："six"→"seven"。
+5. docstring新增段落(g)：把Codex发现的"路径校验追不上真正exec时刻"这个跨越全文件的
+   已知限制诚实记录下来，跟P1-A的段落(d)用同一种"收窄声明而非假装关闭"处理方式。
+
+**验证**：2个新回归测试，各自对本轮修复做了变异测试（去掉对应校验后都在下游无关的
+`TypeError`处中断，证明没真正触发预期检查）——P1-C的测试第一版（真实临时目录+持久
+篡改）被既有整树校验意外顺带catch住、与P1-C修复本身无关，被我排查后放弃改用全mock
+方案精确隔离；P1-D的测试第一版（按tree_digest调用序号触发篡改）在变异体减少调用
+次数后序号错位失效，改用round59已验证过的"按路径hook sha256_file_verified"手法才
+稳健。既有6个测试补充了node_sha256/npm_cli_sha256字段，并修了一个真实的Python
+`mkdir(parents=True)`陷阱（只有叶子目录会应用指定的0o700权限，中间目录用的是进程
+umask，被新增的toolchain子树根目录检查发现）。230→232测试。按用户要求用Workflow
+并行执行验证阶段（双解释器全套测试+py_compile、真实sandbox_e2e.py、真实非mock
+audit端到端），加速本轮完成。
+
+**待办**：针对 round 62 的候选重新派发 `prime-agent-dual-review` Workflow，明确告知
+P1-A 和新增的路径-vs-exec限制都是本轮已知、经用户明确决策接受的限制，不是待发现的
+新问题；两路都无可复现 P0/P1 才是真正双 GO。
