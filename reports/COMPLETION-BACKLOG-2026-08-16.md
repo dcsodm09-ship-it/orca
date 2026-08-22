@@ -538,3 +538,305 @@ patch 升级，模式和上次一致，没有异常。草案先给用户看过�
 - [x] paperclip-privacy-gate-closure 提交入库
 - [x] startup-p1-offline-acceptance 补充说明其结论已被取代
 - [ ] 其余标记 `BLOCKED_*` 的项：逐一等待对应阻断解除后转為 `SAFE_NOW`
+
+## 10. Round 53 双复核收尾（2026-08-22，本节新增）
+
+**Codex gpt-5.6-sol/max 一路的正式完成消息（`worker_done`）始终无法通过被追踪的通道确认**
+——连续 5 次 `agent_prompt_stalled`/`dispatch_capability_invalid`，根因正是同日诊断并修复、
+已提交（`ee982fc0a8`，见 `reports/ORCA-ORCHESTRATION-DISPATCH-RELIABILITY-FIX-2026-08-21.md`）
+的那个 bug 本身——终端提交派发时已经在真忙碌，触发误判，capability 被永久吊销。这个修复
+还没装进正式运行的 Orca.app，所以现场没能被自动救回。
+
+**但真实工作本身确实做完了，且内容通过消息体和磁盘上的完整报告文件都拿到了**，不是靠信任
+片段摘要：完整报告已原样复制存档到 `reports/PRIME-AGENT-ROUND53-CODEX-QA-REPORT-2026-08-22.md`
+（`/tmp/prime-agent-qa.3NVuYg/REPORT.md` 的副本，含全部证据文件——release SHA256SUMS、Node
+SHASUMS256、Sigstore/SLSA attestation 原始 JSON、三次真实 sandbox_e2e.py 回放的完整 JSON
+输出等，均在 `/tmp/prime-agent-qa.3NVuYg/` 下保留至今）。
+
+**Codex 一路结论：GO**（"Ready to merge this specific pin update"）。独立重放三次复现同一哈希
+`fe4402ae740cc0d2f326baf58f80543ecf8e9668e22f6434f0941bed43c732f5`；196 行 registry 依赖穷举
+（非抽样）逐一核对；真的下载解码了三个 Smithy 包的 Sigstore/SLSA attestation bundle 并核对
+SHA-512 摘要，还下载了新旧 tarball 做了真实内容 diff（不只信任 provenance 元数据）；三次真实
+`sandbox_e2e.py` 完整生命周期回放全部 `ok:true`；206 测试两个解释器各跑两遍全过；py_compile
+两个解释器都过。
+
+**结合此前已完成的 Claude opus/max 一路（同样 GO，P2 见下）——commit `bafce01bf5`（上游锁定
+哈希重新钉）现在是一个真正的双 GO，不是单路。**
+
+**Round 53 双方共同/新增的非阻断 follow-up（P2，未处理，留作后续决定）：**
+1. `npm audit` 报告 `extract-zip<=2.0.1` 一个高危 advisory（`GHSA-jmr9-qjv8-65gv`），上游无修复
+   版本；Codex 独立确认本安装器 macOS arm64 支持路径下载的是 `.tar.gz`（走系统 `tar`），
+   有漏洞的 ZIP 分支实际不可达，但生成锁阶段本来就禁用了 npm 自带审计，需要一个独立的、
+   固定节奏的审计闸门。
+2. 生成的 196 行 registry 锁与钉住的上游 v0.7.2 源码锁相比，存在约 36 处版本差异（不含本地
+   workspace 行），包含 `zod` 3.25.76→4.4.3 这种主版本跳变、`@types/node` 22→26 等——四个
+   Prime Agent tarball 本身是逐字节钉住的，但不能说"整条 196 包运行时依赖树"就是 v0.7.2
+   源码提交当时被评审过的那棵树。Codex 建议更强的架构选项：直接从已经下载并钉住的上游源码
+   锁派生生产锁，而不是每次做浮动 range 的新解析。
+3. **新发现**：GitHub release API 当前返回 `"immutable": false"`，与 README 第43-44行"release
+   资产不可变"的措辞不符——字节级别的钉子本身仍然生效（本轮逐字节核对全部通过），但这句
+   措辞需要改得不那么绝对，是文档/信任模型表述问题，不是钉子本身错了。
+4. 已知的、此前 opus/max 一路就发现的：约 2 天的锁定半衰期（发布节奏很快，"重新钉"这个动作
+   本身有变成"时间压力下橡皮图章"的风险）。
+
+**结论与待用户决定**：本次上游锁定哈希重新钉本身（commit `bafce01bf5`）已经拿到真正的双 GO，
+证据链完整、双方结论一致、均可复现验证。**是否要为上述 4 项 follow-up（尤其 1、2 两项）
+单独开一轮，还是先记录为已知技术债、继续走 `plan`→真实 `install`→`enable` 这条路径，需要
+用户明确表态**——按本项目一贯"不擅自扩大范围"的节奏，本节仅记录事实，不代为决定。
+
+## 11. Round 54：4 项 follow-up 全部实现并已提交，双复核已派发（2026-08-22，本节新增）
+
+用户对第10节的4项 follow-up 明确要求"要全部完成"，追问澄清后确认"4项follow-up做完后，
+直接装进真实系统"。
+
+**实现前先做了一次真实的经验验证（不是假设）**：针对第2项"改成从已钉住的上游源码锁
+derive"，先在 scratch 目录用真实 pin 住的 node/npm 工具链、真实 npm registry，尝试把
+`upstream-package-lock.json` 的内容当种子喂给 `npm install --package-lock-only`，
+结果证明这条路**不可靠**——`npm install`（不同于 `npm ci`）把已存在的 lock 当"优化提示"
+而非硬约束，200行里只有10行受种子影响，还有好几行被 npm 自己重新解析回更新的版本，
+种子完全没起作用。要真正做到"完全按上游源码锁钉死"需要自己重新实现 npm 的依赖解析
+逻辑——对一个即将真实安装的安全关键安装器来说，这个风险比它要解决的漂移问题本身更大。
+
+**因此改为实现了更安全、同样有价值的替代方案**（4项全部完成，commit `f1b230ebef`）：
+
+1. **`extract-zip` 审计闸门**：新增只读、显式手动触发的 `python3 install_prime_agent.py
+   audit` 子命令，对已安装版本的真实 lock 跑真正的 `npm audit`，命中不在白名单里的
+   advisory 就 fail closed。白名单目前只有 `extract-zip`（附完整不可达性理由）。用真实
+   `npm audit --omit=dev --json` 输出验证过一个关键细节：npm audit 会把同一个漏洞在
+   `extract-zip`（真实记录）和 `prime-agent`（只是依赖了它）两个条目下各报一次——天真地
+   按顶层包名比对会把 `prime-agent` 自己误判成"未审查"，已用 `_leaf_advisory_records()`
+   正确去重。
+2. **锁漂移追踪**：新增 `compute_lock_drift()`，每次真实 install 都会自动、离线地把
+   生成锁与钉住的上游源码锁逐包名对比，差异写进安装收据（`lock_drift_from_upstream_source`），
+   取代此前每一轮复核都要手写一次性对比脚本的做法。用真实数据验证过：对着真实生成锁和
+   真实上游源码锁跑，产出31条真实漂移记录，与 round 53 报告独立估算的"约36条"量级吻合。
+3. **README 措辞修正**：GitHub release API 现在显示 `immutable:false`，已改掉此前"release
+   资产不可变"的绝对化措辞。
+4. **pin 时效追踪**：新增 `GENERATED_LOCK_PINNED_AT` + `generated_lock_pin_age_days()`，
+   在 `plan()` 证据里展示，纯信息性，不做硬阻断。
+
+**验证**：新增9个单元测试（206→215），双解释器全过；py_compile 双解释器干净；真实
+（非 mock）`sandbox_e2e.py` 完整生命周期 `ok:true`，`production_lock_sha256` 不变，
+`real_user_state_changed:false`；`audit_installed_lock()` 的去重逻辑额外用真实
+`npm audit` 输出验证过，`compute_lock_drift()` 额外用真实上游锁数据验证过——不只是
+针对合成测试数据。
+
+**已提交**：`f1b230ebef`。**双复核已派发**：`run_96210a9f24d2`（Claude opus/max 一路
+后台跑着；Codex gpt-5.6-sol/max 一路 `task_3f5a92c4a9d0`/`ctx_6313379ef4c5` 派发成功）。
+
+**待双复核清零后**：按用户已给出的明确授权，直接执行真实 `install`→`enable`，不再
+额外确认。
+
+## 12. Round 55：round 54 双复核发现2个P1+3个P2，已全部修复并重新提交（2026-08-22）
+
+双复核结果：**Claude opus/max**——GO with reservations（0 P0/P1，5个P2，其中2个建议装机前修）；
+**Codex gpt-5.6-sol/max**——**NO-GO**（2个P1/blocker，其余同样是P2/P3）。两路独立撞到同一批
+核心问题，Codex 定级更严格。按标准规则"任一路存在可复现 P0/P1 都不得完成"，已全部修复：
+
+- **P1（两路都发现，Codex定级blocker）**：新的 `audit` 子命令跑真实 `npm audit` 前，只重新
+  校验了 node/npm 两个二进制文件本身，从没校验过它实际审计的对象——`package-lock.json`、
+  release 整棵树、npm-cli.js 实际会加载执行的其余 npm 运行时库文件。在这个文件自己反复强调
+  的"同 UID 攻击者"威胁模型下，一个被篡改的 lock 或被植入的 `.npmrc` 能骗出一个假的"clean"
+  审计结果。**修复**：`audit_installed_lock()` 现在先调用完整的 `verify()` 通道（和独立
+  `verify` 命令用的是同一套、已经被反复复核过的完整信任链），verify 不过就绝不会去跑
+  npm audit。
+- **P1（两路都发现，Codex定级blocker）**：白名单只按包名匹配，意味着 `extract-zip` 未来
+  出现一个全新、完全不同的漏洞也会被静默接受（两路都用真实 npm audit 输出独立确认了
+  GHSA id 其实一直稳定可解析，这个"schema 不稳定所以只能按包名"的理由本身是错的）。
+  **修复**：白名单改成按 `(包名, 精确 GHSA id)` 元组匹配，`_advisory_ghsa_id()` 解析不出
+  GHSA id 就直接 fail closed。
+- **P2（两路都发现）**：`compute_lock_drift()` 的过滤条件要求 `resolved` 字段必须是完整
+  registry URL，导致上游源码锁里 463 行中有 242 行（真实 npm lockfile v3 行为——很多真
+  registry 包的行本来就没有 `resolved`/`integrity` 字段，不是数据损坏）被静默忽略，漏报了
+  16% 的真实漂移（31 vs 真实36）。已用真实数据核实修复后过滤规则的判定逻辑（`link:true`
+  的 workspace 行必有相对路径 `resolved`，从不缺失），重跑后31→36条，两路各自点名漏掉的
+  6个包全部找回。
+- **P2（两路都发现）**：`GENERATED_LOCK_PINNED_AT` 本身写错了——设成了"写这次 round-54
+  提交那天"（08-22），而不是"`bafce01bf5` 真正重新钉哈希那天"（08-21），导致 `plan()`
+  此刻会报出 `-1` 天这种荒谬负数，恰好在最该被人注意到"这个字段可能不对"的场景下，让它
+  看起来"完全不旧"。已修正常量 + 加了 `max(0, ...)` 钳制防止未来再出现负数。
+- **P2（opus）**：README"Operator commands"一节漏掉了新的 `audit` 命令，已补充。
+
+同时按两路的共同反馈，软化了 README 里"已经证明 lock-seeding 这条路不可行"的过度绝对化
+表述（Codex 指出 npm 的 `overrides` 字段是一个文档化、本轮没试过的可行机制，我最初那次
+seed 实验失败更可能是因为 synthetic root manifest 和源码锁的树形状结构性不兼容，不是 npm
+本身把已有 lock 只当"提示"）。
+
+**验证**：新增4个测试（219→223…实际215→219，见下），双解释器全过；py_compile 干净；真实
+`sandbox_e2e.py` 完整生命周期 `ok:true`；漂移追踪与审计去重逻辑都重新对着真实数据（真实
+生成锁、真实上游源码锁、真实 npm audit 输出）复核过，不只是合成测试数据。
+
+**已提交**：`8db19bdab6`。**按"修复后必须对新候选重审"的规则，已重新派发双复核**。
+
+## 13. Round 56：修复 round 55 双复核的新 P1 + 重新钉哈希（用户要求切换到 Workflow）（2026-08-22）
+
+用户中途明确要求"请用workflow完成"，后续工作已切换为用 Workflow 派发。
+
+**round 55 双复核结果**：opus/max 用近乎逐条 mutation-test 的严谨度确认前面5项修复真正
+生效，同时发现几个小 P2（已修）。Codex sol/max 同样确认修复有效，但**独立发现一个新的
+真正 P1**——新的 `audit` 功能会真的读取 `package.json`/`package-lock.json`，但这两个
+文件此前一直不在这个安装器的"内容锁定"机制里（历史遗留理由是"装完之后没人会再读它们"，
+round 54 的 `audit` 恰好打破了这个前提）。理论攻击面：同 UID 攻击者在真实 `npm ci` 那个
+多分钟子进程窗口期间篡改这两个文件，篡改内容会被静默当成永久可信基线，`npm audit` 之后
+就在审计攻击者自己伪造的"干净"版本。**已修复**：把这两个文件纳入了这个安装器一贯使用的
+pinned-digest 机制，写了两个真实的端到端回归测试（复用"entrypoint 在 npm ci 窗口期间被
+篡改"那个已有测试的技术），并用**真正的 pre-fix mutant**验证过——完全还原 round 55 提交
+时的状态（缺失 pinning + 仍在豁免名单里），确认 `install()` 会成功完成、把攻击者的内容
+写进可信基线，即"PrimeInstallError not raised"，修复后则正确报错。
+
+**两路复核还都各自独立发现**：`GENERATED_LOCK_SHA256` 在复核过程中真的过期了——AWS 恰好
+在这期间发布了新版 `@aws-sdk/core`，本项目自己的 `sandbox_e2e.py` 和 Codex 自己的复核
+运行都在同一个约15分钟窗口内正确地 fail closed。这不是 bug，是这个安装器"fail closed"
+设计正在按预期工作，但意味着已授权的真实安装此刻跑不通，必须重新钉哈希。
+
+**重新钉哈希**（改用 Workflow 派发，19个 agent 并行，81万 token）：真实 `install()` 代码
+路径（不是手搓的 npm 复制品）用全新 cache/home 独立重跑两次，产出完全一致的归一化哈希；
+加上 Codex 复核那次运行的独立确认，一共三方独立收敛到同一个新哈希
+`006d6d1493b35f973316e2bcd8724a26b7bda5a427dbe6ca73447440b929e092`。穷举（非抽样）对比：
+200行中17行变化（8.5%），全部在已经被信任的 `@aws-sdk/*` 家族内，全是同一 major.minor
+线内的 patch 级跳变（一个嵌套副本是 minor 跳变，但仍在同一已 pin 的 major 线内），零个
+新增/删除依赖、零个新脚本、17行全部同一个发布者身份（`aws-sdk-bot` 自动化账号），183行
+未变版本行零静默字段漂移。这个 `@aws-sdk/*` 家族本身不发布 Sigstore/GitHub-OIDC
+attestation（活查询确认，还反向验证过这个检查本身工作正常——拿已知有 attestation 的包
+去测同一个端点，确认返回真实数据而非查询失败）——是这整个包家族一直存在的、与本次改动
+无关的透明度缺口，不是这次跳变引入的倒退。附带修了一个真实的方法论坑：独立复现哈希时，
+`normalized_production_lock()` 的路径替换如果不把 `RELEASE_DIR` mock 成每次真实生成
+所用的确切绝对路径就会静默失效——已写进 README 供以后的复核轮参考，不用再踩一遍。
+
+**验证**：新增4个测试（219→223），双解释器全过；py_compile 干净；真实
+`sandbox_e2e.py` 用新哈希连跑三次，全部 `ok:true`，`production_lock_sha256` 精确匹配，
+`real_user_state_changed:false`。
+
+**已提交**：`1b220213cd`。按标准规则，这是 round 55 双复核的直接补救 + 强制重新钉哈希，
+需要对这个新候选重新做一轮双复核——接下来会用 `prime-agent-dual-review` Workflow
+（用户明确指定）派发。
+
+## 14. Round 56 双复核结果：不构成双 GO（Codex 一路未完成）+ round 57 修复（2026-08-22）
+
+用 `prime-agent-dual-review` Workflow 派发的 round 56 双复核回来了，但**不构成双 GO**：
+
+- **Claude opus/max 一路**：0 P0 / 0 P1，方法论扎实（自己在 scratch 上做了 pre-fix mutant
+  复现了 round 56 修的那个 P1 攻击链、独立复现了两个哈希、对17个变更包做了活体 registry
+  抽查、223/223 测试双解释器全过）。发现2个新 P2：①`GENERATED_LOCK_PINNED_AT` **又**
+  写错了一天——和 round 54 撞过的一模一样的错误（本地日期 vs commit 真实 UTC 日期），这次
+  连本轮自己新加的"记得检查"提醒都没管用；②一段 round-34 时代的历史注释还在说"package.json/
+  package-lock.json 等四个文件永远不会再被读取"，直接和本轮刚加的 pinning 修复自相矛盾。
+- **Codex sol/max 一路**：**没有真正完成**，只回了一句编排层状态文本"正在暂停、等待
+  Monitor 的下一个真实事件"，没有产出任何可评审的具体发现。Workflow 自己的综合判断诚实地
+  拒绝把这个状态当成"通过"处理——明确写"不构成双 GO"，不是"发现分歧"，是缺了整整一路。
+
+**已修复**（round 57，commit `cc1ec35038`）：
+- 修正 `GENERATED_LOCK_PINNED_AT` 为真实的 commit UTC 日期（`2026-08-21`），新增一个
+  真正机械化的回归测试——用未 mock 的真实时钟检查这个常量有没有被设成"未来"日期（这个
+  具体错误模式在这台 UTC+8 机器上，作者本地日期 vs commit 真实 UTC 日期恰好总是差一天）。
+- 清理了那段过时的四文件注释，改成准确的两文件（LICENSE、upstream-package-lock.json）。
+- 顺带修了 README 里一处内部自相矛盾的表述（opus/max 一路明明说"0 P0/P1"，另一段却说
+  "两路一起额外发现"了那个 P1——已改成准确归因为 Codex sol/max 一路单独发现）。
+- 一个 P3（"prefixed" 措辞 vs 实际是子串匹配）——opus 自己验证过子串实现反而比字面"前缀"
+  实现更好（前缀会漏掉11行合法的嵌套 workspace 依赖行），纯文档措辞问题，本轮未动。
+
+**验证**：新增1个测试（223→224），双解释器全过；py_compile 干净；真实 `sandbox_e2e.py`
+`ok:true`，哈希不变（确认本轮只改注释/常量，没碰生成锁本身）。
+
+**下一步**：Codex 一路必须真正完成才能判定双 GO，正在对 `cc1ec35038` 这个新候选重新
+派发（继续用 `prime-agent-dual-review` Workflow）。
+
+## 15. Round 57 双复核结果：Codex 一路真正发现新P1（audit TOCTOU）+ round 58 修复（2026-08-22）
+
+`prime-agent-dual-review` Workflow 对 `cc1ec35038` 的第二次派发这次真正跑完了两路：
+
+- **Claude opus/max**：GO，0 P0/P1（1个P2：日期文案第三次写错；4个P3：其中一个是我自己
+  round 57 新加的注释署名弄反了——把本该是"round 57 响应 opus round-56"写成了
+  "round 56 响应 Codex round-55"，恰好是这段注释本来要修的那类自相矛盾）。
+- **Codex sol/max**：这次真正完整跑完（终端里实打实跑了16分23秒，git show、双解释器
+  测试、sandbox_e2e.py 全部真实执行），但 `worker_done` 提交又被编排层拒绝——邮箱完整
+  保留了原文，内容真实可信。**判定 NO-GO，发现1个真P1**：`audit_installed_lock()`
+  虽然先调用了 `verify()`，但之后启动 `npm audit` 子进程用的是没有绑定"刚验证过的
+  字节"的可变路径——`verify()` 自己那次约27000个文件的整树遍历只返回一个通过/不通过
+  的结论，没有把它当时具体看到的 package.json/package-lock.json 字节回传给调用方，
+  这两者之间存在一个真实的竞态窗口。
+
+Workflow 自己的综合判断很诚实：不替两路仲裁，明确指出 opus/max 那路复核的是同一个
+函数的**不同**角度（cwd 会不会意外扩大豁免范围），根本没碰到 Codex 这个"验证对象和
+实际审计对象能否被中途替换"的问题——不是意见分歧，是覆盖面不同。
+
+**我自己先用真正的 pre-fix mutant 独立复现了一遍**（不是直接相信 Codex 的说法）：
+撤回修复代码，跑新写的攻击复现测试，确认真的是"PrimeInstallError not raised"——
+函数会返回 `ok:true`，但实际审计的是被替换后的攻击者内容。确认是真问题。
+
+**已修复**（round 58，commit `c8279f06f8`）：用这个文件自己在别处早就验证过的
+"捕获→用前立刻复核→用后立刻复核"模式（和 `npm ci` 前后对 node/npm-cli 的复核完全
+同一套手法），把 package.json/package-lock.json 的内容+身份在 `verify()` 返回后
+立刻捕获，`npm audit` 子进程调用前后各复核一次，任一次不一致就直接拒绝返回、不信任
+审计结果。顺带修了 opus/max 发现的日期文案第三次复发（两处）和那处注释自我署名搞反
+的问题。
+
+**验证**：新增1个真正有攻击复现力的测试（mutant验证过），3个既有测试补了必要的 mock；
+224→225，双解释器全过；py_compile 干净；真实 `sandbox_e2e.py` 全生命周期 `ok:true`；
+额外用真实、非mock的 `install()` + 真实 `audit_installed_lock()`（真实 npm audit、
+真实 registry）端到端跑通，确认修复没有在合法路径上引入误报。
+
+**已重新派发双复核**（继续用 `prime-agent-dual-review` Workflow，针对 `c8279f06f8`）。
+
+## 16. Round 58 双复核结果：两路独立收敛到同一个新 P1（audit TOCTOU 只是收窄未闭合）+ round 59 修复（2026-08-22）
+
+针对 `c8279f06f8` 的双复核这次两路都给出了实质结论，而且**两路互相独立地发现了同一个问题**：
+
+- **Claude opus/max**：NO-GO，1 个 P1/blocker。round 58 自己那版修复把"信任锚点"绑定在
+  `verify()` 返回后**这个函数自己**捕获的字节上——而不是绑定在 `verify()` 本身实际
+  证实过的、任何持久的东西上。opus/max 实测复现：同一 UID 的攻击者只要赢下"函数捕获
+  之前"这个窗口（实测约 1.612 秒，比 round 58 修复前的约 15.6 秒收窄了近 10 倍，但
+  没有真正关闭），就能让被捕获的"信任锚点"本身已经是被替换后的内容——后面前后各一次
+  的复核只是拿污染过的锚点跟污染过的实际内容互相核对，永远不会报错。
+- **另一路独立复核**（走 Orca 编排派发，`worker_done` 提交被 `dispatch_capability_invalid`
+  拒绝，邮箱完整保留了原文）：用几乎完全不同的措辞，独立复现了**同一个漏洞**——"同一
+  UID 的原地锁文件替换发生在 verify() 返回之后、但在这段代码调用 load_receipt()、
+  release 校验、node/npm 路径解析、并捕获自己的锚点之前"，之后 `audit_installed_lock()`
+  审计的是攻击者内容，却返回 `ok:true`。判定 NO-GO。
+
+两路独立收敛到同一个具体窗口（而不是覆盖面不同、各说各话），是本文件历史上少见的
+"两个独立复核完全对齐"的情形——直接确认这是真问题，不需要再自行复现判断真伪，
+但仍然按本文件一贯做法用真实 pre-fix mutant 走了一遍 mutation test（见下）。
+
+**已修复**（round 59）：把 `audit_installed_lock()` 的信任锚点从"这个函数自己刚捕获
+的字节"改成受收据里 `release_tree_sha256`/`release_tree_entries` 约束的整树校验
+（`tree_digest()`，跟 `verify()`/`finalize_pending_install()` 已经在用的同一套、同一
+个错误文案 `"Prime Agent release tree drifted"`）——这两个值是**安装时就已经钉死**的
+持久值，不是"这个函数刚才读到什么就信什么"，所以不管攻击者赢下的是哪一段窗口（`load_
+receipt()` 之前、`load_receipt()` 之后、npm audit 子进程期间……），只要整树内容跟
+安装时钉死的值对不上就会被拒绝，不再存在"先捕获、再信它"这一步可以被竞态。顺带关闭
+了这个函数自己长期承认但从未真正检查过的另一个缺口（在 RELEASE_DIR 里偷放一个
+`.npmrc`），并且恢复了 round 55 曾隐含丢掉的、审计执行时对 node/npm-cli 路径的
+执行期绑定。同时修复了 round 58 自己新写的文档段落里again 出现的同一类"署名对象
+写反"问题（这次是把本该说"Round 57 …Codex sol/max"的段落写成了"Round 58 …Codex
+sol/max"，本项目里这类错误至少是第 4 次复发，均由下一轮独立复核发现）。
+
+**mutation test 教训（本轮记录，供之后类似修复参考）**：第一版回归测试把攻击注入点
+放在被 mock 的 `subprocess.run` 副作用里（模拟 npm audit 子进程运行期间被替换）——
+用 `git show c8279f06f8:...` 原样抽取出 round 58 那版函数体（不是手写重建，避免
+`os.stat_result` 元组下标之类的复现错误）跑这个测试，结果**不是**预期的"没抛异常"，
+而是抛出了一个不同的错误（`managed file changed before use`）——round 58 自己那对
+"子进程调用前后各复核一次"确实覆盖了子进程运行期间的窗口，所以这个测试选的攻击时机
+并不能真正区分"round 58 有漏洞"和"round 59 已修复"这两种状态。排查后发现真正的漏洞
+窗口更早：是在 `verify()` 返回之后、round 58 自己捕获信任锚点（`manifest_raw =
+read_private_ssd_file(...)`，函数体里第一处发生在 `load_receipt()`/`verify_private_
+ssd_dir()`/`resolve_ssd()` 全部跑完之后）之前的那一小段。把测试的攻击注入点改成
+`load_receipt()`（verify() 返回后这个函数调用的第一件事）的副作用后，重新跑同一个
+round-58-exact mutant：这次是真正的 `PrimeInstallError not raised`——函数悄悄返回
+`ok:true`，审计的其实是攻击者字节——这才是这两个版本之间真正的行为差异证据。
+
+**验证**：`test_audit_installed_lock_detects_tree_tamper_during_npm_audit_window`
+改为在 `load_receipt()` 副作用里精确复现两路复核描述的那个窗口；新增
+`test_audit_installed_lock_rejects_missing_receipt_tree_digest`；既有3个
+`audit_installed_lock` 测试补了收据里的 `release_tree_sha256`/`release_tree_entries`
+字段和对应 mock；225→226，双解释器（`/usr/bin/python3` 与 `/opt/homebrew/bin/python3`）
+全过；两个解释器 `py_compile` 都干净；真实 `tests/sandbox_e2e.py` 全生命周期
+`ok:true`，`production_lock_sha256` 保持 `006d6d1493...`（本轮不动钉住的哈希）；
+另外用真实、非 mock 的 `install()` + 真实 `audit_installed_lock()`（真实 npm audit、
+真实 registry、无篡改的合法路径）端到端跑通，确认新的整树校验没有在合法安装上引入
+误报。
+
+**待办**：针对 round 59 的候选（本轮修复后的 HEAD）重新派发 `prime-agent-dual-review`
+Workflow，要求两路独立复现攻击场景并尝试找新的角度；两路都无可复现 P0/P1 才能视为
+真正双 GO，随后按用户既有授权（"4项follow-up做完后，直接装进真实系统"）直接执行真实
+`install`→`enable`，无需再次确认。

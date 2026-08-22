@@ -49,13 +49,6 @@ STUB_UPSTREAM_LOCK_SHA256 = installer.sha256_bytes(
 
 
 class PrimeAgentInstallerTests(unittest.TestCase):
-    # Minimal stand-in for os.stat_result, used only by the
-    # audit_installed_lock() unit tests below (which mock the filesystem
-    # away entirely rather than using a real tempdir) -- just needs the
-    # two attributes that function's own manifest_path.lstat()/
-    # lock_path.lstat() calls actually read.
-    _FAKE_STAT = type("FakeStat", (), {"st_dev": 1, "st_ino": 1})()
-
     def fake_extract_node_toolchain(
         self, asset: Path, destination: Path, expected_sha256: str
     ) -> tuple[Path, Path, str, str, dict[Path, str]]:
@@ -456,6 +449,8 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             "release_dir": "/tmp/does-not-matter",
             "node_target": "/tmp/node",
             "npm_target": "/tmp/npm-cli.js",
+            "release_tree_sha256": "treehash",
+            "release_tree_entries": 5,
         }
         audit_report = {
             "auditReportVersion": 2,
@@ -482,12 +477,8 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
             mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
             mock.patch.object(
-                installer, "read_private_ssd_file", side_effect=lambda p: b"stub-content"
-            ),
-            mock.patch.object(Path, "lstat", return_value=self._FAKE_STAT),
-            mock.patch.object(
-                installer, "verify_unchanged_private_ssd_file", return_value=None
-            ) as unchanged_mock,
+                installer, "tree_digest", return_value=("treehash", 5)
+            ) as tree_digest_mock,
             mock.patch.object(
                 installer,
                 "managed_npm_environment",
@@ -497,9 +488,10 @@ class PrimeAgentInstallerTests(unittest.TestCase):
         ):
             result = installer.audit_installed_lock()
         verify_mock.assert_called_once_with()
-        # Both files re-checked once before and once after the subprocess
-        # call -- see audit_installed_lock()'s own round-58 docstring.
-        self.assertEqual(unchanged_mock.call_count, 4)
+        # Whole-tree digest re-checked once before and once after the
+        # subprocess call, both against the receipt's fixed value -- see
+        # audit_installed_lock()'s own round-58 docstring.
+        self.assertEqual(tree_digest_mock.call_count, 2)
         self.assertTrue(result["ok"])
         self.assertEqual([entry["name"] for entry in result["accepted_advisories"]], ["extract-zip"])
         self.assertEqual(
@@ -514,6 +506,8 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             "release_dir": "/tmp/does-not-matter",
             "node_target": "/tmp/node",
             "npm_target": "/tmp/npm-cli.js",
+            "release_tree_sha256": "treehash",
+            "release_tree_entries": 5,
         }
         audit_report = {
             "auditReportVersion": 2,
@@ -538,11 +532,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             mock.patch.object(installer, "load_receipt", return_value=receipt),
             mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
             mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
-            mock.patch.object(
-                installer, "read_private_ssd_file", side_effect=lambda p: b"stub-content"
-            ),
-            mock.patch.object(Path, "lstat", return_value=self._FAKE_STAT),
-            mock.patch.object(installer, "verify_unchanged_private_ssd_file", return_value=None),
+            mock.patch.object(installer, "tree_digest", return_value=("treehash", 5)),
             mock.patch.object(
                 installer,
                 "managed_npm_environment",
@@ -568,6 +558,8 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             "release_dir": "/tmp/does-not-matter",
             "node_target": "/tmp/node",
             "npm_target": "/tmp/npm-cli.js",
+            "release_tree_sha256": "treehash",
+            "release_tree_entries": 5,
         }
         audit_report = {
             "auditReportVersion": 2,
@@ -592,11 +584,7 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             mock.patch.object(installer, "load_receipt", return_value=receipt),
             mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
             mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
-            mock.patch.object(
-                installer, "read_private_ssd_file", side_effect=lambda p: b"stub-content"
-            ),
-            mock.patch.object(Path, "lstat", return_value=self._FAKE_STAT),
-            mock.patch.object(installer, "verify_unchanged_private_ssd_file", return_value=None),
+            mock.patch.object(installer, "tree_digest", return_value=("treehash", 5)),
             mock.patch.object(
                 installer,
                 "managed_npm_environment",
@@ -627,51 +615,116 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 installer.audit_installed_lock()
         run_mock.assert_not_called()
 
-    def test_audit_installed_lock_detects_lock_swap_during_npm_audit_window(self) -> None:
-        # Regression for independent Codex sol/max round-57 re-review,
-        # 2026-08-22, P1/blocker: verify() closes the DURABLE tampering
-        # case, but its own whole-tree walk never bound the specific bytes
-        # it saw for package-lock.json to the specific bytes the `npm
-        # audit` subprocess actually reads moments later -- a same-UID
-        # racer who swaps the file's content DURING that subprocess's own
-        # window would previously have gotten a false-clean result, for
-        # exactly the file this action exists to audit.
+    def test_audit_installed_lock_rejects_missing_receipt_tree_digest(self) -> None:
+        # Fails closed rather than silently skipping the whole-tree bind
+        # if a receipt somehow lacks release_tree_sha256 -- should not be
+        # reachable via any real install() (which always writes it), but
+        # a malformed/hand-edited receipt must not be trusted either.
+        receipt = {
+            "release_dir": "/tmp/does-not-matter",
+            "node_target": "/tmp/node",
+            "npm_target": "/tmp/npm-cli.js",
+        }
+        with (
+            mock.patch.object(installer, "verify", return_value={"ok": True}),
+            mock.patch.object(installer, "load_receipt", return_value=receipt),
+            mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
+            mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
+            mock.patch.object(subprocess, "run") as run_mock,
+        ):
+            with self.assertRaisesRegex(
+                installer.PrimeInstallError, "missing the pinned release tree digest"
+            ):
+                installer.audit_installed_lock()
+        run_mock.assert_not_called()
+
+    def test_audit_installed_lock_detects_tree_tamper_during_npm_audit_window(self) -> None:
+        # Regression for independent Claude opus/max round-58 re-review,
+        # 2026-08-22, P1/blocker: round 58's own first fix attempt bound
+        # the audit's trust anchor to bytes THIS FUNCTION captured moments
+        # after verify() returned -- not to anything durable verify()
+        # itself actually attested -- so a same-UID racer who won the
+        # (measured, real, ~1.6s) window between verify()'s own read and
+        # that capture still got a false-clean result. Fixed by binding to
+        # receipt['release_tree_sha256'] instead -- the same durable,
+        # install-time-fixed value verify() itself compares against -- so
+        # there is no "capture now, trust it" step left to race at all.
         #
-        # This test uses the REAL read_private_ssd_file()/
-        # verify_unchanged_private_ssd_file() (not mocked away, unlike the
-        # tests above) against real files on disk, and simulates the
-        # attack as a side effect of the mocked `subprocess.run` call
-        # itself -- the same technique
-        # _round56_tamper_manifest_or_lock_during_npm_ci_window_harness()
-        # uses to reproduce the sibling install-time attack, applied here
-        # to the audit-time window instead.
+        # Mutation-tested against the exact round-58 function body
+        # (extracted verbatim via `git show c8279f06f8:...`, not hand-
+        # reconstructed): tampering package.json during the npm-audit
+        # *subprocess* window -- this test's own first draft -- turned
+        # out to already be caught by round 58's own before/after
+        # re-checks (those bracket the subprocess call specifically), so
+        # it didn't actually distinguish round-58-vulnerable from
+        # round-59-fixed behaviour. The real round-58 gap is EARLIER:
+        # round 58 captures its own trust anchor (manifest_raw/lock_raw)
+        # only after load_receipt()/verify_private_ssd_dir()/resolve_ssd()
+        # have already run -- so a racer who wins the window between
+        # verify() returning and THAT capture poisons the anchor itself,
+        # and every later re-check just compares tampered-against-
+        # tampered and never fires. This test reproduces exactly that
+        # window by tampering as a side effect of `load_receipt()` -- the
+        # very first call after verify() in both round 58 and round 59 --
+        # the earliest point at which a racer could act. Round 59 still
+        # catches it there because its comparison target
+        # (receipt['release_tree_sha256']) was fixed at install time, long
+        # before either verify() or this function ever ran; round 58's
+        # target was only ever "whatever this function itself just read",
+        # which by this point already reflects the attacker's bytes.
+        #
+        # This test uses the REAL tree_digest() (not mocked, unlike the
+        # tests above) against a real directory on disk. Tampers
+        # package.json specifically (not package-lock.json, unlike round
+        # 57's version of this test) to prove the fix covers the WHOLE
+        # tree, not just the one file the old, narrower version happened
+        # to target.
         with tempfile.TemporaryDirectory() as directory:
-            release = Path(directory).resolve()
-            os.chmod(release, 0o700)
+            root = Path(directory).resolve()
+            release = root / "release"
+            release.mkdir(mode=0o700)
+            tool_root = root / "tool"
+            for name in ("npm-cache", "install-home", "install-tmp"):
+                (tool_root / name).mkdir(mode=0o700, parents=True)
             manifest_path = release / "package.json"
             lock_path = release / "package-lock.json"
             manifest_path.write_bytes(b'{"genuine": "manifest"}\n')
             os.chmod(manifest_path, 0o600)
             lock_path.write_bytes(b'{"genuine": "lock"}\n')
             os.chmod(lock_path, 0o600)
+            # tree_digest()/verify_private_ssd_dir()/resolve_ssd() all
+            # require paths under SSD_ROOT -- mock it to this test's own
+            # real temp root (matching the established pattern used by
+            # e.g. _round32_tamper_generated_exec_target_harness above)
+            # rather than mocking those functions away, so this test
+            # exercises the REAL whole-tree walk end to end.
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                digest, entries = installer.tree_digest(release)
 
             receipt = {
                 "release_dir": os.fspath(release),
                 "node_target": "/tmp/node",
                 "npm_target": "/tmp/npm-cli.js",
+                "release_tree_sha256": digest,
+                "release_tree_entries": entries,
             }
             clean_report = {"auditReportVersion": 2, "vulnerabilities": {}}
 
-            def fake_run_with_swap(*args, **kwargs):
-                # The attack: same-UID racer overwrites the ALREADY-
-                # verified lock file's content IN PLACE (same inode) as a
-                # side effect of npm audit's own subprocess window --
-                # exactly modeling a real racer who wins that window,
-                # without needing real concurrency to reproduce it.
-                with open(lock_path, "r+b") as handle:
+            def fake_load_receipt_with_swap():
+                # The attack: same-UID racer overwrites package.json's
+                # content IN PLACE (same inode) as a side effect of
+                # load_receipt() -- the very first call this function
+                # makes after verify() returns -- exactly modeling a
+                # racer who wins the earliest possible post-verify()
+                # window, without needing real concurrency to reproduce
+                # it.
+                with open(manifest_path, "r+b") as handle:
                     handle.seek(0)
-                    handle.write(b'{"ATTACKER":"swapped during npm audit window"}\n')
+                    handle.write(b'{"ATTACKER":"swapped between verify() and this function\'s own first read"}\n')
                     handle.truncate()
+                return receipt
+
+            def fake_run_no_swap(*args, **kwargs):
                 return subprocess.CompletedProcess(
                     args=list(args[0]) if args else [],
                     returncode=0,
@@ -680,19 +733,20 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 )
 
             with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
                 mock.patch.object(installer, "verify", return_value={"ok": True}),
-                mock.patch.object(installer, "load_receipt", return_value=receipt),
-                mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
+                mock.patch.object(installer, "load_receipt", side_effect=fake_load_receipt_with_swap),
                 mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
                 mock.patch.object(
                     installer,
                     "managed_npm_environment",
                     return_value={"npm_config_audit": "false"},
                 ),
-                mock.patch.object(subprocess, "run", side_effect=fake_run_with_swap),
+                mock.patch.object(subprocess, "run", side_effect=fake_run_no_swap),
             ):
                 with self.assertRaisesRegex(
-                    installer.PrimeInstallError, "changed before use"
+                    installer.PrimeInstallError, "release tree drifted"
                 ):
                     installer.audit_installed_lock()
 

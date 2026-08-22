@@ -9475,7 +9475,7 @@ def audit_installed_lock() -> dict[str, Any]:
     weaker, partial subset of it here. Only once that has raised nothing
     does this proceed to actually run npm audit.
 
-    Round-58 dual review (2026-08-22, Codex sol/max, P1/blocker): calling
+    Round-57 dual review (2026-08-22, Codex sol/max, P1/blocker): calling
     verify() first closes the DURABLE tampering case (anything wrong
     before this function was ever invoked), but verify()'s own tree_
     digest() walk covers the ENTIRE release tree (order 27,000 entries)
@@ -9483,44 +9483,50 @@ def audit_installed_lock() -> dict[str, Any]:
     back to this caller -- so the specific bytes verify() confirmed for
     package.json/package-lock.json, at whatever moment during its walk it
     reached them, were never bound to the specific bytes the `npm audit`
-    subprocess below actually reads moments later. A same-UID racer who
-    wins that window (however narrow) still gets a false-clean result,
-    for exactly the two files this action exists to audit. Closed the
-    same way every other verify-then-exec gap in this file already is
-    (see e.g. the node/npm-cli re-checks bracketing `npm ci` in
-    _install_locked_within_release_dir()): capture both files' content
-    and identity as this function's own, narrower trust anchor
-    immediately after verify() returns, re-verify both are still
-    unchanged immediately before the subprocess call (shrinking verify()'s
-    whole-tree-walk-sized window down to this function's own few
-    intervening lines), and re-verify both AGAIN immediately after the
-    subprocess returns (closing the window during `npm audit`'s own
-    runtime, the same way node/npm-cli are re-checked after `npm ci`).
-    Any mismatch at either checkpoint means this function no longer knows
-    what `npm audit` actually read, and fails closed rather than trusting
-    a report about content that can no longer be shown to be what was
-    reported on.
+    subprocess below actually reads moments later. Round 58's first
+    attempt at a fix captured both files' raw bytes as an in-memory
+    anchor immediately after verify() returned, then re-verified against
+    THAT anchor immediately before and after the subprocess.
+
+    Round-58 dual review (2026-08-22, Claude opus/max, P1/blocker,
+    empirically measured and demonstrated end to end on a real install):
+    that fix narrowed the window from ~15.6s to 1.612s but did not close
+    it -- the anchor was never bound to anything DURABLE that verify()
+    itself actually attested, only to "whatever this function happened to
+    read a moment ago", so a racer who wins the (now much smaller, but
+    still real and still measured as trivially winnable by simple
+    polling) window between verify()'s own read and this function's
+    capture still gets a false-clean result, reproduced live against the
+    real committed code with a real `npm audit`. The same review also
+    proved the docstring's "a planted RELEASE_DIR/.npmrc" half of this
+    function's own stated threat model was never covered at all: a
+    same-UID racer can plant `.npmrc` in the same window, npm honors it,
+    and nothing here ever notices.
+
+    Fixed for real this time by binding to something that does NOT
+    depend on timing at all: `receipt['release_tree_sha256']`, the same
+    DURABLE, install-time-fixed whole-tree digest verify() itself
+    compares against (see verify()'s own `tree_digest(release)` call).
+    Re-running that exact same whole-tree walk immediately before and
+    immediately after the `npm audit` subprocess, and comparing each
+    result against the receipt's fixed value (not against each other, and
+    not against anything this function read moments ago), removes the
+    "capture now, trust it" step entirely -- there is no longer a moment
+    where this function trusts unattested bytes, at any window size. This
+    also, as a direct consequence of covering the WHOLE tree rather than
+    two filenames, closes the `.npmrc` gap and restores the node/npm-cli
+    exec-time binding round 55 had dropped, all in one mechanism, with no
+    separate bookkeeping for any of them.
     """
     verify()
     receipt = load_receipt()
     release = verify_private_ssd_dir(Path(receipt["release_dir"]))
     node = resolve_ssd(Path(receipt["node_target"]))
     npm_cli = resolve_ssd(Path(receipt["npm_target"]))
-    # This function's own narrower trust anchor -- see the round-58
-    # docstring paragraph above for why capturing this here, right after
-    # verify() returns, and re-checking it twice more below (immediately
-    # before and immediately after the actual audit subprocess) is what
-    # actually binds "the bytes verify() confirmed" to "the bytes npm
-    # audit reads", rather than relying on verify()'s own, much coarser
-    # whole-tree pass/fail.
-    manifest_path = release / "package.json"
-    lock_path = release / "package-lock.json"
-    manifest_raw = read_private_ssd_file(manifest_path)
-    manifest_stat = manifest_path.lstat()
-    manifest_identity = (manifest_stat.st_dev, manifest_stat.st_ino)
-    lock_raw = read_private_ssd_file(lock_path)
-    lock_stat = lock_path.lstat()
-    lock_identity = (lock_stat.st_dev, lock_stat.st_ino)
+    expected_tree_sha256 = receipt.get("release_tree_sha256")
+    expected_tree_entries = receipt.get("release_tree_entries")
+    if not isinstance(expected_tree_sha256, str) or not expected_tree_sha256:
+        raise PrimeInstallError("managed receipt is missing the pinned release tree digest")
     cache = verify_private_ssd_dir(TOOL_ROOT / "npm-cache")
     install_home = verify_private_ssd_dir(TOOL_ROOT / "install-home")
     install_tmp = verify_private_ssd_dir(TOOL_ROOT / "install-tmp")
@@ -9529,10 +9535,12 @@ def audit_installed_lock() -> dict[str, Any]:
     # `npm_config_audit=false` -- this function's entire purpose is to run
     # that check for real, on demand.
     environment["npm_config_audit"] = "true"
-    # Immediately before the subprocess that actually reads these two
-    # files -- see the round-58 docstring paragraph above.
-    verify_unchanged_private_ssd_file(manifest_path, manifest_raw, manifest_identity)
-    verify_unchanged_private_ssd_file(lock_path, lock_raw, lock_identity)
+    # Immediately before the subprocess -- see the round-58 docstring
+    # paragraph above for why this compares against the receipt's fixed,
+    # durable digest rather than against anything captured moments ago.
+    digest_before, entries_before = tree_digest(release)
+    if digest_before != expected_tree_sha256 or entries_before != expected_tree_entries:
+        raise PrimeInstallError("Prime Agent release tree drifted")
     try:
         result = subprocess.run(
             [os.fspath(node), os.fspath(npm_cli), "audit", "--omit=dev", "--json"],
@@ -9547,13 +9555,14 @@ def audit_installed_lock() -> dict[str, Any]:
     except (OSError, subprocess.SubprocessError) as exc:
         raise PrimeInstallError("cannot run npm audit") from exc
     # Immediately after: closes the window DURING the subprocess's own
-    # runtime, the same way node/npm-cli are re-checked after `npm ci`
-    # elsewhere in this file -- see the round-58 docstring paragraph
-    # above. If either file changed while `npm audit` was running, the
-    # report below describes content this function can no longer show
-    # was what was actually audited, and must not be trusted.
-    verify_unchanged_private_ssd_file(manifest_path, manifest_raw, manifest_identity)
-    verify_unchanged_private_ssd_file(lock_path, lock_raw, lock_identity)
+    # runtime, against the SAME fixed, durable receipt value -- see the
+    # round-58 docstring paragraph above. If the tree changed while `npm
+    # audit` was running, the report below describes content this
+    # function can no longer show was what was actually audited, and must
+    # not be trusted.
+    digest_after, entries_after = tree_digest(release)
+    if digest_after != expected_tree_sha256 or entries_after != expected_tree_entries:
+        raise PrimeInstallError("Prime Agent release tree drifted")
     # `npm audit` exits non-zero whenever it finds any vulnerability at
     # all, including ones already on ACCEPTED_ADVISORIES -- exit code is
     # deliberately not treated as pass/fail here; the allowlist comparison
