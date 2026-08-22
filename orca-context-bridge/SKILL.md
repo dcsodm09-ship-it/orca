@@ -808,23 +808,91 @@ exactly as it was, so a failed enumeration can never quietly replace a good
 catalog with an empty one.
 
 Dangling cross-project references are data, not failures: they land in
-`unresolved_references` with a reason that separates "the target project
-just hasn't adopted the file yet" (`project-has-no-capabilities-file`) from
-"the target project has capabilities but not that one"
-(`capability-not-found`), from "the target project has the file but it
-doesn't parse" (`capabilities-file-invalid`), from "no such project"
-(`project-unknown`). Only the first resolves itself as adoption spreads;
-the rest are real drift worth chasing — a broken file in particular never
-fixes itself, and its own row in `degraded[]` carries the parse error.
+`unresolved_references` with a `reason` that says exactly which kind of
+drift it is. There are six, and they are the complete list:
+
+| `reason` | `target_project_state` | Meaning |
+|---|---|---|
+| `malformed-ref` | `n/a` | the `depends_on` string is not a legal ref at all |
+| `project-unknown` | `not-enumerated` | no such project in the fleet |
+| `project-has-no-capabilities-file` | `enumerated-not-adopted` | the target project just hasn't adopted the file yet |
+| `capabilities-file-invalid` | `enumerated-file-unreadable` | the target has the file, but it doesn't parse |
+| `capability-ambiguous` | `in-catalog-target-excluded` | the target capability **is** in `capabilities[]`, but its own identity is corrupted (a colliding `global_id`, an ambiguous `project_id`), so it is barred from being a join target |
+| `capability-not-found` | `in-catalog-with-capabilities` | the target project has capabilities, but not that one — **or** the exclusion axis is `duplicate-ref-key`: the target project *does* have that exact `(kind, name)`, twice, which is why it's excluded. Check `target_excluded_reason` to tell the two apart; `ambiguous_ref_keys[]` also names the ref_key in the latter case |
+
+Only `project-has-no-capabilities-file` resolves itself as adoption
+spreads; the rest are real drift worth chasing — a broken file in
+particular never fixes itself, and its own row in `degraded[]` carries the
+parse error. Every unresolved row *except* the `malformed-ref` one also
+carries `target_excluded_reason`: the precise exclusion axis
+(`duplicate-ref-key`, `duplicate-global-id`, `ambiguous-project-id`) when
+the ref_key was barred from the index, and `null` when it was never a
+candidate in the first place. A `malformed-ref` row has no ref_key to
+exclude, so it omits that field along with `ref_key` and `scope`, which are
+`null`.
 
 A `depends_on` entry naming its own capability is neither resolved nor
 unresolved: it gets `state: "self-reference"` and is excluded from the
 target's `in_degree`/`referenced_by`, matching how
-`validate_reusable_capabilities.py` already treats it as an error. Where a
-project has two capabilities sharing a `(kind, name)` pair or an `id`,
-neither wins: the ambiguous key is dropped from the lookup indices and
-recorded in `ambiguous_ref_keys` / `ambiguous_global_ids`, so no consumer
-reads a silently merged entry.
+`validate_reusable_capabilities.py` already treats it as an error.
+
+Where two capabilities collide, neither wins — but the different kinds of
+collision are reported through **different** top-level lists, because they
+are different facts:
+
+- `ambiguous_ref_keys[]` — the literal `ref_key` string is claimed by 2+
+  capabilities (a shared `(kind, name)` pair). "Which one did you mean?"
+  genuinely has no answer. This is the only thing the word *ambiguous*
+  means here.
+- `excluded_ref_keys[]` — a superset, and a list of
+  `{"ref_key", "reason"}` objects rather than bare strings. It records
+  every ref_key barred from `capability_ref_index`, **including** the cases
+  where the ref_key itself is perfectly unique and something about its sole
+  owner disqualifies it. Two capabilities sharing an `id` but with distinct
+  `(kind, name)` pairs land here with `reason: "duplicate-global-id"` and
+  are correctly **absent** from `ambiguous_ref_keys[]`.
+- `ambiguous_global_ids[]` — capability `global_id`s claimed by 2+
+  capabilities. Neither gets a `capability_reverse_index` row, so no
+  consumer reads a silently merged entry.
+- `ambiguous_page_global_ids[]` — the same collision on the wiki-page side.
+  Pages are **flagged and retained**, never dropped (this tool does not own
+  `orca-context-wiki.json`'s schema), so a consumer must check each row's
+  `duplicate_page_global_id` before joining on `global_id`.
+- `cross_namespace_global_id_collisions[]` — `global_id`s claimed by both a
+  page and a capability. `ID_RE` bars `:` from a capability `id`, which
+  closes that axis; the `project_id` axis is *not* closed, because
+  `project_id` is derived from the filesystem and this tool will not refuse
+  to catalog real content over how a directory is named. So the overlap is
+  measured and published rather than promised away. Normally empty; a
+  consumer that merges pages and capabilities into one keyspace must check
+  it first.
+
+Per-row fields worth knowing about, all on `capabilities[]` unless noted:
+`duplicate_ref_key`, `duplicate_global_id`, `project_id_addressable` (false
+when this project's `project_id` makes its own `ref_key` unspellable from
+another project — recorded, never enforced, since same-project resolution
+still works), and `duplicate_depends_on_count` (identical `depends_on`
+strings collapsed before any edge was credited). On each **parsed**
+`depends_on` entry (`state` `resolved` / `self-reference` / `unresolved`,
+i.e. everything but `malformed`): `redundant_spelling`, present and `true`
+only when the author wrote their own project id out in full where the bare
+form would do — computed identically on all three arms, so its absence
+means "not redundant", never "this arm doesn't compute it". `resolved`
+entries can additionally carry `duplicate_edge`: a *different* legal
+spelling that resolved to a target this capability had already credited.
+On each `wiki_pages[]` row: `duplicate_page_global_id`.
+
+Every one of those lists has a matching integer in `counts`
+(`ambiguous_ref_keys`, `excluded_ref_keys`, `ambiguous_global_ids`,
+`ambiguous_page_global_ids`, `cross_namespace_global_id_collisions`,
+`duplicate_edges`, `duplicate_depends_on_entries`,
+`capabilities_with_unaddressable_project_id`), so a consumer can check "is
+there anything to look at?" without walking the arrays.
+`counts.projects_with_sources` — and the human summary's
+"N of M enumerated project paths contributed sources" line — counts
+projects that actually contributed at least one usable source, so a project
+whose `wiki/` directory exists but holds none of the three allow-listed
+files is *not* counted.
 
 `catalog.json` is a derived, regenerable convenience file. It is **not**
 one of `reviewed-startup-pack-manifest.json`'s pinned
@@ -847,3 +915,83 @@ Check `verified_at` in `catalog.json` before relying on it; if it predates
 the change you are reasoning about, rebuild first. Wiring this into
 SessionStart is a later, separately reviewed step — until then, treat the
 catalog's age as something you verify rather than assume.
+
+### Searching the catalog
+
+**Before writing a script, skill, or config-pattern that another project in
+this fleet might already have, search for it.** The catalog exists to stop
+the same thing being built twice; `catalog.json` on its own is a passive
+file, so this is the command that actually asks it:
+
+```bash
+python3 <skill-dir>/scripts/query_catalog.py search "wiki"
+python3 <skill-dir>/scripts/query_catalog.py search "capacity" --json --limit 5
+```
+
+It searches **both** halves of the catalog in one pass — `capabilities[]`
+(a project's declared reusable skills, scripts, and config-patterns) and
+`wiki_pages[]` (a project's reviewed knowledge pages) — matching the
+keyword case-insensitively as a substring of:
+
+| entry type | identity fields | text field |
+|---|---|---|
+| capability | `id`, `name` | `summary` |
+| wiki page | `id`, `title` | `summary` |
+
+Results come back in three ranked tiers, best first: `exact` (the keyword
+*is* the id, name, or title), `identity-substring` (it occurs inside one of
+those), then `summary-substring` (it only occurs in the prose). Within a
+tier the order is fully deterministic, so the same catalog and keyword
+always print the same thing. Each hit reports which fields matched, so it is
+clear why something surfaced.
+
+Every run leads with the catalog's age, because a "no match" answer is only
+worth acting on if the catalog is current:
+
+```text
+catalog last verified 31m ago  (2026-08-22T12:11:40Z)  --  17 capabilities, 43 wiki pages, 7 projects
+```
+
+Past `--stale-after-hours` (default 6) the run prints a `STALE` line telling
+you to rebuild first. A catalog whose `verified_at` is missing or
+unparseable counts as stale too — unprovable freshness must not read as
+proven freshness.
+
+Exit codes are the point of the tool, so branch on them rather than parsing
+the text:
+
+| exit | meaning |
+|---|---|
+| `0` | at least one match |
+| `1` | no match — nothing in the catalog uses that word (grep's convention; mind `set -e`) |
+| `2` | usage error, e.g. an empty keyword |
+| `4` | **could not look**: catalog missing, unreadable, or unparseable |
+
+`1` and `4` are deliberately different. "I found nothing" and "I could not
+look" must never be the same answer to "does this already exist?" — a
+machine that has never run `build_cross_project_catalog.py build` has no
+catalog at all, and that reads as `4`, not as an all-clear.
+
+`--json` prints one object with the full result: the match list untruncated
+by the human view's summary trimming, plus `total_matches`, `truncated`,
+`age_seconds`, `stale`, and a `warnings[]` array carrying anything odd about
+the catalog itself (unknown `schema_version`, entries that were not JSON
+objects, a `verified_at` ahead of this clock). `--quiet` suppresses all
+output for callers that only want the exit code.
+
+The script is read-only in the strongest sense available: it has no output
+file, no cache, no lockfile, and no write path at all — one file opened for
+reading, results printed to stdout. There is no write guard because there is
+nothing to guard. Its test suite pins that with an OS-level read-only tree
+that comes back byte-identical and an interceptor that fails if any file
+descriptor is ever requested with a write flag.
+
+Two limits worth knowing before you trust a `1`:
+
+- The catalog only covers projects that have adopted
+  `wiki/reusable-capabilities.json` or `wiki/orca-context-wiki.json` —
+  today a handful of about 145 enumerated paths. "Not in the catalog" means
+  "not declared", not "does not exist anywhere".
+- Matching is literal substring, not semantic. A capability named
+  `agent_capacity.py` will not surface for `throttle`. Try more than one
+  wording before concluding nothing exists.

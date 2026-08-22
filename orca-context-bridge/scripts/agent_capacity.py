@@ -40,7 +40,12 @@ SIGNATURE_TIMEOUT_SECONDS = 15.0
 CLEANUP_TIMEOUT_SECONDS = 0.25
 DEFAULT_OUTPUT_LIMIT = 64 * 1024
 WORKTREE_OUTPUT_LIMIT = 1024 * 1024
-MAX_WORKTREE_ROWS = 128
+# 2026-08-22 reconciliation merge: raised 128 -> 256. At 128 this machine's
+# real worktree count (143, verified live) exceeded the cap and
+# summarize_orca_worktrees() silently discarded all Orca evidence
+# (worktree_error "invalid_worktree_schema"), degrading a true green gate to
+# an advisory yellow. 256 restores headroom above today's count.
+MAX_WORKTREE_ROWS = 256
 MAX_AGENTS_PER_WORKTREE = 64
 MAX_TOTAL_WORKING_AGENTS = 3
 MEMORY_FREE_RE = __import__("re").compile(
@@ -50,6 +55,20 @@ MEMORY_FREE_RE = __import__("re").compile(
 SYSCTL = Path("/usr/sbin/sysctl")
 MEMORY_PRESSURE = Path("/usr/bin/memory_pressure")
 CODESIGN = Path("/usr/bin/codesign")
+# 2026-08-22 reconciliation merge, round 2: the round-1 candidate reused the
+# ORCA_CLI_COMMAND env var here to override this *.app bundle path, copying
+# the naming convention from orca_readonly_probe.py /
+# orca_lifecycle_precondition_probe.py -- but in those two scripts
+# ORCA_CLI_COMMAND names a PATH-resolved *command* ("orca"), not a bundle
+# directory, so the same variable name meant two incompatible things
+# depending which script read it. Two independent dual reviews (Claude
+# opus + Codex sol, 2026-08-22) both flagged this as a real defect: setting
+# ORCA_CLI_COMMAND=orca (correct usage for the other two scripts) made this
+# module fail closed with orca_authority_unavailable, and the override also
+# widened this trust anchor's input surface with no demonstrated need (the
+# GNOME-screen-reader rationale for the other two scripts is a PATH-lookup
+# concern that does not apply to a fixed bundle path here). Reverted to A's
+# original hardcoded path; no env override for the bundle location.
 ORCA_BUNDLE = Path("/Applications/Orca.app")
 ORCA_ELECTRON = ORCA_BUNDLE / "Contents" / "MacOS" / "Orca"
 ORCA_CLI = ORCA_BUNDLE / "Contents" / "Resources" / "app.asar.unpacked" / "out" / "cli" / "index.js"
