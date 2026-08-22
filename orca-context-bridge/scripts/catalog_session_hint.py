@@ -935,9 +935,15 @@ def spawn_rebuild() -> bool:
             # Reproduced: `PYTHONPATH=<dir with a fake argparse.py>
             # build_cross_project_catalog.py build --quiet` raises during
             # import before the aggregator's own error handling exists;
-            # -I neutralises it (sys.path[0], the script's own directory,
-            # is unaffected by -I, so the aggregator's sibling imports are
-            # untouched).
+            # -I neutralises it. -I DOES clear sys.path[0] (verified: without
+            # it, sys.path[0] is the script's own directory; with it,
+            # sys.path[0] becomes the stdlib zip) -- an earlier version of
+            # this comment claimed the opposite, which was wrong. The
+            # aggregator's sibling imports still work under -I for a
+            # different, real reason: build_cross_project_catalog.py does
+            # its own `sys.path.insert(0, str(Path(__file__).resolve()
+            # .parent))` before importing validate_reusable_capabilities,
+            # independently of whatever the interpreter put there.
             [sys.executable, "-I", str(script), "build", "--quiet"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,

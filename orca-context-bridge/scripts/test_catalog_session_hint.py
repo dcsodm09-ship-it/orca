@@ -1761,14 +1761,21 @@ class NoWritePathTests(unittest.TestCase):
         """-I so a project's own PYTHONPATH cannot hijack this script's
         top-level imports before its own exception handling exists (a real
         RuntimeError-from-a-shadowed-stdlib-module was reproduced without
-        this flag during review)."""
+        this flag during review).
+
+        Asserts token[1] == "-I" specifically, not just "-I appears before
+        hook": `python script -I hook` would also satisfy an ordering-only
+        check while making -I a SCRIPT argument (ignored by
+        catalog_session_hint.py's own argparse, not an interpreter flag at
+        all) rather than the interpreter flag it must be to have any
+        effect."""
         code, out, err = run_subprocess(["print-registration"])
         command = json.loads(out)["hooks"][0]["command"]
         tokens = shlex.split(command)
-        self.assertIn("-I", tokens)
-        self.assertLess(
-            tokens.index("-I"), tokens.index("hook"),
-            "-I must be a Python interpreter flag, positioned before the script path and subcommand",
+        self.assertEqual(
+            tokens[1], "-I",
+            "-I must immediately follow the interpreter to be a real interpreter flag, "
+            f"not a script argument argparse would just ignore; got tokens={tokens!r}",
         )
 
     def test_the_source_contains_no_settings_json_path(self) -> None:
