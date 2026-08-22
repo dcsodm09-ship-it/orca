@@ -840,3 +840,70 @@ round-58-exact mutant：这次是真正的 `PrimeInstallError not raised`——�
 Workflow，要求两路独立复现攻击场景并尝试找新的角度；两路都无可复现 P0/P1 才能视为
 真正双 GO，随后按用户既有授权（"4项follow-up做完后，直接装进真实系统"）直接执行真实
 `install`→`enable`，无需再次确认。
+
+## 17. Round 59 双复核结果：两路独立收敛到同一根因、各自还发现1个新P1 + round 60 修复（2026-08-22）
+
+针对 `73174151d4`（round 59）的双复核这次两路都真正跑完，且**两路再次相互独立收敛**：
+
+- **Claude opus/max**：NO-GO，P0=0，P1=2（另P3=2）。
+  - **P1-1**：round 59 把审计的信任锚绑定在"`verify()` 返回后重新 `load_receipt()`
+    读到的 `release_tree_sha256`/`release_tree_entries`"——但 `expected_receipt_
+    identity()` 钉住的约30个字段里根本不包含这两个。同一 UID 的攻击者只改这两个
+    收据字段（配合篡改过的树）就能绕过 `validate_receipt_identity()` 的全部校验。
+    用两套 harness 复现，其中一套完全不 mock 子进程，证实攻击者的 `node` 二进制被
+    真实 fork/exec，`audit_installed_lock()` 仍返回 `ok:true`。同一套 harness 打在
+    round 58 原文上也可利用——说明这是"声称关闭、实际未关闭"的既有缺口。
+  - **P1-2**：round 59 删除了 round 58 对 package.json/package-lock.json 的逐文件
+    绑定，换成约27000条目的非原子整树遍历；lock 文件在遍历排序中位于 toolchain/**
+    之前，实测遍历读到它之后还剩约156ms才结束。攻击者可以在整树遍历刚哈希完 lock
+    之后换成篡改内容，让 npm audit 读到篡改内容，再在第二次整树遍历读到它之前换
+    回——两次整树校验都通过，audit 结果却是基于篡改内容的。两个P1相互独立：只修
+    P1-1，P1-2依然可利用。
+- **Codex sol/max**：这次真正独立复现完整走完（前两次派发都真实撞上 OpenAI Trusted
+  Access 内容墙，按既定流程换到 fallback 模型 `gpt-5.6-terra`/`high` 后第三次干净
+  跑完，全程6次允许尝试用了3次，过程可审计）。**NO-GO，P0=0，P1=1**：用自己独立的
+  harness（同样不 mock 子进程）复现了和 opus/max P1-1 完全一致的根因——"收据+树"
+  整体换基，静默返回 `ok:true`。未独立发现 P1-2。
+
+Workflow 自己的综合判断：两路**没有**对同一发现的严重度打架，都判为 P1；真正的差异
+是覆盖面——opus/max 额外发现了 P1-2，Codex 没提。判断为覆盖面不同（取并集），不是
+互相矛盾，明确要求两个 P1 一起修，不得只修一个。
+
+**我自己先独立复核了两个发现**（不直接采信任一路的说法）：直接读
+`expected_receipt_identity()`/`validate_receipt_identity()`/`load_receipt()` 源码，
+确认这两个字段确实不在钉住集合里；确认 `verify()` 自己在 9328-9329 行已经把这两个
+字段算好并放进返回值，只是被 `audit_installed_lock()` 第9521行丢弃了。两个发现均
+在代码层面直接证实为真问题。
+
+**已修复**（round 60）：
+1. P1-1：改为 `evidence = verify()`，用 `evidence.get(...)` 取值，不再重新
+   `load_receipt()` 读取这两个字段——`verify()` 的返回值在这个函数自己读收据之前
+   就已经算好、钉死，之后任何对收据文件的同 UID 改写（无论改的是不是被钉住的字段）
+   都不可能再影响它。
+2. P1-2：恢复 round 58 原本对 package.json/package-lock.json 的逐文件捕获+复核，
+   但**锚点提前到比 round 58 原始位置更早**——release/node/npm-cli 刚解析完、
+   两次整树遍历任何一次都还没跑之前——并在子进程调用前后各复核一次。与整树校验
+   互补而非替代：整树校验（现在正确绑定 `evidence`）覆盖整棵树在函数运行期间的
+   任何改动；这对更窄、锚点更早的逐文件校验专门覆盖 npm audit 实际读取的这两个
+   文件，独立于整树遍历本身约1.5秒的非原子性。实践中这还让 P1-1 式的篡改在
+   npm audit 真正被调用之前就被拦下，比 round 58 原始设计更严格。
+3. 顺带修复 round 59 双复核发现的 P3-1（注释指针指向错误的段落）。
+
+**验证**：新增3个测试，两个新P1各自独立做了变异测试证明真正有效（针对**本轮自己的
+修复**做变异，不是针对旧 commit 的历史代码）——P1-1的测试：构造"树已被篡改+收据两个
+摘要字段已被伪造成与篡改后的树一致"的精确攻击场景，打在改回收据绑定的变异体上，
+执行一路绕过两层校验，最后在尝试解析被 mock 的子进程结果时才因为完全无关的
+`TypeError` 中断，证明它压根没触发"release tree drifted"检查；P1-2的测试：hook
+`sha256_file_verified()` 精确复现"遍历1哈希完lock后换、遍历2读lock前换回"的完整
+骗术，打在去掉逐文件校验的变异体上得到`PrimeInstallError not raised`——真正的静默
+误判"clean"结果。226→228测试，双解释器全过；py_compile双解释器干净；真实
+`sandbox_e2e.py`全生命周期`ok:true`，`production_lock_sha256`保持不变；另外用真实、
+非mock的`install()`+真实`audit_installed_lock()`（真实npm audit、真实registry、
+无篡改）端到端跑通，`ok:true`，正确识别唯一白名单里的`extract-zip`通告，未引入
+误报（这也顺带覆盖了opus/max在round 59报告里指出的"unable to verify"点：
+`sandbox_e2e.py`本身完全不调用`audit_installed_lock()`，所以这个独立的真实端到端
+脚本是专门为覆盖这个盲区而单独跑的，round 59和round 60都跑过）。
+
+**待办**：针对 round 60 的候选重新派发 `prime-agent-dual-review` Workflow，明确要求
+不复用任一路此前结果、重新独立复现；两路都无可复现 P0/P1 才是真正双 GO，随后按用户
+既有授权直接执行真实 `install`→`enable`，无需再次确认。
