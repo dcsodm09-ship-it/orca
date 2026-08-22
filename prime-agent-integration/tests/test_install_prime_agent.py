@@ -463,6 +463,19 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             "release_tree_entries": 5,
         }
         fake_stat = os.stat_result((0o600, 111, 222, 1, 0, 0, 0, 0, 0, 0))
+        npmrc_path = Path("/tmp/does-not-matter/.npmrc")
+
+        def fake_lstat(path_self):
+            # Round-60 dual-review regression (2026-08-22, Claude opus/max,
+            # P1-B): the RELEASE_DIR/.npmrc presence check (see docstring
+            # paragraph (c) this round added) needs a REAL "doesn't exist"
+            # signal, not the same flat fake_stat every other path here
+            # gets -- a global return_value would make the check see
+            # `.npmrc` as always-present and always fail closed.
+            if path_self == npmrc_path:
+                raise FileNotFoundError(2, "No such file or directory", os.fspath(path_self))
+            return fake_stat
+
         audit_report = {
             "auditReportVersion": 2,
             "vulnerabilities": {
@@ -488,10 +501,14 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
             mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
             mock.patch.object(installer, "read_private_ssd_file", return_value=b"{}"),
-            mock.patch.object(Path, "lstat", return_value=fake_stat),
+            mock.patch.object(installer, "sha256_file_verified", return_value="binhash"),
+            mock.patch.object(Path, "lstat", fake_lstat),
             mock.patch.object(
                 installer, "verify_unchanged_private_ssd_file"
             ) as verify_unchanged_mock,
+            mock.patch.object(
+                installer, "verify_unchanged_private_ssd_asset_digest"
+            ) as verify_unchanged_asset_mock,
             mock.patch.object(
                 installer, "tree_digest", return_value=("treehash", 5)
             ) as tree_digest_mock,
@@ -505,14 +522,16 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             result = installer.audit_installed_lock()
         verify_mock.assert_called_once_with()
         # Whole-tree digest re-checked once before and once after the
-        # subprocess call, both against verify()'s own durable evidence --
-        # see audit_installed_lock()'s own round-59 dual-review docstring
+        # subprocess call, both against verify()'s own evidence -- see
+        # audit_installed_lock()'s own round-59 dual-review docstring
         # paragraph (a).
         self.assertEqual(tree_digest_mock.call_count, 2)
-        # The narrower, earlier-anchored per-file pair (package.json and
-        # package-lock.json) re-checked once before and once after the
-        # subprocess call too -- see docstring paragraph (b).
+        # The narrower, earlier-anchored bracket (package.json and
+        # package-lock.json byte-exact, node/npm-cli digest-based)
+        # re-checked once before and once after the subprocess call too
+        # -- see docstring paragraphs (b) and (c).
         self.assertEqual(verify_unchanged_mock.call_count, 4)
+        self.assertEqual(verify_unchanged_asset_mock.call_count, 4)
         self.assertTrue(result["ok"])
         self.assertEqual([entry["name"] for entry in result["accepted_advisories"]], ["extract-zip"])
         self.assertEqual(
@@ -534,6 +553,13 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             "release_tree_entries": 5,
         }
         fake_stat = os.stat_result((0o600, 111, 222, 1, 0, 0, 0, 0, 0, 0))
+        npmrc_path = Path("/tmp/does-not-matter/.npmrc")
+
+        def fake_lstat(path_self):
+            if path_self == npmrc_path:
+                raise FileNotFoundError(2, "No such file or directory", os.fspath(path_self))
+            return fake_stat
+
         audit_report = {
             "auditReportVersion": 2,
             "vulnerabilities": {
@@ -558,8 +584,10 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
             mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
             mock.patch.object(installer, "read_private_ssd_file", return_value=b"{}"),
-            mock.patch.object(Path, "lstat", return_value=fake_stat),
+            mock.patch.object(installer, "sha256_file_verified", return_value="binhash"),
+            mock.patch.object(Path, "lstat", fake_lstat),
             mock.patch.object(installer, "verify_unchanged_private_ssd_file"),
+            mock.patch.object(installer, "verify_unchanged_private_ssd_asset_digest"),
             mock.patch.object(installer, "tree_digest", return_value=("treehash", 5)),
             mock.patch.object(
                 installer,
@@ -593,6 +621,13 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             "release_tree_entries": 5,
         }
         fake_stat = os.stat_result((0o600, 111, 222, 1, 0, 0, 0, 0, 0, 0))
+        npmrc_path = Path("/tmp/does-not-matter/.npmrc")
+
+        def fake_lstat(path_self):
+            if path_self == npmrc_path:
+                raise FileNotFoundError(2, "No such file or directory", os.fspath(path_self))
+            return fake_stat
+
         audit_report = {
             "auditReportVersion": 2,
             "vulnerabilities": {
@@ -617,8 +652,10 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
             mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
             mock.patch.object(installer, "read_private_ssd_file", return_value=b"{}"),
-            mock.patch.object(Path, "lstat", return_value=fake_stat),
+            mock.patch.object(installer, "sha256_file_verified", return_value="binhash"),
+            mock.patch.object(Path, "lstat", fake_lstat),
             mock.patch.object(installer, "verify_unchanged_private_ssd_file"),
+            mock.patch.object(installer, "verify_unchanged_private_ssd_asset_digest"),
             mock.patch.object(installer, "tree_digest", return_value=("treehash", 5)),
             mock.patch.object(
                 installer,
@@ -695,6 +732,19 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             os.chmod(manifest_path, 0o600)
             lock_path.write_bytes(b'{"genuine": "lock"}\n')
             os.chmod(lock_path, 0o600)
+            # Real (if fake-content) node/npm-cli under release -- the
+            # round-60 dual-review bracket (docstring paragraph (c)) now
+            # digests these too, so they must exist on disk, and (being
+            # inside `release`) must exist BEFORE the baseline walk below
+            # so both digests already account for them.
+            node_path = release / "toolchain/bin/node"
+            node_path.parent.mkdir(mode=0o700, parents=True)
+            node_path.write_bytes(b"#!/bin/sh\nexec /usr/bin/true\n")
+            os.chmod(node_path, 0o700)
+            npm_cli_path = release / "toolchain/lib/node_modules/npm/bin/npm-cli.js"
+            npm_cli_path.parent.mkdir(mode=0o700, parents=True)
+            npm_cli_path.write_bytes(b"// genuine npm-cli.js stub\n")
+            os.chmod(npm_cli_path, 0o600)
             with mock.patch.object(installer, "SSD_ROOT", root):
                 clean_digest, clean_entries = installer.tree_digest(release)
 
@@ -708,8 +758,8 @@ class PrimeAgentInstallerTests(unittest.TestCase):
 
             receipt = {
                 "release_dir": os.fspath(release),
-                "node_target": "/tmp/node",
-                "npm_target": "/tmp/npm-cli.js",
+                "node_target": os.fspath(node_path),
+                "npm_target": os.fspath(npm_cli_path),
                 # Forged to match the ALREADY-tampered tree above -- not
                 # the true, pre-tamper baseline.
                 "release_tree_sha256": tampered_digest,
@@ -838,6 +888,16 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             os.chmod(manifest_path, 0o600)
             lock_path.write_bytes(b'{"genuine": "lock"}\n')
             os.chmod(lock_path, 0o600)
+            # Real node/npm-cli under release -- the round-60 dual-review
+            # bracket (docstring paragraph (c)) now digests these too.
+            node_path = release / "toolchain/bin/node"
+            node_path.parent.mkdir(mode=0o700, parents=True)
+            node_path.write_bytes(b"#!/bin/sh\nexec /usr/bin/true\n")
+            os.chmod(node_path, 0o700)
+            npm_cli_path = release / "toolchain/lib/node_modules/npm/bin/npm-cli.js"
+            npm_cli_path.parent.mkdir(mode=0o700, parents=True)
+            npm_cli_path.write_bytes(b"// genuine npm-cli.js stub\n")
+            os.chmod(npm_cli_path, 0o600)
             # tree_digest()/verify_private_ssd_dir()/resolve_ssd() all
             # require paths under SSD_ROOT -- mock it to this test's own
             # real temp root (matching the established pattern used by
@@ -849,8 +909,8 @@ class PrimeAgentInstallerTests(unittest.TestCase):
 
             receipt = {
                 "release_dir": os.fspath(release),
-                "node_target": "/tmp/node",
-                "npm_target": "/tmp/npm-cli.js",
+                "node_target": os.fspath(node_path),
+                "npm_target": os.fspath(npm_cli_path),
                 "release_tree_sha256": digest,
                 "release_tree_entries": entries,
             }
@@ -958,14 +1018,27 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             clean_lock_bytes = b'{"genuine": "lock"}\n'
             lock_path.write_bytes(clean_lock_bytes)
             os.chmod(lock_path, 0o600)
+            # Real node/npm-cli under release -- the round-60 dual-review
+            # bracket (docstring paragraph (c)) now digests these too, via
+            # the same sha256_file_verified() this test hooks below (the
+            # hook falls through to the real function for any path other
+            # than lock_path, so these need to exist on disk).
+            node_path = release / "toolchain/bin/node"
+            node_path.parent.mkdir(mode=0o700, parents=True)
+            node_path.write_bytes(b"#!/bin/sh\nexec /usr/bin/true\n")
+            os.chmod(node_path, 0o700)
+            npm_cli_path = release / "toolchain/lib/node_modules/npm/bin/npm-cli.js"
+            npm_cli_path.parent.mkdir(mode=0o700, parents=True)
+            npm_cli_path.write_bytes(b"// genuine npm-cli.js stub\n")
+            os.chmod(npm_cli_path, 0o600)
 
             with mock.patch.object(installer, "SSD_ROOT", root):
                 digest, entries = installer.tree_digest(release)
 
             receipt = {
                 "release_dir": os.fspath(release),
-                "node_target": "/tmp/node",
-                "npm_target": "/tmp/npm-cli.js",
+                "node_target": os.fspath(node_path),
+                "npm_target": os.fspath(npm_cli_path),
             }
             verify_result = {
                 "ok": True,
@@ -1042,6 +1115,161 @@ class PrimeAgentInstallerTests(unittest.TestCase):
             # Caught before `npm audit` was ever invoked -- an even
             # tighter closure than round 58's original design, which only
             # caught this class of tamper after the subprocess returned.
+            run_mock.assert_not_called()
+
+    def test_audit_installed_lock_detects_node_tamper_before_subprocess(self) -> None:
+        # Regression for independent Claude opus/max round-60 re-review,
+        # 2026-08-22, P1-B/blocker: the round-59 tight per-file bracket
+        # covered only package.json/package-lock.json -- `npm audit` also
+        # execs `node` (receipt['node_target']), but nothing re-checked it
+        # between the early per-file capture and the subprocess call,
+        # leaving it exposed to the same class of live-race window
+        # docstring paragraph (b) already closes for manifest/lock. The
+        # independent review reproduced this for real: a substituted
+        # `node` binary genuinely gets exec'd by `npm audit` while
+        # audit_installed_lock() still returns ok:true.
+        #
+        # This test tampers node's content as a side effect of the
+        # whole-tree walk itself (mocked here, unlike the sibling
+        # lock-swap test above, so the exact injection point doesn't
+        # depend on tree_digest()'s own internal walk order) --
+        # simulating a racer who wins the window between this function's
+        # own early capture and the point where it re-checks node
+        # specifically, immediately before the subprocess.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "release"
+            release.mkdir(mode=0o700)
+            tool_root = root / "tool"
+            for name in ("npm-cache", "install-home", "install-tmp"):
+                (tool_root / name).mkdir(mode=0o700, parents=True)
+            manifest_path = release / "package.json"
+            lock_path = release / "package-lock.json"
+            manifest_path.write_bytes(b'{"genuine": "manifest"}\n')
+            os.chmod(manifest_path, 0o600)
+            lock_path.write_bytes(b'{"genuine": "lock"}\n')
+            os.chmod(lock_path, 0o600)
+            node_path = release / "toolchain/bin/node"
+            node_path.parent.mkdir(mode=0o700, parents=True)
+            node_path.write_bytes(b"#!/bin/sh\nexec /usr/bin/true\n")
+            os.chmod(node_path, 0o700)
+            npm_cli_path = release / "toolchain/lib/node_modules/npm/bin/npm-cli.js"
+            npm_cli_path.parent.mkdir(mode=0o700, parents=True)
+            npm_cli_path.write_bytes(b"// genuine npm-cli.js stub\n")
+            os.chmod(npm_cli_path, 0o600)
+
+            receipt = {
+                "release_dir": os.fspath(release),
+                "node_target": os.fspath(node_path),
+                "npm_target": os.fspath(npm_cli_path),
+            }
+            verify_result = {
+                "ok": True,
+                "release_tree_sha256": "treehash",
+                "release_tree_entries": 5,
+            }
+
+            def fake_tree_digest(root_arg, **kwargs):
+                # Whole-tree check #1: tamper node right after "returning"
+                # the expected clean digest -- the racer wins the window
+                # between the early per-file capture (already done by the
+                # time this mock runs) and this function's own re-check
+                # of node, immediately before the subprocess.
+                with open(node_path, "r+b") as handle:
+                    handle.seek(0)
+                    handle.write(b"#!/bin/sh\nexec /bin/sh -c 'ATTACKER OWNS THIS NODE'\n")
+                    handle.truncate()
+                return ("treehash", 5)
+
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "verify", return_value=verify_result),
+                mock.patch.object(installer, "load_receipt", return_value=receipt),
+                mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
+                mock.patch.object(installer, "tree_digest", side_effect=fake_tree_digest),
+                mock.patch.object(
+                    installer,
+                    "managed_npm_environment",
+                    return_value={"npm_config_audit": "false"},
+                ),
+                mock.patch.object(subprocess, "run") as run_mock,
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "managed asset changed before use"
+                ):
+                    installer.audit_installed_lock()
+            run_mock.assert_not_called()
+
+    def test_audit_installed_lock_rejects_planted_release_npmrc(self) -> None:
+        # Regression for independent Claude opus/max round-60 re-review,
+        # 2026-08-22, P1-B/blocker: npm's own "project config" layer
+        # resolves `.npmrc` relative to `cwd` -- which the subprocess call
+        # sets to `release` -- and managed_npm_environment() never pins or
+        # forbids that specific path (it only pins the user/global config
+        # layers via env vars, and separately guards a DIFFERENT `.npmrc`
+        # under install_home). Unlike manifest/lock/node/npm-cli, there is
+        # no "unchanged from an earlier capture" baseline for this file --
+        # a legitimate release never has one at all -- so this proves the
+        # new presence check specifically, planting one before the
+        # function is ever called (the simplest, earliest possible
+        # window: no live race needed at all).
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "release"
+            release.mkdir(mode=0o700)
+            tool_root = root / "tool"
+            for name in ("npm-cache", "install-home", "install-tmp"):
+                (tool_root / name).mkdir(mode=0o700, parents=True)
+            manifest_path = release / "package.json"
+            lock_path = release / "package-lock.json"
+            manifest_path.write_bytes(b'{"genuine": "manifest"}\n')
+            os.chmod(manifest_path, 0o600)
+            lock_path.write_bytes(b'{"genuine": "lock"}\n')
+            os.chmod(lock_path, 0o600)
+            node_path = release / "toolchain/bin/node"
+            node_path.parent.mkdir(mode=0o700, parents=True)
+            node_path.write_bytes(b"#!/bin/sh\nexec /usr/bin/true\n")
+            os.chmod(node_path, 0o700)
+            npm_cli_path = release / "toolchain/lib/node_modules/npm/bin/npm-cli.js"
+            npm_cli_path.parent.mkdir(mode=0o700, parents=True)
+            npm_cli_path.write_bytes(b"// genuine npm-cli.js stub\n")
+            os.chmod(npm_cli_path, 0o600)
+            # The attacker's own planted file -- present before this
+            # function is ever invoked.
+            (release / ".npmrc").write_bytes(
+                b"proxy=http://127.0.0.1:9999/\nstrict-ssl=false\n"
+            )
+
+            receipt = {
+                "release_dir": os.fspath(release),
+                "node_target": os.fspath(node_path),
+                "npm_target": os.fspath(npm_cli_path),
+            }
+            verify_result = {
+                "ok": True,
+                "release_tree_sha256": "treehash",
+                "release_tree_entries": 5,
+            }
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(installer, "TOOL_ROOT", tool_root),
+                mock.patch.object(installer, "verify", return_value=verify_result),
+                mock.patch.object(installer, "load_receipt", return_value=receipt),
+                mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
+                mock.patch.object(installer, "tree_digest", return_value=("treehash", 5)),
+                mock.patch.object(
+                    installer,
+                    "managed_npm_environment",
+                    return_value={"npm_config_audit": "false"},
+                ),
+                mock.patch.object(subprocess, "run") as run_mock,
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError,
+                    "unexpected npm configuration present in release directory",
+                ):
+                    installer.audit_installed_lock()
             run_mock.assert_not_called()
 
     def test_exact_dependency_versions_uses_top_level_release_choice(self) -> None:

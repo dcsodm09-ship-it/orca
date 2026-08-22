@@ -907,3 +907,62 @@ Workflow 自己的综合判断：两路**没有**对同一发现的严重度打�
 **待办**：针对 round 60 的候选重新派发 `prime-agent-dual-review` Workflow，明确要求
 不复用任一路此前结果、重新独立复现；两路都无可复现 P0/P1 才是真正双 GO，随后按用户
 既有授权直接执行真实 `install`→`enable`，无需再次确认。
+
+## 18. Round 60 双复核结果：opus/max 发现2个新P1，其中1个是真正的架构级问题 + round 61 处理（2026-08-22）
+
+针对 `df10fb91c6`（round 60）的双复核，Claude opus/max 一路先回，NO-GO，P0=0，P1=2：
+
+- **P1-B（活动竞态窗口）**：round 60 收紧的逐文件校验只覆盖了 package.json/
+  package-lock.json 这2个文件，但 `npm audit` 同时也会 exec `node`/加载 `npm_cli`，
+  而 npm 自己的"project config"层会去 `cwd`（也就是 `release`）下找 `.npmrc`——
+  `managed_npm_environment()` 从未钉住或禁止这个特定路径。两者都暴露在跟
+  package-lock.json 完全同类的竞态窗口里，已用真实复现证明：被替换的 node 二进制
+  真的被 exec 了，而 `audit_installed_lock()` 仍返回 `ok:true`。
+- **P1-A（持久性伪造，性质不同）**：证明 `verify()` 自己"关闭了持久性篡改这种情形"
+  的说法是假的——`release_tree_sha256`/`release_tree_entries`/`node_sha256`/
+  `npm_cli_sha256`/`entrypoint_sha256`/`launch_guard_sha256`/`command_wrapper_sha256`
+  这7个字段完全没被 `expected_receipt_identity()`/`validate_receipt_identity()` 钉住。
+  攻击者不需要抢任何时间窗口，只要在这个函数（或任何调用 `verify()` 的调用方）
+  被调用**之前**，把树和收据里这些字段一起改成自洽的伪造值，`verify()` 自己重新
+  算出来的"evidence"就已经是被污染的那份——因为比较的两边（树的实际内容、拿来对比
+  的"期望值"）都已经被同一个攻击者控制了，压根没有可检测的不一致。用真实的、
+  持久性重写 `toolchain/bin/node`（同时伪造匹配的 `node_sha256`）复现，成功绕过
+  `verify()` 自己那五个逐文件摘要检查，攻击者的 node 二进制被真实 exec。
+
+**我自己排查后确认**：要真正堵死 P1-A，需要让 `verify()`/`audit_installed_lock()`
+在校验时完全不信任收据里任何聚合值，而是独立重新推导出真正来自源头（tarball摘要、
+`GENERATED_LOCK_SHA256`、这次安装自己生成的 launch-guard/command-wrapper 字节）的
+期望值——这基本等于把 `install()` 里组装 `release_relative_pinned_digests`（跨
+round 29/31/32/34/36/54/56 好几轮才堆出来的逻辑）在校验时也整个独立重跑一遍。也
+确认了文件系统不可变标志（`chflags uchg`）帮不上忙——真正的同 UID 攻击者能像合法
+进程一样自由切换这个标志。这是一次实质性的新架构工作，不是"再收紧一个窗口"那种
+量级的修复。
+
+**已问询用户**（AskUserQuestion，2026-08-22）：P1-B 照常修，P1-A 在"先诚实收窄
+文案"和"投入架构级修复"之间用户选择了**前者**——不做架构改动，把
+`audit_installed_lock()`/`verify()` docstring 里"closes the DURABLE tampering
+case"这类过度承诺改成如实反映现状（只防活动竞态、不防这7个未钉字段的持久性伪造），
+记录为已知限制。
+
+**已修复（round 61）**：
+1. P1-B：把早锚定的逐文件校验扩展到 node/npm-cli（基于摘要而非整字节比对——
+   `verify_unchanged_private_ssd_asset_digest()`，跟 `make_patched_asset()` 大
+   tarball 已经在用的同一套工具，避免把整个大二进制文件的字节内容一直留在内存里），
+   并新增对 `RELEASE_DIR/.npmrc` 的显式存在性检查（这个文件不该存在，没有"内容不变"
+   这种基线可比）——在 release/node/npm-cli 刚解析完、子进程调用前、子进程调用后
+   三个点都检查。
+2. P1-A：docstring 新增一段诚实说明当前只防活动竞态、不防这7个未钉字段的持久性
+   伪造，并订正了此前两处过度承诺的措辞。
+
+**验证**：2个新回归测试（node篡改、.npmrc植入），各自对本轮修复做了变异测试
+（去掉node/npm-cli/.npmrc校验后，都在无关的下游 TypeError 处中断，证明没真正
+触发预期检查）；既有6个audit测试相应更新（3个真实临时目录测试补了真实node/npm-cli
+文件，3个mock测试补了 sha256_file_verified/verify_unchanged_private_ssd_asset_digest
+mock 和一个按路径区分的 Path.lstat side effect）。228→230测试，双解释器全过；
+py_compile双解释器干净；真实 `sandbox_e2e.py` 全生命周期 `ok:true`；真实、非mock的
+`install()`+真实`audit_installed_lock()`（真实npm audit、真实registry、真实大体积
+node/npm-cli二进制被真实摘要）端到端跑通，`ok:true`，未引入误报。
+
+**待办**：针对 round 61 的候选重新派发 `prime-agent-dual-review` Workflow，明确告知
+P1-A 是本轮已知、经用户明确决策接受的限制（不是待发现的新问题），要求两路独立确认
+P1-B 修复本身、以及 docstring 措辞是否真的如实；两路都无可复现 P0/P1 才是真正双 GO。

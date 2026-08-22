@@ -9473,7 +9473,11 @@ def audit_installed_lock() -> dict[str, Any]:
     sha256'], every pinned binary/generated-file digest, orca_support,
     the managed runtime state, and more) rather than re-deriving a
     weaker, partial subset of it here. Only once that has raised nothing
-    does this proceed to actually run npm audit.
+    does this proceed to actually run npm audit. (See the round-60
+    paragraph below for a correction to this paragraph's "closes the
+    DURABLE tampering case" framing -- verify() closes it only for a
+    same-UID racer active DURING a specific call, not for tampering that
+    already happened, persistently, before verify() was ever invoked.)
 
     Round-57 dual review (2026-08-22, Codex sol/max, P1/blocker): calling
     verify() first closes the DURABLE tampering case (anything wrong
@@ -9557,11 +9561,86 @@ def audit_installed_lock() -> dict[str, Any]:
     release/node/npm-cli are resolved, before either whole-tree walk
     runs) and re-verified immediately before and immediately after the
     subprocess -- complementary to the whole-tree checks, not a
-    replacement for them: the whole-tree checks (now correctly bound to
-    verify()'s own durable evidence) cover the REST of the release tree
-    end to end; this tighter, earlier-anchored pair specifically covers
-    the two files `npm audit` actually reads, independent of the
-    whole-tree walk's own ~1.5s non-atomicity.
+    replacement for them: the whole-tree checks (bound to verify()'s own
+    evidence) cover the REST of the release tree end to end; this
+    tighter, earlier-anchored pair specifically covers the two files
+    `npm audit` actually reads, independent of the whole-tree walk's own
+    ~1.5s non-atomicity.
+
+    Round-60 dual review (2026-08-22, Claude opus/max, 2 x P1/blocker,
+    both independently reproduced, one with a real fork/exec of a
+    tampered `node` binary): round 59's fix above had two more real
+    gaps, one narrower and now fixed, one structural and NOT fixed by
+    this function -- narrowing the claims above accordingly rather than
+    claiming a closure that doesn't hold.
+
+    (c) [FIXED] The tight per-file bracket from (b) covered only
+    package.json/package-lock.json -- but `npm audit` also execs `node`
+    and loads `npm_cli` from RELEASE_DIR, and npm's own "project config"
+    layer resolves a `.npmrc` relative to `cwd` (== `release` here),
+    which managed_npm_environment() never pins or forbids (it only pins
+    the user/global config layers via env vars, and separately guards a
+    DIFFERENT `.npmrc` under install_home). Both remained exposed to the
+    exact same class of live-race window (b) already closed for
+    manifest/lock: a same-UID racer could swap `node` for a same-UID
+    racer's own script right after the pre-subprocess whole-tree walk
+    hashes it, have IT be the binary actually exec'd, then swap back
+    before the post-subprocess walk re-hashes it -- reproduced for real,
+    with a substituted `node` binary genuinely being exec'd and
+    `audit_installed_lock()` still returning ok:true. Fixed by extending
+    the same early-anchored bracket to `node`/`npm_cli` (digest-based,
+    via verify_unchanged_private_ssd_asset_digest() -- these are large
+    binaries, not small generated JSON, so this avoids holding a full
+    in-memory copy the way package.json/package-lock.json's byte-exact
+    check does) and adding an explicit presence check for
+    RELEASE_DIR/.npmrc (there being no "unchanged" baseline to compare
+    against for a file that must simply never exist) at the same three
+    points: immediately after release/node/npm-cli resolve, immediately
+    before the subprocess, and immediately after it returns.
+
+    (d) [NOT FIXED -- SCOPE NARROWED INSTEAD] `evidence = verify()`'s own
+    `release_tree_sha256`/`release_tree_entries` -- and, by the identical
+    mechanism, `receipt['node_sha256']`/`['npm_cli_sha256']`/
+    `['entrypoint_sha256']`/`['launch_guard_sha256']`/
+    `['command_wrapper_sha256']` -- are NOT among the fields
+    `expected_receipt_identity()`/`validate_receipt_identity()` pin. This
+    is not a live-race window at all: a same-UID attacker with no timing
+    constraint whatsoever can, at any point before this function (or
+    verify() itself, from ANY caller) is ever invoked, rewrite the
+    release tree AND forge these receipt fields to a mutually consistent
+    value describing the tampered tree. verify()'s own `tree_digest()`
+    call then re-derives a digest that matches that forged value (since
+    it is, genuinely, the tampered tree's real digest) and returns it as
+    "evidence" -- there is no forgery to detect in THAT comparison,
+    because the anchor and the tree being measured are both already
+    compromised. Reproduced for real, including a same-UID persistent
+    rewrite of `toolchain/bin/node` with `node_sha256` forged to match,
+    surviving verify()'s own five pinned-digest checks and resulting in
+    that attacker binary being exec'd by `npm audit`.
+
+    Genuinely closing this would require verify()/audit_installed_lock()
+    to stop trusting ANY receipt-derived aggregate as their comparison
+    target for these fields, and instead independently re-derive the
+    true expected values from the same install-time-immutable sources
+    install() itself pins into `release_relative_pinned_digests` (tarball
+    digests, GENERATED_LOCK_SHA256-verified content, the locally
+    generated launch-guard/command-wrapper bytes) -- re-running,
+    effectively, a substantial share of the pinning logic install() only
+    assembles once today, spread across many rounds since round 24.
+    Deliberately out of scope for this round: per explicit user decision
+    (2026-08-22), this file instead narrows its own claim rather than
+    attempting that architecture under time pressure. The two paragraphs
+    above claiming verify() "closes the DURABLE tampering case (anything
+    wrong before this function was ever invoked)" and that this function
+    "had ALREADY computed and validated the true digest/entries" are
+    corrected: verify()'s tree_digest()/pinned-digest checks close a
+    same-UID racer active DURING a specific call (the live-race windows
+    (b) and (c) defend, and the install-time TOCTOU rounds 29/31/32/34/36
+    defend for the tarball-sourced originals) -- they do NOT close
+    PERSISTENT same-UID tampering of the six receipt fields named above,
+    performed at leisure with no window to race, before any such call
+    ever starts. Both this function and the standalone `verify` action
+    inherit this limitation as-is.
     """
     evidence = verify()
     receipt = load_receipt()
@@ -9572,25 +9651,65 @@ def audit_installed_lock() -> dict[str, Any]:
     # re-read -- see the round-59 dual-review docstring paragraph (a)
     # above for why re-reading the receipt here was itself unsafe:
     # release_tree_sha256/release_tree_entries are not among the fields
-    # validate_receipt_identity() actually pins.
+    # validate_receipt_identity() actually pins. (See docstring paragraph
+    # (d) above for the remaining, deliberately-not-closed limitation
+    # this binding still has.)
     expected_tree_sha256 = evidence.get("release_tree_sha256")
     expected_tree_entries = evidence.get("release_tree_entries")
     if not isinstance(expected_tree_sha256, str) or not expected_tree_sha256:
         raise PrimeInstallError("verify() did not return a pinned release tree digest")
     manifest_path = release / "package.json"
     lock_path = release / "package-lock.json"
+    npmrc_path = release / ".npmrc"
+
+    def assert_no_release_npmrc() -> None:
+        # See docstring paragraph (c) above: npm's own "project config"
+        # layer resolves `.npmrc` relative to `cwd` (== `release`, since
+        # the subprocess below sets cwd=release) -- a path
+        # managed_npm_environment() never pins or forbids. Unlike
+        # manifest/lock/node/npm-cli, there is no "unchanged from an
+        # earlier capture" baseline to compare against here: a legitimate
+        # release never has one at all, so presence itself is the
+        # failure.
+        try:
+            npmrc_path.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise PrimeInstallError(
+                f"cannot inspect managed path before use: {npmrc_path}"
+            ) from exc
+        raise PrimeInstallError(
+            f"unexpected npm configuration present in release directory: {npmrc_path}"
+        )
+
     # Anchored as early as possible -- immediately after release/node/
     # npm-cli are resolved, before either whole-tree walk below runs --
-    # see the round-59 dual-review docstring paragraph (b) above. This
-    # pair is re-verified immediately before and immediately after the
-    # npm audit subprocess call, complementary to (not a substitute for)
-    # the whole-tree checks that bracket this whole function.
+    # see the round-59 dual-review docstring paragraph (b) and the
+    # round-60 dual-review docstring paragraph (c) above. This bracket
+    # (four captured files, one presence check) is re-verified
+    # immediately before and immediately after the npm audit subprocess
+    # call, complementary to (not a substitute for) the whole-tree checks
+    # that bracket this whole function.
     manifest_raw = read_private_ssd_file(manifest_path)
     manifest_stat = manifest_path.lstat()
     manifest_identity = (manifest_stat.st_dev, manifest_stat.st_ino)
     lock_raw = read_private_ssd_file(lock_path)
     lock_stat = lock_path.lstat()
     lock_identity = (lock_stat.st_dev, lock_stat.st_ino)
+    # node/npm_cli are large binaries, not small generated JSON -- a
+    # digest-based capture (verify_unchanged_private_ssd_asset_digest(),
+    # the same tool make_patched_asset()'s own large tarballs already use
+    # for this identical pattern) avoids holding a full in-memory copy of
+    # each alive for the entire remainder of this call, unlike
+    # read_private_ssd_file()'s byte-exact approach above.
+    node_sha256_early = sha256_file_verified(node)
+    node_stat = node.lstat()
+    node_identity = (node_stat.st_dev, node_stat.st_ino)
+    npm_cli_sha256_early = sha256_file_verified(npm_cli)
+    npm_cli_stat = npm_cli.lstat()
+    npm_cli_identity = (npm_cli_stat.st_dev, npm_cli_stat.st_ino)
+    assert_no_release_npmrc()
     cache = verify_private_ssd_dir(TOOL_ROOT / "npm-cache")
     install_home = verify_private_ssd_dir(TOOL_ROOT / "install-home")
     install_tmp = verify_private_ssd_dir(TOOL_ROOT / "install-tmp")
@@ -9599,19 +9718,22 @@ def audit_installed_lock() -> dict[str, Any]:
     # `npm_config_audit=false` -- this function's entire purpose is to run
     # that check for real, on demand.
     environment["npm_config_audit"] = "true"
-    # Whole-tree check #1: compares against verify()'s own durable
-    # evidence, fixed before this function's own logic ever ran -- not
+    # Whole-tree check #1: compares against verify()'s own evidence, not
     # against anything captured moments ago -- see docstring paragraph
-    # (a) above.
+    # (a) above (and paragraph (d) for what this binding does and does
+    # not close).
     digest_before, entries_before = tree_digest(release)
     if digest_before != expected_tree_sha256 or entries_before != expected_tree_entries:
         raise PrimeInstallError("Prime Agent release tree drifted")
     # Immediately before the subprocess: re-verify the EARLY-anchored
-    # per-file capture above -- see docstring paragraph (b) above for why
-    # this narrower, tighter pair is still needed alongside the
-    # whole-tree checks.
+    # bracket above -- see docstring paragraphs (b) and (c) above for why
+    # this narrower, tighter set is still needed alongside the whole-tree
+    # checks.
     verify_unchanged_private_ssd_file(manifest_path, manifest_raw, manifest_identity)
     verify_unchanged_private_ssd_file(lock_path, lock_raw, lock_identity)
+    verify_unchanged_private_ssd_asset_digest(node, node_sha256_early, node_identity)
+    verify_unchanged_private_ssd_asset_digest(npm_cli, npm_cli_sha256_early, npm_cli_identity)
+    assert_no_release_npmrc()
     try:
         result = subprocess.run(
             [os.fspath(node), os.fspath(npm_cli), "audit", "--omit=dev", "--json"],
@@ -9626,12 +9748,15 @@ def audit_installed_lock() -> dict[str, Any]:
     except (OSError, subprocess.SubprocessError) as exc:
         raise PrimeInstallError("cannot run npm audit") from exc
     # Immediately after: closes the window DURING the subprocess's own
-    # runtime for the two files it actually reads -- see docstring
-    # paragraph (b) above.
+    # runtime for the files it actually reads/execs -- see docstring
+    # paragraphs (b) and (c) above.
     verify_unchanged_private_ssd_file(manifest_path, manifest_raw, manifest_identity)
     verify_unchanged_private_ssd_file(lock_path, lock_raw, lock_identity)
+    verify_unchanged_private_ssd_asset_digest(node, node_sha256_early, node_identity)
+    verify_unchanged_private_ssd_asset_digest(npm_cli, npm_cli_sha256_early, npm_cli_identity)
+    assert_no_release_npmrc()
     # Whole-tree check #2: closes the window during the subprocess's own
-    # runtime for the REST of the release tree, against the SAME durable
+    # runtime for the REST of the release tree, against the SAME
     # evidence value -- see docstring paragraph (a) above. If the tree
     # changed while `npm audit` was running, the report below describes
     # content this function can no longer show was what was actually
