@@ -1034,3 +1034,76 @@ audit端到端），加速本轮完成。
 **待办**：针对 round 62 的候选重新派发 `prime-agent-dual-review` Workflow，明确告知
 P1-A 和新增的路径-vs-exec限制都是本轮已知、经用户明确决策接受的限制，不是待发现的
 新问题；两路都无可复现 P0/P1 才是真正双 GO。
+
+## 20. Round 62 双复核结果：两路分歧（opus/max NO-GO 证据扎实 vs Codex GO 覆盖面更窄）+ round 63 修复（2026-08-22）
+
+针对 `96e8dd9b38`（round 62）的双复核出现分歧：
+
+- **Claude opus/max**：NO-GO，P0=0，P1=2（不含两项已接受限制），证据精确到字节级
+  （真实 fork/exec、精确毫秒计时、exec 标记证明攻击者代码真实执行、对 HEAD 和父提交
+  双向变异测试）。
+  - **P1-1（本轮新引入）**：round 62 自己的 toolchain 子树检查只跟自己（子进程前后）
+    比较，正是段落(e)刚为node/npm-cli修过的同一类错误，原样复制到约1920个toolchain
+    库文件上。真实复现：攻击者在早期采集前投毒，在两次整树遍历期间（实测各1.824秒，
+    真实可轮询的宽窗口）保持干净，其余时间（含npm audit子进程期间）保持篡改——
+    `audit_installed_lock()`仍返回`ok:true`。
+  - **P1-2（round 59就存在、本轮才被证实为真）**：manifest.json/package-lock.json
+    自己的早捕获同样只跟自己比较，从未修过。同样手法同样结果：npm audit真的读到
+    攻击者内容，函数却返回`ok:true`。
+  - **P2-1**：docstring段落(g)声称exec前窗口已收窄到"个位数毫秒"，实测round 62的
+    HEAD反而从父提交的48.39ms拉大到357.15ms（7.4倍），因为round 62把慢的toolchain
+    遍历放在了快的逐文件复核之后、紧挨着subprocess.run()之前。
+  - **P3-1**：段落(g)把"平台不可能"（round 47的`validate_exec_target()`已经用真实
+    fork/exec + 裸`os.fork()+os.execve()`两条独立路径证实Darwin完全没有可从Python
+    触达的fexecve(2)等价系统调用）误写成"时间压力下未尝试"的可延期工程选择。
+- **Codex sol/max**（第4次派发才真正完成，前2次真实撞上Trusted Access墙，第3次终端
+  被外部关闭）：GO，P0=0，P1=0。但其报告描述的复现场景是"release walk成功之后再
+  投毒"——round 61就已关闭的更窄窗口——报告文字里没有出现覆盖opus/max那个"早期采集前
+  投毒+两次遍历期间还原"更宽窗口的说明。
+
+**综合判断**：不构成双GO。按项目既定规则，带具体行号+实测数据+真实fork/exec输出的
+可复现P0/P1不能被另一路"报告干净但未说明是否覆盖同一场景"的结论否决。判读两路很可能
+测的是同一段代码里两个不同攻击时序，不是对同一次复现给出相反判断。
+
+**已修复（round 63）**：
+1. P1-1：`write_pending_install()`新增持久化的toolchain子树摘要（`tree_digest(RELEASE_DIR
+   / "toolchain")`，跟`release_tree_sha256`用同一套durability sync barrier前后校验
+   模式），写入`receipt['toolchain_tree_sha256']`/`['toolchain_tree_entries']`；
+   `verify()`新增对应校验并在返回值里携带这两个字段。`audit_installed_lock()`不再
+   需要toolchain的"早捕获"这一步了——子进程前后两次toolchain检查直接跟`verify()`的
+   持久evidence比较，跟整树检查用的是同一种模式。
+2. P1-2：`manifest_sha256`/`generated_lock_sha256`（round 56起就已算出、只是从没
+   单独存过）现在也持久化进收据，`verify()`的五字段逐文件循环扩展为七字段。
+   `audit_installed_lock()`的manifest/lock早捕获现在捕获后立刻跟这两个新字段核对，
+   核对通过后才把捕获值当作后续子进程前后复核的锚点——跟(e)对node/npm-cli的处理
+   完全同构。
+3. 重新排序整个函数：两次整树级别的慢检查（release/、toolchain/）现在先跑，紧挨着
+   放在一起；快速、便宜的逐文件复核（manifest、lock、node、npm-cli、`.npmrc`）现在
+   才是子进程调用前后真正最后做的事——修复P2-1的时序倒退。
+4. 订正段落(g)的两处事实错误：去掉不准确的"个位数毫秒"量化描述；改为交叉引用
+   `validate_exec_target()`已经证实的Darwin平台不可能性，不再暗示这是可以后续投入
+   时间解决的工程缺口。
+5. **写测试过程中额外诚实发现**（不是新一轮复核找到的）：toolchain子树检查对约1918
+   个没有单独逐文件括号保护的文件，提供的是跟整树检查同等级别的保证——受持久证据
+   约束，但仍然只有一次几百毫秒级`tree_digest()`遍历前后这么紧，不像node/npm-cli/
+   manifest/lock那样有独立、跟遍历耗时无关的逐文件括号。实测确认：攻击者在子进程前
+   遍历刚检查完某个文件后立刻篡改、不还原，`npm audit`真的会读到篡改内容，之后
+   才被子进程后的复核发现——函数仍然fail closed（不会返回`ok:true`），但不是
+   before-exec级别的保护。这是段落(g)已接受的一般性限制的一个更具体实例，不是新的
+   缺口类别，已在docstring里诚实记录。
+
+**验证**：3个新回归测试，各自对本轮修复做了变异测试（去掉对应校验后都在下游的
+`TypeError`处中断，证明真正命中了预期检查）；其中1个既有测试(`detects_npm_lib_file_
+tamper_via_toolchain_subtree`)在写测试过程中发现自己原来的"只是不还原"场景其实真的
+会先跑到子进程再被发现——诚实改正了断言，不再声称before-exec保护。共享的
+`fake_extract_node_toolchain`测试fixture（被5个以上完整安装流程集成测试复用）和
+2个独立`write_pending_install()`测试修了同一个真实的Python `mkdir(parents=True)`
+陷阱——`write_pending_install()`新增的toolchain子树`tree_digest()`调用第一次真正
+触及了这些fixture此前从未被这样检验过的目录权限。232→234测试。按用户要求用Workflow
+并行执行验证阶段：双解释器全套测试、py_compile、真实`sandbox_e2e.py`、真实非mock
+audit端到端，全部通过。
+
+**待办**：针对 round 63 的候选重新派发 `prime-agent-dual-review` Workflow，明确告知
+P1-A 和round 62段落(g)的路径-vs-exec限制都是已知、经用户明确决策接受的限制；toolchain
+子树检查对未被逐文件保护的~1918个文件提供的保护级别（fail closed但非before-exec）
+也是本轮诚实记录的已知性质，不是待发现的新问题；两路都无可复现P0/P1才是真正双GO。
