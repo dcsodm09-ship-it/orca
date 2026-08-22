@@ -2246,6 +2246,29 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                 "npmrc",
             ],
         )
+        # Round-64 dual review (2026-08-22, Claude opus/max, P3-4): the
+        # original version of this test only locked the BEFORE-subprocess
+        # half of the bracket -- a mutant moving only the AFTER-subprocess
+        # toolchain check's position left this test green, even though
+        # docstring paragraph (i) explicitly claims the reordering applies
+        # "on both sides of the call". Locking the after-subprocess order
+        # too: fast per-file rechecks run FIRST here (closing the window
+        # during the subprocess's own runtime for the files it actually
+        # reads/execs), THEN both whole-tree-scale walks, back to back --
+        # verified against the live file, line by line.
+        after_run = call_order[call_order.index("subprocess.run") + 1 :]
+        self.assertEqual(
+            after_run,
+            [
+                "file:manifest",
+                "file:lock",
+                "asset:node",
+                "asset:npm_cli",
+                "npmrc",
+                "tree_digest:toolchain",
+                "tree_digest:release",
+            ],
+        )
 
     def test_exact_dependency_versions_uses_top_level_release_choice(self) -> None:
         manifest = {"dependencies": {"chalk": "^5", "@earendil-works/pi-ai": "remote"}}

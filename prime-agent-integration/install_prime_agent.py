@@ -5115,7 +5115,7 @@ def write_pending_install(
     # P1-1/blocker, real fork/exec reproduced): the exact same durable-
     # anchor treatment release_identity gets, scoped to RELEASE_DIR/
     # toolchain specifically -- audit_installed_lock()'s own toolchain-
-    # subtree early capture (round 61's docstring paragraph (f)) was
+    # subtree early capture (round 62's docstring paragraph (f)) was
     # never bound to anything durable, only to itself, the same mistake
     # round 58's original fix made for manifest/lock. Captured here,
     # before the SAME durability sync barrier release_identity is
@@ -9897,7 +9897,7 @@ def audit_installed_lock() -> dict[str, Any]:
     manifest_sha256, generated_lock_sha256 -- not two. (Round-63 dual
     review, 2026-08-22, Claude opus/max, P3-2: an earlier draft of this
     paragraph undercounted the accepted attack surface (d) already
-    covers; corrected here, no code change.)
+    covers; corrected here, no code change.))
 
     Honest scope note on the toolchain-subtree check specifically (added
     while verifying (h), not from a further review round): it protects
@@ -10000,7 +10000,7 @@ def audit_installed_lock() -> dict[str, Any]:
     # P1-2/blocker, real fork/exec reproduced): bind the two captures
     # above to the SAME durable, install-time-fixed receipt fields
     # verify() itself already checked a few lines into its own execution
-    # -- not just to each other. This is the exact same fix round 61
+    # -- not just to each other. This is the exact same fix round 62
     # applied to node/npm-cli (docstring paragraph (e)), extended to the
     # two files this function's own core purpose is to audit -- see
     # docstring paragraph (h) below for why manifest/lock needed this
@@ -10071,10 +10071,10 @@ def audit_installed_lock() -> dict[str, Any]:
     # Round-62 dual-review regression (2026-08-22, Claude opus/max,
     # P1-1/blocker): toolchain-subtree check #1, bound directly to
     # verify()'s durable evidence -- no local "early capture" step left
-    # to poison, unlike round 61's version of this check. Deliberately
+    # to poison, unlike round 62's version of this check. Deliberately
     # placed HERE, alongside the OTHER slow whole-tree-scale walk, and
     # BEFORE the fast per-file rechecks below -- see docstring paragraph
-    # (i) below for why the ordering itself matters: round 61 placed
+    # (i) below for why the ordering itself matters: round 62 placed
     # this walk AFTER the per-file rechecks, which measurably widened
     # (not narrowed) the window between node/npm-cli's own "last check"
     # and the actual subprocess.run() call.
