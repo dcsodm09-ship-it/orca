@@ -2017,6 +2017,236 @@ class PrimeAgentInstallerTests(unittest.TestCase):
                     installer.audit_installed_lock()
             run_mock.assert_not_called()
 
+    def test_verify_rejects_toolchain_tree_drift(self) -> None:
+        # Regression for round-63's own dual review (2026-08-22, Claude
+        # opus/max, P2-1): verify()'s own new toolchain-tree check
+        # (install_prime_agent.py:9287-9292, the durable-binding half of
+        # docstring paragraph (h)) had ZERO regression coverage. The two
+        # tests above isolate the ANALOGOUS check inside
+        # audit_installed_lock() by mocking verify() away entirely --
+        # neither one, nor any other test in this file, ever calls the
+        # real verify() and lets ITS OWN toolchain check run. Deleting
+        # just that if/raise (keeping the tree_digest() call itself, so
+        # evidence["toolchain_tree_sha256"] silently reverts to a
+        # one-time, unchecked observation) left all 234 prior tests
+        # green -- yet it is genuinely load-bearing: with it removed, a
+        # same-UID persistent toolchain tamper is never caught by
+        # verify() at all, and audit_installed_lock() then trusts a
+        # digest verify() never actually checked.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / "release"
+            release.mkdir(mode=0o700)
+            session_dir = root / "session"
+            session_dir.mkdir(mode=0o700)
+            lib_path = release / "toolchain/lib/node_modules/npm/lib/cli.js"
+            lib_path.parent.mkdir(mode=0o700, parents=True)
+            lib_path.write_bytes(b"// genuine npm lib/cli.js stub\n")
+            os.chmod(lib_path, 0o600)
+            for private_dir in (
+                release / "toolchain",
+                release / "toolchain/lib",
+                release / "toolchain/lib/node_modules",
+                release / "toolchain/lib/node_modules/npm",
+                release / "toolchain/lib/node_modules/npm/lib",
+            ):
+                os.chmod(private_dir, 0o700)
+
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                clean_toolchain_digest, clean_toolchain_entries = installer.tree_digest(
+                    release / "toolchain"
+                )
+
+            # The attacker's work, already done before verify() ever
+            # runs: no live race, matching (d)/(h)'s own persistent-
+            # tamper threat model -- the same technique the sibling
+            # audit_installed_lock() tests above use one function down.
+            lib_path.write_bytes(b"// ATTACKER tampered before verify() ran\n")
+            with mock.patch.object(installer, "SSD_ROOT", root):
+                tampered_release_digest, tampered_release_entries = installer.tree_digest(
+                    release
+                )
+
+            receipt = {
+                "release_dir": os.fspath(release),
+                "session_dir": os.fspath(session_dir),
+                "state_dir": os.fspath(root / "state"),
+                "probe_home": os.fspath(root / "probe-home"),
+                "volume_uuid": "test-volume-uuid",
+                "orca_support": True,
+                "lifecycle_lock": os.fspath(root / "lifecycle.lock"),
+                # Whole-tree evidence deliberately forged to match the
+                # ALREADY-tampered tree, so the pre-existing, older
+                # release-wide check just above (:9276-9278) trivially
+                # passes and cannot be what catches this -- isolating the
+                # toolchain-subtree check specifically, mirroring
+                # test_audit_installed_lock_rejects_toolchain_forged_to_
+                # match_a_tampered_tree's own technique one function
+                # down.
+                "release_tree_sha256": tampered_release_digest,
+                "release_tree_entries": tampered_release_entries,
+                # The durable, install-time-pinned toolchain digest:
+                # still the TRUE, pre-tamper value, exactly as a real
+                # receipt would hold it -- the attacker modified only the
+                # live file, never this receipt field.
+                "toolchain_tree_sha256": clean_toolchain_digest,
+                "toolchain_tree_entries": clean_toolchain_entries,
+            }
+            with (
+                mock.patch.object(installer, "SSD_ROOT", root),
+                mock.patch.object(
+                    installer,
+                    "preflight",
+                    return_value={
+                        "volume_uuid": "test-volume-uuid",
+                        "orca_support": True,
+                    },
+                ),
+                mock.patch.object(installer, "load_receipt", return_value=receipt),
+                mock.patch.object(
+                    installer,
+                    "verify_lifecycle_lock_file",
+                    return_value=Path(receipt["lifecycle_lock"]),
+                ),
+                mock.patch.object(installer, "assert_no_unexpected_ancestor_node_modules"),
+                mock.patch.object(
+                    installer, "validate_runtime_state", return_value=root / "state"
+                ),
+                mock.patch.object(installer, "validate_pristine_managed_home"),
+                mock.patch.object(installer, "verify_link"),
+                mock.patch.object(installer, "verify_command_state", return_value=False),
+            ):
+                with self.assertRaisesRegex(
+                    installer.PrimeInstallError, "Prime Agent toolchain tree drifted"
+                ):
+                    installer.verify()
+
+    def test_audit_installed_lock_runs_tree_walks_before_fast_per_file_checks(
+        self,
+    ) -> None:
+        # Regression for round-63's own dual review (2026-08-22, Claude
+        # opus/max, P2-2): the round-63 reordering fix -- both whole-
+        # tree-scale walks (release/, toolchain/) run FIRST, back to
+        # back, immediately after the anchor bindings; the fast, cheap
+        # per-file rechecks (manifest, lock, node, npm-cli) plus the
+        # .npmrc check run LAST, genuinely immediately before
+        # subprocess.run() (docstring paragraph (i)) -- had ZERO
+        # regression coverage. Restoring round 62's own order (toolchain
+        # walk placed AFTER the fast per-file rechecks, directly ahead of
+        # subprocess.run()) left all 234 prior tests green while silently
+        # reopening the exact timing regression (i) fixes: the round-63
+        # dual review measured a real ~2,800x-wider window on that
+        # reverted order versus this one. This test locks ORDER, which
+        # the timing depends on, not the timing itself.
+        manifest_lock_sha256 = installer.sha256_bytes(b"{}")
+        receipt = {
+            "release_dir": "/tmp/does-not-matter",
+            "node_target": "/tmp/node",
+            "npm_target": "/tmp/npm-cli.js",
+            "node_sha256": "binhash",
+            "npm_cli_sha256": "binhash",
+            "manifest_sha256": manifest_lock_sha256,
+            "generated_lock_sha256": manifest_lock_sha256,
+        }
+        verify_result = {
+            "ok": True,
+            "release_tree_sha256": "treehash",
+            "release_tree_entries": 5,
+            "toolchain_tree_sha256": "treehash",
+            "toolchain_tree_entries": 5,
+        }
+        fake_stat = os.stat_result((0o600, 111, 222, 1, 0, 0, 0, 0, 0, 0))
+        release = Path("/tmp/does-not-matter")
+        toolchain_dir = release / "toolchain"
+        manifest_path = release / "package.json"
+        lock_path = release / "package-lock.json"
+        node_path = Path("/tmp/node")
+        npm_cli_path = Path("/tmp/npm-cli.js")
+        npmrc_path = release / ".npmrc"
+
+        def fake_lstat(path_self):
+            if path_self == npmrc_path:
+                raise FileNotFoundError(2, "No such file or directory", os.fspath(path_self))
+            return fake_stat
+
+        audit_report = {"auditReportVersion": 2, "vulnerabilities": {}}
+        completed = subprocess.CompletedProcess(
+            args=["npm", "audit"], returncode=0, stdout=json.dumps(audit_report), stderr=""
+        )
+
+        call_order: list[str] = []
+
+        def spy_tree_digest(path, *args, **kwargs):
+            label = "toolchain" if path == toolchain_dir else "release"
+            call_order.append(f"tree_digest:{label}")
+            return ("treehash", 5)
+
+        def spy_unchanged_file(path, *args, **kwargs):
+            label = "manifest" if path == manifest_path else "lock"
+            call_order.append(f"file:{label}")
+
+        def spy_unchanged_asset(path, *args, **kwargs):
+            label = "node" if path == node_path else "npm_cli"
+            call_order.append(f"asset:{label}")
+
+        def spy_npmrc(release_arg):
+            call_order.append("npmrc")
+
+        def spy_run(*args, **kwargs):
+            call_order.append("subprocess.run")
+            return completed
+
+        with (
+            mock.patch.object(installer, "verify", return_value=verify_result),
+            mock.patch.object(installer, "load_receipt", return_value=receipt),
+            mock.patch.object(installer, "verify_private_ssd_dir", side_effect=lambda p: p),
+            mock.patch.object(installer, "resolve_ssd", side_effect=lambda p: p),
+            mock.patch.object(installer, "read_private_ssd_file", return_value=b"{}"),
+            mock.patch.object(installer, "sha256_file_verified", return_value="binhash"),
+            mock.patch.object(Path, "lstat", fake_lstat),
+            mock.patch.object(
+                installer, "verify_unchanged_private_ssd_file", side_effect=spy_unchanged_file
+            ),
+            mock.patch.object(
+                installer,
+                "verify_unchanged_private_ssd_asset_digest",
+                side_effect=spy_unchanged_asset,
+            ),
+            mock.patch.object(installer, "tree_digest", side_effect=spy_tree_digest),
+            mock.patch.object(installer, "assert_no_release_npmrc", side_effect=spy_npmrc),
+            mock.patch.object(
+                installer,
+                "managed_npm_environment",
+                return_value={"npm_config_audit": "false"},
+            ),
+            mock.patch.object(subprocess, "run", side_effect=spy_run),
+        ):
+            result = installer.audit_installed_lock()
+
+        self.assertTrue(result["ok"])
+        self.assertIn("subprocess.run", call_order)
+        before_run = call_order[: call_order.index("subprocess.run")]
+        # Verified against the live file, line by line: the early npmrc
+        # check (right after the manifest/lock/node/npm-cli anchors are
+        # captured, unrelated to this round's reordering) comes first;
+        # THEN both whole-tree-scale walks, back to back; THEN the four
+        # fast per-file rechecks; THEN the immediately-pre-subprocess
+        # npmrc recheck -- genuinely the last thing before
+        # subprocess.run().
+        self.assertEqual(
+            before_run,
+            [
+                "npmrc",
+                "tree_digest:release",
+                "tree_digest:toolchain",
+                "file:manifest",
+                "file:lock",
+                "asset:node",
+                "asset:npm_cli",
+                "npmrc",
+            ],
+        )
+
     def test_exact_dependency_versions_uses_top_level_release_choice(self) -> None:
         manifest = {"dependencies": {"chalk": "^5", "@earendil-works/pi-ai": "remote"}}
         lock = {

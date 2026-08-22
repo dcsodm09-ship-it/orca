@@ -9778,7 +9778,7 @@ def audit_installed_lock() -> dict[str, Any]:
     forged -- this fix closes the live-race window, not (d)'s separate,
     accepted persistent-forgery case.)
 
-    (f) [ROUND 61's ATTEMPT -- FOUND STILL FLAWED, see (h)] The tight
+    (f) [ROUND 62's ATTEMPT -- FOUND STILL FLAWED, see (h)] The tight
     bracket only ever digested `npm_cli` itself -- a 54-byte shim
     (`require('../lib/cli.js')(process)`). The ~1,920 real implementation
     files under toolchain/lib/node_modules/npm/ that `npm-cli.js`
@@ -9787,7 +9787,7 @@ def audit_installed_lock() -> dict[str, Any]:
     atomicity -- reopening the identical swap-then-restore class of
     window (b) already closed for package-lock.json, just against npm's
     own library files instead. Reproduced for real: a substituted npm
-    library file genuinely loaded and executed. Round 61's fix
+    library file genuinely loaded and executed. Round 62's fix
     early-anchored a WHOLE-SUBTREE digest of `toolchain/` itself
     (`tree_digest(release / "toolchain")`), re-verified before/after the
     subprocess -- but, per its own text just above, only against ITS OWN
@@ -9892,21 +9892,34 @@ def audit_installed_lock() -> dict[str, Any]:
     receipt fields are themselves persistently forged before any call
     starts -- the same accepted boundary (e) already has for
     node_sha256/npm_cli_sha256; see (d) above. The seven fields (d) names
-    are now nine.)
+    are now ELEVEN, not nine: this round added FOUR new unpinned evidence
+    fields -- toolchain_tree_sha256, toolchain_tree_entries,
+    manifest_sha256, generated_lock_sha256 -- not two. (Round-63 dual
+    review, 2026-08-22, Claude opus/max, P3-2: an earlier draft of this
+    paragraph undercounted the accepted attack surface (d) already
+    covers; corrected here, no code change.)
 
     Honest scope note on the toolchain-subtree check specifically (added
     while verifying (h), not from a further review round): it protects
-    the ~1,918 files under toolchain/ that have no individual per-file
-    bracket of their own (everything except node/npm-cli themselves) with
-    the SAME quality of guarantee the whole-tree check (a) already
-    provides -- durable-evidence-bound, but still only as tight as one
-    multi-hundred-millisecond `tree_digest()` walk before the subprocess
-    and one after, NOT the walk-independent, immediately-before/after-
-    exec tightness node/npm-cli/manifest/lock get from their own
-    dedicated early-anchored brackets. Confirmed empirically (see
+    the ~4,706 files under toolchain/ that have no individual per-file
+    bracket of their own (every regular file under toolchain/ except
+    node/npm-cli themselves) with the SAME quality of guarantee the
+    whole-tree check (a) already provides -- durable-evidence-bound, but
+    still only as tight as one multi-hundred-millisecond `tree_digest()`
+    walk before the subprocess and one after, NOT the walk-independent,
+    immediately-before/after-exec tightness node/npm-cli/manifest/lock
+    get from their own dedicated early-anchored brackets. (Round-63 dual
+    review, 2026-08-22, Claude opus/max, P3-3: an earlier draft of this
+    note said "~1,918", which is actually the npm-package subtree's own
+    regular-file count -- see paragraph (f) above, where that number is
+    the correct scope. A real installed tree measured 5,776 total
+    toolchain/ entries (matching receipt['toolchain_tree_entries']
+    exactly) and 4,708 regular files under toolchain/, i.e. ~4,706 once
+    node and npm-cli's own two dedicated-bracket files are excluded --
+    corrected here, no code change.) Confirmed empirically (see
     `test_audit_installed_lock_detects_npm_lib_file_tamper_via_
     toolchain_subtree`): a same-UID racer who tampers one of those
-    ~1,918 files right after the pre-subprocess toolchain walk examines
+    ~4,706 files right after the pre-subprocess toolchain walk examines
     it, and never restores it, still gets that content read by the real
     `npm audit` subprocess before the post-subprocess toolchain recheck
     catches it -- this function still fails closed (never returns
@@ -9914,18 +9927,26 @@ def audit_installed_lock() -> dict[str, Any]:
     a narrower, more specific instance of (g)'s general point, not a new
     kind of gap.
 
-    (i) [FIXED] Round 61 placed its toolchain-subtree recheck AFTER the
+    (i) [FIXED] Round 62 placed its toolchain-subtree recheck AFTER the
     manifest/lock/node/npm-cli per-file rechecks, immediately before the
     subprocess call -- meaning the slow toolchain walk (real, measured
     ~0.4s for the toolchain subtree alone) ran AFTER node/npm-cli's own
     "last check", not before it, directly widening the exact window (g)
     describes rather than narrowing it: measured at 357.15ms on round
-    61's HEAD versus 48.39ms on its own parent commit, a 7.4x
+    62's own HEAD versus 48.39ms on its parent commit (round 61), a 7.4x
     regression, not an improvement, in the one place this docstring
     explicitly promises the opposite (see the file's own established
     rule for this pattern: "Called as the LAST statement before
     subprocess.run() so the remaining window is as small as this
-    platform allows"). Fixed by reordering: both whole-tree-scale walks
+    platform allows"). (Round-63 dual review, 2026-08-22, Claude
+    opus/max, P3-4: this paragraph and paragraph (f) above previously
+    both attributed the `toolchain_digest_early` code and its ordering
+    bug to "round 61"; `git show 57585f2d29` (round 61) has zero
+    occurrences of `toolchain_digest_early`, `git show 96e8dd9b38`
+    (round 62) has three -- objectively confirming this code, and the
+    bug, are round 62's, matching paragraph (g)'s own already-correct
+    "round 62" label and this file's round-63 commit message. Corrected
+    here, no code change.) Fixed by reordering: both whole-tree-scale walks
     (release/, toolchain/) now run FIRST, back to back, immediately after
     the whole-tree check passes; the fast, cheap per-file rechecks
     (manifest, lock, node, npm-cli, `.npmrc`) run LAST, genuinely
