@@ -1,0 +1,244 @@
+{
+  "version": 1,
+  "meta": {
+    "content_version": 2,
+    "updated_at": "2026-08-22T09:33:10+00:00"
+  },
+  "project": {
+    "path": "/Users/www1adwawd/orca/workspaces/orca/完善orca"
+  },
+  "pages": [
+    {
+      "id": "orca-capability-tests",
+      "title": "Orca 能力测试矩阵",
+      "path": "wiki/Orca能力测试与知识图谱.md",
+      "summary": "记录 235 个 Orca 命令入口的能力面测试、证据等级和需要独立授权的边界。",
+      "status": "partial-live-verified"
+    },
+    {
+      "id": "multi-agent-routing",
+      "title": "Claude、Codex 与 Orca 多 Agent 路由",
+      "path": "本机Claude-Codex-Orca多Agent操作手册.md",
+      "summary": "Codex 内部使用原生子 agent；跨模型受监督任务走 Orca；tmux 仅是 Orca 不可用时的独立 CLI 承载层。",
+      "status": "live-verified"
+    },
+    {
+      "id": "codex-claude-bypass-dispatch",
+      "title": "Codex 向 Claude 派单 bypass 策略",
+      "path": "wiki/Codex向Claude派单bypass策略.md",
+      "summary": "所有 Codex 到 Claude 的 Dispatch 必须请求并验证 bypassPermissions；无法证明 effective 一致时在副作用前失败。",
+      "status": "user-approved-policy"
+    },
+    {
+      "id": "resource-gate",
+      "title": "主机资源门槛",
+      "path": "本机Claude-Codex-Orca多Agent操作手册.md",
+      "summary": "agent_capacity.py 计算 load 与 memory pressure 得出的红黄绿信号；自提交 76e7d88ccb(2026-08-16，用户三次重复要求彻底移除门禁后落地)起该信号仅作为 advisory_true_recommendation 参考输出，不再阻断或封顶新 worker——每次调用固定返回 gate: \"gate_removed\"、new_workers_default: 2、new_workers_max: 3。",
+      "status": "live-verified"
+    },
+    {
+      "id": "capacity-preflight",
+      "title": "本机 Agent 容量预检",
+      "path": "orca-context-bridge/scripts/agent_capacity.py",
+      "summary": "无副作用地汇总主机与 Orca 聚合状态；真实红黄绿信号仍完整计算，但仅出现在 advisory_true_recommendation 字段供参考，不再决定本轮新增 worker 上限（该上限自 2026-08-16 起固定为 default 2 / max 3，见 resource-gate）。",
+      "status": "live-verified"
+    },
+    {
+      "id": "orca-readonly-probe",
+      "title": "Orca 只读能力探测",
+      "path": "orca-context-bridge/scripts/orca_readonly_probe.py",
+      "summary": "无 payload 输出地验证 18 个 Orca list/status/capability 入口；本轮 16 个成功，账户列表与当前工作树失败且显式标红。",
+      "status": "live-verified"
+    },
+    {
+      "id": "orca-cli-capability-catalog",
+      "title": "Orca CLI 全量能力目录",
+      "path": "wiki/orca-cli-capability-inventory.json",
+      "summary": "从本机 agent-context schema 提取每一条 Orca CLI 命令，并严格区分无 payload 实测、schema 发现和需要隔离目标的操作。",
+      "status": "schema-complete"
+    },
+    {
+      "id": "orchestration-lifecycle",
+      "title": "Orca 受监督编排生命周期",
+      "path": "wiki/Orca能力测试与知识图谱.md",
+      "summary": "Run、Task、Dispatch、worker_done 和 worker-release 提供跨模型任务的可追溯结算。",
+      "status": "read-only-verified"
+    },
+    {
+      "id": "orchestration-precondition-probe",
+      "title": "Orca 编排前置条件验证",
+      "path": "orca-context-bridge/scripts/orca_lifecycle_precondition_probe.py",
+      "summary": "仅在当前终端未绑定 Run 时验证 task-create 被 run_required 无副作用拒绝；已绑定时跳过，不写入 Task。",
+      "status": "live-verified"
+    },
+    {
+      "id": "sandbox-acceptance",
+      "title": "隔离端到端验收",
+      "path": "wiki/Orca能力测试与知识图谱.md",
+      "summary": "工作树、自动化、浏览器写入、账户、远端和设备需要单独测试目标与授权。",
+      "status": "awaiting-test-scope"
+    },
+    {
+      "id": "ego-global-policy",
+      "title": "Orca 全应用 Ego 全局策略",
+      "path": "Ego与Cloudflare域名操作手册.md",
+      "summary": "所有 Orca agent 入口使用 Ego router 串行网页轮次，外网仅保留 hostname 标签，内网不加标签。",
+      "status": "live-verified"
+    },
+    {
+      "id": "ego-profile-isolation",
+      "title": "Ego 资料隔离边界",
+      "path": "Ego与Cloudflare域名操作手册.md",
+      "summary": "Space 不作为 Cookie 或登录态隔离；没有官方 createProfile 时展示请求安全拒绝。",
+      "status": "live-verified"
+    },
+    {
+      "id": "ego-capability-regression",
+      "title": "Ego 本地能力回归",
+      "path": "scripts/verify_ego_capabilities.sh",
+      "summary": "临时 127.0.0.1 夹具验证底层网页能力、截图与 router 并发互斥；dispatchKey 为已知缺口。",
+      "status": "live-verified"
+    },
+    {
+      "id": "desktop-mcp-realtime-control",
+      "title": "实时桌面坐标控制",
+      "path": "desktop-mcp/README.md",
+      "summary": "Codex 与 Claude Code 共享的 screenshot-free macOS MCP 输入链路：Hammerspoon Accessibility/CGEvent、单例 broker、60Hz 实测 p95 8.98ms，并支持可选光标轨迹。",
+      "status": "live-verified"
+    },
+    {
+      "id": "prime-agent-install",
+      "title": "Prime Agent 安装管线闭环",
+      "path": "wiki/Prime-Agent安装管线闭环.md",
+      "summary": "install_prime_agent.py 经 8 轮 TOCTOU 修复-双复核循环后达成真正双 GO，已真实安装上线；记录可复用的双 GO 判定标准、变异测试纪律与 TOCTOU 分层加固模式。",
+      "status": "live-verified"
+    }
+  ],
+  "links": [
+    {
+      "from": "orca-capability-tests",
+      "to": "multi-agent-routing",
+      "relation": "documents"
+    },
+    {
+      "from": "orca-capability-tests",
+      "to": "orchestration-lifecycle",
+      "relation": "documents"
+    },
+    {
+      "from": "multi-agent-routing",
+      "to": "resource-gate",
+      "relation": "governed_by"
+    },
+    {
+      "from": "multi-agent-routing",
+      "to": "codex-claude-bypass-dispatch",
+      "relation": "constrained_by"
+    },
+    {
+      "from": "codex-claude-bypass-dispatch",
+      "to": "orchestration-lifecycle",
+      "relation": "governs"
+    },
+    {
+      "from": "codex-claude-bypass-dispatch",
+      "to": "sandbox-acceptance",
+      "relation": "requires"
+    },
+    {
+      "from": "resource-gate",
+      "to": "capacity-preflight",
+      "relation": "computed_by"
+    },
+    {
+      "from": "orca-capability-tests",
+      "to": "orca-readonly-probe",
+      "relation": "documents"
+    },
+    {
+      "from": "orca-readonly-probe",
+      "to": "sandbox-acceptance",
+      "relation": "scoped_by"
+    },
+    {
+      "from": "orca-capability-tests",
+      "to": "orca-cli-capability-catalog",
+      "relation": "documents"
+    },
+    {
+      "from": "orca-capability-tests",
+      "to": "orchestration-precondition-probe",
+      "relation": "documents"
+    },
+    {
+      "from": "orchestration-precondition-probe",
+      "to": "orchestration-lifecycle",
+      "relation": "verifies"
+    },
+    {
+      "from": "orchestration-precondition-probe",
+      "to": "sandbox-acceptance",
+      "relation": "scoped_by"
+    },
+    {
+      "from": "orca-cli-capability-catalog",
+      "to": "orca-readonly-probe",
+      "relation": "evidence_by"
+    },
+    {
+      "from": "orca-cli-capability-catalog",
+      "to": "sandbox-acceptance",
+      "relation": "scoped_by"
+    },
+    {
+      "from": "orchestration-lifecycle",
+      "to": "sandbox-acceptance",
+      "relation": "requires"
+    },
+    {
+      "from": "orca-capability-tests",
+      "to": "ego-global-policy",
+      "relation": "documents"
+    },
+    {
+      "from": "ego-global-policy",
+      "to": "multi-agent-routing",
+      "relation": "governed_by"
+    },
+    {
+      "from": "ego-global-policy",
+      "to": "ego-profile-isolation",
+      "relation": "constrained_by"
+    },
+    {
+      "from": "ego-global-policy",
+      "to": "ego-capability-regression",
+      "relation": "verified_by"
+    },
+    {
+      "from": "ego-capability-regression",
+      "to": "sandbox-acceptance",
+      "relation": "scoped_by"
+    },
+    {
+      "from": "orca-capability-tests",
+      "to": "desktop-mcp-realtime-control",
+      "relation": "documents"
+    },
+    {
+      "from": "desktop-mcp-realtime-control",
+      "to": "sandbox-acceptance",
+      "relation": "constrained_by"
+    },
+    {
+      "from": "desktop-mcp-realtime-control",
+      "to": "multi-agent-routing",
+      "relation": "shared_by"
+    },
+    {
+      "from": "prime-agent-install",
+      "to": "multi-agent-routing",
+      "relation": "uses"
+    }
+  ]
+}

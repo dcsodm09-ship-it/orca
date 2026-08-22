@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "project": "orca/完善orca",
+  "capabilities": [
+    {
+      "id": "agent-capacity-preflight",
+      "kind": "script",
+      "name": "agent_capacity.py",
+      "path": "orca-context-bridge/scripts/agent_capacity.py",
+      "summary": "Advisory host-capacity snapshot (CPU/load/memory-pressure plus Orca worktree counts) for sizing a multi-agent wave; never starts, stops, or signals an agent.",
+      "last_verified_at": "2026-08-22T05:13:40Z",
+      "depends_on": []
+    },
+    {
+      "id": "wiki-edit-guard",
+      "kind": "script",
+      "name": "wiki_edit_guard.py",
+      "path": "orca-context-bridge/scripts/wiki_edit_guard.py",
+      "summary": "Pre-write barrier for a hand-maintained wiki catalog: rejects a semantic edit that does not bump meta.content_version, and reports up front whether the write will leave the signed manifest pin stale.",
+      "last_verified_at": "2026-08-22T05:13:40Z",
+      "depends_on": []
+    },
+    {
+      "id": "wiki-freshness-check",
+      "kind": "script",
+      "name": "check_wiki_freshness.py",
+      "path": "orca-context-bridge/scripts/check_wiki_freshness.py",
+      "summary": "Standalone anytime re-check of whether wiki/orca-context-wiki.json still hashes to its signed manifest pin, instead of discovering the drift at the next SessionStart.",
+      "last_verified_at": "2026-08-22T05:13:40Z",
+      "depends_on": [
+        "script:build_startup_bundle.py"
+      ]
+    },
+    {
+      "id": "startup-bundle-verifier",
+      "kind": "script",
+      "name": "build_startup_bundle.py",
+      "path": "orca-context-bridge/scripts/build_startup_bundle.py",
+      "summary": "Reviewed-pack trust anchor: hashes shared sources, summarizes Git authority state, and gates delivery on a three-part storage check (project path, Git common dir, volume UUID).",
+      "last_verified_at": null,
+      "depends_on": []
+    },
+    {
+      "id": "orca-readonly-probe",
+      "kind": "script",
+      "name": "orca_readonly_probe.py",
+      "path": "orca-context-bridge/scripts/orca_readonly_probe.py",
+      "summary": "Exercises ~18 read-only Orca list/status/capability commands and prints labels plus pass/fail only, deliberately withholding account, terminal, and diagnostic payloads.",
+      "last_verified_at": null,
+      "depends_on": []
+    },
+    {
+      "id": "tmux-agent-mailbox",
+      "kind": "script",
+      "name": "tmux_bridge.py",
+      "path": "orca-context-bridge/scripts/tmux_bridge.py",
+      "summary": "Mailbox-style message passing between agents in local tmux panes, treating every received message as untrusted data; --inject (real send-keys typing) is a separate, deliberate action.",
+      "last_verified_at": null,
+      "depends_on": []
+    },
+    {
+      "id": "orca-context-bridge",
+      "kind": "skill",
+      "name": "orca-context-bridge",
+      "path": "orca-context-bridge/SKILL.md",
+      "summary": "Skill that syncs a redacted local Claude/Codex session catalog into an Orca workspace, indexes processes/PRs/wiki into a knowledge graph, and builds bounded startup context.",
+      "last_verified_at": null,
+      "depends_on": []
+    },
+    {
+      "id": "local-wiki-catalog",
+      "kind": "config-pattern",
+      "name": "local-wiki-catalog",
+      "path": "wiki/orca-context-wiki.json",
+      "summary": "Convention for a small hand-reviewed per-project knowledge catalog (pages with id/title/path/summary/status plus typed links) that a graph builder can consume without touching a remote wiki.",
+      "last_verified_at": null,
+      "depends_on": []
+    },
+    {
+      "id": "write-containment-guard",
+      "kind": "config-pattern",
+      "name": "write-containment-guard",
+      "path": "orca-context-bridge/scripts/build_startup_bundle.py",
+      "summary": "Pattern of resolving a caller-supplied path and refusing it unless it stays inside one declared root, so a read-only aggregator cannot be argued into writing outside its own output directory.",
+      "last_verified_at": null,
+      "depends_on": []
+    },
+    {
+      "id": "reusable-capabilities-validator",
+      "kind": "script",
+      "name": "validate_reusable_capabilities.py",
+      "path": "orca-context-bridge/scripts/validate_reusable_capabilities.py",
+      "summary": "Read-only structural validator for a wiki/reusable-capabilities.json file: schema, depends_on grammar, same-project ref resolution.",
+      "last_verified_at": null,
+      "depends_on": []
+    },
+    {
+      "id": "cross-project-catalog-build",
+      "kind": "script",
+      "name": "build_cross_project_catalog.py",
+      "path": "orca-context-bridge/scripts/build_cross_project_catalog.py",
+      "summary": "Read-only aggregator: consolidates every Orca project's three public wiki files into one cross-project catalog.",
+      "last_verified_at": null,
+      "depends_on": [
+        "script:validate_reusable_capabilities.py"
+      ]
+    },
+    {
+      "id": "prime-agent-verified-install-pipeline",
+      "kind": "script",
+      "name": "install_prime_agent.py",
+      "path": "prime-agent-integration/install_prime_agent.py",
+      "summary": "Project-specific verified installer/auditor for one pinned third-party CLI: digest-verified tarballs, hermetic pinned-toolchain npm ci, durable-receipt-bound TOCTOU hardening, opt-in npm-audit gate. Reference for the TOCTOU pattern, not an entrypoint another project imports.",
+      "last_verified_at": "2026-08-22T09:38:05Z",
+      "depends_on": []
+    }
+  ]
+}

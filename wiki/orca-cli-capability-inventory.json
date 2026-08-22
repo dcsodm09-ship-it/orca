@@ -1,0 +1,1432 @@
+{
+  "version": 1,
+  "schemaVersion": 1,
+  "commandCount": 235,
+  "verificationCounts": {
+    "isolated_target_or_authorization_required": 195,
+    "live_read_only_failed_current": 1,
+    "live_read_only_verified": 17,
+    "schema_discovered_read_only": 22
+  },
+  "commands": [
+    {
+      "command": "account add",
+      "summary": "Add a managed Claude or Codex account by signing in on this Orca host",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "account list",
+      "summary": "List managed Claude and Codex accounts on this Orca host",
+      "verification": "live_read_only_failed_current",
+      "boundary": "The current no-payload local probe failed; schema discovery is not runtime success evidence."
+    },
+    {
+      "command": "agent hooks off",
+      "summary": "Disable Orca-managed agent status hooks and remove local hook entries",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "agent hooks on",
+      "summary": "Enable Orca-managed agent status hooks",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "agent hooks status",
+      "summary": "Show whether Orca-managed agent status hooks are enabled",
+      "verification": "live_read_only_verified",
+      "boundary": "The current no-payload local probe completed this command successfully."
+    },
+    {
+      "command": "agent-context",
+      "summary": "Print the machine-readable command schema for agents",
+      "verification": "live_read_only_verified",
+      "boundary": "The current no-payload local probe completed this command successfully."
+    },
+    {
+      "command": "artifacts delete",
+      "summary": "Delete an artifact owned by the signed-in Orca account",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "artifacts list",
+      "summary": "List artifacts owned by the signed-in Orca account",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "artifacts share",
+      "summary": "Share an HTML or Markdown file with your Orca account",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "artifacts unshare",
+      "summary": "Delete the artifact associated with a previously shared file",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "artifacts update",
+      "summary": "Update a file previously shared from this Orca profile",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "automations create",
+      "summary": "Create a scheduled Orca automation",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "automations edit",
+      "summary": "Edit an Orca automation",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "automations list",
+      "summary": "List scheduled Orca automations",
+      "verification": "live_read_only_verified",
+      "boundary": "The current no-payload local probe completed this command successfully."
+    },
+    {
+      "command": "automations remove",
+      "summary": "Remove an Orca automation and its run history",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "automations run",
+      "summary": "Run an Orca automation now",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "automations runs",
+      "summary": "List automation run history",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "automations show",
+      "summary": "Show one Orca automation",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "back",
+      "summary": "Navigate back in browser history",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "capture start",
+      "summary": "Start capturing console and network events",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "capture stop",
+      "summary": "Stop capturing console and network events",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "check",
+      "summary": "Check a checkbox/radio by ref",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "claude-teams",
+      "summary": "Start Claude Code Agent Teams in the current Orca terminal",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "clear",
+      "summary": "Clear an input element by ref",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "click",
+      "summary": "Click a browser element by ref",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "clipboard read",
+      "summary": "Read clipboard contents",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "clipboard write",
+      "summary": "Write text to clipboard",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "computer capabilities",
+      "summary": "Show computer-use provider capabilities",
+      "verification": "live_read_only_verified",
+      "boundary": "The current no-payload local probe completed this command successfully."
+    },
+    {
+      "command": "computer click",
+      "summary": "Click an app element or window coordinate, optionally with modifiers",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "computer drag",
+      "summary": "Drag between app elements or window coordinates",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "computer get-app-state",
+      "summary": "Capture a compact accessibility snapshot of an app",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "computer hotkey",
+      "summary": "Press a platform-aware key combination",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "computer list-apps",
+      "summary": "List running apps available to computer-use",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "computer list-windows",
+      "summary": "List windows for an app available to computer-use",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "computer paste-text",
+      "summary": "Paste exact text at the current app focus",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "computer perform-secondary-action",
+      "summary": "Perform an advertised secondary accessibility action",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "computer permissions",
+      "summary": "Open computer-use permission setup",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "computer press-key",
+      "summary": "Press a single key such as Return or Escape",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "computer scroll",
+      "summary": "Scroll an app element or window coordinate",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "computer set-value",
+      "summary": "Set the value of a settable app element",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "computer type-text",
+      "summary": "Type literal text at the current app focus",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "console",
+      "summary": "Show captured console log entries",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "cookie delete",
+      "summary": "Delete a cookie by name",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "cookie get",
+      "summary": "Get cookies for the active tab (optionally filter by URL)",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "cookie set",
+      "summary": "Set a cookie",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "dblclick",
+      "summary": "Double-click element by ref",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "diagnostics memory",
+      "summary": "Collect a memory snapshot for Orca and managed terminals",
+      "verification": "live_read_only_verified",
+      "boundary": "The current no-payload local probe completed this command successfully."
+    },
+    {
+      "command": "dialog accept",
+      "summary": "Accept a browser dialog",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "dialog dismiss",
+      "summary": "Dismiss a browser dialog",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "download",
+      "summary": "Download a file by clicking a selector",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "drag",
+      "summary": "Drag from one element to another",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "emulator attach",
+      "summary": "Attach/start helper for a device and make it active for the worktree",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "emulator ax",
+      "summary": "Dump the accessibility tree (Android uiautomator; iOS serve-sim AX, frames 0..1)",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "emulator button",
+      "summary": "Hardware button (home, side_button, etc.)",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "emulator devices",
+      "summary": "List all emulator devices/AVDs across iOS and Android",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "emulator exec",
+      "summary": "Raw passthrough (e.g. orca emulator exec --command \"tap 0.5 0.7\" or \"ca-debug blended on\")",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "emulator gesture",
+      "summary": "Send a multi-point gesture sequence",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "emulator install",
+      "summary": "Install an APK onto the target Android device",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "emulator kill",
+      "summary": "Stop helper for device",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "emulator launch",
+      "summary": "Launch an Android app by package (and optional activity)",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "emulator list",
+      "summary": "List available/running emulators (Orca-managed + raw serve-sim)",
+      "verification": "live_read_only_verified",
+      "boundary": "The current no-payload local probe completed this command successfully."
+    },
+    {
+      "command": "emulator logcat",
+      "summary": "Capture a one-shot logcat dump from the Android device",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "emulator permissions",
+      "summary": "Grant/revoke an Android runtime permission, or reset all runtime grants",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "emulator rotate",
+      "summary": "Rotate device",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "emulator shutdown",
+      "summary": "Stop helper and shut down the simulator device",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "emulator tap",
+      "summary": "Tap at normalized 0..1 coords (preferred for single taps)",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "emulator type",
+      "summary": "Type text (US ASCII only)",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "environment add",
+      "summary": "Save a remote Orca runtime environment from a pairing code",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "environment list",
+      "summary": "List saved Orca runtime environments",
+      "verification": "live_read_only_verified",
+      "boundary": "The current no-payload local probe completed this command successfully."
+    },
+    {
+      "command": "environment rm",
+      "summary": "Remove one saved Orca runtime environment",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "environment show",
+      "summary": "Show one saved Orca runtime environment",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "eval",
+      "summary": "Evaluate JavaScript in the browser page context",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "exec",
+      "summary": "Run any agent-browser command against the active browser tab",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "file diff",
+      "summary": "Open a workspace file diff in the Orca editor",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "file open",
+      "summary": "Open a workspace file in the Orca editor",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "file open-changed",
+      "summary": "Open all git-changed files for a workspace",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "fill",
+      "summary": "Clear and fill a browser input by ref",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "find",
+      "summary": "Find element by semantic locator and perform action",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "focus",
+      "summary": "Focus a browser element by ref",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "forward",
+      "summary": "Navigate forward in browser history",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "full-screenshot",
+      "summary": "Capture a full-page screenshot (beyond viewport)",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "geolocation",
+      "summary": "Override browser geolocation",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "get",
+      "summary": "Get element property (text, html, value, url, title, count, box)",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "goto",
+      "summary": "Navigate the active browser tab to a URL",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "highlight",
+      "summary": "Highlight an element by selector",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "hover",
+      "summary": "Hover over a browser element by ref",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "inserttext",
+      "summary": "Insert text without key events",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "intercept disable",
+      "summary": "Disable request interception",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "intercept enable",
+      "summary": "Enable request interception (pause matching requests)",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "intercept list",
+      "summary": "List paused (intercepted) requests",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "is",
+      "summary": "Check element state (visible, enabled, checked)",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "keypress",
+      "summary": "Press a key (Enter, Tab, Escape, ArrowDown, etc.)",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear assignee clear",
+      "summary": "Clear a Linear issue assignee",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear assignee set",
+      "summary": "Assign a Linear issue",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear attach",
+      "summary": "Attach a link to a Linear issue",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear comment add",
+      "summary": "Add a comment to a Linear issue",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear create",
+      "summary": "Create a Linear issue",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear due-date clear",
+      "summary": "Clear a Linear issue due date",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear due-date set",
+      "summary": "Set a Linear issue due date",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear estimate clear",
+      "summary": "Clear a Linear issue estimate",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear estimate set",
+      "summary": "Set a Linear issue estimate",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear issue",
+      "summary": "Read Linear issue context for agents",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear label add",
+      "summary": "Add labels to a Linear issue",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear label remove",
+      "summary": "Remove labels from a Linear issue",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear label set",
+      "summary": "Replace labels on a Linear issue",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear list",
+      "summary": "List Linear issues for task triage",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "linear list-issues",
+      "summary": "List Linear issues with MCP-compatible filters",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear priority clear",
+      "summary": "Clear a Linear issue priority",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear priority set",
+      "summary": "Set a Linear issue priority",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear project list",
+      "summary": "List connected Linear projects",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "linear relation add",
+      "summary": "Add a Linear issue relation",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear relation remove",
+      "summary": "Remove a Linear issue relation",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear save-issue",
+      "summary": "Create or update a Linear issue",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear search",
+      "summary": "Search connected Linear workspaces",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear status set",
+      "summary": "Set a Linear issue status",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear team labels",
+      "summary": "List Linear team labels",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear team list",
+      "summary": "List connected Linear teams",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "linear team members",
+      "summary": "List Linear team members",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "linear team states",
+      "summary": "List Linear team workflow states",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "memory add",
+      "summary": "Store one confirmed local cross-agent memory entry",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "memory draft",
+      "summary": "Use current local Codex or Claude authorization to draft one reviewed L1 fact",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "memory draft-recover",
+      "summary": "Clear one verified dead cloud-draft lock after interruption",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "memory forget",
+      "summary": "Remove one local memory entry after confirmation",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "memory get",
+      "summary": "Read one local memory entry by its exact id",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "memory list",
+      "summary": "List bounded local memory metadata and excerpts",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "memory search",
+      "summary": "Search local memory with bounded excerpts",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "mouse down",
+      "summary": "Press mouse button",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "mouse move",
+      "summary": "Move mouse to x,y coordinates",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "mouse up",
+      "summary": "Release mouse button",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "mouse wheel",
+      "summary": "Scroll wheel",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "network",
+      "summary": "Show captured network requests",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "open",
+      "summary": "Launch Orca and wait for the runtime to be reachable",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration ask",
+      "summary": "Ask the coordinator a question and block until answered",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration check",
+      "summary": "Check messages for a terminal",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "orchestration coordinator-start",
+      "summary": "Retired: load the current orchestration skill",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration coordinator-stop",
+      "summary": "Retired: load the current orchestration skill",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration dispatch",
+      "summary": "Dispatch a task to a terminal",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration dispatch-show",
+      "summary": "Show dispatch context for a task",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration gate-create",
+      "summary": "Create a decision gate blocking a task",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration gate-list",
+      "summary": "List decision gates",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration gate-resolve",
+      "summary": "Resolve a pending decision gate",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration inbox",
+      "summary": "Show messages across (or for) recipients",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration reply",
+      "summary": "Reply to a message",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration reset",
+      "summary": "Reset one explicit orchestration state scope",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration run-create",
+      "summary": "Create and bind a lightweight orchestration Run",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration run-current",
+      "summary": "Show the Run bound to this coordinator terminal",
+      "verification": "live_read_only_verified",
+      "boundary": "The current no-payload local probe completed this command successfully."
+    },
+    {
+      "command": "orchestration run-list",
+      "summary": "List lightweight orchestration Runs",
+      "verification": "live_read_only_verified",
+      "boundary": "The current no-payload local probe completed this command successfully."
+    },
+    {
+      "command": "orchestration run-show",
+      "summary": "Show one lightweight orchestration Run",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration run-use",
+      "summary": "Bind this coordinator terminal to an existing Run",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration send",
+      "summary": "Send an inter-agent message",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration task-create",
+      "summary": "Create an orchestration task",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration task-list",
+      "summary": "List orchestration tasks",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration task-update",
+      "summary": "Update a task status",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration worker-abandon",
+      "summary": "Fence a worker without claiming its process stopped",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration worker-list",
+      "summary": "List supervised worker terminal resource accounting",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration worker-read",
+      "summary": "Read bounded output from one supervised worker",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration worker-release",
+      "summary": "Release the terminal of one settled supervised worker",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration worker-retain",
+      "summary": "Keep one supervised worker terminal live for debugging",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration worker-show",
+      "summary": "Inspect one supervised worker Dispatch",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration worker-start",
+      "summary": "Start one supervised worker on the Run home or a connected Orca server",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "orchestration worker-stop",
+      "summary": "Fence and stop only one supervised agent terminal",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "pdf",
+      "summary": "Export the active browser tab as PDF",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "project list",
+      "summary": "List durable projects known to Orca",
+      "verification": "live_read_only_verified",
+      "boundary": "The current no-payload local probe completed this command successfully."
+    },
+    {
+      "command": "project setup-clone",
+      "summary": "Make a project available on a host by cloning a repository",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "project setup-create",
+      "summary": "Create independent project host setup metadata",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "project setup-delete",
+      "summary": "Remove a project host setup",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "project setup-existing-folder",
+      "summary": "Make a project available on a host by importing an existing folder",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "project setup-update",
+      "summary": "Update project host setup metadata",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "project setups",
+      "summary": "List project host setups",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "reload",
+      "summary": "Reload the active browser tab",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "repo add",
+      "summary": "Add a project to Orca by filesystem path",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "repo list",
+      "summary": "List repos registered in Orca",
+      "verification": "live_read_only_verified",
+      "boundary": "The current no-payload local probe completed this command successfully."
+    },
+    {
+      "command": "repo search-refs",
+      "summary": "Search branch/tag refs within a repo",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "repo set-base-ref",
+      "summary": "Set the repo's default base ref for future worktrees",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "repo show",
+      "summary": "Show one registered repo",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "screenshot",
+      "summary": "Capture a viewport screenshot of the active browser tab",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "scroll",
+      "summary": "Scroll the browser viewport",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "scrollintoview",
+      "summary": "Scroll element into view",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "select",
+      "summary": "Select a dropdown option by ref",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "select-all",
+      "summary": "Select all text in an input by ref",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "serve",
+      "summary": "Start an Orca runtime server without opening a desktop window",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "set credentials",
+      "summary": "Set HTTP auth credentials",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "set device",
+      "summary": "Emulate a device",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "set headers",
+      "summary": "Set extra HTTP headers",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "set media",
+      "summary": "Set color scheme and reduced motion preferences",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "set offline",
+      "summary": "Toggle offline mode",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "skills get",
+      "summary": "Print a version-matched skill guide as Markdown",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "skills install",
+      "summary": "Install bundled Orca skills via the community skills CLI",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "skills list",
+      "summary": "List version-matched skill guides bundled with this Orca CLI",
+      "verification": "live_read_only_verified",
+      "boundary": "The current no-payload local probe completed this command successfully."
+    },
+    {
+      "command": "skills update",
+      "summary": "Update already-installed Orca skills via the community skills CLI",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "snapshot",
+      "summary": "Capture an accessibility snapshot of the active browser tab",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "status",
+      "summary": "Show app/runtime/graph readiness",
+      "verification": "live_read_only_verified",
+      "boundary": "The current no-payload local probe completed this command successfully."
+    },
+    {
+      "command": "storage local clear",
+      "summary": "Clear all localStorage",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "storage local get",
+      "summary": "Get a localStorage value by key",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "storage local set",
+      "summary": "Set a localStorage value",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "storage session clear",
+      "summary": "Clear all sessionStorage",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "storage session get",
+      "summary": "Get a sessionStorage value by key",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "storage session set",
+      "summary": "Set a sessionStorage value",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "tab close",
+      "summary": "Close a browser tab",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "tab create",
+      "summary": "Create a new browser tab in the current worktree",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "tab current",
+      "summary": "Show the current browser tab",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "tab list",
+      "summary": "List open browser tabs",
+      "verification": "live_read_only_verified",
+      "boundary": "The current no-payload local probe completed this command successfully."
+    },
+    {
+      "command": "tab profile clone",
+      "summary": "Clone a browser tab into a different browser profile",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "tab profile create",
+      "summary": "Create a browser session profile for browser tabs",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "tab profile delete",
+      "summary": "Delete a browser session profile used by browser tabs",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "tab profile list",
+      "summary": "List browser session profiles available to browser tabs",
+      "verification": "live_read_only_verified",
+      "boundary": "The current no-payload local probe completed this command successfully."
+    },
+    {
+      "command": "tab profile set",
+      "summary": "Switch a browser tab to a different browser profile",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "tab profile show",
+      "summary": "Show the browser profile bound to a tab",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "tab profile use-default",
+      "summary": "Switch a browser tab back to the default browser profile",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "tab show",
+      "summary": "Show one browser tab by page id",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "tab switch",
+      "summary": "Switch the active browser tab",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "terminal close",
+      "summary": "Close a terminal pane/session, or its whole tab with --tab",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "terminal create",
+      "summary": "Create a terminal session in the current worktree",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "terminal list",
+      "summary": "List live Orca-managed terminals",
+      "verification": "live_read_only_verified",
+      "boundary": "The current no-payload local probe completed this command successfully."
+    },
+    {
+      "command": "terminal read",
+      "summary": "Read bounded terminal output",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "terminal rename",
+      "summary": "Set or clear the title of a terminal tab",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "terminal send",
+      "summary": "Send input to a live terminal",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "terminal show",
+      "summary": "Show terminal metadata and preview",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "terminal split",
+      "summary": "Split an existing terminal pane",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "terminal stop",
+      "summary": "Stop terminals for a worktree",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "terminal switch",
+      "summary": "Switch to a terminal tab in the UI",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "terminal wait",
+      "summary": "Wait for a terminal condition",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "type",
+      "summary": "Type text at the current browser focus",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "uncheck",
+      "summary": "Uncheck a checkbox/radio by ref",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "upload",
+      "summary": "Upload files to a file input element",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "viewport",
+      "summary": "Set browser viewport size",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "vm recipe doctor",
+      "summary": "Validate a per-workspace environment recipe without provisioning by default",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "wait",
+      "summary": "Wait for element, text, URL, load state, JS condition, or timeout",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "worktree create",
+      "summary": "Create a new Orca-managed worktree",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "worktree current",
+      "summary": "Show the Orca-managed worktree for the current directory",
+      "verification": "live_read_only_verified",
+      "boundary": "The current no-payload local probe completed this command successfully."
+    },
+    {
+      "command": "worktree list",
+      "summary": "List Orca-managed worktrees",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "worktree ps",
+      "summary": "Show a compact orchestration summary across worktrees",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    },
+    {
+      "command": "worktree rm",
+      "summary": "Remove a worktree from Orca and git",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "worktree set",
+      "summary": "Update Orca metadata for a worktree",
+      "verification": "isolated_target_or_authorization_required",
+      "boundary": "Action, credentials, UI state, or external target is involved; verify only with a named isolated target and authorization."
+    },
+    {
+      "command": "worktree show",
+      "summary": "Show one worktree",
+      "verification": "schema_discovered_read_only",
+      "boundary": "Read-only command discovered from the local schema; it is not bulk-run because its output may be scope-sensitive."
+    }
+  ],
+  "note": "Catalog contains schema metadata only. It never runs commands outside the fixed no-payload read-only probe.",
+  "liveProbe": {
+    "ok": false,
+    "passed": 17,
+    "failed": [
+      "accounts"
+    ],
+    "workingDirectory": "/Volumes/Extreme SSD/Orca/workspaces/orca/完善orca"
+  }
+}
