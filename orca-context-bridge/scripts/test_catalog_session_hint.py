@@ -84,6 +84,15 @@ PROTECTED_SHA256 = {
 
 REAL_CATALOG = Path("/Volumes/Extreme SSD/Orca/manifests/cross-project-catalog/catalog.json")
 
+# The real, fixed filesystem location of the project this test suite is
+# conceptually about (registered in the catalog as "orca/完善orca") --
+# deliberately NOT derived from SCRIPTS_DIR/SCRIPT_PATH, which reflect
+# wherever THIS COPY of catalog_session_hint.py happens to be importable
+# from (the tracked workspace, a staging dir, or the deployed skill
+# directory ~/.agents/skills/orca-context-bridge/scripts/, none of which
+# is itself the project being asserted about).
+REAL_WORKSPACE_PROJECT_ROOT = Path("/Volumes/Extreme SSD/Orca/workspaces/orca/完善orca")
+
 
 # ---------------------------------------------------------------------------
 # Fixture helpers
@@ -1949,12 +1958,12 @@ class RealCatalogTests(unittest.TestCase):
                     self.assertIn(key, dep)
 
     def test_this_workspace_resolves_to_its_catalog_project_id(self) -> None:
-        root = SCRIPTS_DIR.parent.parent  # .../完善orca
-        self.assertEqual(csh.match_project_id(self.catalog, root), "orca/完善orca")
+        self.assertEqual(
+            csh.match_project_id(self.catalog, REAL_WORKSPACE_PROJECT_ROOT), "orca/完善orca")
 
     def test_all_four_input_variants_resolve_identically(self) -> None:
         import unicodedata
-        root = SCRIPTS_DIR.parent.parent
+        root = REAL_WORKSPACE_PROJECT_ROOT
         for variant in (str(root), str(root) + "/", str(root) + "/./",
                         unicodedata.normalize("NFD", str(root)), str(root / "orca-context-bridge")):
             with self.subTest(variant=variant):
