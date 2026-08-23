@@ -938,12 +938,23 @@ keyword case-insensitively as a substring of:
 | capability | `id`, `name` | `summary` |
 | wiki page | `id`, `title` | `summary` |
 
-Results come back in three ranked tiers, best first: `exact` (the keyword
-*is* the id, name, or title), `identity-substring` (it occurs inside one of
-those), then `summary-substring` (it only occurs in the prose). Within a
-tier the order is fully deterministic, so the same catalog and keyword
-always print the same thing. Each hit reports which fields matched, so it is
-clear why something surfaced.
+Each hit is classified into one of three bands, best first: `exact` (the
+keyword *is* the id, name, or title), `identity-substring` (it occurs inside
+one of those), then `summary-substring` (it only occurs in the prose). The
+band label is still reported on every hit, but ordering itself is a
+continuous score: a band weight (100 / 50 / 10) plus a small bonus for
+matching several fields at once, so a `--json` result also carries a numeric
+`score` alongside `rank`. A second pass then applies diversity decay —
+several hits from one loud project are progressively discounted (never to
+zero) so they cannot bury a single hit from a quieter project; this can, by
+design, place a discounted `exact` from a project with many hits below an
+undiscounted `identity-substring` from a project with only one. The whole
+pipeline is still a pure function of the catalog and the keyword — no clock
+is read anywhere in scoring or decay — and ties at exactly equal score fall
+back to the same fully deterministic (project, entry type, global id,
+catalog order) tie-break the ranking has always used, so the same catalog
+and keyword always print the same thing. Each hit reports which fields
+matched, so it is clear why something surfaced.
 
 Every run leads with the catalog's age, because a "no match" answer is only
 worth acting on if the catalog is current:

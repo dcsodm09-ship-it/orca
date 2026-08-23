@@ -351,6 +351,270 @@ class RankingTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# T-11..T-19: continuous scoring and diversity decay, the ranking-algorithm
+# upgrade that replaced the old three-tier hard priority. compute_score()
+# and diversity_multiplier() are tested directly, then a full search()
+# scenario proves the decay actually reorders results rather than just
+# decorating them with an extra field.
+# ---------------------------------------------------------------------------
+
+
+class ScoreAndDiversityTests(unittest.TestCase):
+    def test_t11_compute_score_tier_base_values(self) -> None:
+        """A single matched field (no density bonus) reduces to exactly the
+        tier's base RANK_SCORE value."""
+        self.assertEqual(qc.compute_score(qc.RANK_EXACT, ["id"]), 100.0)
+        self.assertEqual(qc.compute_score(qc.RANK_IDENTITY_SUBSTRING, ["id"]), 50.0)
+        self.assertEqual(qc.compute_score(qc.RANK_SUMMARY_SUBSTRING, ["summary"]), 10.0)
+
+    def test_t12_compute_score_density_bonus_accrues_per_extra_field(self) -> None:
+        self.assertEqual(qc.compute_score(qc.RANK_EXACT, ["id", "name"]), 103.0)
+        self.assertEqual(qc.compute_score(qc.RANK_EXACT, ["id", "name", "project_id"]), 106.0)
+        self.assertEqual(
+            qc.compute_score(qc.RANK_EXACT, ["id", "name", "project_id", "global_id"]), 109.0
+        )
+
+    def test_t13_compute_score_density_bonus_is_capped(self) -> None:
+        """FIELD_MATCH_BONUS_MAX_FIELDS (4) extra fields is the ceiling: a
+        5th (and any further) extra matched field must not add more."""
+        five_fields = ["a", "b", "c", "d", "e"]  # 4 extra beyond the first
+        six_fields = five_fields + ["f"]  # 5 extra -- must NOT score higher
+        capped = qc.RANK_SCORE[qc.RANK_EXACT] + qc.FIELD_MATCH_BONUS_MAX_FIELDS * qc.FIELD_MATCH_BONUS
+        self.assertEqual(qc.compute_score(qc.RANK_EXACT, five_fields), capped)
+        self.assertEqual(qc.compute_score(qc.RANK_EXACT, six_fields), capped)
+
+    def test_t14_tier_gap_exceeds_max_density_bonus_by_design(self) -> None:
+        """The whole "continuous score still behaves like tiers in practice"
+        claim rests on this inequality holding, not on any hard-coded tier
+        rule in the sort itself: a maximally field-dense hit in a weaker
+        band can never out-score even a bare, single-field hit in the next
+        band up."""
+        max_identity_substring = qc.compute_score(qc.RANK_IDENTITY_SUBSTRING, list("abcdefghij"))
+        max_summary_substring = qc.compute_score(qc.RANK_SUMMARY_SUBSTRING, list("abcdefghij"))
+        self.assertLess(max_identity_substring, qc.RANK_SCORE[qc.RANK_EXACT])
+        self.assertLess(max_summary_substring, qc.RANK_SCORE[qc.RANK_IDENTITY_SUBSTRING])
+
+    def test_t15_diversity_multiplier_values_and_floor(self) -> None:
+        self.assertEqual(qc.diversity_multiplier(0), 1.0)
+        self.assertEqual(qc.diversity_multiplier(1), 0.625)
+        self.assertEqual(qc.diversity_multiplier(2), 0.4375)
+        self.assertEqual(qc.diversity_multiplier(3), 0.34375)
+        # Approaches DIVERSITY_FLOOR but never reaches or crosses it.
+        self.assertGreater(qc.diversity_multiplier(50), qc.DIVERSITY_FLOOR)
+        self.assertAlmostEqual(qc.diversity_multiplier(50), qc.DIVERSITY_FLOOR, places=9)
+
+    def test_t16_scoring_and_diversity_are_pure_no_wall_clock(self) -> None:
+        """Mirrors test_t93's spirit for the two new functions specifically:
+        neither reads a clock, so neither can quietly reintroduce the
+        wall-clock dependency the task explicitly forbids. Checked three
+        ways, each closing a gap the previous one leaves open:
+
+        1. Direct source inspection, so a literal `datetime.now()` or
+           `time.time()` call cannot hide from a human reading the diff.
+           On its own this is defeatable by a disguised alias (e.g. `from
+           time import time as _clock; _clock()`), which spells none of
+           the banned substrings -- independent review demonstrated this
+           by mutation-testing an earlier version of this exact test.
+        2. A `mock.patch` sentinel on every wall-clock entry point these
+           two functions could plausibly reach through the ACCESS PATH a
+           disguised alias would still have to use at call time -- the
+           live `time`/`os` module attributes, and `qc`'s own already-
+           imported `datetime` name -- configured to fail the test the
+           instant any of them is actually called, while proving
+           compute_score()/diversity_multiplier() still return the
+           documented values without tripping any of them. This is what
+           actually catches the aliased-import case (1) cannot: the alias
+           is rebound fresh at call time from the same (now-patched)
+           module attribute, so patching the attribute intercepts it
+           regardless of what local name it was imported under.
+        3. Repeated calls with identical arguments never disagree.
+
+        A BRAND-NEW top-level `import time`/`import os.times`-style
+        module import under any alias is separately, independently pinned
+        by test_t92_source_declares_no_write_api_and_no_trust_anchor_
+        import's exact-import-surface check (it walks the whole AST, not
+        just top-level statements, and fails on any module name outside
+        its fixed allow-list regardless of the alias chosen) -- verified
+        empirically during independent review by mutation-testing that
+        exact scenario against both scripts and confirming t92 fails."""
+        import inspect
+
+        for fn in (qc.compute_score, qc.diversity_multiplier):
+            source = inspect.getsource(fn)
+            self.assertNotIn("datetime", source, fn.__name__)
+            self.assertNotIn("time.time", source, fn.__name__)
+            self.assertNotIn(".now(", source, fn.__name__)
+            self.assertNotIn("perf_counter", source, fn.__name__)
+
+        def _sentinel(*_args, **_kwargs):
+            raise AssertionError("compute_score/diversity_multiplier read a wall clock")
+
+        with mock.patch("time.time", side_effect=_sentinel), \
+                mock.patch("time.perf_counter", side_effect=_sentinel), \
+                mock.patch("time.monotonic", side_effect=_sentinel), \
+                mock.patch("os.times", side_effect=_sentinel), \
+                mock.patch.object(qc, "datetime") as fake_datetime:
+            fake_datetime.now.side_effect = _sentinel
+            self.assertEqual(qc.compute_score(qc.RANK_EXACT, ["id", "name"]), 103.0)
+            self.assertEqual(qc.compute_score(qc.RANK_IDENTITY_SUBSTRING, ["id"]), 50.0)
+            self.assertEqual(qc.diversity_multiplier(0), 1.0)
+            self.assertEqual(qc.diversity_multiplier(2), 0.4375)
+
+        for _ in range(5):
+            self.assertEqual(qc.compute_score(qc.RANK_EXACT, ["id", "name"]), 103.0)
+            self.assertEqual(qc.diversity_multiplier(2), 0.4375)
+
+    def test_t17_full_search_scoring_and_diversity_are_deterministic(self) -> None:
+        """Same spirit as test_t93 (search_catalog as a whole is a pure
+        function), pinned specifically against a fixture that actually
+        exercises diversity decay across repeated project_id hits, not just
+        a single match where the decay pass is a no-op."""
+        catalog = make_catalog(
+            capabilities=[
+                _capability(
+                    project_id="proj/A", id=f"alpha-shared-{i}", name=f"n{i}",
+                    summary="nothing", global_id=f"ga{i}",
+                )
+                for i in range(3)
+            ],
+            wiki_pages=[],
+        )
+        first = search(catalog, "shared")
+        second = search(catalog, "shared")
+        self.assertEqual(json.dumps(first, sort_keys=True), json.dumps(second, sort_keys=True))
+
+    def test_t18_diversity_decay_reorders_same_tier_same_density_hits_across_projects(self) -> None:
+        """Proves the decay mechanism actually changes result order, not
+        just that it computes a number nobody looks at. Four hits, all the
+        SAME band (identity-substring) and the SAME density (one matched
+        field each) -- without diversity decay they would tie on score and
+        settle purely on the (project_id, ...) tie-break, which would put
+        every "proj/A" hit before the lone "proj/B" hit. WITH decay, the
+        crowded project's 2nd and 3rd hits fall behind the quiet project's
+        1st hit."""
+        catalog = make_catalog(
+            capabilities=[
+                _capability(
+                    project_id="proj/A", id="alpha-shared-one", name="unrelated1",
+                    summary="nothing", global_id="ga1",
+                ),
+                _capability(
+                    project_id="proj/A", id="alpha-shared-two", name="unrelated2",
+                    summary="nothing", global_id="ga2",
+                ),
+                _capability(
+                    project_id="proj/A", id="alpha-shared-three", name="unrelated3",
+                    summary="nothing", global_id="ga3",
+                ),
+                _capability(
+                    project_id="proj/B", id="beta-shared-one", name="unrelatedb",
+                    summary="nothing", global_id="gb1",
+                ),
+            ],
+            wiki_pages=[],
+        )
+        result = search(catalog, "shared")
+        self.assertEqual(result["total_matches"], 4)
+        # Sanity check on the premise: all four really are the same band and
+        # the same density before diversity is applied at all.
+        self.assertTrue(all(m["rank"] == "identity-substring" for m in result["matches"]))
+        self.assertTrue(all(m["matched_fields"] == ["id"] for m in result["matches"]))
+
+        global_ids = [m["global_id"] for m in result["matches"]]
+        # ga1 and gb1 both keep their un-decayed 50.0 (k=0 in their own
+        # project); gb1 sorts second on the (project_id, ...) tie-break at
+        # equal score. ga2 (k=1) and ga3 (k=2) are decayed below that tied
+        # 50.0 and fall to the back, still in their own relative order.
+        self.assertEqual(global_ids, ["ga1", "gb1", "ga2", "ga3"])
+
+        scores = {m["global_id"]: m["score"] for m in result["matches"]}
+        self.assertEqual(scores["ga1"], 50.0)
+        self.assertEqual(scores["gb1"], 50.0)
+        self.assertEqual(scores["ga2"], 31.25)
+        self.assertEqual(scores["ga3"], 21.875)
+
+    def test_t19_score_field_is_present_and_positioned_right_after_rank(self) -> None:
+        """The task's output-format requirement: every match dict carries a
+        "score" key, and it comes right after "rank" in iteration order
+        (dict order is insertion order in Python 3.7+), not appended at the
+        end. Checked for BOTH entry types -- _capability_match() and
+        _page_match() build their dicts independently, so one having the
+        right key order does not prove the other does."""
+        catalog = make_catalog(capabilities=[_capability(id="guard", name="guard.py")], wiki_pages=[])
+        match = search(catalog, "guard")["matches"][0]
+        self.assertEqual(match["entry_type"], "capability")
+        self.assertIn("score", match)
+        self.assertIsInstance(match["score"], float)
+        keys = list(match.keys())
+        self.assertEqual(keys.index("score"), keys.index("rank") + 1)
+
+        page_catalog = make_catalog(capabilities=[], wiki_pages=[_page(id="guard-page", title="guard.md")])
+        page_match = search(page_catalog, "guard")["matches"][0]
+        self.assertEqual(page_match["entry_type"], "wiki_page")
+        self.assertIn("score", page_match)
+        self.assertIsInstance(page_match["score"], float)
+        page_keys = list(page_match.keys())
+        self.assertEqual(page_keys.index("score"), page_keys.index("rank") + 1)
+
+    def test_t19b_diversity_decay_can_rank_a_stronger_band_below_a_weaker_one(self) -> None:
+        """Independent review flagged that the module docstring's "gap
+        between bands is far larger than the bonus cap" inequality (T-14)
+        only rules out a WEAKER band out-scoring a STRONGER one via density
+        bonus. It says nothing about diversity decay, which is a second,
+        independent discount and is NOT covered by that inequality -- the
+        module docstring says so explicitly (see the RANKING section's "This
+        CAN reorder a lower-band match ... ahead of a decayed higher-band
+        match" paragraph), but nothing pinned the concrete threshold before
+        this test: three or more same-band, same-density hits piling up in
+        one project is enough, on its own, to decay an EXACT match below an
+        un-decayed IDENTITY-SUBSTRING match from a quieter project. This is
+        the documented, by-design behavior, not a regression -- the test
+        exists so a future change cannot silently remove it (or silently
+        make it worse) without a test noticing either way."""
+        catalog = make_catalog(
+            capabilities=[
+                _capability(
+                    project_id="proj/loud", id="wombat", name=f"unrelated-loud-{i}",
+                    summary="nothing", global_id=f"gl{i}",
+                )
+                for i in range(3)
+            ]
+            + [
+                _capability(
+                    project_id="proj/quiet", id="unrelated-quiet", name="wombat-helper",
+                    summary="nothing", global_id="gq1",
+                )
+            ],
+            wiki_pages=[],
+        )
+        result = search(catalog, "wombat")
+        self.assertEqual(result["total_matches"], 4)
+
+        by_id = {m["global_id"]: m for m in result["matches"]}
+        # Sanity check on the premise: three EXACT hits (single field,
+        # un-bonused, 100.0 pre-decay) crowd one project; one
+        # IDENTITY-SUBSTRING hit (single field, 50.0, un-decayed since it
+        # is alone in its project) sits in a quieter one.
+        self.assertEqual(by_id["gl0"]["rank"], "exact")
+        self.assertEqual(by_id["gl1"]["rank"], "exact")
+        self.assertEqual(by_id["gl2"]["rank"], "exact")
+        self.assertEqual(by_id["gq1"]["rank"], "identity-substring")
+
+        order = [m["global_id"] for m in result["matches"]]
+        self.assertEqual(order, ["gl0", "gl1", "gq1", "gl2"])
+
+        scores = {gid: m["score"] for gid, m in by_id.items()}
+        self.assertEqual(scores["gl0"], 100.0)
+        self.assertEqual(scores["gl1"], 62.5)
+        self.assertEqual(scores["gq1"], 50.0)
+        self.assertEqual(scores["gl2"], 43.75)
+        # The actual claim: an EXACT-band hit (gl2) ends up ranked, and
+        # scored, below an IDENTITY-SUBSTRING-band hit (gq1) -- a real
+        # cross-band reordering, not merely a same-band reshuffle like T-18.
+        self.assertLess(scores["gl2"], scores["gq1"])
+
+
+# ---------------------------------------------------------------------------
 # T-20..T-26: staleness reporting.
 # ---------------------------------------------------------------------------
 

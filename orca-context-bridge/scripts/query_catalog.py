@@ -18,8 +18,10 @@ types (added after independent review: `global_id` is the catalog's own
 documented join key and is printed on every result row, so searching the
 exact value this tool just printed is the natural next query, and it must
 not come back a false "nothing uses that word"). Matching happens across
-BOTH `capabilities[]` and `wiki_pages[]`, and ranks exact identity matches
-above substring ones. The point is the plan's: check whether something
+BOTH `capabilities[]` and `wiki_pages[]`, and scores exact identity matches
+above substring ones by default (see RANKING below for the continuous score
+and the one deliberate case -- diversity decay -- where that default is
+NOT an absolute guarantee). The point is the plan's: check whether something
 already exists somewhere in the fleet before building it again.
 
 READ-ONLY, WITH NO WRITE PATH AT ALL
@@ -69,14 +71,43 @@ semantics that track owns.
 
 RANKING
 -------
-Three tiers, best first. Within a tier, ordering is fully deterministic
-(project_id, then entry type, then global_id, then catalog order), so the
-same catalog and keyword always produce the same output:
+Continuous weighted scoring, not three hard tiers. Every match is still
+classified into the same three bands classify_entry() has always computed
+-- exact identity, identity-substring, summary-substring (see RANK_LABELS,
+unchanged) -- but the band no longer sorts results by itself. compute_score()
+turns (band, matched_fields) into a float: a large base value per band
+(RANK_SCORE: 100 / 50 / 10) plus a small density bonus for matching more
+than one field (FIELD_MATCH_BONUS per extra field, capped at
+FIELD_MATCH_BONUS_MAX_FIELDS extra fields). The gap between bands (50, then
+40) is deliberately far larger than the bonus's cap (12): a hit in a weaker
+band can never out-score even an un-bonused hit in a stronger one. That
+ordering is not a second, hard-coded tier rule bolted onto the score -- it
+is what the chosen weights produce on their own, which is the actual point
+of moving from hard tiers to a continuous score.
 
-    exact               keyword equals a capability `name`/`id` or a page
-                        `title`/`id` outright (case-insensitive)
-    identity-substring  keyword occurs inside one of those identity fields
-    summary-substring   keyword occurs only in the `summary`
+A second, independent pass then applies diversity decay (_rank_matches()):
+sorted by score, each match past the first FROM THE SAME project_id is
+discounted by diversity_multiplier(k) (k = 0, 1, 2, ... counting only
+within that one project, across capabilities and wiki_pages together), so
+several hits from one loud project do not bury a single hit from a
+quieter one. This CAN reorder a lower-band match from a quiet project
+ahead of a decayed higher-band match from a project that already placed
+several stronger hits above it -- that is the mechanism working as
+designed, not a bug, and it is the one place this tool's ranking is
+deliberately not a strict band order.
+
+Both passes run to completion on every call and are tie-broken, at exact
+float equality, by the same fully deterministic (project_id, then entry
+type, then global_id, then catalog order) tuple the old three-tier
+ranking already used. The "same catalog and keyword always produce the
+same output" invariant was never actually about bands or scores -- it
+depends on search_catalog() staying a pure function (no filesystem read,
+no clock read anywhere in scoring or diversity; `now` is caller-supplied
+and used only for staleness, never for ranking) plus that tie-break as the
+last resort whenever two matches land on exactly equal score. `rank` (the
+band label) is kept on every result alongside the new `score` field
+precisely so a human reading the output still gets the qualitative "why"
+even though the sort itself is now quantitative.
 
 STALENESS
 ---------
@@ -171,6 +202,55 @@ RANK_LABELS = {
     RANK_IDENTITY_SUBSTRING: "identity-substring",
     RANK_SUMMARY_SUBSTRING: "summary-substring",
 }
+
+# Continuous scoring (see the RANKING section of the module docstring).
+# Base value per band. The gap between adjacent bands (50, then 40) is
+# deliberately far larger than FIELD_MATCH_BONUS_MAX_FIELDS *
+# FIELD_MATCH_BONUS (12 at most): no amount of density bonus lets a weaker
+# band out-score a stronger one. That is a property of these four numbers
+# together, not a rule enforced anywhere in code -- changing any of them
+# without preserving the inequality would silently break it.
+RANK_SCORE = {
+    RANK_EXACT: 100.0,
+    RANK_IDENTITY_SUBSTRING: 50.0,
+    RANK_SUMMARY_SUBSTRING: 10.0,
+}
+FIELD_MATCH_BONUS = 3.0
+# Bonus stops accruing after this many EXTRA matched fields (i.e. beyond
+# the first), so a field-dense entry cannot keep climbing indefinitely and
+# is capped well under the smallest inter-band gap above.
+FIELD_MATCH_BONUS_MAX_FIELDS = 4
+
+# Diversity decay (see the RANKING section of the module docstring). Reused
+# verbatim from X (Twitter)'s open-sourced recommendation algorithm rather
+# than hand-tuned here: DIVERSITY_DECAY is the per-step multiplicative
+# falloff, DIVERSITY_FLOOR is the asymptote every same-project run decays
+# toward but never reaches (a project's 2nd, 3rd, ... hit is discounted,
+# never zeroed out).
+DIVERSITY_DECAY = 0.5
+DIVERSITY_FLOOR = 0.25
+
+
+def compute_score(rank: int, matched_fields: list) -> float:
+    """Turn one match's (band, matched_fields) into a continuous score.
+
+    Pure arithmetic on its two arguments -- no filesystem, no clock, no
+    global or hidden state -- so it produces the same float for the same
+    inputs every time, which is what keeps _rank_matches()'s tie-break
+    meaningful (see test_scoring_is_pure_no_wall_clock)."""
+    bonus_fields = min(len(matched_fields) - 1, FIELD_MATCH_BONUS_MAX_FIELDS)
+    return RANK_SCORE[rank] + bonus_fields * FIELD_MATCH_BONUS
+
+
+def diversity_multiplier(k: int) -> float:
+    """Discount factor for the (k+1)-th hit from one project_id, k=0-based.
+
+    k is purely a count over THIS result set (see _rank_matches()) -- never
+    a time-based notion of "recent" or "today". Same formula and constants
+    as X (Twitter)'s open-sourced recommendation code: geometric decay
+    toward DIVERSITY_FLOOR, never below it."""
+    return (1 - DIVERSITY_FLOOR) * (DIVERSITY_DECAY ** k) + DIVERSITY_FLOOR
+
 
 # Field order here is also the order matched_fields is reported in, so that
 # output is deterministic rather than dict-iteration-dependent.
@@ -514,10 +594,11 @@ def classify_entry(
     return rank, matched
 
 
-def _capability_match(entry: dict, rank: int, matched: list) -> dict:
+def _capability_match(entry: dict, rank: int, matched: list, score: float) -> dict:
     return {
         "entry_type": "capability",
         "rank": RANK_LABELS[rank],
+        "score": score,
         "matched_fields": matched,
         "project_id": _entry_str(entry, "project_id"),
         "global_id": _entry_str(entry, "global_id"),
@@ -530,10 +611,11 @@ def _capability_match(entry: dict, rank: int, matched: list) -> dict:
     }
 
 
-def _page_match(entry: dict, rank: int, matched: list) -> dict:
+def _page_match(entry: dict, rank: int, matched: list, score: float) -> dict:
     return {
         "entry_type": "wiki_page",
         "rank": RANK_LABELS[rank],
+        "score": score,
         "matched_fields": matched,
         "project_id": _entry_str(entry, "project_id"),
         "global_id": _entry_str(entry, "global_id"),
@@ -557,7 +639,17 @@ def _collect(
     """Scan one of the catalog's two entry lists. Returns
     (row_count, skipped_non_dict). A non-list is the caller's problem to
     warn about; a non-dict ROW inside a real list is counted and skipped
-    here so the count can be surfaced instead of vanishing."""
+    here so the count can be surfaced instead of vanishing.
+
+    Each match appended to `out` is a (score, identity, match) triple:
+    `score` is the pre-diversity compute_score() value, `identity` is the
+    same (project_id, entry_type, global_id, catalog-order index) tuple
+    the tie-break has always used, and `match` is the rendered result dict
+    -- already carrying a "score" key (set to this same pre-diversity
+    value) that _rank_matches() overwrites in place once the diversity
+    pass computes the final value, so "score" keeps its documented
+    position right after "rank" instead of landing at the end of the
+    dict."""
     if not isinstance(rows, list):
         return 0, 0
     skipped = 0
@@ -569,16 +661,64 @@ def _collect(
         if verdict is None:
             continue
         rank, matched = verdict
-        match = render(entry, rank, matched)
-        sort_key = (
-            rank,
+        score = compute_score(rank, matched)
+        match = render(entry, rank, matched, score)
+        identity = (
             _entry_str(entry, "project_id") or "",
             entry_type,
             _entry_str(entry, "global_id") or "",
             index,
         )
-        out.append((sort_key, match))
+        out.append((score, identity, match))
     return len(rows), skipped
+
+
+def _rank_matches(scored: list) -> list:
+    """Two-pass ranking over every match collected from both entry lists
+    (see the RANKING section of the module docstring for the full
+    rationale; this is where it is actually implemented).
+
+    Pass 1 orders by the pre-diversity score alone, tie-broken by the same
+    (project_id, entry_type, global_id, catalog-order index) tuple
+    _collect() has always attached. That fixed, deterministic order is
+    what "the k-th hit in this project" (k starting at 0) means for pass 2
+    -- k comes only from counting positions in THIS result set, never from
+    a clock or any state outside `scored`.
+
+    Pass 2 applies diversity_multiplier(k) to every match using the k
+    assigned from pass 1's order, then re-sorts by the resulting
+    final_score with the IDENTICAL tie-break tuple. Two matches with
+    exactly equal final_score therefore land in the same relative order
+    pass 1 (and every prior run over the same catalog and keyword) already
+    put them in -- that tie-break is what keeps "same catalog + same
+    keyword -> same output" true even with a continuous score and a decay
+    stage layered on top of it.
+
+    Mutates each match dict's already-present "score" key in place (set by
+    _collect() to the pre-diversity value) rather than adding a new key, so
+    "score" keeps its documented position right after "rank"."""
+
+    def sort_key(item: tuple) -> tuple:
+        # item[0] is the score to rank by (negated for descending-by-score
+        # ascending sort); item[1] is the (project_id, entry_type,
+        # global_id, index) tie-break tuple, unpacked so its four fields
+        # sort individually rather than as one nested tuple.
+        return (-item[0],) + item[1]
+
+    pass1 = sorted(scored, key=sort_key)
+
+    project_hit_count: dict = {}
+    pass2: list = []
+    for score, identity, match in pass1:
+        project_id = identity[0]
+        k = project_hit_count.get(project_id, 0)
+        project_hit_count[project_id] = k + 1
+        final_score = score * diversity_multiplier(k)
+        match["score"] = final_score
+        pass2.append((final_score, identity, match))
+
+    pass2.sort(key=sort_key)
+    return [match for _, _, match in pass2]
 
 
 def search_catalog(
@@ -687,8 +827,7 @@ def search_catalog(
             }
         )
 
-    scored.sort(key=lambda pair: pair[0])
-    matches = [match for _, match in scored]
+    matches = _rank_matches(scored)
     total_matches = len(matches)
     returned = matches[:limit]
 
@@ -751,7 +890,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     search = subparsers.add_parser(
         "search",
-        help="Case-insensitive substring search across capabilities and wiki pages; exact matches first.",
+        help="Case-insensitive substring search across capabilities and wiki pages, ranked by a "
+        "continuous relevance score (exact matches score highest; see the module docstring's "
+        "RANKING section for the diversity-decay case where that is not an absolute guarantee).",
         description="Search capabilities[] (id/name/summary) and wiki_pages[] (id/title/summary) in "
         "catalog.json. Exit 0 = matched, 1 = no match, 2 = usage error, 4 = catalog unavailable.",
     )
@@ -838,7 +979,7 @@ def _print_human(result: dict) -> None:
         fields = ",".join(match["matched_fields"])
         print()
         print(
-            f"[{position}] {match['rank']:<18} {project_id}  "
+            f"[{position}] {match['rank']:<18} (score {match['score']:.1f})  {project_id}  "
             f"{_flatten_for_terminal(kind or '?')}  {_flatten_for_terminal(match['id'] or '?')}"
         )
         if identity:
