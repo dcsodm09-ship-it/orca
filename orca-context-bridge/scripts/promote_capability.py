@@ -83,7 +83,31 @@ lands second silently discards the first call's already-"approved" write).
 The identity recheck described below is a defense against a DIFFERENT
 actor -- something other than this tool editing the target file mid-flight
 -- not a substitute for holding the lock against concurrent invocations of
-this tool itself. Two target shapes:
+this tool itself. `reject`/`withdraw` (`_terminal_transition()`) hold this
+SAME lock too as of the round-2 fix below: an earlier revision let them run
+their read-check-write sequence completely unlocked, so a reject/withdraw
+could race a concurrent approve on the identical candidate and leave
+promotion-ledger.jsonl with both an "approve" AND a "reject"/"withdraw"
+entry for the same candidate_id -- a self-contradictory audit trail,
+independently reproduced 5/5 runs before this fix. Two target shapes:
+
+Round-2 fix, also documented here since it changes what this section's own
+guarantees mean: `cmd_approve` now re-validates every field of the
+candidate record it is about to act on (`_revalidate_record_for_approve()`)
+using draft's own validators, before trusting any of it to build a
+filesystem path. A candidate record is JSON this tool itself wrote under
+PROMOTION_ROOT and later reads back; nothing previously re-checked that a
+record still looked like something draft would have produced by the time
+approve got to it. `resolve_knowledge_md_path()`'s own containment check
+was also widened to cover the FINAL page_id-derived path, not just the
+knowledge/ directory it is built from -- two independent layers over the
+same field, deliberately, not one covering for the other's absence. See
+that function's own docstring for the exact exploit this closes (a
+tampered record's "id" containing "/../" segments escaping the target
+project root entirely). `git_commit_paths()`'s commit call was also scoped
+to the specific paths this write touched (`git commit -- <paths>`, not a
+bare `git commit`) so it can no longer sweep up whatever else a caller had
+already staged in the target repo for something unrelated.
 
   "reusable-capabilities.json": read existing file -> capture an fstat-based
   identity for the read (dev/ino/mtime_ns/size) -> build the new document ->
@@ -1332,8 +1356,30 @@ def resolve_wiki_target_path(project_root: Path, filename: str) -> Path:
 
 
 def resolve_knowledge_md_path(project_root: Path, page_id: str) -> Path:
-    # page_id is already ID_RE-validated by this point (no '/', no '..', no
-    # leading dot) -- f"{page_id}.md" is inherently a single safe component.
+    # round-2-fix P0: this function's ONLY containment check used to be on
+    # `real_knowledge` (the wiki/knowledge/ directory itself), never on the
+    # actual final path `real_knowledge / f"{page_id}.md"`. The comment that
+    # used to sit here ("page_id is already ID_RE-validated by this point")
+    # was true for draft but NOT for approve: approve's page_id comes
+    # straight from a candidate record JSON file read off disk (see
+    # cmd_approve -> find_candidate()), with no re-validation of its own
+    # between draft-time and approve-time. If that on-disk record is
+    # tampered with (or simply corrupted) between draft and approve so its
+    # "id" contains "/" segments -- e.g. "../../../OUTSIDE/PWNED" -- the old
+    # code below would join it onto real_knowledge and hand back a path
+    # that resolves OUTSIDE the project root entirely, and the caller
+    # (atomic_write_in_dir) would write there without complaint. A dual
+    # review demonstrated this is real and reproducible end-to-end (approve
+    # returns status:"approved" with a file written outside the target
+    # project). _revalidate_record_for_approve() (see cmd_approve) is the
+    # PRIMARY fix -- it re-runs the exact same ID_RE check draft already
+    # ran, against the record as it stands right now, closing the actual
+    # attack surface. The containment check added below is the SECOND,
+    # independent layer: even if that upstream re-validation were ever
+    # skipped, weakened, or bypassed by some future caller, this function
+    # must not be able to hand back a path outside its own knowledge_dir on
+    # its own -- belt AND suspenders, deliberately, not either/or.
+    #
     # Same lexical-vs-resolved discipline as resolve_wiki_target_path()
     # above: the symlink-component check MUST run on unresolved
     # (.absolute()-only) paths, since a resolved path has already had every
@@ -1363,7 +1409,22 @@ def resolve_knowledge_md_path(project_root: Path, page_id: str) -> Path:
         real_knowledge.relative_to(real_root)
     except ValueError as exc:
         raise PromoteFatal("target_knowledge_dir_escapes_project_root") from exc
-    return real_knowledge / f"{page_id}.md"
+
+    # THE FIX: resolve the FINAL path (directory + page_id-derived filename)
+    # and check IT for containment, not just the directory it was built
+    # from. A page_id containing "/" (e.g. from a tampered candidate
+    # record) makes `f"{page_id}.md"` a multi-segment relative path when
+    # joined onto real_knowledge; .resolve(strict=False) collapses any
+    # ".."/".": components in it, and relative_to() below then rejects the
+    # result if that collapse walked the path outside real_knowledge.
+    knowledge_final = (real_knowledge / f"{page_id}.md").resolve(strict=False)
+    try:
+        knowledge_final.relative_to(real_knowledge)
+    except ValueError as exc:
+        raise PromoteFatal("target_knowledge_path_escapes_knowledge_dir") from exc
+    if knowledge_final.parent != real_knowledge:
+        raise PromoteFatal("target_knowledge_path_not_direct_child_of_knowledge_dir")
+    return knowledge_final
 
 
 def atomic_write_in_dir(final_path: Path, payload: bytes) -> None:
@@ -1425,7 +1486,23 @@ def is_git_repo(real_path: Path) -> bool:
 
 def git_commit_paths(real_path: Path, relpaths: list[str], message: str) -> tuple[bool, str | None, str | None]:
     """Returns (committed, commit_sha, error_message). NEVER runs without
-    -C real_path; never touches any repo other than the one at real_path."""
+    -C real_path; never touches any repo other than the one at real_path.
+
+    round-2-fix: `git commit -m message` with NO pathspec commits the
+    ENTIRE index, not just whatever this call's own `git add` just staged.
+    A caller (a human, another tool, a CI step) that had already run its
+    own `git add` on some unrelated file in this SAME target project's
+    working tree -- for a change that has nothing to do with this
+    approve -- would see that unrelated file silently swept into this
+    tool's commit, with this tool's own commit message and authorship,
+    the moment approve happened to run. Demonstrated concretely: stage an
+    unrelated file, then call approve; the resulting commit's --name-only
+    log included it. `git commit -- <relpaths>` is a partial commit: git
+    commits ONLY the given paths (using their current working-tree state
+    for that commit), and leaves anything else already in the index
+    exactly as staged for a future commit -- so this tool's write is fully
+    scoped to the files IT wrote, never anything else the caller's index
+    happened to be carrying."""
     try:
         add_proc = subprocess.run(
             ["git", "-C", str(real_path), "add", "--"] + relpaths,
@@ -1436,7 +1513,7 @@ def git_commit_paths(real_path: Path, relpaths: list[str], message: str) -> tupl
         if add_proc.returncode != 0:
             return False, None, f"git add failed: {add_proc.stderr.strip() or add_proc.stdout.strip()}"
         commit_proc = subprocess.run(
-            ["git", "-C", str(real_path), "commit", "-m", message],
+            ["git", "-C", str(real_path), "commit", "-m", message, "--"] + relpaths,
             capture_output=True,
             timeout=30,
             text=True,
@@ -2018,6 +2095,202 @@ def _approve_orca_context_wiki(
     }
 
 
+def _revalidate_record_for_approve(record: dict[str, Any]) -> None:
+    """round-2-fix P0, primary fix: re-run the EXACT SAME schema/format
+    validation draft (or amend) already ran, against the record as it
+    stands on disk right now, before any of its fields are used to build a
+    filesystem path.
+
+    Why this exists: draft/amend validate their input once, at draft time,
+    and then write the resulting record to a JSON file under
+    PROMOTION_ROOT. `approve` later reads that SAME file back
+    (find_candidate()) and trusted it completely -- nothing between draft
+    and approve re-checks that the file's contents still look like
+    something draft would have produced. If that file is edited on disk in
+    between (a bug elsewhere, a compromised process with write access to
+    PROMOTION_ROOT, or simple corruption), approve had no independent
+    opinion of its own and would happily use a tampered "id" to build a
+    write path (see resolve_knowledge_md_path's docstring for the concrete
+    exploit this closes: id="../../../OUTSIDE/PWNED" survives untouched
+    from tamper to write). Reusing validate_capability_candidate_input()/
+    validate_knowledge_candidate_input() here (rather than inventing a
+    parallel set of checks) is deliberate: those functions ARE the
+    authority on what a well-formed candidate looks like, and a second,
+    independently-written check function is exactly the kind of thing that
+    silently drifts out of sync with the first one (see KIND_VALUES's own
+    documented history of that failure mode in this same file).
+
+    Raises PromoteValidationError/PromoteUsageError-shaped
+    PromoteValidationError on anything that fails; callers should let it
+    propagate (approve has not written anything yet at the point this is
+    called)."""
+    target_project = record.get("target_project")
+    proposed_target = record.get("proposed_target")
+    operation = record.get("operation")
+
+    if operation not in OPERATION_VALUES:
+        raise PromoteValidationError("bad_operation", f"operation must be one of {list(OPERATION_VALUES)}, got {operation!r}")
+    if proposed_target not in PROPOSED_TARGETS:
+        raise PromoteValidationError("bad_proposed_target", f"proposed_target must be one of {list(PROPOSED_TARGETS)}, got {proposed_target!r}")
+    # target_project itself is never used to build a write path (the actual
+    # write target comes from catalog.json's own project_roots lookup, a
+    # dict-key lookup, not a path join) -- still re-validated here for
+    # defense in depth and because it IS used to build this tool's own
+    # PROMOTION_ROOT-confined candidate/content paths (project_dir(),
+    # candidate_path(), content_md_path()).
+    _validate_target_project(target_project)
+
+    if operation == "amend_depends_on":
+        # round-2-fix round-2 (post-NO-GO): cmd_amend() hardcodes
+        # proposed_target to "reusable-capabilities.json" -- it is never
+        # legitimately "orca-context-wiki.json" for this operation. Without
+        # this check, a record whose on-disk "operation" is tampered/left as
+        # "amend_depends_on" but whose "proposed_target" is changed to
+        # "orca-context-wiki.json" sails through this branch (which never
+        # looks at proposed_target) and returns having validated NOTHING
+        # that _approve_orca_context_wiki() is about to read: that function
+        # unconditionally uses record["id"]/record["title"]/record["path"]/
+        # record["wiki_status"], all of which are None on an amend record
+        # (see cmd_amend), and writes+commits a page of literal nulls into
+        # the target project's real wiki file before anything catches it.
+        if proposed_target != "reusable-capabilities.json":
+            raise PromoteValidationError(
+                "bad_proposed_target_for_operation",
+                "operation 'amend_depends_on' must have proposed_target "
+                f"'reusable-capabilities.json', got {proposed_target!r}",
+            )
+        # amend candidates carry no id/kind/name/path/summary of their own
+        # (see cmd_amend) -- re-validate the amend-specific fields using
+        # the identical checks cmd_amend itself already applies to them.
+        target_kind = record.get("amend_target_kind")
+        target_name = record.get("amend_target_name")
+        ref = record.get("amend_add_depends_on")
+        if target_kind not in KIND_VALUES:
+            raise PromoteValidationError("bad_target_kind", f"amend_target_kind must be one of {list(KIND_VALUES)}, got {target_kind!r}")
+        if not _is_plain_str(target_name) or not target_name or _has_control_chars(target_name):
+            raise PromoteValidationError("bad_target_name", "amend_target_name must be a non-empty, control-character-free string")
+        if not _is_plain_str(ref) or not ref or ref != ref.strip() or _has_control_chars(ref):
+            raise PromoteValidationError("bad_add_depends_on", "amend_add_depends_on must be a non-empty, trimmed, control-character-free string")
+        ref_parts = ref.split(":")
+        if len(ref_parts) not in (2, 3) or any(not p for p in ref_parts):
+            raise PromoteValidationError("bad_add_depends_on_grammar", "amend_add_depends_on must be \"<kind>:<name>\" or \"<project>:<kind>:<name>\"")
+        if ref_parts[-2] not in KIND_VALUES:
+            raise PromoteValidationError("bad_add_depends_on_kind", f"kind must be one of {list(KIND_VALUES)}")
+        if len(ref_parts) == 2 and f"{ref_parts[0]}:{ref_parts[1]}" == f"{target_kind}:{target_name}":
+            raise PromoteValidationError("self_reference", "amend_add_depends_on must not name the amend target itself")
+        return
+
+    # Reuse validate_source() itself rather than re-checking source's shape
+    # ad hoc -- same "don't reinvent" discipline as everything else in this
+    # function. validate_source() reads payload["source"], so build a
+    # minimal payload for it up front.
+    source = validate_source({"source": record.get("source")})
+
+    if proposed_target == "reusable-capabilities.json":
+        payload = {
+            "target_project": target_project,
+            "proposed_target": proposed_target,
+            "source": source,
+            "id": record.get("id"),
+            "kind": record.get("kind"),
+            "name": record.get("name"),
+            "path": record.get("path"),
+            "summary": record.get("summary"),
+            "last_verified_at": record.get("last_verified_at"),
+            "depends_on": record.get("depends_on"),
+        }
+        validate_capability_candidate_input(payload)
+    else:  # "orca-context-wiki.json"
+        payload = {
+            "target_project": target_project,
+            "proposed_target": proposed_target,
+            "source": source,
+            "id": record.get("id"),
+            "title": record.get("title"),
+            "path": record.get("path"),
+            "summary": record.get("summary"),
+            "wiki_status": record.get("wiki_status"),
+            # content_md itself is not re-validated here: the record never
+            # stores the body text (only has_content_md/content_md_relpath
+            # -- see cmd_draft), and the body is not used to build any
+            # filesystem path (only "id" is, via resolve_knowledge_md_path).
+            # It is re-read from PROMOTION_ROOT's own staged content.md file
+            # further down in _approve_orca_context_wiki, whose read path is
+            # built from candidate_id and target_project (re-validated
+            # above), not from "id". candidate_id/target_project are NOT
+            # re-checked here for well-formedness on their own -- they are
+            # instead cross-checked in cmd_approve/_terminal_transition, by
+            # _verify_record_matches_found_location(), against the actual
+            # directory/filename find_candidate() found this record under
+            # (see that function's docstring for why a field-level format
+            # check alone is not enough here).
+            "content_md": None,
+        }
+        validate_knowledge_candidate_input(payload)
+
+
+def _verify_record_matches_found_location(root: Path, record: dict[str, Any], record_path: Path) -> None:
+    """round-2-fix round-2 (post-NO-GO hardening).
+
+    find_candidate() locates a candidate purely by scanning PROMOTION_ROOT's
+    subdirectories for a file literally named "<the CLI-supplied
+    candidate_id>.json" -- it never checks that the JSON record it reads
+    back agrees, in its OWN "target_project"/"candidate_id" fields, with the
+    directory/filename it was actually found under. Three call sites rebuild
+    a path FROM those record fields rather than reusing record_path itself:
+
+      - save_candidate() (used by cmd_approve's own final "approved" save,
+        AND by _terminal_transition's "rejected"/"withdrawn" save) recomputes
+        the write path from record["target_project"]/record["candidate_id"].
+      - cmd_approve separately looks record["target_project"] up in
+        catalog.json to decide which real project's wiki/capabilities file
+        to actually mutate.
+      - _approve_orca_context_wiki()'s staged-content.md lookup builds its
+        read path from record["candidate_id"]/record["target_project"].
+
+    If either field is tampered on disk in between draft/amend and
+    approve/reject/withdraw, every one of those rebuilt paths silently
+    diverges from where the record actually lives on disk:
+
+      - a tampered "target_project" makes cmd_approve write the REAL target
+        project's file (wiki or capabilities) for a completely different,
+        merely catalog-known project than the one the candidate was staged
+        against and reviewed for, and makes save_candidate() write the
+        "approved" record into that other project's directory under
+        PROMOTION_ROOT -- leaving the original staged file behind unchanged
+        (still "pending_approval"), so the same candidate_id now exists
+        twice on disk with contradictory status and a write has landed in a
+        project nobody approved it for.
+      - a tampered "candidate_id" makes content_md_path() look for the
+        staged content.md under the WRONG id-named subdirectory, which is
+        only discovered *after* _approve_orca_context_wiki() has already
+        written the new page into the target project's real wiki file and
+        bumped its content_version -- a partial, uncommitted write with no
+        matching "approved" candidate record to show for it. The same
+        tampered field also corrupts _terminal_transition's ledger/record
+        the same way "target_project" does.
+
+    Recomputing the expected path from the record's own fields with the
+    exact same containment-checked helper draft/amend use to create it
+    (candidate_path()), and requiring it to equal record_path (the file
+    find_candidate() actually opened), catches both variants -- and any
+    combination of the two -- before anything else runs.
+    """
+    try:
+        expected_path = candidate_path(root, record.get("target_project"), record.get("candidate_id"))
+    except PromoteFatal as exc:
+        raise PromoteValidationError(
+            "record_location_mismatch",
+            f"target_project/candidate_id no longer resolve to a valid PROMOTION_ROOT path: {exc}",
+        ) from exc
+    if expected_path != record_path.resolve(strict=False):
+        raise PromoteValidationError(
+            "record_location_mismatch",
+            "record's target_project/candidate_id fields do not match the file it was found in "
+            "(the on-disk record was likely tampered with after draft/amend)",
+        )
+
+
 def cmd_approve(args: argparse.Namespace) -> dict[str, Any]:
     approved_by = (args.approved_by or "").strip()
     rationale = (args.rationale or "").strip()
@@ -2058,8 +2331,27 @@ def cmd_approve(args: argparse.Namespace) -> dict[str, Any]:
             raise PromoteValidationError("candidate_not_found", args.candidate_id)
         record, record_path = found
 
+        # round-2-fix round-2 (post-NO-GO): confirm the record's own
+        # target_project/candidate_id fields still agree with the file
+        # find_candidate() actually found it under, BEFORE anything else
+        # (including the status check) trusts either field. See
+        # _verify_record_matches_found_location()'s own docstring for the
+        # exact target_project-redirect and candidate_id-mismatch exploits
+        # this closes.
+        _verify_record_matches_found_location(root, record, record_path)
+
         if record.get("status") != "pending_approval":
             raise PromoteValidationError("candidate_not_pending", f"status is {record.get('status')!r}")
+
+        # round-2-fix P0: re-validate every field this candidate record
+        # carries, using the SAME checks draft/amend already ran, before
+        # any of it is trusted to build a filesystem path. See
+        # _revalidate_record_for_approve()'s own docstring and
+        # resolve_knowledge_md_path()'s docstring for the exact exploit
+        # this closes. Deliberately placed BEFORE the catalog is even
+        # loaded -- a record that fails this check is refused on its own
+        # terms, independent of anything catalog.json says.
+        _revalidate_record_for_approve(record)
 
         source = record.get("source") if isinstance(record.get("source"), dict) else {}
         mechanism = source.get("mechanism")
@@ -2134,32 +2426,61 @@ def _terminal_transition(args: argparse.Namespace, *, new_status: str, action: s
         raise PromoteUsageError("empty_rationale")
 
     root = ensure_promotion_root()
-    found = find_candidate(root, args.candidate_id)
-    if found is None:
-        raise PromoteValidationError("candidate_not_found", args.candidate_id)
-    record, _record_path = found
-    if record.get("status") != "pending_approval":
-        raise PromoteValidationError("candidate_not_pending", f"status is {record.get('status')!r}")
+    # round-2-fix P1: this read-check-write sequence used to run with NO
+    # lock at all, while draft/amend/approve all serialize against each
+    # other under the same PROMOTION_ROOT lock. That let reject/withdraw
+    # race a concurrent approve on the SAME candidate: approve can finish
+    # writing the target project's wiki file and be partway through saving
+    # its own "status: approved" candidate record when an unlocked
+    # reject/withdraw reads the still-"pending_approval" record, decides it
+    # is a valid transition, and writes "status: rejected" over it --
+    # either clobbering approve's own write outright, or leaving a
+    # "rejected" record for a candidate whose wiki write actually landed on
+    # disk (the two states most needed to stay consistent for this ledger
+    # to mean anything). Holding the same lock draft/amend/approve already
+    # use makes this transition's own read-check-write atomic with respect
+    # to every other subcommand of this tool.
+    lock_path = acquire_lock(root)
+    try:
+        found = find_candidate(root, args.candidate_id)
+        if found is None:
+            raise PromoteValidationError("candidate_not_found", args.candidate_id)
+        record, record_path = found
 
-    decided_at = now_iso()
-    record["status"] = new_status
-    record["decided_by"] = decided_by
-    record["rationale"] = rationale
-    record["decided_at"] = decided_at
-    record["updated_at"] = decided_at
-    save_candidate(root, record)
-    append_ledger(
-        root,
-        {
-            "ts": decided_at,
-            "action": action,
-            "candidate_id": record["candidate_id"],
-            "target_project": record["target_project"],
-            "proposed_target": record["proposed_target"],
-            "status": new_status,
-            "decided_by": decided_by,
-        },
-    )
+        # round-2-fix round-2 (post-NO-GO): same integrity check cmd_approve
+        # now runs -- see _verify_record_matches_found_location()'s
+        # docstring. Without it, a tampered "target_project"/"candidate_id"
+        # makes this transition's own save_candidate() call below write the
+        # "rejected"/"withdrawn" record into a different PROMOTION_ROOT
+        # subdirectory than the one it was actually found in, leaving the
+        # original file behind still showing "pending_approval" -- the same
+        # split-record inconsistency the approve path is protected against.
+        _verify_record_matches_found_location(root, record, record_path)
+
+        if record.get("status") != "pending_approval":
+            raise PromoteValidationError("candidate_not_pending", f"status is {record.get('status')!r}")
+
+        decided_at = now_iso()
+        record["status"] = new_status
+        record["decided_by"] = decided_by
+        record["rationale"] = rationale
+        record["decided_at"] = decided_at
+        record["updated_at"] = decided_at
+        save_candidate(root, record)
+        append_ledger(
+            root,
+            {
+                "ts": decided_at,
+                "action": action,
+                "candidate_id": record["candidate_id"],
+                "target_project": record["target_project"],
+                "proposed_target": record["proposed_target"],
+                "status": new_status,
+                "decided_by": decided_by,
+            },
+        )
+    finally:
+        release_lock(lock_path)
     return {"candidate_id": record["candidate_id"], "status": new_status}
 
 

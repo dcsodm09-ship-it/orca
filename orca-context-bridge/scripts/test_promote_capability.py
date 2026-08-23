@@ -915,6 +915,349 @@ class ApproveOrcaContextWikiTests(PromoteCapabilityTestCase):
         after = (proj / "wiki" / "orca-context-wiki.json").read_bytes()
         self.assertEqual(before, after, "no write should happen when the guard's own hash pin fails")
 
+    def test_approve_commit_does_not_swallow_unrelated_pre_staged_file(self) -> None:
+        # round-2-fix: `git commit -m msg` with no pathspec commits the
+        # WHOLE index, not just what this call's own `git add` just staged.
+        # A caller that had already run its own unrelated `git add` in this
+        # SAME target project's working tree before invoking approve must
+        # never see that file swept into approve's own commit.
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a", content_md=None)
+
+        unrelated = proj / "UNRELATED_NOT_PART_OF_THIS_APPROVE.txt"
+        unrelated.write_text("staged by someone else, unrelated to this approve call\n", encoding="utf-8")
+        _run_git(["add", "--", str(unrelated)], proj)
+        status_before = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"], capture_output=True, text=True, check=True).stdout
+        self.assertIn("UNRELATED_NOT_PART_OF_THIS_APPROVE.txt", status_before)
+
+        code, result, _err = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code, 0, result)
+        self.assertTrue(result["git_committed"])
+
+        log = subprocess.run(
+            ["git", "-C", str(proj), "log", "-1", "--name-only", "--pretty=format:%s"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        self.assertNotIn(
+            "UNRELATED_NOT_PART_OF_THIS_APPROVE.txt",
+            log,
+            "approve's own commit must never include a file the caller staged for something else",
+        )
+        self.assertIn("wiki/orca-context-wiki.json", log)
+
+        # The unrelated file must still be sitting in the index afterward
+        # (approve must not have unstaged it either) -- it was simply never
+        # part of THIS commit.
+        status_after = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"], capture_output=True, text=True, check=True).stdout
+        self.assertIn(
+            "UNRELATED_NOT_PART_OF_THIS_APPROVE.txt",
+            status_after,
+            "the unrelated file must remain staged for the caller's own future commit",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Approve-time record re-validation (P0 regression): a candidate record file
+# living under PROMOTION_ROOT is JSON on disk that approve reads back
+# between draft and approve time. An earlier revision trusted every field
+# in it completely once draft had validated it once; a dual review
+# demonstrated that a candidate record tampered (or corrupted) on disk
+# between draft and approve -- specifically its "id" field, which
+# resolve_knowledge_md_path() uses directly to build a filesystem path --
+# let approve write a file OUTSIDE the target project root entirely, with
+# approve reporting status: "approved" and no error. These tests attack
+# that exact path end-to-end via the public CLI (draft -> tamper the
+# on-disk record -> approve), not via any internal shortcut, and assert on
+# the one signal that actually matters: no file landed outside the project
+# root.
+# ---------------------------------------------------------------------------
+
+
+class ApproveTimeRecordTamperingTests(PromoteCapabilityTestCase):
+    def _traversal_id_to(self, proj: Path, outside_target: Path) -> str:
+        """Build a page_id whose "/"-joined segments walk from
+        <proj>/wiki/knowledge/ to outside_target, purely lexically (the
+        directories involved need not exist yet)."""
+        knowledge_dir = proj / "wiki" / "knowledge"
+        rel = os.path.relpath(str(outside_target), start=str(knowledge_dir))
+        return rel.replace(os.sep, "/")
+
+    def test_approve_refuses_tampered_id_path_traversal_knowledge(self) -> None:
+        proj = self.make_project("declared-project")
+        self.write_catalog({"declared-project": proj})
+        code, result, _err = self.draft_knowledge("declared-project", id="legit-page")
+        self.assertEqual(code, 0, result)
+        candidate_id = result["candidate_id"]
+
+        # A directory that is a SIBLING of self.tmp's "projects" dir --
+        # unambiguously outside declared-project's own root, and outside
+        # every other fake project this test file could ever create too.
+        outside_target = self.tmp / "OUTSIDE_TARGET"
+        outside_target.mkdir(parents=True, exist_ok=True)
+        pwned_file = outside_target / "PWNED-file.md"
+
+        candidate_file = self.promotion_root / "declared-project" / f"{candidate_id}.json"
+        record = json.loads(candidate_file.read_text(encoding="utf-8"))
+        traversal_id = self._traversal_id_to(proj, outside_target)
+        self.assertIn("/", traversal_id, "the payload must actually contain a path separator to exercise the bug")
+        record["id"] = traversal_id
+        candidate_file.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        code2, result2, _err2 = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        # THE critical assertion: no file was written outside the project
+        # root, regardless of which exit code/reason approve settles on.
+        self.assertFalse(
+            pwned_file.exists(),
+            f"path-traversal write escaped the project root: {pwned_file} must not exist",
+        )
+        self.assertNotEqual(code2, 0, result2)
+        self.assertEqual(result2.get("reason"), "bad_id", result2)
+
+        # The candidate must not have been silently marked approved either.
+        after_record = json.loads(candidate_file.read_text(encoding="utf-8"))
+        self.assertEqual(after_record["status"], "pending_approval")
+
+    def test_approve_refuses_tampered_id_path_traversal_capability(self) -> None:
+        # Even though the "reusable-capabilities.json" branch never uses
+        # "id" to build a filesystem path directly (see
+        # _approve_reusable_capabilities), the SAME tampered-record threat
+        # model applies to it, and the fix (re-validate the whole record,
+        # not just knowledge candidates) must reject it too, on the same
+        # ID_RE grammar grounds, before it ever reaches the target file.
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code, result, _err = self.draft_capability("proj-a", id="my-cap")
+        self.assertEqual(code, 0, result)
+        candidate_id = result["candidate_id"]
+
+        candidate_file = self.promotion_root / "proj-a" / f"{candidate_id}.json"
+        record = json.loads(candidate_file.read_text(encoding="utf-8"))
+        record["id"] = "../../../etc/PWNED"
+        candidate_file.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        before = (proj / "wiki" / "reusable-capabilities.json").read_bytes()
+        code2, result2, _err2 = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertNotEqual(code2, 0, result2)
+        self.assertEqual(result2.get("reason"), "bad_id", result2)
+        after = (proj / "wiki" / "reusable-capabilities.json").read_bytes()
+        self.assertEqual(before, after, "no write should happen once the tampered id fails re-validation")
+
+    def test_approve_refuses_tampered_path_field(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code, result, _err = self.draft_capability("proj-a")
+        self.assertEqual(code, 0, result)
+        candidate_id = result["candidate_id"]
+
+        candidate_file = self.promotion_root / "proj-a" / f"{candidate_id}.json"
+        record = json.loads(candidate_file.read_text(encoding="utf-8"))
+        record["path"] = "../../../../etc/passwd"
+        candidate_file.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        code2, result2, _err2 = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertNotEqual(code2, 0, result2)
+        self.assertEqual(result2.get("reason"), "bad_field", result2)
+
+    def test_approve_refuses_tampered_operation(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code, result, _err = self.draft_capability("proj-a")
+        candidate_id = result["candidate_id"]
+        candidate_file = self.promotion_root / "proj-a" / f"{candidate_id}.json"
+        record = json.loads(candidate_file.read_text(encoding="utf-8"))
+        record["operation"] = "bogus_operation"
+        candidate_file.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        code2, result2, _err2 = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertNotEqual(code2, 0, result2)
+        self.assertEqual(result2.get("reason"), "bad_operation", result2)
+
+    def test_approve_still_succeeds_for_an_untampered_record(self) -> None:
+        # Sanity/non-regression: the new re-validation step must not reject
+        # a perfectly normal candidate that was never tampered with.
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code, result, _err = self.draft_capability("proj-a")
+        candidate_id = result["candidate_id"]
+        code2, result2, _err2 = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code2, 0, result2)
+
+
+class ApproveTargetProjectAndCandidateIdIntegrityTests(PromoteCapabilityTestCase):
+    """round-2-fix round-2 (post-NO-GO): a fully independent tamper vector
+    from ApproveTimeRecordTamperingTests above. "target_project" and
+    "candidate_id" both pass _revalidate_record_for_approve()'s format
+    checks trivially -- a real, catalog-known OTHER project name, or a
+    syntactically valid uuid-like string, is not itself malformed. The bug
+    is that save_candidate()/content_md_path() rebuild a path FROM these
+    record fields rather than reusing the path find_candidate() actually
+    found the record at. See _verify_record_matches_found_location()'s own
+    docstring for the full exploit description."""
+
+    def test_approve_refuses_target_project_redirected_to_another_catalog_project(self) -> None:
+        victim = self.make_project("victim")
+        attacker_owned = self.make_project("attacker-owned")
+        self.write_catalog({"victim": victim, "attacker-owned": attacker_owned})
+        code, result, _err = self.draft_capability("victim", id="my-cap")
+        self.assertEqual(code, 0, result)
+        candidate_id = result["candidate_id"]
+
+        candidate_file = self.promotion_root / "victim" / f"{candidate_id}.json"
+        record = json.loads(candidate_file.read_text(encoding="utf-8"))
+        record["target_project"] = "attacker-owned"
+        candidate_file.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        victim_before = (victim / "wiki" / "reusable-capabilities.json").read_bytes()
+        attacker_before = (attacker_owned / "wiki" / "reusable-capabilities.json").read_bytes()
+
+        code2, result2, _err2 = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertNotEqual(code2, 0, result2)
+        self.assertEqual(result2.get("reason"), "record_location_mismatch", result2)
+
+        # Neither project's real file was touched.
+        self.assertEqual(victim_before, (victim / "wiki" / "reusable-capabilities.json").read_bytes())
+        self.assertEqual(attacker_before, (attacker_owned / "wiki" / "reusable-capabilities.json").read_bytes())
+
+        # No split record: nothing was created under attacker-owned's
+        # PROMOTION_ROOT directory, and the original file still says
+        # pending_approval.
+        self.assertFalse((self.promotion_root / "attacker-owned").exists())
+        after_record = json.loads(candidate_file.read_text(encoding="utf-8"))
+        self.assertEqual(after_record["status"], "pending_approval")
+
+    def test_reject_refuses_target_project_redirected_to_another_catalog_project(self) -> None:
+        # Same tamper, exercised through _terminal_transition (reject)
+        # rather than approve -- reject/withdraw never touch a real target
+        # project file, but they DO call save_candidate(), which has the
+        # exact same rebuild-from-record-fields bug.
+        victim = self.make_project("victim")
+        attacker_owned = self.make_project("attacker-owned")
+        self.write_catalog({"victim": victim, "attacker-owned": attacker_owned})
+        code, result, _err = self.draft_capability("victim", id="my-cap")
+        self.assertEqual(code, 0, result)
+        candidate_id = result["candidate_id"]
+
+        candidate_file = self.promotion_root / "victim" / f"{candidate_id}.json"
+        record = json.loads(candidate_file.read_text(encoding="utf-8"))
+        record["target_project"] = "attacker-owned"
+        candidate_file.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        code2, result2, _err2 = run_cli_json(
+            ["reject", "--candidate-id", candidate_id, "--decided-by", "t", "--rationale", "r"]
+        )
+        self.assertNotEqual(code2, 0, result2)
+        self.assertEqual(result2.get("reason"), "record_location_mismatch", result2)
+        self.assertFalse((self.promotion_root / "attacker-owned").exists())
+        after_record = json.loads(candidate_file.read_text(encoding="utf-8"))
+        self.assertEqual(after_record["status"], "pending_approval")
+
+    def test_approve_refuses_candidate_id_field_mismatch_before_any_wiki_write(self) -> None:
+        # The dangerous variant: the FILE is found correctly (via the real
+        # --candidate-id CLI arg matching the real filename), but the
+        # record's internal "candidate_id" field -- used later by
+        # content_md_path() to locate the staged content.md -- has been
+        # changed to point somewhere else. Before this round's fix, this
+        # was only discovered AFTER _approve_orca_context_wiki() had
+        # already written the new page + bumped content_version into the
+        # target project's real wiki file (a partial write with no
+        # matching "approved" candidate record).
+        proj = self.make_project("proj-a", wiki_content_version=1)
+        self.write_catalog({"proj-a": proj})
+        code, result, _err = self.draft_knowledge("proj-a")
+        self.assertEqual(code, 0, result)
+        real_candidate_id = result["candidate_id"]
+
+        candidate_file = self.promotion_root / "proj-a" / f"{real_candidate_id}.json"
+        record = json.loads(candidate_file.read_text(encoding="utf-8"))
+        self.assertTrue(record["has_content_md"])
+        record["candidate_id"] = "cand-" + ("0" * 20)  # syntactically fine, just WRONG
+        candidate_file.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        wiki_path = proj / "wiki" / "orca-context-wiki.json"
+        before = wiki_path.read_bytes()
+
+        code2, result2, _err2 = run_cli_json(
+            ["approve", "--candidate-id", real_candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertNotEqual(code2, 0, result2)
+        self.assertEqual(result2.get("reason"), "record_location_mismatch", result2)
+
+        # THE critical assertion: the target project's real wiki file must
+        # be byte-for-byte untouched -- no partial write, no bumped
+        # content_version, nothing to roll back.
+        after = wiki_path.read_bytes()
+        self.assertEqual(before, after, "no write should reach the target project's wiki file once the id mismatch is caught")
+        after_doc = json.loads(after.decode("utf-8"))
+        self.assertEqual(after_doc["meta"]["content_version"], 1)
+        self.assertEqual(after_doc["pages"], [])
+
+    def test_approve_still_succeeds_with_untampered_target_project_and_candidate_id(self) -> None:
+        # Sanity/non-regression companion to the two attacks above.
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code, result, _err = self.draft_capability("proj-a")
+        candidate_id = result["candidate_id"]
+        code2, result2, _err2 = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code2, 0, result2)
+
+
+class ResolveKnowledgeMdPathContainmentTests(unittest.TestCase):
+    """Layer 2 in isolation: resolve_knowledge_md_path()'s own containment
+    check over the FINAL page_id-derived path, independent of the approve-
+    time re-validation tested above. Calling the function directly (not
+    through the CLI) proves this layer holds even if some future caller of
+    resolve_knowledge_md_path() ever skipped the upstream re-validation."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="knowledge-path-test-"))
+        self.addCleanup(shutil.rmtree, str(self.tmp), ignore_errors=True)
+        self.proj = self.tmp / "proj"
+        (self.proj / "wiki").mkdir(parents=True)
+
+    def test_traversal_page_id_refused(self) -> None:
+        outside = self.tmp / "OUTSIDE"
+        outside.mkdir()
+        rel = os.path.relpath(str(outside), start=str(self.proj / "wiki" / "knowledge"))
+        malicious_id = rel.replace(os.sep, "/") + "/PWNED"
+        with self.assertRaises(pc.PromoteFatal) as ctx:
+            pc.resolve_knowledge_md_path(self.proj, malicious_id)
+        self.assertEqual(ctx.exception.reason, "target_knowledge_path_escapes_knowledge_dir")
+        self.assertFalse((outside / "PWNED.md").exists())
+
+    def test_normal_page_id_still_resolves_inside_knowledge_dir(self) -> None:
+        result = pc.resolve_knowledge_md_path(self.proj, "a-normal-id")
+        expected = (self.proj / "wiki" / "knowledge" / "a-normal-id.md").resolve()
+        self.assertEqual(result, expected)
+
+    def test_nested_traversal_with_extra_segments_refused(self) -> None:
+        # A payload that dips outside and back in (still ends up escaping
+        # overall) must also be refused, not just a pure "../../.." prefix.
+        outside = self.tmp / "OUTSIDE2"
+        outside.mkdir()
+        rel = os.path.relpath(str(outside), start=str(self.proj / "wiki" / "knowledge"))
+        malicious_id = rel.replace(os.sep, "/") + "/nested/PWNED"
+        with self.assertRaises(pc.PromoteFatal):
+            pc.resolve_knowledge_md_path(self.proj, malicious_id)
+
 
 # ---------------------------------------------------------------------------
 # CLI: reject / withdraw
@@ -1155,6 +1498,66 @@ class AmendTests(PromoteCapabilityTestCase):
         )
         self.assertEqual(code, 0, result)
 
+    def test_amend_approve_refuses_proposed_target_retargeted_to_wiki(self) -> None:
+        # round-2-fix round-2 (post-NO-GO): cmd_amend() always hardcodes
+        # proposed_target to "reusable-capabilities.json" -- it is never
+        # legitimately "orca-context-wiki.json" for an amend_depends_on
+        # candidate. A record whose on-disk proposed_target is retargeted
+        # to "orca-context-wiki.json" while operation stays
+        # "amend_depends_on" must never reach _approve_orca_context_wiki(),
+        # which would otherwise write a page of literal nulls
+        # (id/title/path/status are all None on an amend record -- see
+        # cmd_amend) into the target project's real wiki file and commit
+        # it, reporting "approved" success.
+        proj = self.make_project("proj-a", wiki_content_version=1)
+        self._seed_published_capability(proj)
+        self.write_catalog({"proj-a": proj})
+        code, result, _err = run_cli_json(
+            [
+                "amend",
+                "--target-project",
+                "proj-a",
+                "--target",
+                "script:base.py",
+                "--add-depends-on",
+                "script:other.py",
+                "--source",
+                "human",
+                "--catalog",
+                str(self.catalog_path),
+            ]
+        )
+        self.assertEqual(code, 0, result)
+        candidate_id = result["candidate_id"]
+
+        candidate_file = self.promotion_root / "proj-a" / f"{candidate_id}.json"
+        record = json.loads(candidate_file.read_text(encoding="utf-8"))
+        self.assertEqual(record["operation"], "amend_depends_on")
+        record["proposed_target"] = "orca-context-wiki.json"
+        candidate_file.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        wiki_path = proj / "wiki" / "orca-context-wiki.json"
+        before = wiki_path.read_bytes()
+        caps_before = (proj / "wiki" / "reusable-capabilities.json").read_bytes()
+
+        code2, result2, _err2 = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertNotEqual(code2, 0, result2)
+        self.assertEqual(result2.get("reason"), "bad_proposed_target_for_operation", result2)
+
+        after = wiki_path.read_bytes()
+        self.assertEqual(before, after, "no null-field page may be written to the target wiki")
+        after_doc = json.loads(after.decode("utf-8"))
+        self.assertEqual(after_doc["meta"]["content_version"], 1)
+        self.assertEqual(after_doc["pages"], [])
+        self.assertEqual(caps_before, (proj / "wiki" / "reusable-capabilities.json").read_bytes())
+
+        log = subprocess.run(
+            ["git", "-C", str(proj), "log", "--oneline"], capture_output=True, text=True, check=True
+        ).stdout
+        self.assertNotIn("promote_capability: approve", log)
+
 
 # ---------------------------------------------------------------------------
 # Concurrency-lock regression tests.
@@ -1325,6 +1728,205 @@ class ConcurrencyLockTests(PromoteCapabilityTestCase):
 
         pending = pc.list_project_candidates(self.promotion_root, "proj-dup")
         self.assertEqual(len(pending), 1, pending)
+
+    def test_concurrent_reject_during_approve_does_not_corrupt_ledger(self) -> None:
+        # round-2-fix P1: _terminal_transition() (shared by reject/withdraw)
+        # used to run its whole read-check-write sequence with NO lock at
+        # all, while draft/amend/approve all serialize under the same
+        # PROMOTION_ROOT lock. A dual review demonstrated this let
+        # reject/withdraw race a concurrent approve on the SAME pending
+        # candidate: on the unfixed code this test reliably (independently
+        # reproduced 5/5 runs outside this suite) got BOTH commands to
+        # report success, leaving promotion-ledger.jsonl with an "approve"
+        # AND a "reject" event for the identical candidate_id -- a
+        # self-contradictory audit trail no reader of that ledger could
+        # trust. Widen the same way the other tests in this class do: slow
+        # down a function approve calls WHILE it holds the lock
+        # (load_catalog, called right after acquire_lock in cmd_approve) so
+        # a concurrent reject has a real window to attempt to run.
+        proj = self.make_project("proj-race2")
+        self.write_catalog({"proj-race2": proj})
+        code0, result0, _e0 = self.draft_capability("proj-race2", id="race2-cap", name="race2.py")
+        self.assertEqual(code0, 0, result0)
+        candidate_id = result0["candidate_id"]
+
+        real_load_catalog = pc.load_catalog
+        slow = threading.local()
+
+        def patched(path: Path):
+            result = real_load_catalog(path)
+            if getattr(slow, "on", False):
+                time.sleep(0.5)
+            return result
+
+        pc.load_catalog = patched
+        self.addCleanup(setattr, pc, "load_catalog", real_load_catalog)
+
+        outcomes: dict[str, tuple[int, dict, str]] = {}
+
+        def approve_worker() -> None:
+            slow.on = True
+            outcomes["approve"] = run_cli_json(
+                [
+                    "approve",
+                    "--candidate-id",
+                    candidate_id,
+                    "--catalog",
+                    str(self.catalog_path),
+                    "--approved-by",
+                    "t",
+                    "--rationale",
+                    "race",
+                ]
+            )
+
+        def reject_worker() -> None:
+            slow.on = False
+            outcomes["reject"] = run_cli_json(
+                ["reject", "--candidate-id", candidate_id, "--decided-by", "t", "--rationale", "concurrent reject attempt"]
+            )
+
+        t_approve = threading.Thread(target=approve_worker)
+        t_reject = threading.Thread(target=reject_worker)
+        t_approve.start()
+        time.sleep(0.15)  # let approve acquire the lock and enter the slowed load_catalog()
+        t_reject.start()
+        t_approve.join(timeout=5)
+        t_reject.join(timeout=5)
+
+        code_approve, res_approve, _ = outcomes["approve"]
+        code_reject, res_reject, _ = outcomes["reject"]
+
+        # approve must win this race (it started first and got the lock
+        # first); reject must fail CLEANLY, never silently succeed while
+        # approve is also in flight on the same candidate.
+        self.assertEqual(code_approve, 0, res_approve)
+        self.assertIn(code_reject, (1, 4), res_reject)
+        self.assertIn(res_reject.get("reason"), ("lock_held", "candidate_not_pending"), res_reject)
+
+        ledger_lines = (self.promotion_root / pc.LEDGER_NAME).read_text(encoding="utf-8").strip().splitlines()
+        actions_for_candidate = [
+            entry["action"] for entry in (json.loads(line) for line in ledger_lines) if entry.get("candidate_id") == candidate_id
+        ]
+        # THE critical assertion: never both an "approve" and a "reject"
+        # ledger entry for the identical candidate_id.
+        self.assertNotIn("reject", actions_for_candidate, actions_for_candidate)
+        self.assertIn("approve", actions_for_candidate, actions_for_candidate)
+
+        final_record = json.loads((self.promotion_root / "proj-race2" / f"{candidate_id}.json").read_text(encoding="utf-8"))
+        self.assertEqual(final_record["status"], "approved")
+        doc = json.loads((proj / "wiki" / "reusable-capabilities.json").read_text(encoding="utf-8"))
+        self.assertEqual([e["id"] for e in doc["capabilities"]], ["race2-cap"], "the real write must match the final 'approved' status")
+
+    def test_concurrent_withdraw_during_approve_does_not_corrupt_ledger(self) -> None:
+        # Same race as above, for withdraw (the other caller of the shared
+        # _terminal_transition()) -- both callers share the same fix, but
+        # each has its own dedicated test rather than assuming symmetry.
+        proj = self.make_project("proj-race3")
+        self.write_catalog({"proj-race3": proj})
+        code0, result0, _e0 = self.draft_capability("proj-race3", id="race3-cap", name="race3.py")
+        self.assertEqual(code0, 0, result0)
+        candidate_id = result0["candidate_id"]
+
+        real_load_catalog = pc.load_catalog
+        slow = threading.local()
+
+        def patched(path: Path):
+            result = real_load_catalog(path)
+            if getattr(slow, "on", False):
+                time.sleep(0.5)
+            return result
+
+        pc.load_catalog = patched
+        self.addCleanup(setattr, pc, "load_catalog", real_load_catalog)
+
+        outcomes: dict[str, tuple[int, dict, str]] = {}
+
+        def approve_worker() -> None:
+            slow.on = True
+            outcomes["approve"] = run_cli_json(
+                [
+                    "approve",
+                    "--candidate-id",
+                    candidate_id,
+                    "--catalog",
+                    str(self.catalog_path),
+                    "--approved-by",
+                    "t",
+                    "--rationale",
+                    "race",
+                ]
+            )
+
+        def withdraw_worker() -> None:
+            slow.on = False
+            outcomes["withdraw"] = run_cli_json(
+                ["withdraw", "--candidate-id", candidate_id, "--decided-by", "t", "--rationale", "concurrent withdraw attempt"]
+            )
+
+        t_approve = threading.Thread(target=approve_worker)
+        t_withdraw = threading.Thread(target=withdraw_worker)
+        t_approve.start()
+        time.sleep(0.15)
+        t_withdraw.start()
+        t_approve.join(timeout=5)
+        t_withdraw.join(timeout=5)
+
+        code_approve, res_approve, _ = outcomes["approve"]
+        code_withdraw, res_withdraw, _ = outcomes["withdraw"]
+        self.assertEqual(code_approve, 0, res_approve)
+        self.assertIn(code_withdraw, (1, 4), res_withdraw)
+        self.assertIn(res_withdraw.get("reason"), ("lock_held", "candidate_not_pending"), res_withdraw)
+
+        ledger_lines = (self.promotion_root / pc.LEDGER_NAME).read_text(encoding="utf-8").strip().splitlines()
+        actions_for_candidate = [
+            entry["action"] for entry in (json.loads(line) for line in ledger_lines) if entry.get("candidate_id") == candidate_id
+        ]
+        self.assertNotIn("withdraw", actions_for_candidate, actions_for_candidate)
+        self.assertIn("approve", actions_for_candidate, actions_for_candidate)
+
+    def test_stale_lock_grants_exactly_one_concurrent_caller(self) -> None:
+        # Verification, not a fix: an independent review flagged a possible
+        # "two callers can both succeed against a stale lock" race. Real
+        # concurrent attempts (both here via threads, and separately via
+        # real independent OS processes outside this suite, 40/40 trials)
+        # never produced more than one simultaneous acquirer -- os.open's
+        # O_CREAT|O_EXCL is atomic at the OS level, and acquire_lock()'s
+        # retry loop only permits ONE stale-unlink-and-retry per call. This
+        # test pins that property down so a future change to acquire_lock()
+        # that broke it would be caught here.
+        base_dir = self.tmp / "lock-race-dir"
+        base_dir.mkdir()
+        lock_path = base_dir / pc.LOCK_NAME
+        lock_path.write_text('{"pid": 999999, "started_at": "stale"}', encoding="utf-8")
+        stale_time = time.time() - (pc.LOCK_STALE_SECONDS + 1)
+        os.utime(str(lock_path), (stale_time, stale_time))
+
+        barrier = threading.Barrier(2)
+        results: list[str] = []
+        results_lock = threading.Lock()
+
+        def worker() -> None:
+            try:
+                barrier.wait(timeout=5)
+            except threading.BrokenBarrierError:
+                pass
+            try:
+                pc.acquire_lock(base_dir)
+                outcome = "acquired"
+            except pc.PromoteFatal as exc:
+                outcome = f"failed:{exc.reason}"
+            with results_lock:
+                results.append(outcome)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        acquired_count = sum(1 for r in results if r == "acquired")
+        self.assertEqual(acquired_count, 1, results)
 
 
 # ---------------------------------------------------------------------------
