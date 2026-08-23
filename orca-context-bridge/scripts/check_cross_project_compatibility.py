@@ -1231,16 +1231,99 @@ def _drain_and_wait(proc: subprocess.Popen, deadline: float) -> tuple[bytes, boo
                 # retained then sliced later. This is the actual memory
                 # bound; `totals[fd]` alone tracks whether more arrived.
 
+    # Fix-round addition (independently reproduced P1, two variants): the
+    # process-group id is captured HERE, before any wait/reap can happen
+    # below, and used as the fixed kill target for the rest of this
+    # function. os.getpgid(proc.pid) would raise ProcessLookupError once
+    # `proc` has been reaped -- but start_new_session=True guarantees the
+    # GROUP itself was created equal to the direct child's own pid at
+    # spawn time, and a process group persists past its founding member's
+    # exit as long as any other member (e.g. a forked grandchild) is
+    # still in it. Capturing the id now, while `proc` is still guaranteed
+    # alive (Popen just returned successfully), keeps the kill target
+    # valid regardless of when -- or whether -- the direct child gets
+    # reaped first.
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        pgid = None  # should not happen this soon after a successful Popen
+
     timed_out = False
     try:
         # Phase 1: read until both streams hit EOF or the declared deadline.
         _read_until(deadline)
-        if open_fds:
-            timed_out = True
+
+        # BUG FIXED HERE (independent review, two reproduced variants):
+        # `open_fds` emptying out only proves this check_command's own
+        # stdout/stderr pipes hit EOF -- it does NOT prove the check (or
+        # anything it spawned into the same process group) has actually
+        # finished running. A direct child that closes/redirects fd 1/2
+        # while continuing to run past its declared timeout, or a forked
+        # grandchild that closes its own copies of those fds while a
+        # short-lived direct child immediately os._exit()s, both make
+        # `open_fds` empty long before anything in the group is actually
+        # done -- the second case is the more severe of the two: it was
+        # reported back as a false PASS (timed_out=False, exit_code=0)
+        # while the grandchild kept running, un-killed.
+        #
+        # Signal A (unchanged from before the fix): the pipes never both
+        # reached EOF by the deadline. Kept as-is because it is still the
+        # ONLY signal that can catch a setsid()-escaped descendant -- one
+        # that left the process group entirely and so cannot be reached
+        # by the os.killpg() call below at all (see this function's own
+        # docstring on that accepted, out-of-scope residual), but that
+        # can still be holding the inherited pipe write end open.
+        pipes_still_open = bool(open_fds)
+
+        # Signal B (the fix): whether anything is still alive in the
+        # check_command's process GROUP once its declared budget is
+        # exhausted -- deliberately not `proc.poll()` on the direct
+        # child alone, since a direct child that has already exited
+        # (e.g. via os._exit() immediately after forking) can leave a
+        # grandchild that inherited the same process group still
+        # running, and `proc.poll()` alone would miss that grandchild
+        # entirely (this is exactly the false-pass variant above).
+        if not pipes_still_open:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                # Phase 1 returned early because both pipes hit EOF, not
+                # because the deadline arrived. Give the direct child
+                # the rest of its declared budget to actually finish
+                # before deciding anything is stuck -- a fast,
+                # well-behaved check that happens to close its own
+                # stdio early and then exits cleanly BEFORE the deadline
+                # must still be reported as a normal success, not
+                # killed.
+                try:
+                    proc.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    pass
+
+        # Sending SIGKILL straight to the group and reading whether that
+        # raised (nothing left to signal) IS the group-scoped equivalent
+        # of "is it still running": it relies on the same os.killpg()
+        # primitive this function already used before the fix, never on
+        # pipe state, and deliberately does not track individual
+        # descendant PIDs. On this platform (confirmed empirically), a
+        # group whose only remaining member is an unreaped zombie --
+        # e.g. the direct child's own zombie, after everything else
+        # (such as a setsid()-escaped descendant) has left the group --
+        # raises PermissionError rather than ProcessLookupError; a group
+        # with a genuinely live member (direct child or descendant)
+        # always succeeds regardless of whether the direct child itself
+        # has already been reaped. Both exceptions mean the same thing
+        # here: nothing reachable in this group is actually alive.
+        group_was_alive = False
+        if pgid is not None:
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass  # already exited on its own between the timeout firing and this line
+                os.killpg(pgid, signal.SIGKILL)
+                group_was_alive = True
+            except (ProcessLookupError, PermissionError):
+                group_was_alive = False
+
+        timed_out = pipes_still_open or group_was_alive
+
+        if timed_out:
             # Phase 2: one short, SEPARATELY-bounded best-effort drain after
             # the kill. A descendant that stayed IN the process group dies
             # immediately, so this returns almost instantly; a grandchild

@@ -821,6 +821,146 @@ class ProcessGroupTimeoutTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Fix-round regression tests: the timeout-kill decision in _drain_and_wait()
+# was gated on `open_fds` (pipe state) rather than actual process/group
+# liveness. A check_command that closed or redirected its own stdout/stderr
+# (fd 1/2) before its declared timeout elapsed made `open_fds` empty EARLY,
+# so the tool's only os.killpg() call was never reached even though the
+# process (or, in the more severe variant, a forked grandchild) was still
+# running well past both the declared timeout and the
+# --timeout-ceiling-seconds ceiling.
+# ---------------------------------------------------------------------------
+
+
+class StdioClosedButProcessAliveTimeoutTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="ccc-run-stdio-closed-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_direct_child_closes_stdio_then_outlives_timeout_is_killed(self) -> None:
+        """Variant 1: the direct child itself closes fd 1/2 immediately,
+        then keeps running well past its declared timeout. Pre-fix,
+        `open_fds` emptied out right away (both pipes hit EOF as soon as
+        the child closed its own copies), `timed_out` stayed False
+        forever, and the tool returned after PROCESS_WAIT_GRACE_SECONDS
+        with `timed_out: False, exit_code: None` while the child was
+        still alive and running."""
+        pidfile = self.tmp / "child.pid"
+        script = self.tmp / "close_and_sleep.py"
+        script.write_text(
+            "import os, time\n"
+            f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+            "os.close(1)\n"
+            "os.close(2)\n"
+            "time.sleep(20)\n",
+            encoding="utf-8",
+        )
+        start = time.monotonic()
+        outcome = ccc._run_one_check([sys.executable, str(script)], self.tmp, 1.0)
+        elapsed = time.monotonic() - start
+
+        self.assertTrue(outcome["timed_out"], outcome)
+        # Killed by SIGKILL -- Popen reports this as returncode -SIGKILL,
+        # never as a clean 0 or an unresolved None.
+        self.assertEqual(outcome["exit_code"], -signal.SIGKILL, outcome)
+        self.assertLess(
+            elapsed,
+            1.0 + ccc.PROCESS_GROUP_KILL_DRAIN_GRACE_SECONDS + ccc.PROCESS_WAIT_GRACE_SECONDS + 5.0,
+        )
+
+        pid = int(pidfile.read_text(encoding="utf-8").strip())
+        self.assertTrue(
+            _wait_until_process_gone(pid),
+            "child that closed its own stdio survived past its declared timeout -- P1 regressed",
+        )
+
+    def test_forked_grandchild_survives_direct_child_exit_and_is_killed(self) -> None:
+        """Variant 2, the more severe repro: the direct child forks a
+        grandchild that closes fd 1/2 and keeps running, while the direct
+        child itself exits immediately with os._exit(0). Neither process
+        ever calls os.setsid() -- the grandchild stays in the SAME
+        process group os.killpg() targets. Pre-fix this was a FALSE PASS:
+        both pipes hit EOF almost instantly (the direct child's exit and
+        the grandchild's own fd-close each drop a reference to the pipe's
+        write end), so the tool returned `timed_out: False, exit_code: 0`
+        -- a clean, honestly-reported "success" for the direct child --
+        while the grandchild kept running un-killed."""
+        pidfile = self.tmp / "grandchild.pid"
+        script = self.tmp / "fork_and_exit.py"
+        script.write_text(
+            "import os, time\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n"
+            # Write the pidfile BEFORE closing fd 1/2 (not after) -- this
+            # is a deliberate ordering, not cosmetic: closing fd 1/2 is
+            # what can make the parent's read loop observe EOF and race
+            # ahead to killing this process, so the pidfile write must
+            # be guaranteed (by program order within THIS process) to
+            # have already landed before that close call even happens.
+            f"    open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+            "    os.close(1)\n"
+            "    os.close(2)\n"
+            "    time.sleep(20)\n"
+            "    os._exit(0)\n"
+            "else:\n"
+            "    os._exit(0)\n",
+            encoding="utf-8",
+        )
+        start = time.monotonic()
+        outcome = ccc._run_one_check([sys.executable, str(script)], self.tmp, 1.0)
+        elapsed = time.monotonic() - start
+
+        # The direct child's own exit code (0, from os._exit(0)) is
+        # honestly reported -- that part is correct and unchanged. The
+        # fix is that `timed_out` must now be True precisely because
+        # something in its process group was still alive at the
+        # deadline, which is what stops callers from treating
+        # (exit_code=0, timed_out=False) as a trustworthy clean pass.
+        self.assertEqual(outcome["exit_code"], 0, outcome)
+        self.assertTrue(
+            outcome["timed_out"],
+            "false pass: reported timed_out=False while the grandchild was still alive -- " + repr(outcome),
+        )
+        self.assertLess(
+            elapsed,
+            1.0 + ccc.PROCESS_GROUP_KILL_DRAIN_GRACE_SECONDS + ccc.PROCESS_WAIT_GRACE_SECONDS + 5.0,
+        )
+
+        deadline = time.monotonic() + 3.0
+        pid = None
+        while time.monotonic() < deadline:
+            if pidfile.exists():
+                content = pidfile.read_text(encoding="utf-8").strip()
+                if content:
+                    pid = int(content)
+                    break
+            time.sleep(0.05)
+        self.assertIsNotNone(pid, "grandchild never wrote its own pid -- fixture race, not what's under test")
+        self.assertTrue(
+            _wait_until_process_gone(pid),
+            "grandchild survived past the parent's timeout-triggered group kill -- P1 (false pass) regressed",
+        )
+
+    def test_closes_stdio_early_but_exits_cleanly_before_deadline_is_still_a_normal_success(self) -> None:
+        """Regression guard for the fix's own precision: a fast,
+        well-behaved check that happens to close its own stdout/stderr
+        early and then exits cleanly BEFORE the declared deadline must
+        stay a normal, non-timed-out success -- the fix must only change
+        behavior for processes still ALIVE at the deadline, not for every
+        check that merely touches fd 1/2."""
+        script = self.tmp / "close_then_exit_fast.py"
+        script.write_text(
+            "import os\nos.close(1)\nos.close(2)\n",
+            encoding="utf-8",
+        )
+        outcome = ccc._run_one_check([sys.executable, str(script)], self.tmp, 10.0)
+        self.assertFalse(outcome["timed_out"], outcome)
+        self.assertEqual(outcome["exit_code"], 0, outcome)
+
+
+# ---------------------------------------------------------------------------
 # Authorization + affected-set gating
 # ---------------------------------------------------------------------------
 
@@ -1131,6 +1271,76 @@ class RunEndToEndTests(unittest.TestCase):
         self.assertEqual(check["declared_timeout_seconds"], 1000.0)
         self.assertEqual(check["effective_timeout_seconds"], 1.0)
         self.assertTrue(check["timed_out"])
+
+    def test_false_pass_from_orphaned_grandchild_is_not_reported_as_a_clean_run(self) -> None:
+        """End-to-end regression for the more severe of the two P1
+        variants (see StdioClosedButProcessAliveTimeoutTests): a
+        check_command's direct process forks a grandchild that closes
+        its own stdio and keeps running past the declared timeout, while
+        the direct process itself exits 0 immediately -- no setsid(), so
+        the grandchild stays in the SAME process group. Pre-fix,
+        run_compatibility_checks() -- which treats `exit_code == 0 and
+        not timed_out` as a genuine success -- could report the whole
+        run as exit_code=0 while that grandchild was silently still
+        running. Post-fix, the individual check is correctly flagged
+        timed_out=True, which flips the run's overall exit_code to 1
+        (any_failed_or_timed_out) even though the direct child's own
+        exit_code is an honest 0."""
+        global_id = "t#x"
+        dep_dir = make_project_dir(self.tmp, "dep")
+        pidfile = self.tmp / "grandchild.pid"
+        script = self.tmp / "fork_and_exit.py"
+        script.write_text(
+            "import os, time\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n"
+            # Write the pidfile BEFORE closing fd 1/2 (not after) -- see
+            # the identical fixture in StdioClosedButProcessAliveTimeout
+            # Tests for why this ordering isn't cosmetic.
+            f"    open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+            "    os.close(1)\n"
+            "    os.close(2)\n"
+            "    time.sleep(20)\n"
+            "    os._exit(0)\n"
+            "else:\n"
+            "    os._exit(0)\n",
+            encoding="utf-8",
+        )
+        write_compat_check(
+            dep_dir,
+            [
+                make_check_entry(
+                    depends_on_ref=global_id,
+                    check_command=[sys.executable, str(script)],
+                    timeout_seconds=1,
+                )
+            ],
+        )
+        catalog = make_affected_catalog(global_id, "dep", projects=[make_project_row("dep", dep_dir)])
+        result = _run_compat(
+            catalog=catalog, global_id=global_id, authorize_project=["dep"], compat_runs_root=self.runs_root
+        )
+        check = result["projects"][0]["checks"][0]
+        self.assertEqual(check["exit_code"], 0, check)
+        self.assertTrue(check["timed_out"], check)
+        self.assertEqual(
+            result["exit_code"],
+            1,
+            "run reported a clean pass (exit_code != 1) while a grandchild was still running -- false pass regressed: "
+            + repr(result),
+        )
+
+        deadline = time.monotonic() + 3.0
+        pid = None
+        while time.monotonic() < deadline:
+            if pidfile.exists():
+                content = pidfile.read_text(encoding="utf-8").strip()
+                if content:
+                    pid = int(content)
+                    break
+            time.sleep(0.05)
+        self.assertIsNotNone(pid, "grandchild never wrote its own pid -- fixture race, not what's under test")
+        self.assertTrue(_wait_until_process_gone(pid), "grandchild survived the full run -- false pass regressed")
 
     def test_lock_released_before_execution_phase_does_not_deadlock(self) -> None:
         global_id = "t#x"
