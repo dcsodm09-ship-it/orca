@@ -40,11 +40,25 @@ import promote_capability as pc  # noqa: E402
 # ---------------------------------------------------------------------------
 # Module-wide safety net: prove the REAL repository's git state is untouched
 # by this entire test run, no matter which tests execute. Read-only diff
-# only -- `git status --porcelain`, never a write command, against the real
-# repo this test file happens to live inside.
+# only -- `git status --porcelain`, never a write command.
+#
+# FIXED absolute path, deliberately NOT Path(__file__).resolve().parents[2]:
+# this file is deployed to two locations -- the tracked workspace
+# (orca-context-bridge/scripts/, three levels under the real repo root, where
+# the old relative derivation happened to be correct) and
+# ~/.agents/skills/orca-context-bridge/scripts/ (not a git checkout at all,
+# where that same derivation resolves to something with no .git and this
+# module's own setUpModule() sanity check fails before a single test can
+# run). This is exactly the AUTHORITY_TRACKED_PATHS relocate-time lesson M8
+# Gate A already hit once this session, applied here to a test-only
+# constant rather than a production write path -- same root cause (a path
+# pinned relative to wherever this file happens to be deployed, not to
+# where it actually needs to point), lower stakes (this only breaks the
+# test suite's own precondition check, not a real write), same fix (a fixed
+# absolute path, independent of deployment location).
 # ---------------------------------------------------------------------------
 
-REAL_REPO_ROOT = Path(__file__).resolve().parents[2]
+REAL_REPO_ROOT = Path("/Volumes/Extreme SSD/Orca/workspaces/orca/完善orca")
 _REAL_REPO_STATUS_BEFORE: str | None = None
 
 
