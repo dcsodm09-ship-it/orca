@@ -1,0 +1,1452 @@
+#!/usr/bin/env python3
+"""Unit + isolation tests for promote_capability.py (M8-3, Gate B).
+
+SAFETY INVARIANT THIS FILE EXISTS TO PROVE (see module docstring below and
+setUpModule/tearDownModule): every single test in this file operates on
+fake projects built fresh under tempfile.mkdtemp(), each with its own
+independent `git init` repository -- NEVER the real "完善orca" repository
+this test file itself lives in, and NEVER any other real project on this
+machine. setUpModule()/tearDownModule() snapshot `git status --porcelain`
+of the real repo before and after the ENTIRE test run and assert they are
+byte-for-byte identical, regardless of which individual tests ran or in
+what order.
+
+Run with:
+    python3 -m unittest test_promote_capability.py -v
+(from this directory), or plain `python3 test_promote_capability.py`.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import promote_capability as pc  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Module-wide safety net: prove the REAL repository's git state is untouched
+# by this entire test run, no matter which tests execute. Read-only diff
+# only -- `git status --porcelain`, never a write command, against the real
+# repo this test file happens to live inside.
+# ---------------------------------------------------------------------------
+
+REAL_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REAL_REPO_STATUS_BEFORE: str | None = None
+
+
+def _real_repo_git_status() -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(REAL_REPO_ROOT), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    return proc.stdout
+
+
+def setUpModule() -> None:
+    global _REAL_REPO_STATUS_BEFORE
+    assert (REAL_REPO_ROOT / ".git").exists(), f"sanity check failed: {REAL_REPO_ROOT} does not look like the real repo"
+    _REAL_REPO_STATUS_BEFORE = _real_repo_git_status()
+
+
+def tearDownModule() -> None:
+    after = _real_repo_git_status()
+    if after != _REAL_REPO_STATUS_BEFORE:
+        raise AssertionError(
+            "REAL REPO GIT STATE CHANGED DURING THE TEST RUN -- this must never happen.\n"
+            f"--- before ---\n{_REAL_REPO_STATUS_BEFORE!r}\n--- after ---\n{after!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fixture helpers -- every path below is inside a tempfile.mkdtemp() tree.
+# ---------------------------------------------------------------------------
+
+
+def _run_git(args: list[str], cwd: Path) -> None:
+    subprocess.run(["git", "-C", str(cwd)] + args, capture_output=True, text=True, timeout=30, check=True)
+
+
+def make_fake_project(
+    base_dir: Path,
+    project_id: str,
+    *,
+    wiki_content_version: int = 1,
+    with_manifest_pin: bool = False,
+    add_script_file: str | None = "scripts/my_script.py",
+) -> Path:
+    """An independent fake project: its own `git init` repo, its own fake
+    wiki/*.json files. NEVER a subdirectory of the real repo."""
+    proj_dir = base_dir / "projects" / project_id.replace("/", "__")
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    _run_git(["init", "-q"], proj_dir)
+    _run_git(["config", "user.email", "test@example.invalid"], proj_dir)
+    _run_git(["config", "user.name", "Promote Capability Test"], proj_dir)
+
+    wiki_dir = proj_dir / "wiki"
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+    reusable = {"schema_version": 1, "project": project_id, "capabilities": []}
+    (wiki_dir / "reusable-capabilities.json").write_text(json.dumps(reusable, indent=2, ensure_ascii=False), encoding="utf-8")
+    wiki_doc = {
+        "version": 1,
+        "meta": {"content_version": wiki_content_version, "updated_at": "2026-08-01T00:00:00Z"},
+        "project": {"path": str(proj_dir)},
+        "pages": [],
+    }
+    (wiki_dir / "orca-context-wiki.json").write_text(json.dumps(wiki_doc, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    if add_script_file:
+        script_path = proj_dir / add_script_file
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        script_path.write_text("#!/usr/bin/env python3\n# dummy fixture script\n", encoding="utf-8")
+
+    if with_manifest_pin:
+        manifest_dir = proj_dir / ".orca" / "context"
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        (manifest_dir / "reviewed-startup-pack-manifest.json").write_text(
+            json.dumps({"schema_version": 2, "shared_source_sha256s": {"wiki": "0" * 64}}, indent=2),
+            encoding="utf-8",
+        )
+
+    _run_git(["add", "-A"], proj_dir)
+    _run_git(["commit", "-q", "-m", "fixture: initial fake project state"], proj_dir)
+    return proj_dir
+
+
+def _chmod_tree(path: Path, mode: int) -> None:
+    for root, dirs, files in os.walk(path):
+        for name in dirs:
+            os.chmod(os.path.join(root, name), mode)
+        for name in files:
+            os.chmod(os.path.join(root, name), mode)
+    os.chmod(str(path), mode)
+
+
+def make_catalog_file(
+    catalog_path: Path,
+    projects: dict[str, Path],
+    *,
+    capability_ref_index: dict[str, str] | None = None,
+) -> None:
+    doc = {
+        "projects": [{"project_id": pid, "real_path": str(path), "status": "ok"} for pid, path in projects.items()],
+        "capabilities": [],
+        "capability_ref_index": capability_ref_index or {},
+    }
+    catalog_path.write_text(json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def run_cli(argv: list[str]) -> tuple[int, str, str]:
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = pc.main(argv)
+    return code, out.getvalue(), err.getvalue()
+
+
+def run_cli_json(argv: list[str]) -> tuple[int, dict, str]:
+    code, out, err = run_cli(argv + ["--json"])
+    # Success prints its JSON body to stdout; _emit_error() prints its JSON
+    # body to stderr (see promote_capability.py's _emit_error). Fall back
+    # to stderr so callers get a real "reason" either way instead of {}.
+    body = out.strip() or err.strip()
+    parsed = json.loads(body) if body else {}
+    return code, parsed, err
+
+
+# ---------------------------------------------------------------------------
+# Base test case: isolated tmp tree + isolated PROMOTION_ROOT (module
+# constant monkeypatch -- promote_capability.py deliberately exposes no CLI
+# flag to override it, matching detect_capability_changes.py's own
+# established convention; see that script's module docstring).
+# ---------------------------------------------------------------------------
+
+
+class PromoteCapabilityTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="promote-cap-test-"))
+        self.addCleanup(shutil.rmtree, str(self.tmp), ignore_errors=True)
+        self.promotion_root = self.tmp / "promotion-root"
+        self._orig_root = pc.PROMOTION_ROOT
+        pc.PROMOTION_ROOT = self.promotion_root
+        self.addCleanup(self._restore_root)
+        self.catalog_path = self.tmp / "catalog.json"
+
+    def _restore_root(self) -> None:
+        pc.PROMOTION_ROOT = self._orig_root
+
+    def make_project(self, project_id: str, **kwargs) -> Path:
+        return make_fake_project(self.tmp, project_id, **kwargs)
+
+    def write_catalog(self, projects: dict[str, Path], **kwargs) -> None:
+        make_catalog_file(self.catalog_path, projects, **kwargs)
+
+    def draft_capability(self, project_id: str, **overrides) -> tuple[int, dict, str]:
+        payload = {
+            "target_project": project_id,
+            "proposed_target": "reusable-capabilities.json",
+            "id": "my-cap",
+            "kind": "script",
+            "name": "my_script.py",
+            "path": "scripts/my_script.py",
+            "summary": "A dummy capability for tests.",
+            "last_verified_at": None,
+            "depends_on": [],
+            "source": {"mechanism": "human"},
+        }
+        payload.update(overrides)
+        input_path = self.tmp / f"draft-input-{len(list(self.tmp.glob('draft-input-*')))}.json"
+        input_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return run_cli_json(["draft", "--from-json", str(input_path), "--catalog", str(self.catalog_path)])
+
+    def draft_knowledge(self, project_id: str, **overrides) -> tuple[int, dict, str]:
+        payload = {
+            "target_project": project_id,
+            "proposed_target": "orca-context-wiki.json",
+            "id": "x-algo-notes",
+            "title": "X 算法笔记",
+            "path": "wiki/knowledge/x-algo-notes.md",
+            "summary": "Notes about the X algorithm.",
+            "wiki_status": "promoted-unverified",
+            "content_md": "# X 算法笔记\n\n正文内容。\n",
+            "source": {"mechanism": "human"},
+        }
+        payload.update(overrides)
+        input_path = self.tmp / f"draft-input-{len(list(self.tmp.glob('draft-input-*')))}.json"
+        input_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return run_cli_json(["draft", "--from-json", str(input_path), "--catalog", str(self.catalog_path)])
+
+
+# ---------------------------------------------------------------------------
+# Unit-level tests: helpers, dedup algorithm, input validation
+# ---------------------------------------------------------------------------
+
+
+class NormalizeAndHashTests(unittest.TestCase):
+    def test_normalize_is_nfc_casefold(self) -> None:
+        # "Å" (U+00C5) vs "A" + combining ring (U+0041 U+030A) -- same
+        # grapheme, different code points until NFC-normalized.
+        composed = "Å"
+        decomposed = "Å"
+        self.assertEqual(pc._normalize(composed), pc._normalize(decomposed))
+        self.assertEqual(pc._normalize("ABC"), pc._normalize("abc"))
+
+    def test_compute_key_deterministic(self) -> None:
+        fields = {"kind": "script", "name": "foo.py", "title": None}
+        k1 = pc.compute_key("proj-a", "reusable-capabilities.json", fields)
+        k2 = pc.compute_key("proj-a", "reusable-capabilities.json", fields)
+        self.assertEqual(k1, k2)
+        self.assertEqual(len(k1), 64)
+
+    def test_compute_key_sensitive_to_project_kind_name(self) -> None:
+        base = pc.compute_key("proj-a", "reusable-capabilities.json", {"kind": "script", "name": "foo.py", "title": None})
+        other_project = pc.compute_key("proj-b", "reusable-capabilities.json", {"kind": "script", "name": "foo.py", "title": None})
+        other_name = pc.compute_key("proj-a", "reusable-capabilities.json", {"kind": "script", "name": "bar.py", "title": None})
+        knowledge = pc.compute_key("proj-a", "orca-context-wiki.json", {"kind": None, "name": None, "title": "foo.py"})
+        self.assertNotEqual(base, other_project)
+        self.assertNotEqual(base, other_name)
+        # Same literal name string, but knowledge vs capability namespace
+        # must not collide (design's kind_label discipline).
+        self.assertNotEqual(base, knowledge)
+
+    def test_compute_key_case_and_form_insensitive(self) -> None:
+        a = pc.compute_key("Proj-A", "reusable-capabilities.json", {"kind": "script", "name": "FOO.py", "title": None})
+        b = pc.compute_key("proj-a", "reusable-capabilities.json", {"kind": "script", "name": "foo.py", "title": None})
+        self.assertEqual(a, b)
+
+    def test_compute_content_hash_sensitive_to_summary_and_body(self) -> None:
+        h1 = pc.compute_content_hash({"summary": "a summary", "content_md": None})
+        h2 = pc.compute_content_hash({"summary": "a different summary", "content_md": None})
+        h3 = pc.compute_content_hash({"summary": "a summary", "content_md": "body text"})
+        self.assertNotEqual(h1, h2)
+        self.assertNotEqual(h1, h3)
+
+
+class KindValuesCrossFileEqualityTests(unittest.TestCase):
+    """§3.0.2's new mandate: any 'copy, don't import' constant gets a
+    cross-file equality test, not just a one-time assertion in prose. This
+    is exactly the failure class that already bit this repo for real
+    (agent_capacity.py's two diverged copies)."""
+
+    def test_kind_values_matches_validate_reusable_capabilities(self) -> None:
+        scripts_dir = Path(__file__).resolve().parent
+        sys.path.insert(0, str(scripts_dir))
+        import validate_reusable_capabilities as vrc  # noqa: E402
+
+        self.assertEqual(tuple(pc.KIND_VALUES), tuple(vrc.KIND_VALUES))
+
+    def test_kind_values_matches_build_cross_project_catalog(self) -> None:
+        # build_cross_project_catalog.py is not symlinked into this staging
+        # scripts/ dir (only validate_reusable_capabilities.py and
+        # wiki_edit_guard.py are), so fall back to the real deployed
+        # skill's copy. Skip gracefully if it is not present in this
+        # environment rather than failing a test on an unrelated deployment
+        # gap.
+        candidate_paths = [
+            Path.home() / ".agents" / "skills" / "orca-context-bridge" / "scripts" / "build_cross_project_catalog.py",
+        ]
+        found = next((p for p in candidate_paths if p.is_file()), None)
+        if found is None:
+            self.skipTest("build_cross_project_catalog.py not found on this machine; skipping cross-file check")
+        text = found.read_text(encoding="utf-8")
+        self.assertIn('KIND_VALUES = ("skill", "script", "config-pattern")', text)
+
+
+class CapabilityCandidateInputValidationTests(unittest.TestCase):
+    def test_happy_path(self) -> None:
+        fields = pc.validate_capability_candidate_input(
+            {
+                "id": "my-cap",
+                "kind": "script",
+                "name": "my_script.py",
+                "path": "scripts/my_script.py",
+                "summary": "does a thing",
+                "last_verified_at": None,
+                "depends_on": [],
+            }
+        )
+        self.assertEqual(fields["id"], "my-cap")
+        self.assertEqual(fields["kind"], "script")
+
+    def test_bad_kind_rejected(self) -> None:
+        with self.assertRaises(pc.PromoteValidationError):
+            pc.validate_capability_candidate_input(
+                {"id": "x", "kind": "bogus", "name": "n", "path": "p.py", "summary": "s"}
+            )
+
+    def test_bad_id_grammar_rejected(self) -> None:
+        with self.assertRaises(pc.PromoteValidationError):
+            pc.validate_capability_candidate_input(
+                {"id": "Not_Valid", "kind": "script", "name": "n.py", "path": "p.py", "summary": "s"}
+            )
+
+    def test_path_traversal_rejected(self) -> None:
+        with self.assertRaises(pc.PromoteValidationError):
+            pc.validate_capability_candidate_input(
+                {"id": "x", "kind": "script", "name": "n.py", "path": "../../etc/passwd", "summary": "s"}
+            )
+
+    def test_absolute_path_rejected(self) -> None:
+        with self.assertRaises(pc.PromoteValidationError):
+            pc.validate_capability_candidate_input(
+                {"id": "x", "kind": "script", "name": "n.py", "path": "/etc/passwd", "summary": "s"}
+            )
+
+    def test_unknown_field_rejected(self) -> None:
+        with self.assertRaises(pc.PromoteValidationError):
+            pc.validate_capability_candidate_input(
+                {"id": "x", "kind": "script", "name": "n.py", "path": "p.py", "summary": "s", "bogus_field": 1}
+            )
+
+    def test_depends_on_self_reference_rejected(self) -> None:
+        with self.assertRaises(pc.PromoteValidationError):
+            pc.validate_capability_candidate_input(
+                {
+                    "id": "x",
+                    "kind": "script",
+                    "name": "n.py",
+                    "path": "p.py",
+                    "summary": "s",
+                    "depends_on": ["script:n.py"],
+                }
+            )
+
+    def test_depends_on_bad_grammar_rejected(self) -> None:
+        with self.assertRaises(pc.PromoteValidationError):
+            pc.validate_capability_candidate_input(
+                {"id": "x", "kind": "script", "name": "n.py", "path": "p.py", "summary": "s", "depends_on": ["not-valid"]}
+            )
+
+
+class KnowledgeCandidateInputValidationTests(unittest.TestCase):
+    def test_happy_path(self) -> None:
+        fields = pc.validate_knowledge_candidate_input(
+            {"id": "notes", "title": "Some Notes", "path": "wiki/knowledge/notes.md", "summary": "notes about x"}
+        )
+        self.assertEqual(fields["title"], "Some Notes")
+        self.assertEqual(fields["wiki_status"], "promoted-unverified")
+
+    def test_depends_on_rejected(self) -> None:
+        with self.assertRaises(pc.PromoteValidationError):
+            pc.validate_knowledge_candidate_input(
+                {
+                    "id": "notes",
+                    "title": "t",
+                    "path": "p.md",
+                    "summary": "s",
+                    "depends_on": ["script:a.py"],
+                }
+            )
+
+    def test_content_md_too_large_rejected(self) -> None:
+        with self.assertRaises(pc.PromoteValidationError):
+            pc.validate_knowledge_candidate_input(
+                {
+                    "id": "notes",
+                    "title": "t",
+                    "path": "p.md",
+                    "summary": "s",
+                    "content_md": "x" * (pc.MAX_CONTENT_MD_BYTES + 1),
+                }
+            )
+
+
+# ---------------------------------------------------------------------------
+# CLI: draft
+# ---------------------------------------------------------------------------
+
+
+class DraftCommandTests(PromoteCapabilityTestCase):
+    def test_draft_capability_candidate_creates_pending_record(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code, result, _err = self.draft_capability("proj-a")
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result["status"], "pending_approval")
+        candidate_file = self.promotion_root / "proj-a" / f"{result['candidate_id']}.json"
+        self.assertTrue(candidate_file.is_file())
+        record = json.loads(candidate_file.read_text(encoding="utf-8"))
+        self.assertEqual(record["operation"], "create")
+        self.assertEqual(record["proposed_target"], "reusable-capabilities.json")
+
+    def test_draft_knowledge_candidate_stages_content_md(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code, result, _err = self.draft_knowledge("proj-a")
+        self.assertEqual(code, 0, result)
+        content_file = self.promotion_root / "proj-a" / result["candidate_id"] / "content.md"
+        self.assertTrue(content_file.is_file())
+        self.assertIn("正文内容", content_file.read_text(encoding="utf-8"))
+
+    def test_draft_exact_duplicate_rejected(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code1, result1, _ = self.draft_capability("proj-a")
+        self.assertEqual(code1, 0)
+        code2, result2, _ = self.draft_capability("proj-a")
+        self.assertEqual(code2, 1)
+        self.assertEqual(result2["reason"], "exact_duplicate")
+        self.assertEqual(result2["message"]["existing_candidate_id"], result1["candidate_id"])
+
+    def test_draft_content_change_marks_possible_revision(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code1, result1, _ = self.draft_capability("proj-a", summary="first summary text")
+        self.assertEqual(code1, 0)
+        code2, result2, _ = self.draft_capability("proj-a", summary="a completely different summary text")
+        self.assertEqual(code2, 0)
+        self.assertEqual(result2["possible_revision_of"], result1["candidate_id"])
+        self.assertNotEqual(result1["content_hash"], result2["content_hash"])
+        self.assertEqual(result1["key"], result2["key"])
+
+    def test_draft_bad_json_input_is_usage_error(self) -> None:
+        bad_path = self.tmp / "bad.json"
+        bad_path.write_text("{not valid json", encoding="utf-8")
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code, result, _err = run_cli_json(["draft", "--from-json", str(bad_path), "--catalog", str(self.catalog_path)])
+        self.assertEqual(code, 2)
+
+    def test_draft_missing_input_file_is_usage_error(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code, result, _err = run_cli_json(
+            ["draft", "--from-json", str(self.tmp / "does-not-exist.json"), "--catalog", str(self.catalog_path)]
+        )
+        self.assertEqual(code, 2)
+
+    def test_draft_bad_proposed_target_is_validation_error(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code, result, _err = self.draft_capability("proj-a", proposed_target="something-else.json")
+        self.assertEqual(code, 1)
+
+    def test_draft_unknown_target_project_is_recorded_not_blocked(self) -> None:
+        self.write_catalog({})
+        code, result, _err = self.draft_capability("totally-unknown-project")
+        self.assertEqual(code, 0)
+        self.assertFalse(result["target_project_known_in_catalog"])
+
+    def test_draft_depends_on_resolution_against_catalog(self) -> None:
+        proj_a = self.make_project("proj-a")
+        proj_b = self.make_project("proj-b")
+        self.write_catalog(
+            {"proj-a": proj_a, "proj-b": proj_b},
+            capability_ref_index={"proj-a:script:base.py": "proj-a#base-cap"},
+        )
+        code, result, _err = self.draft_capability(
+            "proj-a", name="dependent.py", id="dependent-cap", depends_on=["script:base.py", "script:missing.py"]
+        )
+        self.assertEqual(code, 0, result)
+        resolutions = {r["raw"]: r for r in result["depends_on_resolution"]}
+        self.assertTrue(resolutions["script:base.py"]["resolved"])
+        self.assertFalse(resolutions["script:missing.py"]["resolved"])
+
+    def test_draft_target_project_path_traversal_rejected(self) -> None:
+        self.write_catalog({})
+        code, result, _err = self.draft_capability("../../etc")
+        self.assertEqual(code, 1)
+
+
+# ---------------------------------------------------------------------------
+# CLI: approve -- reusable-capabilities.json branch
+# ---------------------------------------------------------------------------
+
+
+class ApproveReusableCapabilitiesTests(PromoteCapabilityTestCase):
+    def _draft_and_get_id(self, project_id: str, **overrides) -> str:
+        code, result, _err = self.draft_capability(project_id, **overrides)
+        self.assertEqual(code, 0, result)
+        return result["candidate_id"]
+
+    def test_approve_writes_into_correct_fake_project_only(self) -> None:
+        proj_a = self.make_project("proj-a")
+        proj_b = self.make_project("proj-b")
+        self.write_catalog({"proj-a": proj_a, "proj-b": proj_b})
+        candidate_id = self._draft_and_get_id("proj-a")
+
+        code, result, _err = run_cli_json(
+            [
+                "approve",
+                "--candidate-id",
+                candidate_id,
+                "--catalog",
+                str(self.catalog_path),
+                "--approved-by",
+                "tester",
+                "--rationale",
+                "looks good",
+            ]
+        )
+        self.assertEqual(code, 0, result)
+
+        doc_a = json.loads((proj_a / "wiki" / "reusable-capabilities.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(doc_a["capabilities"]), 1)
+        self.assertEqual(doc_a["capabilities"][0]["id"], "my-cap")
+
+        doc_b = json.loads((proj_b / "wiki" / "reusable-capabilities.json").read_text(encoding="utf-8"))
+        self.assertEqual(doc_b["capabilities"], [])
+
+    def test_approve_updates_candidate_status_and_ledger(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+        code, result, _err = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "tester", "--rationale", "ok"]
+        )
+        self.assertEqual(code, 0, result)
+        record = json.loads((self.promotion_root / "proj-a" / f"{candidate_id}.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["status"], "approved")
+        self.assertEqual(record["approved_by"], "tester")
+        ledger_lines = (self.promotion_root / pc.LEDGER_NAME).read_text(encoding="utf-8").strip().splitlines()
+        actions = [json.loads(line)["action"] for line in ledger_lines]
+        self.assertEqual(actions, ["draft", "approve"])
+
+    def test_approve_rolls_back_when_referenced_path_missing(self) -> None:
+        # draft's own path validation is structural-only (no existence
+        # check); approve's post-write self-check DOES check existence
+        # (check_paths=True) -- this is the gap that makes a genuine
+        # rollback reachable without any mocking.
+        proj = self.make_project("proj-a", add_script_file=None)
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a", path="scripts/does_not_exist.py")
+
+        before = (proj / "wiki" / "reusable-capabilities.json").read_bytes()
+        code, result, _err = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code, 1, result)
+        self.assertEqual(result["reason"], "post_write_self_check_failed")
+        after = (proj / "wiki" / "reusable-capabilities.json").read_bytes()
+        self.assertEqual(before, after, "file must be rolled back to its original bytes")
+
+    def test_approve_duplicate_id_in_target_rejected(self) -> None:
+        proj = self.make_project("proj-a")
+        doc_path = proj / "wiki" / "reusable-capabilities.json"
+        doc = json.loads(doc_path.read_text(encoding="utf-8"))
+        doc["capabilities"].append(
+            {
+                "id": "my-cap",
+                "kind": "script",
+                "name": "other.py",
+                "path": "scripts/my_script.py",
+                "summary": "already exists",
+                "last_verified_at": None,
+                "depends_on": [],
+            }
+        )
+        doc_path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        _run_git(["add", "-A"], proj)
+        _run_git(["commit", "-q", "-m", "seed duplicate id"], proj)
+
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+        code, result, _err = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(result["reason"], "duplicate_id")
+
+    def test_approve_concurrent_modification_detected(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+        before = (proj / "wiki" / "reusable-capabilities.json").read_bytes()
+
+        with mock.patch.object(pc, "identity_unchanged", return_value=False):
+            code, result, _err = run_cli_json(
+                ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+            )
+        self.assertEqual(code, 4, result)
+        self.assertEqual(result["reason"], "concurrent_modification_detected")
+        after = (proj / "wiki" / "reusable-capabilities.json").read_bytes()
+        self.assertEqual(before, after, "no write should happen when concurrency check fails")
+
+    def test_approve_candidate_not_found(self) -> None:
+        self.write_catalog({})
+        code, result, _err = run_cli_json(
+            ["approve", "--candidate-id", "cand-doesnotexist", "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(result["reason"], "candidate_not_found")
+
+    def test_approve_twice_rejected_second_time(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+        code1, _r1, _e1 = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code1, 0)
+        code2, result2, _e2 = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code2, 1)
+        self.assertEqual(result2["reason"], "candidate_not_pending")
+
+    def test_approve_missing_approved_by_is_usage_error(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+        code, result, _err = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "  ", "--rationale", "r"]
+        )
+        self.assertEqual(code, 2)
+
+    def test_approve_non_human_source_requires_confirm_flag(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a", source={"mechanism": "auto-scan"})
+        code, result, _err = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(result["reason"], "confirm_non_human_source_required")
+
+        code2, result2, _e2 = run_cli(
+            [
+                "approve",
+                "--candidate-id",
+                candidate_id,
+                "--catalog",
+                str(self.catalog_path),
+                "--approved-by",
+                "t",
+                "--rationale",
+                "r",
+                "--confirm-non-human-source",
+                "--json",
+            ]
+        )
+        self.assertEqual(code2, 0)
+
+    def test_approve_unknown_target_project_in_catalog_is_fatal(self) -> None:
+        proj = self.make_project("proj-a")
+        # catalog omits proj-a entirely by the time approve runs
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+        self.write_catalog({})
+        code, result, _err = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(result["reason"], "target_project_unknown_in_catalog")
+
+
+# ---------------------------------------------------------------------------
+# CLI: approve -- orca-context-wiki.json branch
+# ---------------------------------------------------------------------------
+
+
+class ApproveOrcaContextWikiTests(PromoteCapabilityTestCase):
+    def _draft_and_get_id(self, project_id: str, **overrides) -> str:
+        code, result, _err = self.draft_knowledge(project_id, **overrides)
+        self.assertEqual(code, 0, result)
+        return result["candidate_id"]
+
+    def test_approve_writes_page_bumps_version_and_commits(self) -> None:
+        proj = self.make_project("proj-a", wiki_content_version=1)
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+
+        code, result, _err = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "tester", "--rationale", "ok"]
+        )
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result["new_content_version"], 2)
+        self.assertTrue(result["git_committed"])
+        self.assertIsNotNone(result["git_commit_sha"])
+
+        wiki_doc = json.loads((proj / "wiki" / "orca-context-wiki.json").read_text(encoding="utf-8"))
+        self.assertEqual(wiki_doc["meta"]["content_version"], 2)
+        self.assertEqual(len(wiki_doc["pages"]), 1)
+        self.assertEqual(wiki_doc["pages"][0]["id"], "x-algo-notes")
+
+        knowledge_md = proj / "wiki" / "knowledge" / "x-algo-notes.md"
+        self.assertTrue(knowledge_md.is_file())
+        self.assertIn("正文内容", knowledge_md.read_text(encoding="utf-8"))
+
+        # The commit really happened in the FAKE project's own repo.
+        log = subprocess.run(
+            ["git", "-C", str(proj), "log", "-1", "--name-only", "--pretty=format:%s"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        self.assertIn("wiki/orca-context-wiki.json", log)
+        self.assertIn("wiki/knowledge/x-algo-notes.md", log)
+        status = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(status.strip(), "", "fake project working tree must be clean after a committed approve")
+
+    def test_approve_without_content_md_only_writes_metadata(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a", content_md=None)
+        code, result, _err = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code, 0, result)
+        self.assertIsNone(result["knowledge_md_relpath"])
+        self.assertFalse((proj / "wiki" / "knowledge").exists())
+
+    def test_approve_manifest_resign_notice_present_when_pinned(self) -> None:
+        proj = self.make_project("proj-a", with_manifest_pin=True)
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+        code, result, _err = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code, 0, result)
+        self.assertTrue(result["requires_manifest_resign"])
+        self.assertIn("SessionStart", _err)
+        self.assertIn("re-sign", _err)
+
+    def test_approve_manifest_resign_notice_absent_when_not_pinned(self) -> None:
+        proj = self.make_project("proj-a", with_manifest_pin=False)
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+        code, result, err = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code, 0, result)
+        self.assertFalse(result["requires_manifest_resign"])
+        self.assertNotIn("SessionStart", err)
+
+    def test_approve_no_commit_requires_ack_flag(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+        code, result, _err = run_cli_json(
+            [
+                "approve",
+                "--candidate-id",
+                candidate_id,
+                "--catalog",
+                str(self.catalog_path),
+                "--approved-by",
+                "t",
+                "--rationale",
+                "r",
+                "--no-commit",
+            ]
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(result["reason"], "no_commit_requires_acknowledgement")
+
+    def test_approve_no_commit_with_ack_skips_git(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+        code, result, err = run_cli_json(
+            [
+                "approve",
+                "--candidate-id",
+                candidate_id,
+                "--catalog",
+                str(self.catalog_path),
+                "--approved-by",
+                "t",
+                "--rationale",
+                "r",
+                "--no-commit",
+                "--i-understand-this-leaves-an-uncommitted-tracked-path",
+            ]
+        )
+        self.assertEqual(code, 0, result)
+        self.assertFalse(result["git_committed"])
+        status = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"], capture_output=True, text=True, check=True).stdout
+        self.assertNotEqual(status.strip(), "", "wiki file should be a real uncommitted change")
+        self.assertIn("uncommitted tracked-path", err)
+
+    def test_approve_git_commit_failure_still_reports_success_with_notice(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+        git_dir = proj / ".git"
+        _chmod_tree(git_dir, 0o500)
+        self.addCleanup(_chmod_tree, git_dir, 0o700)
+        try:
+            code, result, err = run_cli_json(
+                ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+            )
+        finally:
+            _chmod_tree(git_dir, 0o700)
+        self.assertEqual(code, 0, result)
+        self.assertFalse(result["git_committed"])
+        self.assertIsNotNone(result.get("git_commit_error"))
+        self.assertIn("uncommitted tracked-path", err)
+        # The wiki write itself DID succeed even though commit failed.
+        wiki_doc = json.loads((proj / "wiki" / "orca-context-wiki.json").read_text(encoding="utf-8"))
+        self.assertEqual(wiki_doc["meta"]["content_version"], 2)
+
+    def test_approve_target_not_git_repo_refuses_before_write(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+        shutil.rmtree(proj / ".git")
+        before = (proj / "wiki" / "orca-context-wiki.json").read_bytes()
+        code, result, _err = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code, 4, result)
+        self.assertEqual(result["reason"], "target_project_not_a_git_repo")
+        after = (proj / "wiki" / "orca-context-wiki.json").read_bytes()
+        self.assertEqual(before, after)
+
+    def test_approve_wiki_edit_guard_refusal_rolls_back(self) -> None:
+        # old meta.updated_at set in the far future so wiki_edit_guard.py's
+        # own "strictly newer" rule refuses the write for real (no
+        # mocking of the guard's logic itself).
+        proj = self.make_project("proj-a")
+        wiki_path = proj / "wiki" / "orca-context-wiki.json"
+        doc = json.loads(wiki_path.read_text(encoding="utf-8"))
+        doc["meta"]["updated_at"] = "2099-01-01T00:00:00Z"
+        wiki_path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        _run_git(["add", "-A"], proj)
+        _run_git(["commit", "-q", "-m", "seed future updated_at"], proj)
+
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+        before = wiki_path.read_bytes()
+        code, result, _err = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code, 1, result)
+        self.assertEqual(result["reason"], "wiki_edit_guard_refused")
+        after = wiki_path.read_bytes()
+        self.assertEqual(before, after, "guard refusal must leave the file untouched")
+
+    def test_approve_duplicate_page_id_rejected(self) -> None:
+        proj = self.make_project("proj-a")
+        wiki_path = proj / "wiki" / "orca-context-wiki.json"
+        doc = json.loads(wiki_path.read_text(encoding="utf-8"))
+        doc["pages"].append({"id": "x-algo-notes", "title": "existing", "path": "p.md", "summary": "s", "status": "live-verified"})
+        wiki_path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        _run_git(["add", "-A"], proj)
+        _run_git(["commit", "-q", "-m", "seed duplicate page id"], proj)
+
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+        code, result, _err = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(result["reason"], "duplicate_page_id")
+
+    def test_wiki_edit_guard_hash_pin_mismatch_refuses(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+
+        guard_path = pc.resolve_wiki_edit_guard_path()
+        real_read_bytes = Path.read_bytes
+        call_state = {"n": 0}
+
+        def fake_read_bytes(self_path):  # noqa: ANN001
+            if self_path == guard_path:
+                call_state["n"] += 1
+                if call_state["n"] == 1:
+                    return real_read_bytes(self_path)
+                return b"# tampered content, not the real guard\n"
+            return real_read_bytes(self_path)
+
+        before = (proj / "wiki" / "orca-context-wiki.json").read_bytes()
+        with mock.patch.object(Path, "read_bytes", fake_read_bytes):
+            code, result, _err = run_cli_json(
+                ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+            )
+        self.assertEqual(code, 4, result)
+        self.assertEqual(result["reason"], "wiki_edit_guard_hash_mismatch")
+        after = (proj / "wiki" / "orca-context-wiki.json").read_bytes()
+        self.assertEqual(before, after, "no write should happen when the guard's own hash pin fails")
+
+
+# ---------------------------------------------------------------------------
+# CLI: reject / withdraw
+# ---------------------------------------------------------------------------
+
+
+class RejectWithdrawTests(PromoteCapabilityTestCase):
+    def test_reject_transitions_status_without_touching_project_files(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code0, result0, _e0 = self.draft_capability("proj-a")
+        candidate_id = result0["candidate_id"]
+        before = (proj / "wiki" / "reusable-capabilities.json").read_bytes()
+
+        code, result, _err = run_cli_json(["reject", "--candidate-id", candidate_id, "--decided-by", "t", "--rationale", "not needed"])
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result["status"], "rejected")
+        after = (proj / "wiki" / "reusable-capabilities.json").read_bytes()
+        self.assertEqual(before, after)
+
+        record = json.loads((self.promotion_root / "proj-a" / f"{candidate_id}.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["status"], "rejected")
+        self.assertEqual(record["decided_by"], "t")
+
+    def test_withdraw_transitions_status(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        _c, result0, _e = self.draft_capability("proj-a")
+        code, result, _err = run_cli_json(["withdraw", "--candidate-id", result0["candidate_id"], "--decided-by", "t", "--rationale", "changed my mind"])
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result["status"], "withdrawn")
+
+    def test_reject_already_decided_candidate_fails(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        _c, result0, _e = self.draft_capability("proj-a")
+        candidate_id = result0["candidate_id"]
+        run_cli_json(["withdraw", "--candidate-id", candidate_id, "--decided-by", "t", "--rationale", "r"])
+        code, result, _err = run_cli_json(["reject", "--candidate-id", candidate_id, "--decided-by", "t", "--rationale", "r"])
+        self.assertEqual(code, 1)
+        self.assertEqual(result["reason"], "candidate_not_pending")
+
+    def test_reject_missing_rationale_is_usage_error(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        _c, result0, _e = self.draft_capability("proj-a")
+        code, result, _err = run_cli_json(["reject", "--candidate-id", result0["candidate_id"], "--decided-by", "t", "--rationale", "  "])
+        self.assertEqual(code, 2)
+
+    def test_reject_unknown_candidate(self) -> None:
+        code, result, _err = run_cli_json(["reject", "--candidate-id", "cand-nope", "--decided-by", "t", "--rationale", "r"])
+        self.assertEqual(code, 1)
+        self.assertEqual(result["reason"], "candidate_not_found")
+
+
+# ---------------------------------------------------------------------------
+# CLI: amend
+# ---------------------------------------------------------------------------
+
+
+class AmendTests(PromoteCapabilityTestCase):
+    def _seed_published_capability(self, proj: Path, *, kind: str = "script", name: str = "base.py", depends_on=None) -> None:
+        doc_path = proj / "wiki" / "reusable-capabilities.json"
+        doc = json.loads(doc_path.read_text(encoding="utf-8"))
+        doc["capabilities"].append(
+            {
+                "id": "base-cap",
+                "kind": kind,
+                "name": name,
+                "path": "scripts/my_script.py",
+                "summary": "the base capability",
+                "last_verified_at": None,
+                "depends_on": depends_on or [],
+            }
+        )
+        # Same-project depends_on refs must resolve WITHIN the file
+        # (validate_document()'s dangling_local_ref rule, exercised for
+        # real by approve's post-write self-check) -- seed the entry that
+        # "script:other.py" amends will point at so a real amend test
+        # exercises a genuinely valid end state, not a self-inflicted
+        # dangling reference.
+        doc["capabilities"].append(
+            {
+                "id": "other-cap",
+                "kind": "script",
+                "name": "other.py",
+                "path": "scripts/my_script.py",
+                "summary": "the capability amends point at",
+                "last_verified_at": None,
+                "depends_on": [],
+            }
+        )
+        doc_path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        _run_git(["add", "-A"], proj)
+        _run_git(["commit", "-q", "-m", "seed base capability"], proj)
+
+    def test_amend_draft_then_approve_appends_depends_on(self) -> None:
+        proj = self.make_project("proj-a")
+        self._seed_published_capability(proj)
+        self.write_catalog({"proj-a": proj}, capability_ref_index={"proj-a:script:base.py": "proj-a#base-cap"})
+
+        code, result, _err = run_cli_json(
+            [
+                "amend",
+                "--target-project",
+                "proj-a",
+                "--target",
+                "script:base.py",
+                "--add-depends-on",
+                "script:other.py",
+                "--source",
+                "human",
+                "--catalog",
+                str(self.catalog_path),
+            ]
+        )
+        self.assertEqual(code, 0, result)
+        self.assertTrue(result["amend_target_known_in_catalog"])
+        candidate_id = result["candidate_id"]
+
+        code2, result2, _e2 = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code2, 0, result2)
+        doc = json.loads((proj / "wiki" / "reusable-capabilities.json").read_text(encoding="utf-8"))
+        self.assertIn("script:other.py", doc["capabilities"][0]["depends_on"])
+
+    def test_amend_target_not_found_at_approve_time(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code, result, _err = run_cli_json(
+            [
+                "amend",
+                "--target-project",
+                "proj-a",
+                "--target",
+                "script:does-not-exist.py",
+                "--add-depends-on",
+                "script:other.py",
+                "--source",
+                "human",
+                "--catalog",
+                str(self.catalog_path),
+            ]
+        )
+        self.assertEqual(code, 0, result)
+        code2, result2, _e2 = run_cli_json(
+            ["approve", "--candidate-id", result["candidate_id"], "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code2, 1)
+        self.assertEqual(result2["reason"], "amend_target_not_found")
+
+    def test_amend_depends_on_already_present_rejected(self) -> None:
+        proj = self.make_project("proj-a")
+        self._seed_published_capability(proj, depends_on=["script:other.py"])
+        self.write_catalog({"proj-a": proj})
+        code, result, _err = run_cli_json(
+            [
+                "amend",
+                "--target-project",
+                "proj-a",
+                "--target",
+                "script:base.py",
+                "--add-depends-on",
+                "script:other.py",
+                "--source",
+                "human",
+                "--catalog",
+                str(self.catalog_path),
+            ]
+        )
+        self.assertEqual(code, 0, result)
+        code2, result2, _e2 = run_cli_json(
+            ["approve", "--candidate-id", result["candidate_id"], "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code2, 1)
+        self.assertEqual(result2["reason"], "depends_on_already_present")
+
+    def test_amend_self_reference_rejected(self) -> None:
+        self.write_catalog({})
+        code, result, _err = run_cli_json(
+            [
+                "amend",
+                "--target-project",
+                "proj-a",
+                "--target",
+                "script:base.py",
+                "--add-depends-on",
+                "script:base.py",
+                "--source",
+                "human",
+                "--catalog",
+                str(self.catalog_path),
+            ]
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(result["reason"], "self_reference")
+
+    def test_amend_bad_target_grammar_usage_error(self) -> None:
+        self.write_catalog({})
+        code, result, _err = run_cli_json(
+            [
+                "amend",
+                "--target-project",
+                "proj-a",
+                "--target",
+                "not-valid-grammar",
+                "--add-depends-on",
+                "script:other.py",
+                "--source",
+                "human",
+                "--catalog",
+                str(self.catalog_path),
+            ]
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(result["reason"], "bad_target")
+
+    def test_amend_free_text_source_not_coupled_to_m8_1(self) -> None:
+        # --source is deliberately free text -- any non-empty string works,
+        # including a shape that only means something once a future signal
+        # (M8-1) is independently authorized.
+        self.write_catalog({})
+        code, result, _err = run_cli_json(
+            [
+                "amend",
+                "--target-project",
+                "proj-a",
+                "--target",
+                "script:base.py",
+                "--add-depends-on",
+                "script:other.py",
+                "--source",
+                "mention-evidence:edge-1234",
+                "--catalog",
+                str(self.catalog_path),
+            ]
+        )
+        self.assertEqual(code, 0, result)
+
+
+# ---------------------------------------------------------------------------
+# Concurrency-lock regression tests.
+#
+# An independent review demonstrated two real, reproducible TOCTOU races in
+# an earlier revision of this file:
+#   1. cmd_approve acquired NO lock at all. Two concurrent `approve` calls
+#      against different candidates targeting the SAME project's SAME wiki
+#      file could each pass their own fstat-identity recheck (since neither
+#      had written yet) and then race to write -- whichever wrote second
+#      silently discarded the first call's already-"approved" write, with
+#      no error and no trace.
+#   2. cmd_draft/cmd_amend computed their exact-duplicate check BEFORE
+#      acquiring the lock that protects their own write, so two concurrent
+#      submissions of the byte-identical candidate could both observe "no
+#      existing duplicate" and both write a pending_approval record.
+#
+# Both are fixed by moving the read-check-write sequence inside the same
+# PROMOTION_ROOT lock draft/amend already used for their own writes. Each
+# test below widens the exact race window the original bug needed by
+# inserting a controlled sleep at the precise point the bug's own
+# read-then-decide happened -- not by changing any decision logic -- so a
+# passing test here is proof the LOCK, not lucky scheduling, prevents the
+# race. See module docstring's "THE SINGLE WRITE EXCEPTION" section.
+# ---------------------------------------------------------------------------
+
+
+class ConcurrencyLockTests(PromoteCapabilityTestCase):
+    def test_concurrent_approve_does_not_silently_lose_a_write(self) -> None:
+        proj = self.make_project("proj-race")
+        self.write_catalog({"proj-race": proj})
+
+        code_a, res_a, _ = self.draft_capability("proj-race", id="race-a", name="race_a.py")
+        code_b, res_b, _ = self.draft_capability("proj-race", id="race-b", name="race_b.py")
+        self.assertEqual(code_a, 0, res_a)
+        self.assertEqual(code_b, 0, res_b)
+        cand_a, cand_b = res_a["candidate_id"], res_b["candidate_id"]
+
+        real_identity_unchanged = pc.identity_unchanged
+        slow = threading.local()
+
+        def patched(path: Path, identity: tuple) -> bool:
+            result = real_identity_unchanged(path, identity)
+            if getattr(slow, "on", False):
+                time.sleep(0.5)
+            return result
+
+        pc.identity_unchanged = patched
+        self.addCleanup(setattr, pc, "identity_unchanged", real_identity_unchanged)
+
+        outcomes: dict[str, tuple[int, dict, str]] = {}
+
+        def worker(key: str, candidate_id: str, make_slow: bool) -> None:
+            slow.on = make_slow
+            outcomes[key] = run_cli_json(
+                [
+                    "approve",
+                    "--candidate-id",
+                    candidate_id,
+                    "--catalog",
+                    str(self.catalog_path),
+                    "--approved-by",
+                    "t",
+                    "--rationale",
+                    "race",
+                ]
+            )
+
+        t_a = threading.Thread(target=worker, args=("A", cand_a, True))
+        t_b = threading.Thread(target=worker, args=("B", cand_b, False))
+        t_a.start()
+        time.sleep(0.15)  # let A acquire the lock and enter the slowed identity check first
+        t_b.start()
+        t_a.join(timeout=5)
+        t_b.join(timeout=5)
+
+        code_a2, res_a2, _ = outcomes["A"]
+        code_b2, res_b2, _ = outcomes["B"]
+
+        # Exactly one must succeed (0); the other must fail CLEANLY with a
+        # named lock_held reason (4) -- never both exit 0 while one write is
+        # silently discarded on disk.
+        self.assertEqual(sorted([code_a2, code_b2]), [0, 4], (res_a2, res_b2))
+        loser_result = res_a2 if code_a2 == 4 else res_b2
+        self.assertEqual(loser_result.get("reason"), "lock_held")
+
+        doc = json.loads((proj / "wiki" / "reusable-capabilities.json").read_text())
+        ids_on_disk = sorted(e["id"] for e in doc["capabilities"])
+        winner_id = "race-a" if code_a2 == 0 else "race-b"
+        # The critical assertion: disk contains EXACTLY the winner's entry.
+        # A silent-overwrite bug would show only ONE id here too but paired
+        # with the loser's OWN candidate record wrongly claiming "approved"
+        # -- checked next.
+        self.assertEqual(ids_on_disk, [winner_id])
+
+        loser_candidate_id = cand_b if code_a2 == 0 else cand_a
+        found = pc.find_candidate(self.promotion_root, loser_candidate_id)
+        self.assertIsNotNone(found)
+        self.assertEqual(found[0]["status"], "pending_approval", "the loser must NOT be marked approved when its write never landed")
+
+        # A real caller retries after lock_held; the retry must succeed and
+        # must not clobber the winner's already-written entry.
+        code_retry, res_retry, _ = run_cli_json(
+            [
+                "approve",
+                "--candidate-id",
+                loser_candidate_id,
+                "--catalog",
+                str(self.catalog_path),
+                "--approved-by",
+                "t",
+                "--rationale",
+                "retry-after-lock-held",
+            ]
+        )
+        self.assertEqual(code_retry, 0, res_retry)
+        doc2 = json.loads((proj / "wiki" / "reusable-capabilities.json").read_text())
+        self.assertEqual(sorted(e["id"] for e in doc2["capabilities"]), ["race-a", "race-b"])
+
+    def test_concurrent_identical_draft_does_not_create_duplicate_pending_record(self) -> None:
+        proj = self.make_project("proj-dup")
+        self.write_catalog({"proj-dup": proj})
+
+        real_list = pc.list_project_candidates
+        slow = threading.local()
+
+        def patched(root: Path, target_project: str) -> list:
+            result = real_list(root, target_project)
+            if getattr(slow, "on", False):
+                time.sleep(0.5)
+            return result
+
+        pc.list_project_candidates = patched
+        self.addCleanup(setattr, pc, "list_project_candidates", real_list)
+
+        payload = {
+            "target_project": "proj-dup",
+            "proposed_target": "reusable-capabilities.json",
+            "id": "dup-cap",
+            "kind": "script",
+            "name": "dup_cap.py",
+            "path": "scripts/my_script.py",
+            "summary": "identical candidate submitted twice concurrently",
+            "source": {"mechanism": "human"},
+        }
+        input_path = self.tmp / "dup-input.json"
+        input_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        outcomes: dict[str, tuple[int, dict, str]] = {}
+
+        def worker(key: str, make_slow: bool) -> None:
+            slow.on = make_slow
+            outcomes[key] = run_cli_json(["draft", "--from-json", str(input_path), "--catalog", str(self.catalog_path)])
+
+        t_a = threading.Thread(target=worker, args=("A", True))
+        t_b = threading.Thread(target=worker, args=("B", False))
+        t_a.start()
+        time.sleep(0.15)
+        t_b.start()
+        t_a.join(timeout=5)
+        t_b.join(timeout=5)
+
+        code_a, res_a, _ = outcomes["A"]
+        code_b, res_b, _ = outcomes["B"]
+        self.assertEqual(sorted([code_a, code_b]), [0, 4], (res_a, res_b))
+        loser = res_a if code_a == 4 else res_b
+        self.assertEqual(loser.get("reason"), "lock_held")
+
+        pending = pc.list_project_candidates(self.promotion_root, "proj-dup")
+        self.assertEqual(len(pending), 1, pending)
+
+
+# ---------------------------------------------------------------------------
+# Isolation tests -- the critical safety-boundary proof for this delivery
+# ---------------------------------------------------------------------------
+
+
+class IsolationTests(PromoteCapabilityTestCase):
+    def test_draft_never_touches_target_project_files_even_when_readonly(self) -> None:
+        proj = self.make_project("proj-a")
+        _chmod_tree(proj, 0o500)
+        self.addCleanup(_chmod_tree, proj, 0o700)
+        self.write_catalog({"proj-a": proj})
+
+        before_reusable = (proj / "wiki" / "reusable-capabilities.json").stat().st_mtime_ns
+        code, result, _err = self.draft_capability("proj-a")
+        self.assertEqual(code, 0, result)
+        after_reusable = (proj / "wiki" / "reusable-capabilities.json").stat().st_mtime_ns
+        self.assertEqual(before_reusable, after_reusable, "draft must never touch the target project's own files")
+
+    def test_approve_readonly_project_fails_cleanly_no_traceback_no_partial_write(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code0, result0, _e0 = self.draft_capability("proj-a")
+        self.assertEqual(code0, 0)
+        candidate_id = result0["candidate_id"]
+
+        before = (proj / "wiki" / "reusable-capabilities.json").read_bytes()
+        _chmod_tree(proj / "wiki", 0o500)
+        self.addCleanup(_chmod_tree, proj, 0o700)
+
+        code, result, err = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        # Must fail cleanly with the named permission reason (never a raw
+        # PermissionError traceback, never a silent partial write).
+        self.assertEqual(code, 4, result)
+        self.assertEqual(result["reason"], "target_write_permission_denied")
+        self.assertNotIn("Traceback", err)
+
+        _chmod_tree(proj / "wiki", 0o700)
+        after = (proj / "wiki" / "reusable-capabilities.json").read_bytes()
+        self.assertEqual(before, after, "a failed write must never leave a partial change")
+
+    def test_approve_readonly_wiki_dir_gets_named_permission_error(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code0, result0, _e0 = self.draft_capability("proj-a")
+        candidate_id = result0["candidate_id"]
+
+        os.chmod(str(proj / "wiki"), 0o500)
+        self.addCleanup(os.chmod, str(proj / "wiki"), 0o700)
+        try:
+            code, result, _err = run_cli_json(
+                ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+            )
+        finally:
+            os.chmod(str(proj / "wiki"), 0o700)
+        self.assertEqual(code, 4, result)
+        self.assertEqual(result["reason"], "target_write_permission_denied")
+
+    def test_reject_withdraw_never_touch_any_project_file(self) -> None:
+        proj = self.make_project("proj-a")
+        _chmod_tree(proj, 0o500)
+        self.addCleanup(_chmod_tree, proj, 0o700)
+        self.write_catalog({"proj-a": proj})
+        # draft must work read-only; candidate lives entirely in
+        # PROMOTION_ROOT, never inside `proj`.
+        code0, result0, _e0 = self.draft_capability("proj-a")
+        self.assertEqual(code0, 0)
+        code, result, _err = run_cli_json(["reject", "--candidate-id", result0["candidate_id"], "--decided-by", "t", "--rationale", "r"])
+        self.assertEqual(code, 0, result)
+
+
+class ExitCodeCoverageTests(PromoteCapabilityTestCase):
+    """A focused sweep asserting every documented exit code (0/1/2/4) is
+    reachable for the decision-class contract this tool implements."""
+
+    def test_exit_0_success(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code, _r, _e = self.draft_capability("proj-a")
+        self.assertEqual(code, 0)
+
+    def test_exit_1_validation_failed(self) -> None:
+        self.write_catalog({})
+        code, result, _e = run_cli_json(["reject", "--candidate-id", "cand-nope", "--decided-by", "t", "--rationale", "r"])
+        self.assertEqual(code, 1)
+
+    def test_exit_2_usage_error(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        code0, result0, _e0 = self.draft_capability("proj-a")
+        code, _r, _e = run_cli_json(
+            ["approve", "--candidate-id", result0["candidate_id"], "--catalog", "  ", "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code, 2)
+
+    def test_exit_4_environment_broken(self) -> None:
+        code, result, _e = run_cli_json(["draft", "--from-json", str(self.tmp / "x.json"), "--catalog", str(self.tmp / "missing-catalog.json")])
+        # from-json missing is checked first (usage, exit 2); use a real
+        # input file but a missing catalog to reach the catalog-fatal path.
+        input_path = self.tmp / "input.json"
+        input_path.write_text(
+            json.dumps(
+                {
+                    "target_project": "proj-a",
+                    "proposed_target": "reusable-capabilities.json",
+                    "id": "x",
+                    "kind": "script",
+                    "name": "n.py",
+                    "path": "p.py",
+                    "summary": "s",
+                    "source": {"mechanism": "human"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        code2, result2, _e2 = run_cli_json(["draft", "--from-json", str(input_path), "--catalog", str(self.tmp / "missing-catalog.json")])
+        self.assertEqual(code2, 4)
+        self.assertEqual(result2["reason"], "catalog_missing")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1159,3 +1159,41 @@ Both are pure detection/query tools with no automation wired to them: no
 hook calls either one, and neither one publishes anything — the M8 gates
 that would (auto-scan discovery, auto-publish, executing a third project's
 own compatibility command) are separately authorized, later steps.
+
+### Promoting a capability across projects (M8 Gate B — built, not yet installed)
+
+`promote_capability.py` is the one place in this whole plan a process is
+allowed to write into a project other than its own:
+
+```bash
+python3 <skill-dir>/scripts/promote_capability.py draft --from-json <path> --catalog <catalog.json>
+python3 <skill-dir>/scripts/promote_capability.py approve --candidate-id <id> \
+    --approved-by "<name>" --rationale "<why>" --catalog <catalog.json>
+python3 <skill-dir>/scripts/promote_capability.py reject|withdraw --candidate-id <id> ...
+python3 <skill-dir>/scripts/promote_capability.py amend --target-project <p> --target <kind:name> \
+    --add-depends-on <ref> --source <free-text>
+```
+
+`draft` validates a hand-filled candidate (reusing `validate_reusable_capabilities.py`'s
+checks, exact-hash deduplication only — no fuzzy matching) and stages it under a
+fixed, non-tracked root
+(`/Volumes/Extreme SSD/Orca/manifests/cross-project-catalog/capability-promotion-pending-authorization/`,
+not yet the eventual production name — wiring this into anything automated is a
+separate, unauthorized step). `approve` is the only write path: for a
+`reusable-capabilities.json` target it's an atomic write plus a self-check re-run
+of the validator; for `orca-context-wiki.json` it subprocess-calls
+`wiki_edit_guard.py` (SHA-256-pinned at startup, refused if it drifts), writes
+atomically, commits in the same call by default (closing the
+"written-but-uncommitted" NACK window this plan hit twice before), and prints an
+un-suppressible warning if the write requires a manifest re-sign — it never
+performs that re-sign itself. Every `draft`/`amend`/`approve` call holds the same
+lock, closing a real lost-update race a review caught between concurrent
+`approve` calls landing on the same target.
+
+**Not yet true**: this is built and tested (against disposable fake projects
+only — nothing here has ever touched a real project's real files) but not
+registered anywhere, not wired to any automation, and not the target of any
+discovery pipeline yet (`draft --from-discovery-hit` is intentionally
+unimplemented). Actually using it against a real project, and any future
+automation that would call it without a human in the loop, are separate,
+unauthorized steps.
