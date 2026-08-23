@@ -1128,3 +1128,34 @@ the M1 milestone hit earlier in this plan. Any future candidate under active
 review must live outside `wiki/` and `orca-context-bridge/` (repo root is the
 established pattern) until it is actually committed and the manifest
 re-signed against the commit that includes it.
+
+### Detecting cross-project impact (M8 Gate A, read-only)
+
+Two read-only tools flag when a shared `script`/`config-pattern` capability
+has actually changed, and who declared a dependency on it:
+
+```bash
+python3 <skill-dir>/scripts/detect_capability_changes.py detect --catalog <catalog.json>
+python3 <skill-dir>/scripts/check_cross_project_compatibility.py affected \
+    --changed-global-id "<project>#<capability-id>" --catalog <catalog.json>
+```
+
+`detect` content-hashes every `capabilities[]` entry whose `kind` is `script`
+or `config-pattern` (an allow-list — `skill` and any future/unknown kind
+never participate), including the referenced script file's own bytes when
+`kind == "script"`, and excludes every `*_at`/`*_timestamp` field on purpose
+so re-verifying a capability without touching it never reads as a change.
+Its output is a real, guarded write — but pinned to a fixed path outside
+every project's tracked tree
+(`/Volumes/Extreme SSD/Orca/manifests/cross-project-catalog/compat-pending-authorization/`,
+deliberately not yet the production `compat/` name: wiring this into
+anything that treats it as authoritative is a separate, not-yet-granted
+step). `affected` then answers "who depends on this" by reading the
+catalog's own `capability_reverse_index`, degrading to exit 3 rather than a
+false "confirmed none" whenever a reverse-index row disagrees with itself
+(declared `in_degree` not matching what it could actually resolve).
+
+Both are pure detection/query tools with no automation wired to them: no
+hook calls either one, and neither one publishes anything — the M8 gates
+that would (auto-scan discovery, auto-publish, executing a third project's
+own compatibility command) are separately authorized, later steps.
