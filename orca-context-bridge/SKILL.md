@@ -1160,7 +1160,7 @@ hook calls either one, and neither one publishes anything — the M8 gates
 that would (auto-scan discovery, auto-publish, executing a third project's
 own compatibility command) are separately authorized, later steps.
 
-### Promoting a capability across projects (M8 Gate B — built, not yet installed)
+### Promoting a capability across projects (M8 Gate B — deployed, not registered)
 
 `promote_capability.py` is the one place in this whole plan a process is
 allowed to write into a project other than its own:
@@ -1176,8 +1176,9 @@ python3 <skill-dir>/scripts/promote_capability.py amend --target-project <p> --t
 
 `draft` validates a hand-filled candidate (reusing `validate_reusable_capabilities.py`'s
 checks, exact-hash deduplication only — no fuzzy matching) and stages it under a
-fixed, non-tracked root
-(`/Volumes/Extreme SSD/Orca/manifests/cross-project-catalog/capability-promotion-pending-authorization/`,
+fixed, non-tracked, top-level root — a sibling of `cross-project-catalog/`, not
+nested inside it, matching the design doc's directory layout
+(`/Volumes/Extreme SSD/Orca/manifests/capability-promotion-pending-authorization/`,
 not yet the eventual production name — wiring this into anything automated is a
 separate, unauthorized step). `approve` is the only write path: for a
 `reusable-capabilities.json` target it's an atomic write plus a self-check re-run
@@ -1190,10 +1191,127 @@ performs that re-sign itself. Every `draft`/`amend`/`approve` call holds the sam
 lock, closing a real lost-update race a review caught between concurrent
 `approve` calls landing on the same target.
 
-**Not yet true**: this is built and tested (against disposable fake projects
-only — nothing here has ever touched a real project's real files) but not
-registered anywhere, not wired to any automation, and not the target of any
-discovery pipeline yet (`draft --from-discovery-hit` is intentionally
-unimplemented). Actually using it against a real project, and any future
-automation that would call it without a human in the loop, are separate,
-unauthorized steps.
+**Not yet true**: this is deployed to `~/.agents/skills/orca-context-bridge/scripts/`
+and tested (against disposable fake projects only — nothing here has ever
+touched a real project's real files) but still not registered in
+`catalog_session_hint.py` or any SessionStart path, not wired to any
+automation, and not the target of any discovery pipeline yet (`draft
+--from-discovery-hit` is intentionally unimplemented). Actually using it
+against a real project, and any future automation that would call it
+without a human in the loop, are separate, unauthorized steps.
+
+### Discovering and evidencing cross-project candidates (M8 Gate C — deferred, real-data numbers not encouraging)
+
+Two independent, read-mostly tool pairs that sit between M4's read-only
+catalog and M8-3's promotion pipeline — one looks for *unstated* textual
+relationships between things already in the catalog, the other scans a
+project's own files for things that aren't in the catalog yet. Both produce
+leads for a human to look at, not entries a human is asked to trust.
+
+**M8-1 — text-mention fuzzy evidence.** `build_mention_evidence.py build`
+scans `capabilities[] ∪ wiki_pages[]` in an existing `catalog.json` for
+deterministic substring mentions of one entry's name/id inside another
+entry's summary or title, and writes a separate, catalog.json-sibling file,
+`mention-evidence.json`. It never writes back into `catalog.json` itself.
+
+```bash
+python3 <skill-dir>/scripts/build_mention_evidence.py build --catalog <catalog.json> --json
+python3 <skill-dir>/scripts/query_mention_evidence.py search \
+    --global-id-either-side "<project>#<id>" --json
+```
+
+`build` is a generator (0 = ran, even if zero edges were found; 2 = usage
+error; 4 = fatal). `search` follows this catalog's usual query convention:
+0 = found, 1 = confirmed none, 2 = usage error, 3 = partial trust (stale
+derived data or an unknown global_id), 4 = cannot answer at all. Every edge
+is capped at `medium` confidence — plain substring overlap is never treated
+as `high` — and a pair that already has a declared `depends_on` between
+them is excluded, since that relationship is already known, not newly
+discovered.
+
+**M8-2 — auto-scan discovery.** `discover_capability_candidates.py scan`
+walks one or more explicitly named project roots (never the whole fleet
+unless `--all-projects` is passed) looking for un-catalogued signals — a
+script with an argparse-shaped shebang, a directory with a `SKILL.md`, a
+`reports/`-style Markdown file — and writes `discovery-hits.json` under
+`manifests/capability-discovery/`. `review_capability_candidates.py
+list/show/mark` is the paired triage tool; `mark` only ever writes to one
+hit's own record in that same file and never touches any project's own
+files.
+
+```bash
+python3 <skill-dir>/scripts/discover_capability_candidates.py scan --root <project-path> --json
+python3 <skill-dir>/scripts/review_capability_candidates.py list --state pending --json
+python3 <skill-dir>/scripts/review_capability_candidates.py mark --hit-id <id> \
+    --state triaged_for_promotion --marked-by "<name>" --json
+```
+
+A discovery hit is a strictly lower-stakes concept than a promotion
+candidate: marking one `triaged_for_promotion` is bookkeeping in
+`discovery-hits.json`, not a step that reaches any project's `wiki/`.
+Turning a hit into an actual `promote_capability.py` candidate is a manual,
+human transcription step in v1 — `draft --from-discovery-hit` is
+intentionally unimplemented.
+
+**Not yet true, and not a formality**: neither pair is registered in
+`catalog_session_hint.py` or any SessionStart path, and neither has been
+run against any real project's real directory in production use — only
+against disposable fixtures in their own test suites. More importantly, the
+front-loaded validation this design required before requesting
+authorization to build these (M8-DESIGN-FINAL-2026-08-23 §3.2.4, §3.3.3)
+already ran against the real fleet catalog, and its own numbers were not
+encouraging: M8-1 produced only 3 candidate edges total, all same-project,
+zero cross-project — nowhere near enough data to validate the CJK-boundary
+noise mitigation the design called for. M8-2's real-sample false-positive
+rate was 44-72% (AI-judged, strict vs. loose scoring) on a 25-item sample,
+with over half of all real hits falling into noise categories the original
+design hadn't anticipated. The design doc's own numeric acceptance
+thresholds for both were never formally cleared by human judgment — only by
+an AI's first-pass read of that same real-data sample. Treat both tools as
+instrumentation for further validation, not as a discovery pipeline ready
+to feed `promote_capability.py`.
+
+### Executing third-party compatibility checks (M8 Gate D — highest risk, not authorized for real use)
+
+`check_cross_project_compatibility.py run` is the one tool in this whole
+plan that executes code a human wrote and committed in *another* project,
+not code that ships in this skill:
+
+```bash
+python3 <skill-dir>/scripts/check_cross_project_compatibility.py run \
+    --global-id "<project>#<capability-id>" \
+    --authorize-project <other-project-id> \
+    [--authorize-project <other-project-id> ...] \
+    --catalog <catalog.json>
+```
+
+It only runs a project's own declared `check_command` from that project's
+own `wiki/compat-check.json` (`check_command` argv list, `timeout_seconds`,
+`reviewed_by`, `reviewed_at` — all required, all hand-authored and
+git-committed by that project). There is no `--authorize-all`: every
+`--authorize-project` must already be in the `affected` set computed from
+`--global-id` (Gate A's own reverse-index query), execution is
+`shell=False` with an explicit argv, `wiki/compat-check.json` is re-read
+immediately before each project's command runs (closing the TOCTOU window
+between authorization and execution), and a hard ceiling caps any declared
+`timeout_seconds` regardless of what the project itself asked for.
+`--stale-after-hours` (default 6, matching `query_catalog.py`) refuses to
+run against a stale `catalog.json` unless `--allow-stale-catalog` is passed
+explicitly. Results land per-project under a separate directory,
+`manifests/compat-runs/<run_id>/<project_id>.json` — deliberately not
+mixed into `cross-project-catalog/compat/`'s Tier-1 deterministic hash
+output, since Tier-2's raw execution output has a different trust level.
+
+`reviewed_by`/`reviewed_at` are self-declared by the project that wrote
+`compat-check.json` — there is no independent third-party check of who
+actually reviewed it, only the fact that the declaration had to be
+committed into that project's own git history to take effect.
+
+**Not yet true**: this has never been run against any real project's
+`wiki/compat-check.json` — no project in this fleet has adopted that file
+yet, and this tool is not registered in any hook or SessionStart path. Per
+the design doc (§4), Gate D is the highest-risk of the four gates — the
+only one that executes third-party code — and depends on Gate A's output;
+it is not itself authorized for real use, and running it against a real
+project is a separate decision, not a byproduct of this documentation
+existing.

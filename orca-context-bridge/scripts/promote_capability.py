@@ -64,6 +64,16 @@ add a flag that could point it somewhere else -- tests that need an
 isolated root monkeypatch the PROMOTION_ROOT module constant directly (see
 test_detect_capability_changes.py's own convention), never a CLI override.
 
+This directory is a TOP-LEVEL sibling of `manifests/cross-project-catalog/`,
+not nested inside it -- unlike `compat-pending-authorization/` above, which
+*is* correctly nested there because the design doc's own directory tree
+(M8-DESIGN-FINAL-2026-08-23.md 3.0.1) places `compat/` as a child of
+`cross-project-catalog/` (M4's aggregated/authenticated-derived-data tree)
+while it places `capability-promotion/` as an independent peer, deliberately
+NOT nested under `cross-project-catalog/`, specifically so this staging
+tree's name/location never implies it is downstream of or subordinate to
+M4's read-only aggregation.
+
 THE SINGLE WRITE EXCEPTION -- FULLY DOCUMENTED, DEFENDED IN DEPTH
 ------------------------------------------------------------------
 `approve` writes into "the target project's own wiki/" and nowhere else,
@@ -217,7 +227,7 @@ sys.dont_write_bytecode = True
 # ---------------------------------------------------------------------------
 
 PROMOTION_ROOT = Path(
-    "/Volumes/Extreme SSD/Orca/manifests/cross-project-catalog/"
+    "/Volumes/Extreme SSD/Orca/manifests/"
     "capability-promotion-pending-authorization"
 )
 LEDGER_NAME = "promotion-ledger.jsonl"
