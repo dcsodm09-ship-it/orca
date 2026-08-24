@@ -2301,6 +2301,79 @@ def _approve_orca_context_wiki(
             assert knowledge_dir_fd is not None
             atomic_write_in_dir(knowledge_final, content_md_bytes, dir_fd=knowledge_dir_fd)
 
+        # round-5-fix P1 (this bug class's THIRD fix -- see round-4-fix's
+        # own comment block above for the first two). Grok's dedicated
+        # final gate on round-4's fix found that moving the knowledge-body
+        # write earlier in this function -- to make invoke_wiki_edit_guard()
+        # below the LAST mutating step, closing the knowledge-write TOCTOU
+        # -- relocated, but did not eliminate, the identical class of
+        # vulnerability onto the wiki write itself, which is now
+        # unavoidably that last mutating step. The identity_unchanged()
+        # check earlier in this function (right after new_payload is
+        # built) now runs BEFORE the knowledge-body write, so a real
+        # window opened up between it and invoke_wiki_edit_guard() --
+        # spanning pin_wiki_edit_guard_sha256()/verify_wiki_edit_guard_sha256()
+        # and the knowledge-body write -- during which an attacker with
+        # write access to the target project's wiki/ directory can swap
+        # wiki_path itself for a symlink to a file OUTSIDE the project
+        # (invoke_wiki_edit_guard() passes str(wiki_path) to
+        # wiki_edit_guard.py as a subprocess argument, and that file's own
+        # main() does its own `.expanduser().resolve(strict=False)` on
+        # that string -- a symlink placed there in the meantime is
+        # followed without complaint), or swap wiki/ itself for a symlink
+        # to an outside directory holding a decoy copy of the wiki file.
+        # Both were independently reproduced end-to-end: approve reports
+        # success/approved/committed while the real mutation landed
+        # outside the target project and the project's own path now
+        # points outside itself.
+        #
+        # The fix: re-run the containment/identity checks again, right
+        # here, as the very last thing before the subprocess is spawned --
+        # as little CODE (not comments) as possible in between:
+        #
+        #   1. _has_symlink_component() again, on a freshly-built LEXICAL
+        #      (unresolved, .absolute()-only) "wiki/<name>" path -- same
+        #      discipline resolve_wiki_target_path() already documents and
+        #      applies: checked FIRST here because it is the more specific
+        #      diagnosis (a symlink was introduced) and gets its own
+        #      distinct PromoteFatal reason, separate from
+        #      "concurrent_modification_detected", so the two failure
+        #      modes stay distinguishable in logs/tests. Deliberately
+        #      re-derived from real_path/wiki_path.name rather than reusing
+        #      the already-.resolve()d `wiki_path` variable: resolving
+        #      first would silently collapse a just-introduced symlink
+        #      component before this check ever saw it (the exact no-op
+        #      pitfall resolve_wiki_target_path's own docstring warns
+        #      about).
+        #   2. identity_unchanged() again, reusing the exact same
+        #      identity tuple captured earlier -- catches an in-place
+        #      content swap of the wiki file that does not involve a
+        #      symlink at all (e.g. the regular file's bytes rewritten
+        #      out from under this process), which check 1 would not
+        #      detect on its own.
+        #
+        # This narrows the window to the true minimum: between this
+        # re-check and wiki_edit_guard.py's OWN os.open()/.resolve() call
+        # inside its own subprocess, moments later. Fully eliminating even
+        # that residual window would require modifying wiki_edit_guard.py
+        # itself (e.g. to accept an already-opened file descriptor, or use
+        # O_NOFOLLOW internally instead of Path.resolve()) -- EXPLICITLY
+        # OUT OF SCOPE here: wiki_edit_guard.py is a separately-maintained,
+        # SHA-256-pinned, already-hardened dependency this codebase
+        # deliberately does not modify or duplicate (design doc 3.0.2's
+        # named "call, don't copy" exception -- see the section header
+        # above invoke_wiki_edit_guard()). Modifying it needs its own
+        # dedicated review, not a drive-by change bundled into this fix.
+        # This residual gap is accepted as a known, accepted limitation --
+        # not silently ignored -- and is now bounded by a single
+        # subprocess's own startup latency instead of spanning this whole
+        # function's knowledge-body write and everything else that used to
+        # run in between.
+        if _has_symlink_component((real_path / "wiki" / wiki_path.name).absolute(), real_path.absolute()):
+            raise PromoteFatal("wiki_path_symlink_introduced", str(wiki_path))
+        if not identity_unchanged(wiki_path, identity):
+            raise PromoteFatal("concurrent_modification_detected", str(wiki_path))
+
         guard_result = invoke_wiki_edit_guard(guard_path, wiki_path, new_payload)
     finally:
         if knowledge_dir_fd is not None:

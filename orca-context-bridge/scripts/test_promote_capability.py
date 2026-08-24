@@ -1211,6 +1211,138 @@ class ApproveOrcaContextWikiTests(PromoteCapabilityTestCase):
         )
         self.assertEqual(code2, 0, result2)
 
+    def test_approve_wiki_file_symlink_swap_before_guard_invocation_refused(self) -> None:
+        # round-5-fix P1 regression, scenario 1 (the exact repro): with
+        # round-4's fix in place, invoke_wiki_edit_guard() -- which passes
+        # str(wiki_path) to wiki_edit_guard.py as a subprocess argument,
+        # and that file's own main() does its own
+        # `.expanduser().resolve(strict=False)` on that string -- is now
+        # unavoidably the LAST mutating step in _approve_orca_context_wiki().
+        # An attacker with write access to the target project's wiki/
+        # directory can swap wiki/orca-context-wiki.json itself for a
+        # symlink to a file OUTSIDE the project in the window between the
+        # earlier identity_unchanged() check (which now runs before the
+        # knowledge-body write) and invoke_wiki_edit_guard(). Reproduced
+        # here by hooking atomic_write_in_dir (the knowledge-body write,
+        # the last thing that runs before this fix's new re-checks) to
+        # perform the swap immediately after it completes -- i.e. as late
+        # as possible before invoke_wiki_edit_guard() would otherwise run.
+        proj = self.make_project("proj-a", wiki_content_version=1)
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+
+        wiki_path = proj / "wiki" / "orca-context-wiki.json"
+        before_bytes = wiki_path.read_bytes()
+
+        outside_dir = Path(tempfile.mkdtemp(prefix="promote-cap-outside-file-"))
+        self.addCleanup(shutil.rmtree, str(outside_dir), ignore_errors=True)
+        outside_file = outside_dir / "decoy-wiki.json"
+        outside_file.write_bytes(before_bytes)
+
+        git_head_before = subprocess.run(
+            ["git", "-C", str(proj), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+        real_atomic_write_in_dir = pc.atomic_write_in_dir
+
+        def swap_then_write(final_path, payload, *, dir_fd=None):
+            result = real_atomic_write_in_dir(final_path, payload, dir_fd=dir_fd)
+            # Attacker swaps the real wiki file for a symlink to a file
+            # OUTSIDE the project, right in the window this fix's late
+            # re-check exists to close.
+            wiki_path.unlink()
+            wiki_path.symlink_to(outside_file)
+            return result
+
+        with mock.patch.object(pc, "atomic_write_in_dir", side_effect=swap_then_write):
+            code, result, _err = run_cli_json(
+                ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+            )
+
+        # approve must NOT report success.
+        self.assertEqual(code, 4, result)
+        self.assertEqual(result["reason"], "wiki_path_symlink_introduced")
+
+        # The OUTSIDE file must be completely untouched -- no new page, no
+        # bumped content_version, byte-identical to what it was before.
+        self.assertEqual(outside_file.read_bytes(), before_bytes, "the outside file must never be mutated")
+
+        # The candidate must NOT have transitioned to approved.
+        record_path = pc.candidate_path(pc.PROMOTION_ROOT, "proj-a", candidate_id)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["status"], "pending_approval")
+        self.assertNotIn("approve_result", record)
+
+        # No git commit happened in the target project.
+        git_head_after = subprocess.run(
+            ["git", "-C", str(proj), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        self.assertEqual(git_head_before, git_head_after, "no commit must have happened against the fake project")
+
+    def test_approve_wiki_dir_symlink_swap_before_guard_invocation_refused(self) -> None:
+        # round-5-fix P1 regression, scenario 2 (the directory-swap
+        # variant): wiki/ ITSELF replaced with a symlink to an outside
+        # directory holding a decoy copy of the wiki file, in the same
+        # window as the scenario-1 test above. Before this fix,
+        # invoke_wiki_edit_guard() would follow the swapped-in wiki/ down
+        # to the decoy file (git then correctly refuses the
+        # symlink-crossing pathspec, so git_committed would be False, but
+        # the decoy copy would have been mutated and approve would still
+        # report status "approved").
+        proj = self.make_project("proj-a", wiki_content_version=1)
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+
+        wiki_dir = proj / "wiki"
+        wiki_path = wiki_dir / "orca-context-wiki.json"
+        before_bytes = wiki_path.read_bytes()
+
+        outside_dir = Path(tempfile.mkdtemp(prefix="promote-cap-outside-dir-"))
+        self.addCleanup(shutil.rmtree, str(outside_dir), ignore_errors=True)
+        outside_wiki_copy = outside_dir / "orca-context-wiki.json"
+        outside_wiki_copy.write_bytes(before_bytes)
+
+        git_head_before = subprocess.run(
+            ["git", "-C", str(proj), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+        real_atomic_write_in_dir = pc.atomic_write_in_dir
+
+        def swap_then_write(final_path, payload, *, dir_fd=None):
+            result = real_atomic_write_in_dir(final_path, payload, dir_fd=dir_fd)
+            # Attacker replaces wiki/ ITSELF with a symlink to an outside
+            # directory holding a decoy copy of the wiki file.
+            shutil.rmtree(str(wiki_dir))
+            wiki_dir.symlink_to(outside_dir, target_is_directory=True)
+            return result
+
+        with mock.patch.object(pc, "atomic_write_in_dir", side_effect=swap_then_write):
+            code, result, _err = run_cli_json(
+                ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+            )
+
+        # approve must NOT report success.
+        self.assertEqual(code, 4, result)
+        self.assertEqual(result["reason"], "wiki_path_symlink_introduced")
+
+        # The OUTSIDE decoy copy must be completely untouched.
+        self.assertEqual(outside_wiki_copy.read_bytes(), before_bytes, "the outside decoy copy must never be mutated")
+
+        # The candidate must NOT have transitioned to approved.
+        record_path = pc.candidate_path(pc.PROMOTION_ROOT, "proj-a", candidate_id)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["status"], "pending_approval")
+        self.assertNotIn("approve_result", record)
+
+        # No git commit happened in the target project. (wiki/ no longer
+        # exists as a real directory under proj at all at this point --
+        # it was replaced by a symlink -- so `git -C proj` still works
+        # fine since .git itself was never touched.)
+        git_head_after = subprocess.run(
+            ["git", "-C", str(proj), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        self.assertEqual(git_head_before, git_head_after, "no commit must have happened against the fake project")
+
 
 class KnowledgeDirFdTocTouTests(unittest.TestCase):
     """round-4-fix regression: a dedicated Grok final gate demonstrated
