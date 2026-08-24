@@ -139,24 +139,55 @@ already staged in the target repo for something unrelated.
   anything below touches the target wiki file, closing a round-fix P0 where
   a missing staged `content.md` used to be discovered only after the wiki
   file below had already been rewritten, leaving it modified-and-
-  uncommitted with no matching "approved" record -> build the candidate new
+  uncommitted with no matching "approved" record. That same containment
+  step also now opens a directory file descriptor for `wiki/knowledge/` at
+  the exact instant containment is confirmed (round-4-fix; see
+  `_resolve_knowledge_md_path_and_dir_fd()`) -> build the candidate new
   payload (content_version incremented by exactly 1, since every write here
   adds a page) -> pin this script's own copy of wiki_edit_guard.py's
-  SHA-256 the first time this run needs it -> subprocess-invoke
-  wiki_edit_guard.py's own `--apply --json` (its semantic-diff /
-  content_version bookkeeping logic is NOT copied here -- see "WHY
-  wiki_edit_guard.py IS CALLED, NOT COPIED" below) -> re-verify the pinned
-  hash is unchanged immediately before that invocation, refusing fail-closed
-  on any mismatch -> write the already-read `content.md` bytes (if the
-  candidate has one) to the already-resolved `wiki/knowledge/<id>.md` path
-  -> by default, `git add` + `git commit` in the TARGET project's own repo
-  in the SAME call, eliminating the "written but not committed" NACK window
-  that hit this same plan for real twice (M1, M7) -- `--no-commit` is an
-  explicit, doubly-named escape hatch.
+  SHA-256 the first time this run needs it -> re-verify the pinned hash is
+  unchanged immediately before invoking it, refusing fail-closed on any
+  mismatch -> write the already-read `content.md` bytes (if the candidate
+  has one) THROUGH that same directory file descriptor to the
+  already-resolved `wiki/knowledge/<id>.md` filename (round-4-fix: this now
+  happens BEFORE the wiki write below, not after -- see the round-4-fix
+  note further down and `_approve_orca_context_wiki()`'s own comments) ->
+  subprocess-invoke wiki_edit_guard.py's own `--apply --json` (its
+  semantic-diff / content_version bookkeeping logic is NOT copied here --
+  see "WHY wiki_edit_guard.py IS CALLED, NOT COPIED" below) -- this is now
+  the LAST mutating step in the sequence before the commit -> by default,
+  `git add` + `git commit` in the TARGET project's own repo in the SAME
+  call, eliminating the "written but not committed" NACK window that hit
+  this same plan for real twice (M1, M7) -- `--no-commit` is an explicit,
+  doubly-named escape hatch.
   -> detect whether the target project's own
   reviewed-startup-pack-manifest.json pins this exact path, and if so, print
   an UNSUPPRESSABLE notice that its next SessionStart will fail closed until
   a human re-signs it. `approve` never re-signs that manifest itself.
+
+  round-4-fix (this bug class's SECOND fix -- the round-fix P0 above only
+  closed the "missing content.md" trigger, not the general class): the
+  knowledge-body write used to be a SEPARATE, LATER step that ran AFTER the
+  wiki write above, so it could still fail for reasons other than "the
+  staged file doesn't exist" -- e.g. a pre-existing-but-unwritable
+  wiki/knowledge/ directory (mkdir's own exist_ok=True is a silent no-op on
+  an already-existing directory, so it never catches this), or any other
+  OSError on that write -- leaving the wiki file mutated-and-uncommitted
+  with the candidate stuck at pending_approval forever and a retry blocked
+  by duplicate_page_id. Independently reproduced end-to-end. A dedicated
+  Grok final gate separately found a TOCTOU in the same area: the
+  containment check and the eventual by-name write were separated by a
+  real subprocess call (invoke_wiki_edit_guard()), a window in which
+  wiki/knowledge could be swapped for a symlink to outside the project.
+  Both are fixed together: the untracked knowledge body is now written
+  FIRST (through a directory file descriptor captured at containment-check
+  time, never by re-walking the path by name later), and the tracked wiki
+  write is the LAST mutating step this function performs before the git
+  commit -- see `_approve_orca_context_wiki()`'s own comments for why
+  nothing after that last step can itself fail. This makes "wiki mutated +
+  reported failure", "wiki mutated + candidate stuck pending forever", and
+  "knowledge write escapes the project root" all provably impossible, not
+  just less likely.
 
 WHY wiki_edit_guard.py IS CALLED, NOT COPIED
 ------------------------------------------------------------------
@@ -1373,7 +1404,7 @@ def resolve_wiki_target_path(project_root: Path, filename: str) -> Path:
     return resolved_final
 
 
-def resolve_knowledge_md_path(project_root: Path, page_id: str) -> Path:
+def _resolve_knowledge_md_path_and_dir_fd(project_root: Path, page_id: str) -> tuple[Path, int]:
     # round-2-fix P0: this function's ONLY containment check used to be on
     # `real_knowledge` (the wiki/knowledge/ directory itself), never on the
     # actual final path `real_knowledge / f"{page_id}.md"`. The comment that
@@ -1442,10 +1473,75 @@ def resolve_knowledge_md_path(project_root: Path, page_id: str) -> Path:
         raise PromoteFatal("target_knowledge_path_escapes_knowledge_dir") from exc
     if knowledge_final.parent != real_knowledge:
         raise PromoteFatal("target_knowledge_path_not_direct_child_of_knowledge_dir")
+    if os.sep in knowledge_final.name or knowledge_final.name in (".", ".."):
+        # Cannot actually happen given the parent-equality check just
+        # above (a Path's .name is by construction a single component,
+        # never containing a separator) -- asserted explicitly anyway
+        # because this filename is about to be used directly against a
+        # directory file descriptor below (never re-resolved as a full
+        # path), and that call site must never be handed anything that
+        # could be misread as a multi-component or ".."-relative name.
+        raise PromoteFatal("target_knowledge_path_not_direct_child_of_knowledge_dir")
+
+    # round-4-fix (this bug class's SECOND fix -- see the module docstring
+    # "THE SINGLE WRITE EXCEPTION" section and _approve_orca_context_wiki()'s
+    # own comments for the full history). Everything above this point is a
+    # pure containment CHECK -- no mutation of the target project beyond,
+    # at most, creating an EMPTY, untracked wiki/knowledge/ directory
+    # (harmless and idempotent, same as before this fix). A dedicated Grok
+    # final gate demonstrated that the caller used to take the plain Path
+    # this function returned and re-walk it BY NAME much later, after a
+    # real subprocess call (invoke_wiki_edit_guard()) had already run in
+    # between -- a genuine TOCTOU window: if something with write access to
+    # wiki/ replaced wiki/knowledge (or any ancestor) with a symlink to
+    # outside the project during that window, the later by-name write
+    # would silently follow it, and approve would report success with the
+    # body landed outside the target project entirely.
+    #
+    # The fix: open a DIRECTORY FILE DESCRIPTOR for real_knowledge right
+    # now, at the exact moment containment has just been confirmed, with
+    # O_NOFOLLOW so the open itself refuses outright if the final path
+    # component has, in the brief unavoidable gap since the .resolve()
+    # calls above, already become a symlink. A dir_fd stays pinned to
+    # THIS directory's specific inode for as long as it stays open --
+    # completely independent of what the name "wiki/knowledge" resolves
+    # to afterwards, no matter how much (or how little) work the caller
+    # does before actually writing through it. The caller MUST perform the
+    # actual knowledge-body write through this fd
+    # (atomic_write_in_dir(..., dir_fd=...)), never by re-walking
+    # "wiki/knowledge/<name>" as a fresh path by name -- doing so would
+    # silently reopen exactly the window this fd exists to close. The
+    # caller owns the fd and must close it (see _approve_orca_context_wiki()).
+    try:
+        dir_fd = os.open(str(real_knowledge), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except PermissionError as exc:
+        raise PromoteFatal("target_write_permission_denied", str(exc)) from exc
+    except OSError as exc:
+        raise PromoteFatal("knowledge_dir_unopenable", str(exc)) from exc
+
+    return knowledge_final, dir_fd
+
+
+def resolve_knowledge_md_path(project_root: Path, page_id: str) -> Path:
+    """Thin wrapper over _resolve_knowledge_md_path_and_dir_fd() for every
+    caller that only wants the checked-and-resolved Path, not a live
+    directory file descriptor -- e.g. every test in this suite that calls
+    this function directly to exercise the containment logic in isolation,
+    and any other caller with no TOCTOU-sensitive write to perform. Opens
+    and immediately closes the dir_fd (the underlying containment checks
+    and their PromoteFatal reasons are unchanged). The one caller that
+    actually performs a knowledge-body write (_approve_orca_context_wiki())
+    calls _resolve_knowledge_md_path_and_dir_fd() directly instead, so it
+    can keep the fd open across the gap until the real write happens."""
+    knowledge_final, dir_fd = _resolve_knowledge_md_path_and_dir_fd(project_root, page_id)
+    try:
+        os.close(dir_fd)
+    except OSError:
+        pass
     return knowledge_final
 
 
-def atomic_write_in_dir(final_path: Path, payload: bytes) -> None:
+def atomic_write_in_dir(final_path: Path, payload: bytes, *, dir_fd: int | None = None) -> None:
     """Same tmp-file+os.replace discipline as atomic_write_within, but for
     a write target OUTSIDE this tool's own PROMOTION_ROOT (the target
     project's wiki/ directory) -- containment for THIS write was already
@@ -1456,10 +1552,55 @@ def atomic_write_in_dir(final_path: Path, payload: bytes) -> None:
     isolation test, or a real permissions problem) is converted to a named
     PromoteFatal rather than propagating as a raw OSError/traceback --
     "a clean, meaningful failure, not a PermissionError traceback or a
-    silent partial write" is an explicit requirement for this tool."""
-    tmp_path = final_path.parent / f".{final_path.name}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
+    silent partial write" is an explicit requirement for this tool.
+
+    dir_fd (round-4-fix): when given, every filesystem operation below is
+    performed relative to this OPEN directory file descriptor (os.open's
+    own dir_fd= parameter, os.rename's src_dir_fd=/dst_dir_fd=), never by
+    re-walking final_path.parent as a string. final_path is still used
+    only to derive the plain filename (final_path.name); its directory
+    component is NEVER touched by name when dir_fd is given -- the caller
+    is expected to have obtained dir_fd at the exact moment its own
+    containment check passed (see _resolve_knowledge_md_path_and_dir_fd()),
+    so writing through it guarantees the write lands in the SAME directory
+    inode that was actually checked, regardless of anything that has since
+    happened to the name that directory used to be reachable under (a
+    later rename or symlink swap of that name, or any ancestor of it,
+    cannot redirect a write already anchored to the fd).
+
+    os.replace() has no dir_fd-capable form on this platform (confirmed
+    empirically: os.replace not in os.supports_dir_fd, even though
+    os.rename is). os.rename() is used instead for the dir_fd path, which
+    is safe here because this whole function already assumes POSIX
+    (O_NOFOLLOW and os.O_DIRECTORY do not exist on Windows either) and
+    POSIX's rename(2) already atomically replaces an existing destination
+    -- the exact guarantee os.replace() exists to add on top of
+    os.rename() only for Windows' sake."""
+    filename = final_path.name
+    if dir_fd is not None and (os.sep in filename or filename in (".", "..")):
+        # Cannot happen given how every current caller builds final_path
+        # (always a direct child of the checked directory) -- asserted
+        # explicitly anyway since this string is about to be used as a
+        # dir_fd-relative name, and that call site must never be handed
+        # anything that could be misread as a multi-component path.
+        raise PromoteFatal("target_write_invalid_filename", filename)
+    tmp_name = f".{filename}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
+    tmp_path = final_path.parent / tmp_name
+
+    def _unlink_tmp() -> None:
+        try:
+            if dir_fd is not None:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            else:
+                os.unlink(str(tmp_path))
+        except OSError:
+            pass
+
     try:
-        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        if dir_fd is not None:
+            fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dir_fd)
+        else:
+            fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
     except PermissionError as exc:
         raise PromoteFatal("target_write_permission_denied", str(exc)) from exc
     try:
@@ -1468,18 +1609,15 @@ def atomic_write_in_dir(final_path: Path, payload: bytes) -> None:
             os.fsync(fd)
         finally:
             os.close(fd)
-        os.replace(str(tmp_path), str(final_path))
+        if dir_fd is not None:
+            os.rename(tmp_name, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        else:
+            os.replace(str(tmp_path), str(final_path))
     except PermissionError as exc:
-        try:
-            os.unlink(str(tmp_path))
-        except OSError:
-            pass
+        _unlink_tmp()
         raise PromoteFatal("target_write_permission_denied", str(exc)) from exc
     except BaseException:
-        try:
-            os.unlink(str(tmp_path))
-        except OSError:
-            pass
+        _unlink_tmp()
         raise
 
 
@@ -2030,7 +2168,8 @@ def _approve_orca_context_wiki(
     if do_commit and not is_git_repo(real_path):
         raise PromoteFatal("target_project_not_a_git_repo", str(real_path))
 
-    # round-fix P0: this whole block used to run AFTER invoke_wiki_edit_guard()
+    # round-fix P0 (round 3 of this bug class -- see round-4-fix below for
+    # the sequel): this whole block used to run AFTER invoke_wiki_edit_guard()
     # below -- i.e. after the target project's real wiki/orca-context-wiki.json
     # had ALREADY been rewritten on disk. A missing staged content.md (e.g. it
     # disappeared between draft and approve for any reason) was then only
@@ -2046,69 +2185,129 @@ def _approve_orca_context_wiki(
     #
     # Also read the content.md bytes into memory now (not just is_file()),
     # and resolve+precompute knowledge_final/knowledge_md_relpath now too
-    # (pure path arithmetic, no filesystem write): everything about the
+    # (this does at most create an EMPTY untracked wiki/knowledge/ directory
+    # -- see _resolve_knowledge_md_path_and_dir_fd()): everything about the
     # knowledge_final write that CAN be checked/prepared without touching the
-    # target wiki file is done here. That leaves the actual
-    # atomic_write_in_dir() disk write (further below, after the guard call)
-    # as the only thing that can still fail once the guard has already run --
-    # a much narrower failure surface (disk-full/permission/race) than "the
-    # source file might not even exist" or "the destination path might not
-    # resolve", which is what used to be checked at that late point.
+    # target wiki file is done here.
     knowledge_final: Path | None = None
     knowledge_md_relpath: str | None = None
     content_md_bytes: bytes | None = None
-    if record.get("has_content_md"):
-        content_md_source = content_md_path(ensure_promotion_root(), record["target_project"], record["candidate_id"])
-        if not content_md_source.is_file():
-            raise PromoteFatal("staged_content_md_missing", str(content_md_source))
-        knowledge_final = resolve_knowledge_md_path(real_path, record["id"])
-        content_md_bytes = content_md_source.read_bytes()
-        # knowledge_final is a fully .resolve()d path; real_path (straight
-        # from catalog.json) may not be (e.g. this machine's own
-        # /var -> /private/var) -- relative_to() needs both sides in the
-        # same basis, same class of bug documented on resolve_wiki_target_path().
-        knowledge_md_relpath = str(knowledge_final.relative_to(real_path.resolve(strict=False)))
+    knowledge_dir_fd: int | None = None
+    try:
+        if record.get("has_content_md"):
+            content_md_source = content_md_path(ensure_promotion_root(), record["target_project"], record["candidate_id"])
+            if not content_md_source.is_file():
+                raise PromoteFatal("staged_content_md_missing", str(content_md_source))
+            # round-4-fix: use the dir_fd-returning variant, not plain
+            # resolve_knowledge_md_path(), so the actual write further
+            # below can go through a directory file descriptor captured at
+            # the instant containment was confirmed instead of re-walking
+            # "wiki/knowledge/<id>.md" by name later -- see that function's
+            # own docstring/comments for the TOCTOU this closes.
+            knowledge_final, knowledge_dir_fd = _resolve_knowledge_md_path_and_dir_fd(real_path, record["id"])
+            content_md_bytes = content_md_source.read_bytes()
+            # knowledge_final is a fully .resolve()d path; real_path (straight
+            # from catalog.json) may not be (e.g. this machine's own
+            # /var -> /private/var) -- relative_to() needs both sides in the
+            # same basis, same class of bug documented on resolve_wiki_target_path().
+            knowledge_md_relpath = str(knowledge_final.relative_to(real_path.resolve(strict=False)))
 
-    old_raw, identity = read_with_identity(wiki_path, MAX_WIKI_BYTES)
-    old_payload = _load_json_object(old_raw, label="target_orca_context_wiki")
+        old_raw, identity = read_with_identity(wiki_path, MAX_WIKI_BYTES)
+        old_payload = _load_json_object(old_raw, label="target_orca_context_wiki")
 
-    old_meta = old_payload.get("meta")
-    if not isinstance(old_meta, dict) or not isinstance(old_meta.get("content_version"), int) or isinstance(old_meta.get("content_version"), bool):
-        raise PromoteFatal(
-            "target_wiki_meta_missing_needs_bootstrap",
-            f"{wiki_path} has no valid meta.content_version; bootstrap it out-of-band with "
-            f"wiki_edit_guard.py --bootstrap before using approve",
-        )
-    old_version = old_meta["content_version"]
+        old_meta = old_payload.get("meta")
+        if not isinstance(old_meta, dict) or not isinstance(old_meta.get("content_version"), int) or isinstance(old_meta.get("content_version"), bool):
+            raise PromoteFatal(
+                "target_wiki_meta_missing_needs_bootstrap",
+                f"{wiki_path} has no valid meta.content_version; bootstrap it out-of-band with "
+                f"wiki_edit_guard.py --bootstrap before using approve",
+            )
+        old_version = old_meta["content_version"]
 
-    pages = old_payload.get("pages")
-    if not isinstance(pages, list):
-        raise PromoteFatal("target_wiki_pages_malformed", "pages is not a list")
-    for page in pages:
-        if isinstance(page, dict) and page.get("id") == record["id"]:
-            raise PromoteValidationError("duplicate_page_id", f"page id {record['id']!r} already exists in the target wiki")
+        pages = old_payload.get("pages")
+        if not isinstance(pages, list):
+            raise PromoteFatal("target_wiki_pages_malformed", "pages is not a list")
+        for page in pages:
+            if isinstance(page, dict) and page.get("id") == record["id"]:
+                raise PromoteValidationError("duplicate_page_id", f"page id {record['id']!r} already exists in the target wiki")
 
-    new_page = {
-        "id": record["id"],
-        "title": record["title"],
-        "path": record["path"],
-        "summary": record["summary"],
-        "status": record["wiki_status"],
-    }
-    new_payload = copy.deepcopy(old_payload)
-    new_payload["pages"].append(new_page)
-    new_payload["meta"] = {"content_version": old_version + 1, "updated_at": now_iso()}
+        new_page = {
+            "id": record["id"],
+            "title": record["title"],
+            "path": record["path"],
+            "summary": record["summary"],
+            "status": record["wiki_status"],
+        }
+        new_payload = copy.deepcopy(old_payload)
+        new_payload["pages"].append(new_page)
+        new_payload["meta"] = {"content_version": old_version + 1, "updated_at": now_iso()}
 
-    if not identity_unchanged(wiki_path, identity):
-        raise PromoteFatal("concurrent_modification_detected", str(wiki_path))
+        if not identity_unchanged(wiki_path, identity):
+            raise PromoteFatal("concurrent_modification_detected", str(wiki_path))
 
-    guard_path, pinned_sha256 = pin_wiki_edit_guard_sha256()
-    verify_wiki_edit_guard_sha256(guard_path, pinned_sha256)
-    guard_result = invoke_wiki_edit_guard(guard_path, wiki_path, new_payload)
+        guard_path, pinned_sha256 = pin_wiki_edit_guard_sha256()
+        verify_wiki_edit_guard_sha256(guard_path, pinned_sha256)
 
-    if knowledge_final is not None:
-        assert content_md_bytes is not None
-        atomic_write_in_dir(knowledge_final, content_md_bytes)
+        # round-4-fix P0 (this bug class's SECOND fix -- round-fix P0 above
+        # closed only the "missing content.md" trigger, not the general
+        # class). This used to be invoke_wiki_edit_guard() FIRST, then the
+        # knowledge-body write. That let a failure in the knowledge write
+        # (e.g. a pre-existing-but-unwritable wiki/knowledge/ directory --
+        # mkdir's own exist_ok=True is a silent no-op on an
+        # already-existing directory, so it never catches this; or any
+        # other OSError on that write) surface AFTER the target project's
+        # tracked wiki/orca-context-wiki.json had already been mutated: the
+        # exception propagated out of this function before cmd_approve
+        # could mark the candidate approved, so it stayed pending_approval
+        # forever, while the wiki file itself carried the new page and a
+        # bumped content_version, uncommitted -- and a retry was blocked
+        # outright by the duplicate_page_id check above, since the page
+        # now already existed. Independently reproduced end-to-end.
+        #
+        # The fix: write the knowledge body -- an UNTRACKED, brand-new file
+        # nothing references yet -- to its final destination FIRST (through
+        # knowledge_dir_fd, per the TOCTOU note on
+        # _resolve_knowledge_md_path_and_dir_fd()), and make the tracked
+        # wiki write (invoke_wiki_edit_guard(), right below) the LAST
+        # mutating step in this function before the git commit. If this
+        # write fails, nothing has touched the target wiki file at all:
+        # the candidate stays pending_approval, and a retry is always
+        # possible (any orphaned wiki/knowledge/<id>.md left behind by a
+        # partial attempt is silently overwritten by atomic_write_in_dir on
+        # the next try, since the page id was never added to the wiki and
+        # duplicate_page_id can't yet fire against it).
+        #
+        # If it succeeds, invoke_wiki_edit_guard() below is -- by
+        # inspection of wiki_edit_guard.py's own _atomic_write_text()
+        # (temp file + os.replace, the same discipline used throughout
+        # this codebase) -- itself all-or-nothing: it either fully
+        # rewrites the target wiki file or leaves it fully untouched,
+        # never partially. Nothing AFTER it in this function can itself
+        # raise: check_requires_manifest_resign() is a best-effort read
+        # that already swallows its own OSError/PromoteUsageError
+        # internally (see its own docstring), and git_commit_paths()
+        # already never raises -- it reports failure through its own
+        # return tuple, which is exactly the existing git_committed:false
+        # / git_commit_error handling a few lines down (mirroring the
+        # module docstring's own already-accepted "git commit can fail
+        # after a successful write" case). So once invoke_wiki_edit_guard()
+        # returns successfully, there is no remaining step in this
+        # function that can turn a real, already-landed wiki mutation into
+        # an uncaught exception -- there is deliberately no NEW fallback
+        # branch built for that here, because there is nothing left for it
+        # to catch.
+        if knowledge_final is not None:
+            assert content_md_bytes is not None
+            assert knowledge_dir_fd is not None
+            atomic_write_in_dir(knowledge_final, content_md_bytes, dir_fd=knowledge_dir_fd)
+
+        guard_result = invoke_wiki_edit_guard(guard_path, wiki_path, new_payload)
+    finally:
+        if knowledge_dir_fd is not None:
+            try:
+                os.close(knowledge_dir_fd)
+            except OSError:
+                pass
 
     requires_resign = check_requires_manifest_resign(real_path, "wiki/orca-context-wiki.json")
 

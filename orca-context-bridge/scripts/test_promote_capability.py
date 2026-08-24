@@ -1072,6 +1072,222 @@ class ApproveOrcaContextWikiTests(PromoteCapabilityTestCase):
         record = json.loads(record_path.read_text(encoding="utf-8"))
         self.assertEqual(record["status"], "pending_approval")
 
+    def test_approve_preexisting_unwritable_knowledge_dir_fails_cleanly_retry_possible(self) -> None:
+        # round-4-fix regression: the SECOND, more severe trigger for this
+        # same bug class. Unlike the round-3 test just above (wiki/
+        # ITSELF unwritable, caught early because os.makedirs() then
+        # fails outright), this reproduces a pre-EXISTING wiki/knowledge/
+        # directory that is itself unwritable while wiki/ remains
+        # writable. os.makedirs(..., exist_ok=True) is a silent no-op on
+        # an already-existing directory -- it neither chmods it nor
+        # raises -- so the pre-fix code sailed straight through the
+        # "cheap checks" section, invoked wiki_edit_guard.py (which DID
+        # mutate the target project's real wiki/orca-context-wiki.json:
+        # appended the page, bumped content_version), and only THEN
+        # failed on the knowledge-body write itself. That left the wiki
+        # file modified-and-uncommitted, the candidate stuck at
+        # pending_approval forever, and a retry blocked outright by
+        # duplicate_page_id -- independently reproduced end-to-end
+        # against the pre-fix code before writing this fix. This test
+        # asserts the fixed outcome: the wiki file stays untouched, the
+        # candidate is never "stuck" (a retry is always possible), and
+        # once the permission problem is fixed out-of-band, the retry
+        # actually succeeds.
+        proj = self.make_project("proj-a", wiki_content_version=1)
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+
+        knowledge_dir = proj / "wiki" / "knowledge"
+        knowledge_dir.mkdir(parents=True)
+        os.chmod(str(knowledge_dir), 0o500)  # read+execute, NOT writable
+        self.addCleanup(lambda: os.chmod(str(knowledge_dir), 0o700) if knowledge_dir.exists() else None)
+
+        wiki_path = proj / "wiki" / "orca-context-wiki.json"
+        before_bytes = wiki_path.read_bytes()
+        before_hash = pc._sha256_hex(before_bytes)
+        status_before = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(status_before.strip(), "", "fixture project must start with a clean working tree")
+
+        try:
+            code, result, _err = run_cli_json(
+                ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+            )
+        finally:
+            os.chmod(str(knowledge_dir), 0o700)
+
+        self.assertEqual(code, 4, result)
+        self.assertEqual(result["reason"], "target_write_permission_denied")
+
+        # THE critical assertion: the wiki file is byte-for-byte
+        # untouched -- NOT mutated-and-uncommitted the way the pre-fix
+        # code left it (bumped content_version, appended page).
+        after_bytes = wiki_path.read_bytes()
+        self.assertEqual(before_bytes, after_bytes, "wiki file must be byte-for-byte identical, never partially mutated")
+        self.assertEqual(before_hash, pc._sha256_hex(after_bytes))
+        after_doc = json.loads(after_bytes.decode("utf-8"))
+        self.assertEqual(after_doc["meta"]["content_version"], 1, "content_version must not have been bumped")
+        self.assertEqual(after_doc["pages"], [], "no page must have been appended")
+
+        status_after = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(status_after.strip(), "", "target project's git tree must be clean after a failed approve, never modified-and-uncommitted")
+
+        # The candidate must NOT be stuck: still pending_approval, with no
+        # approve_result recorded -- never the old "wiki mutated but
+        # candidate never marked approved, retry blocked by
+        # duplicate_page_id forever" shape.
+        record_path = pc.candidate_path(pc.PROMOTION_ROOT, "proj-a", candidate_id)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["status"], "pending_approval")
+        self.assertNotIn("approve_result", record)
+
+        # Prove the retry claim for real: fix the permission and approve
+        # again -- must now succeed cleanly, with no duplicate_page_id
+        # obstruction and no leftover corrupt state from the failed
+        # attempt.
+        os.chmod(str(knowledge_dir), 0o700)
+        code2, result2, _err2 = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code2, 0, result2)
+        self.assertEqual(result2["new_content_version"], 2)
+        final_doc = json.loads(wiki_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(final_doc["pages"]), 1)
+        self.assertEqual(final_doc["pages"][0]["id"], "x-algo-notes")
+
+    def test_approve_injected_oserror_during_knowledge_write_leaves_wiki_untouched(self) -> None:
+        # round-4-fix regression, generalized: the fix's guarantee must
+        # hold for ANY OSError from the knowledge-body write, not just
+        # the named PermissionError case exercised just above (a real
+        # disk-full condition, for instance, surfaces as a plain
+        # OSError/ENOSPC that atomic_write_in_dir does not convert to a
+        # named PromoteFatal -- see its own docstring, which documents
+        # only the PermissionError conversion). Inject a disk-full-shaped
+        # OSError directly at the one write call that remains BEFORE the
+        # tracked wiki write after the reorder, and confirm the wiki file
+        # is still never touched and the candidate is never left stuck.
+        proj = self.make_project("proj-a", wiki_content_version=1)
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+
+        wiki_path = proj / "wiki" / "orca-context-wiki.json"
+        before_bytes = wiki_path.read_bytes()
+
+        real_atomic_write_in_dir = pc.atomic_write_in_dir
+
+        def failing_atomic_write_in_dir(final_path, payload, *, dir_fd=None):
+            if dir_fd is not None:
+                # Simulated disk-full: a plain OSError, deliberately NOT
+                # a PermissionError, to prove the fix's ordering
+                # guarantee does not depend on atomic_write_in_dir's own
+                # PermissionError-to-PromoteFatal conversion.
+                raise OSError(28, "No space left on device")
+            return real_atomic_write_in_dir(final_path, payload, dir_fd=dir_fd)
+
+        with mock.patch.object(pc, "atomic_write_in_dir", side_effect=failing_atomic_write_in_dir):
+            code, result, _err = run_cli_json(
+                ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+            )
+
+        self.assertEqual(code, 4, result)
+
+        after_bytes = wiki_path.read_bytes()
+        self.assertEqual(before_bytes, after_bytes, "wiki file must be byte-for-byte identical after an injected write failure")
+        after_doc = json.loads(after_bytes.decode("utf-8"))
+        self.assertEqual(after_doc["meta"]["content_version"], 1)
+        self.assertEqual(after_doc["pages"], [])
+
+        status_after = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(status_after.strip(), "", "target project's git tree must be clean after a failed approve")
+
+        record_path = pc.candidate_path(pc.PROMOTION_ROOT, "proj-a", candidate_id)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["status"], "pending_approval")
+        self.assertNotIn("approve_result", record)
+
+        # Retry (with the injected failure removed) must succeed cleanly
+        # -- proving the candidate was never actually stuck.
+        code2, result2, _err2 = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code2, 0, result2)
+
+
+class KnowledgeDirFdTocTouTests(unittest.TestCase):
+    """round-4-fix regression: a dedicated Grok final gate demonstrated
+    that the ORIGINAL caller of resolve_knowledge_md_path() took the
+    plain Path it returned and re-walked it BY NAME much later, after a
+    real subprocess call (invoke_wiki_edit_guard()) had already run in
+    between -- a genuine TOCTOU window. An attacker with write access to
+    wiki/ could swap wiki/knowledge for a symlink to outside the target
+    project during that window; the pre-fix code would then silently
+    follow the new symlink and write the knowledge body outside the
+    project entirely, while approve still reported success.
+
+    These tests exercise the fix -- the directory file descriptor
+    _resolve_knowledge_md_path_and_dir_fd() hands back -- directly and
+    deterministically: swap the directory for a symlink AFTER
+    containment was confirmed but BEFORE the write, and confirm the
+    write stays anchored to the ORIGINAL directory's inode, never the
+    new symlink target."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="knowledge-dir-fd-toctou-"))
+        self.addCleanup(shutil.rmtree, str(self.tmp), ignore_errors=True)
+        self.proj = self.tmp / "proj"
+        (self.proj / "wiki").mkdir(parents=True)
+
+    def test_symlink_swap_after_containment_check_does_not_escape(self) -> None:
+        knowledge_final, dir_fd = pc._resolve_knowledge_md_path_and_dir_fd(self.proj, "a-page")
+        knowledge_dir = self.proj / "wiki" / "knowledge"
+        self.assertTrue(knowledge_dir.is_dir())
+
+        # THE attack: an attacker with write access to wiki/ swaps
+        # wiki/knowledge for a symlink to outside the project, in the
+        # window between containment-check (just above) and the actual
+        # write (just below) -- exactly the window a dedicated Grok final
+        # gate demonstrated was exploitable against the pre-fix code. The
+        # real directory has to move somewhere before a symlink can take
+        # its name; renaming it (rather than deleting it) also lets this
+        # test verify exactly where the write actually landed afterward.
+        outside = self.tmp / "OUTSIDE"
+        outside.mkdir()
+        moved_aside = self.proj / "wiki" / "knowledge-real"
+        os.rename(str(knowledge_dir), str(moved_aside))
+        os.symlink(str(outside), str(knowledge_dir))
+
+        try:
+            pc.atomic_write_in_dir(knowledge_final, b"PWNED-CONTENT", dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+
+        # THE critical assertion: nothing landed at the attacker's
+        # symlink target -- the write did not escape the project.
+        self.assertEqual(list(outside.iterdir()), [], "no file must land in the swapped-in symlink target")
+
+        # The write landed in the ORIGINAL directory instead -- reachable
+        # here at its post-rename name, proving the dir_fd stayed
+        # anchored to the checked inode regardless of the by-name swap.
+        real_written = moved_aside / "a-page.md"
+        self.assertTrue(real_written.is_file(), "the write must have landed in the ORIGINALLY-checked directory")
+        self.assertEqual(real_written.read_bytes(), b"PWNED-CONTENT")
+
+        # And the symlinked "knowledge" name itself was never walked by
+        # the write -- it still points exactly where the attacker put it.
+        self.assertEqual(os.readlink(str(knowledge_dir)), str(outside))
+
+    def test_preexisting_symlink_at_knowledge_dir_refused_outright(self) -> None:
+        # A different variant: wiki/knowledge is ALREADY a symlink before
+        # containment checking even starts (pre-existing protection, not
+        # new in this round -- confirms the refactor into
+        # _resolve_knowledge_md_path_and_dir_fd() did not weaken it).
+        outside = self.tmp / "OUTSIDE2"
+        outside.mkdir()
+        os.symlink(str(outside), str(self.proj / "wiki" / "knowledge"))
+        with self.assertRaises(pc.PromoteFatal) as ctx:
+            pc._resolve_knowledge_md_path_and_dir_fd(self.proj, "a-page")
+        self.assertEqual(ctx.exception.reason, "knowledge_dir_is_symlink")
+        self.assertEqual(list(outside.iterdir()), [])
+
 
 # ---------------------------------------------------------------------------
 # Approve-time record re-validation (P0 regression): a candidate record file
