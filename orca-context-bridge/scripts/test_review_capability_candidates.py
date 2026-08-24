@@ -42,11 +42,20 @@ def _run_dcc(argv: list[str]) -> tuple[int, str, str]:
 
 
 def make_hit(hit_id: str, *, state: str = "pending", content_sha256: str | None = "hash-x",
-             path: str | None = None, project_id: str = "p", signal_type: str = "capability:script",
+             path: str | None = None, project_id: str = "p", root_real_path: str | None = None,
+             signal_type: str = "capability:script",
              noise_signals: list[str] | None = None) -> dict:
+    # root_real_path defaults to a value derived from project_id (NOT the
+    # same field, just a convenient default so existing callers that only
+    # ever set project_id keep behaving the same way as before P1-1's fix
+    # moved cluster scoping from project_id to root_real_path -- distinct
+    # project_id values still default to distinct root_real_path values
+    # unless a test deliberately overrides one or the other to reproduce
+    # the real "same project_id, different root_real_path" shape).
     return {
         "hit_id": hit_id,
         "project_id": project_id,
+        "root_real_path": root_real_path if root_real_path is not None else f"/root/{project_id}",
         "signal_type": signal_type,
         "path": path or f"scripts/{hit_id}.py",
         "content_sha256": content_sha256,
@@ -371,6 +380,53 @@ class MarkTests(BaseTestCase):
         by_id = {h["hit_id"]: h for h in doc["hits"]}
         self.assertEqual(by_id["a"]["state"], "dismissed")
         self.assertEqual(by_id["b"]["state"], "dismissed")
+
+    def test_cluster_apply_scoped_by_root_real_path_not_shared_project_id(self) -> None:
+        """P1-1 (max-tier Gate C re-review): the P0-2 fix moved hit_id's own
+        identity from project_id to root_real_path, but mark
+        --apply-to-duplicate-cluster's default safety scope was left keyed
+        on project_id. This machine's real catalog.json proves project_id
+        is not a reliable proxy for "different project" (e.g. 'hgcloud' ->
+        3 distinct real_paths, 'rn邮箱' -> 4 -- shared project_id, genuinely
+        different projects). Reproduce that exact shape: two hits sharing
+        ONE project_id but with DIFFERENT root_real_path (mirroring two
+        scanned roots that happen to share a project_id string) and
+        byte-identical content. Confirm the default (no
+        --allow-cross-project-cluster) affects ONLY the reviewed hit's own
+        root_real_path, and --allow-cross-project-cluster is required to
+        also affect the other root."""
+        self.write_hits([
+            make_hit("a", content_sha256="shared-hash", project_id="dup-id", root_real_path="/wt1"),
+            make_hit("b", content_sha256="shared-hash", project_id="dup-id", root_real_path="/wt2"),
+        ])
+        code, out, err = _run_rcc([
+            "mark", "--hit-id", "a", "--state", "dismissed", "--marked-by", "tester",
+            "--apply-to-duplicate-cluster", "--hits-path", str(self.hits_path), "--json",
+        ])
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertEqual(payload["affected_hit_ids"], ["a"])
+
+        doc = self.read_hits()
+        by_id = {h["hit_id"]: h for h in doc["hits"]}
+        self.assertEqual(by_id["a"]["state"], "dismissed")
+        # b shares project_id AND content_sha256 with a, but lives under a
+        # DIFFERENT root_real_path -- must NOT be touched by the default
+        # (root_real_path-scoped) cluster application.
+        self.assertEqual(by_id["b"]["state"], "pending")
+
+        # --allow-cross-project-cluster is required to also reach b.
+        code, out, err = _run_rcc([
+            "mark", "--hit-id", "a", "--state", "dismissed", "--marked-by", "tester",
+            "--apply-to-duplicate-cluster", "--allow-cross-project-cluster",
+            "--hits-path", str(self.hits_path), "--json",
+        ])
+        self.assertEqual(code, 0, err)
+        payload2 = json.loads(out)
+        self.assertEqual(set(payload2["affected_hit_ids"]), {"a", "b"})
+        doc2 = self.read_hits()
+        by_id2 = {h["hit_id"]: h for h in doc2["hits"]}
+        self.assertEqual(by_id2["b"]["state"], "dismissed")
 
     def test_re_marking_an_already_terminal_hit_overwrites(self) -> None:
         self.write_hits([make_hit("a", state="dismissed")])

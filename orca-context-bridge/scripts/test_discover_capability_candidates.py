@@ -361,6 +361,49 @@ class NoiseRuleATests(BaseTestCase):
             self.assertNotIn("content_duplicate", h["noise_signals"])
         self.assertEqual(doc["noise_rules"]["A"]["hits_affected"], 0)
 
+    def test_cluster_scoped_by_root_real_path_not_shared_project_id(self) -> None:
+        """P1-1 (max-tier Gate C re-review): the P0-2 fix moved hit_id's own
+        identity from project_id to root_real_path, but this clustering key
+        was left on project_id. This machine's real catalog.json proves
+        project_id is not a reliable proxy for "different project": e.g.
+        'hgcloud' -> 3 distinct real_paths, 'rn邮箱' -> 4. Reproduce that
+        exact shape here -- two DIFFERENT roots sharing ONE project_id,
+        byte-identical content in both -- and confirm clustering still does
+        NOT span them by default (only root_real_path, not project_id,
+        should scope the cluster)."""
+        proj1 = self.tmp / "wt1"
+        proj2 = self.tmp / "wt2"
+        content = "identical content, two roots, ONE shared project_id\n"
+        self.make_knowledge_md(proj1, "reports/note.md", content)
+        self.make_knowledge_md(proj2, "reports/note.md", content)
+        catalog = self.tmp / "catalog.json"
+        _write_json(catalog, make_catalog(projects=[
+            make_project_row("dup-id", proj1),
+            make_project_row("dup-id", proj2),
+        ]))
+
+        code, _, err = _run_main(self.scan_argv([proj1, proj2], catalog, quiet=True))
+        self.assertEqual(code, 0, err)
+        doc = self.read_hits_doc()
+        hits = [h for h in doc["hits"] if h["path"] == "reports/note.md"]
+        self.assertEqual(len(hits), 2)
+        self.assertEqual({h["project_id"] for h in hits}, {"dup-id"})
+        # Same project_id, but two different root_real_paths -- must NOT be
+        # clustered by default.
+        for h in hits:
+            self.assertIsNone(h["duplicate_of"])
+            self.assertNotIn("content_duplicate", h["noise_signals"])
+        self.assertEqual(doc["noise_rules"]["A"]["hits_affected"], 0)
+
+        # --allow-cross-project-cluster still opts back into clustering by
+        # content_sha256 alone, regardless of root_real_path or project_id.
+        code, _, err = _run_main(
+            self.scan_argv([proj1, proj2], catalog, allow_cross_project_cluster=True, quiet=True)
+        )
+        self.assertEqual(code, 0, err)
+        doc2 = self.read_hits_doc()
+        self.assertEqual(doc2["noise_rules"]["A"]["hits_affected"], 1)
+
     def test_allow_cross_project_cluster_opts_back_into_old_behavior(self) -> None:
         proj_a = self.tmp / "proj_a"
         proj_b = self.tmp / "proj_b"
@@ -948,6 +991,84 @@ class StatePersistenceTests(BaseTestCase):
         self.assertEqual(code, 0, err)
         doc2 = self.read_hits_doc()
         self.assertEqual(doc2["hits"], [])
+
+    def test_noise_rule_toggle_does_not_drop_terminal_state_for_unchanged_file(self) -> None:
+        """P2-1 (max-tier Gate C re-review): a hit not being re-detected
+        this run because a noise rule setting differs from the run that
+        produced the record must NOT be treated as equivalent to "the file
+        is gone" -- only positive evidence (the file missing, or its
+        content changed) should drop a terminal-state record. Reproduce
+        with noise rule C: run 1 has C disabled and detects a hit inside a
+        `-STAGED-review-only` dir, marked dismissed; run 2 has C back at
+        its default (enabled), pruning that directory before the walk
+        descends into it, so the hit is not redetected even though the
+        underlying file is byte-identical and was never touched."""
+        proj = self.tmp / "proj"
+        self.make_knowledge_md(proj, "work-STAGED-review-only/reports/hidden.md")
+        catalog = self.tmp / "catalog.json"
+        _write_json(catalog, make_catalog())
+
+        code, _, err = _run_main(self.scan_argv([proj], catalog, disable_noise_rule=["C"], quiet=True))
+        self.assertEqual(code, 0, err)
+        doc1 = self.read_hits_doc()
+        idx = next(i for i, h in enumerate(doc1["hits"]) if h["path"] == "work-STAGED-review-only/reports/hidden.md")
+        hit_id = doc1["hits"][idx]["hit_id"]
+        doc1["hits"][idx]["state"] = "dismissed"
+        doc1["hits"][idx]["state_note"] = "reviewed"
+        doc1["hits"][idx]["state_set_by"] = "human"
+        (self.output_dir / dcc.HITS_NAME).write_text(json.dumps(doc1, ensure_ascii=False), encoding="utf-8")
+
+        # rerun WITHOUT disabling C -- rule C is back to its default
+        # (enabled) and prunes the directory before ever walking into it,
+        # so this hit is not redetected this run. The root itself WAS
+        # scanned, and the file on disk is unchanged.
+        code, _, err = _run_main(self.scan_argv([proj], catalog, quiet=True))
+        self.assertEqual(code, 0, err)
+        doc2 = self.read_hits_doc()
+        hit2 = next((h for h in doc2["hits"] if h["hit_id"] == hit_id), None)
+        self.assertIsNotNone(
+            hit2, "terminal-state record was dropped when a noise rule toggle merely suppressed redetection"
+        )
+        self.assertEqual(hit2["state"], "dismissed")
+        self.assertEqual(hit2["state_note"], "reviewed")
+        self.assertEqual(doc2["summary"]["hits_carried_forward_scanned_but_not_redetected"], 1)
+
+    def test_transient_read_error_does_not_drop_terminal_state_for_unchanged_file(self) -> None:
+        """P2-1 (max-tier Gate C re-review), second trigger: a transient
+        read error on one file (EACCES here -- the same class of error a
+        large --all-projects walk can genuinely hit as EMFILE/ENFILE) must
+        also not be treated as equivalent to "the file is gone". Reproduce
+        by chmod'ing the file unreadable between two runs, content
+        otherwise unchanged; the scan-time read fails (no hit produced this
+        run) and this must NOT drop the prior terminal state."""
+        proj = self.tmp / "proj"
+        p = self.make_script(proj, "scripts/flaky.py")
+        catalog = self.tmp / "catalog.json"
+        _write_json(catalog, make_catalog())
+
+        code, _, err = _run_main(self.scan_argv([proj], catalog, quiet=True))
+        self.assertEqual(code, 0, err)
+        doc1 = self.read_hits_doc()
+        idx = next(i for i, h in enumerate(doc1["hits"]) if h["path"] == "scripts/flaky.py")
+        hit_id = doc1["hits"][idx]["hit_id"]
+        doc1["hits"][idx]["state"] = "dismissed"
+        doc1["hits"][idx]["state_note"] = "reviewed"
+        doc1["hits"][idx]["state_set_by"] = "human"
+        (self.output_dir / dcc.HITS_NAME).write_text(json.dumps(doc1, ensure_ascii=False), encoding="utf-8")
+
+        os.chmod(str(p), 0o000)
+        try:
+            code, _, err = _run_main(self.scan_argv([proj], catalog, quiet=True))
+            self.assertEqual(code, 0, err)
+        finally:
+            os.chmod(str(p), 0o644)
+
+        doc2 = self.read_hits_doc()
+        hit2 = next((h for h in doc2["hits"] if h["hit_id"] == hit_id), None)
+        self.assertIsNotNone(hit2, "terminal-state record was dropped on a transient read error")
+        self.assertEqual(hit2["state"], "dismissed")
+        self.assertEqual(hit2["state_note"], "reviewed")
+        self.assertEqual(doc2["summary"]["hits_carried_forward_scanned_but_not_redetected"], 1)
 
     def test_scope_narrowed_rerun_does_not_wipe_unscanned_projects_terminal_state(self) -> None:
         """A rescan with a narrower --root set than a previous run (e.g. the

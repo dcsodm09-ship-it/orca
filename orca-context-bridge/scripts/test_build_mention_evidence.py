@@ -1122,17 +1122,27 @@ def _load_module_from_path(module_name: str, path: Path):
 _THIS_DIR = Path(__file__).resolve().parent
 # Two path candidates each: the deployed layout (this tool's eventual home
 # is orca-context-bridge/scripts/, the SAME directory query_catalog.py
-# already lives in) and the current staging layout (a sibling directory of
-# this one). Neither candidate is fatal if missing; each equivalence class
-# below is individually skipped (not the whole file) when its source is not
-# found, so an unrelated missing file never masks the other's real check.
+# already lives in) and the current staging layout, where
+# mention_evidence_prototype.py lives at
+# m8-gate-c-validation-STAGED-review-only/scripts/ -- a SIBLING of
+# orca-context-bridge/ (i.e. two directories up from this file, at the repo
+# root), NOT a sibling of orca-context-bridge/scripts/ itself. P2-2
+# (max-tier Gate C re-review): an earlier revision used `_THIS_DIR.parent`
+# (one level up, landing inside orca-context-bridge/) for this candidate --
+# off by one directory level from the prototype's real location, so
+# is_file() was always False and every PrototypeConstantEquivalenceTests
+# case silently skipped in both the repo and once deployed, defeating the
+# M8 design 3.0.2-mandated drift guard entirely. Neither candidate is fatal
+# if missing; each equivalence class below is individually skipped (not the
+# whole file) when its source is not found, so an unrelated missing file
+# never masks the other's real check.
 _PROTOTYPE_PATH = _first_existing(
     _THIS_DIR / "mention_evidence_prototype.py",
-    _THIS_DIR.parent / "m8-gate-c-validation-STAGED-review-only" / "scripts" / "mention_evidence_prototype.py",
+    _THIS_DIR.parent.parent / "m8-gate-c-validation-STAGED-review-only" / "scripts" / "mention_evidence_prototype.py",
 )
 _QUERY_CATALOG_PATH = _first_existing(
     _THIS_DIR / "query_catalog.py",
-    _THIS_DIR.parent / "orca-context-bridge" / "scripts" / "query_catalog.py",
+    _THIS_DIR.parent.parent / "m8-gate-c-validation-STAGED-review-only" / "scripts" / "query_catalog.py",
 )
 
 _NORMALIZE_PROBES = [

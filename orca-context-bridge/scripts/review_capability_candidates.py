@@ -52,7 +52,7 @@ if it happens to have duplicates. The command's own output always lists
 `affected_hit_ids` explicitly, whether or not the flag was used, so a
 caller never has to guess which records changed.
 
-Cluster application is scoped to the SAME project_id as the named
+Cluster application is scoped to the SAME root_real_path as the named
 --hit-id by default, mirroring discover_capability_candidates.py's own
 default scoping for noise rule A itself: this codebase's own "copy, don't
 import" convention (M8 design 3.0.2) deliberately manufactures
@@ -63,6 +63,21 @@ never-looked-at file in a different project. `--allow-cross-project-cluster`
 opts back into matching purely by content_sha256, for a caller who has
 confirmed (e.g. via `list --duplicates-only`) that the cluster genuinely
 does span projects and that's intended.
+
+Scoped on `root_real_path`, NOT `project_id` -- P1-1 in the max-tier Gate C
+re-review found the P0-2 fix (hit_id moved from project_id to
+root_real_path) was incomplete: this default safety scope was left on
+project_id, which this machine's real catalog.json proves is neither
+stable nor unique (two different real projects, e.g. "hgcloud" and "rn邮
+箱", each map to multiple distinct real_path rows sharing one project_id
+string). A `mark --apply-to-duplicate-cluster` without
+`--allow-cross-project-cluster` could therefore still silently affect a
+hit in a different real project, as long as that project happened to
+share a project_id string with the one actually reviewed -- exactly the
+leak this default scope exists to prevent. `--allow-cross-project-cluster`
+now means "cluster/apply across different root_real_paths", not "across
+different project_id strings" -- see
+test_cluster_apply_scoped_by_root_real_path_not_shared_project_id.
 
 WRITE-SURFACE CONFINEMENT FOR `mark`
 ----------------------------------------------------------------------------
@@ -504,13 +519,13 @@ def cmd_mark(args: argparse.Namespace) -> int:
         affected_ids = [hit_id]
         if args.apply_to_duplicate_cluster:
             content_sha256 = target.get("content_sha256")
-            target_project_id = target.get("project_id")
+            target_root_real_path = target.get("root_real_path")
             if content_sha256:
                 for h in good:
                     if h.get("content_sha256") != content_sha256 or h["hit_id"] in affected_ids:
                         continue
-                    # Cluster application is scoped to the SAME project_id as
-                    # the named --hit-id by default, matching
+                    # Cluster application is scoped to the SAME root_real_path
+                    # as the named --hit-id by default, matching
                     # discover_capability_candidates.py's own noise-rule-A
                     # default scoping (see that file's
                     # apply_noise_rule_a_content_duplicates docstring): a
@@ -521,8 +536,13 @@ def cmd_mark(args: argparse.Namespace) -> int:
                     # one project onto a legitimate, never-looked-at hit in
                     # another. --allow-cross-project-cluster opts back into
                     # matching purely by content_sha256, mirroring the scan
-                    # side's own opt-in of the same name.
-                    if not args.allow_cross_project_cluster and h.get("project_id") != target_project_id:
+                    # side's own opt-in of the same name. Scoped on
+                    # root_real_path, NOT project_id (P1-1, max-tier Gate C
+                    # re-review): this machine's real catalog.json has
+                    # multiple different real projects sharing one
+                    # project_id string, so project_id alone is not a safe
+                    # proxy for "same project" here.
+                    if not args.allow_cross_project_cluster and h.get("root_real_path") != target_root_real_path:
                         continue
                     affected_ids.append(h["hit_id"])
 
@@ -595,9 +615,9 @@ def build_parser() -> argparse.ArgumentParser:
     mark_p.add_argument("--note", type=str, default=None)
     mark_p.add_argument("--apply-to-duplicate-cluster", action="store_true", dest="apply_to_duplicate_cluster")
     mark_p.add_argument("--allow-cross-project-cluster", action="store_true", dest="allow_cross_project_cluster",
-                         help="With --apply-to-duplicate-cluster, also match hits in OTHER projects sharing "
-                              "the same content_sha256 (default: cluster application is scoped to the named "
-                              "hit's own project_id).")
+                         help="With --apply-to-duplicate-cluster, also match hits under OTHER scanned roots "
+                              "sharing the same content_sha256 (default: cluster application is scoped to the "
+                              "named hit's own root_real_path).")
     mark_p.add_argument("--hits-path", type=str, default=None, dest="hits_path")
     mark_p.add_argument("--json", action="store_true")
     mark_p.add_argument("--quiet", action="store_true")

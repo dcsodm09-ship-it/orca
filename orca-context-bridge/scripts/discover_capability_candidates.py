@@ -183,9 +183,28 @@ forward, byte-for-byte and untouched, any existing record whose
 `root_real_path` was not among the real paths actually scanned this run
 (see `scanned_real_paths` / `carried_forward_hits` in `cmd_scan()`, and
 `summary.hits_carried_forward_from_unscanned_projects`). A hit whose root
-WAS scanned this run but genuinely no longer exists on disk is still
-correctly dropped, not carried forward -- see
-test_hit_that_disappears_from_disk_is_not_carried_forward.
+WAS scanned this run but genuinely no longer exists on disk (or whose
+content has changed) is still correctly dropped, not carried forward --
+see test_hit_that_disappears_from_disk_is_not_carried_forward.
+
+A hit whose root WAS scanned this run but simply was not RE-DETECTED by
+this run's own signal detection is a THIRD, narrower case (P2-1, max-tier
+Gate C re-review): a noise rule (C/D) toggled between the run that
+produced the record and this one can prune a directory this run without
+the underlying file having moved at all, and a transient read error
+(EMFILE/ENFILE/EACCES) on one file during a large `--all-projects` walk
+can suppress detection without the file changing either. Treating
+"not redetected this run" as equivalent to "genuinely gone" would silently
+undo a human's terminal-state triage decision through a different trigger
+than the identical-rerun case above -- confirmed reproducible. `scan`
+therefore also carries forward a TERMINAL-state record whose root WAS
+scanned this run but wasn't redetected, UNLESS this run finds POSITIVE
+on-disk evidence the file is actually gone or its content changed (see
+`_hit_is_positively_gone_or_changed()` and
+`summary.hits_carried_forward_scanned_but_not_redetected`). A `pending`
+record not redetected under this same condition is NOT specially carried
+forward -- it has no human-authored state to lose and simply reappears
+fresh the next time it IS redetected.
 
 An existing discovery-hits.json that exists but cannot be READ AT ALL as a
 valid document (corrupt JSON, wrong top-level shape, or over
@@ -775,7 +794,7 @@ def apply_noise_rule_a_content_duplicates(
     lexicographically shortest relative path as primary. Returns the count
     of hits marked as non-primary duplicates.
 
-    Clustering is scoped to (project_id, content_sha256) by default, NOT
+    Clustering is scoped to (root_real_path, content_sha256) by default, NOT
     content_sha256 alone. The real, validated finding this rule generalizes
     (140/405 hits, 34.6%) was six dated snapshots INSIDE ONE repo. Clustering
     across project boundaries by default instead swept up genuinely distinct
@@ -789,14 +808,26 @@ def apply_noise_rule_a_content_duplicates(
     project P1, stamped with P1's own note. `--allow-cross-project-cluster`
     opts back into the old cross-project behavior for a caller who
     genuinely wants it (matching review_capability_candidates.py's own
-    mark --apply-to-duplicate-cluster --allow-cross-project-cluster)."""
+    mark --apply-to-duplicate-cluster --allow-cross-project-cluster).
+
+    Scoped on `root_real_path`, NOT `project_id` -- P1-1 in the max-tier
+    Gate C re-review found the P0-2 fix (hit_id moved from project_id to
+    root_real_path) was incomplete: this clustering key was left on
+    project_id, which this machine's real catalog.json proves is neither
+    stable nor unique (two different real projects, e.g. "hgcloud" and
+    "rn邮箱", each map to multiple distinct real_path rows sharing one
+    project_id string). Scoping on project_id therefore let a cluster
+    silently span two different real projects that merely happened to
+    share a project_id, exactly the cross-project leak this scoping exists
+    to prevent -- see
+    test_cluster_scoped_by_root_real_path_not_shared_project_id."""
     if "A" in disabled_rules:
         return 0
     by_hash: dict[tuple[str, str] | str, list[dict]] = {}
     for h in all_hits:
         sha = h.get("content_sha256")
         if sha:
-            key = sha if allow_cross_project_cluster else (h.get("project_id"), sha)
+            key = sha if allow_cross_project_cluster else (h.get("root_real_path"), sha)
             by_hash.setdefault(key, []).append(h)
     affected = 0
     for group in by_hash.values():
@@ -994,6 +1025,44 @@ def load_existing_hits(path: Path) -> tuple[dict[str, dict], str, str | None]:
     return out, "ok", None
 
 
+def _hit_is_positively_gone_or_changed(rec: dict, max_file_bytes: int) -> bool:
+    """True only when we have POSITIVE, on-disk evidence that a previously
+    recorded hit's underlying file is gone or its content changed -- i.e.
+    the record must NOT be blindly carried forward. Absence of evidence
+    (path can't be reconstructed, a transient read error, or the content
+    genuinely still matches) means the caller should carry the record
+    forward. See P2-1 (max-tier Gate C re-review): a hit not being
+    re-detected in a given run because a noise rule setting differs from
+    the run that produced it, or because of a transient read error
+    (EMFILE/ENFILE/EACCES on one file in a large --all-projects walk), is
+    NOT equivalent to "the file is gone" and must not be treated as such --
+    only used for hits whose root WAS scanned this run but which this
+    run's own signal detection did not happen to reproduce (see cmd_scan);
+    a root never scanned this run at all carries forward unconditionally,
+    with no need to consult this function."""
+    root_real_path = rec.get("root_real_path")
+    rel_path = rec.get("path")
+    if not isinstance(root_real_path, str) or not isinstance(rel_path, str):
+        return False  # can't reconstruct a path to check -- no evidence, do not drop
+    abs_path = Path(root_real_path) if rel_path == "(root)" else Path(root_real_path) / rel_path
+    if rec.get("kind") == "dir":
+        if not abs_path.is_dir():
+            return True  # positively gone
+        target = abs_path / "SKILL.md"
+    else:
+        if not abs_path.exists():
+            return True  # positively gone
+        target = abs_path
+    prior_sha = rec.get("content_sha256")
+    if not isinstance(prior_sha, str):
+        return False  # nothing recorded to compare content against -- no evidence either way
+    raw, _reason = read_file_bounded(target, max_file_bytes)
+    if raw is None:
+        return False  # unreadable right now (possibly the same transient condition that
+        # suppressed redetection this run) -- not positive evidence of change
+    return hashlib.sha256(raw).hexdigest() != prior_sha
+
+
 def _backup_unreadable_hits_file(base_dir: Path, src_path: Path, run_id: str) -> Path:
     """Streams src_path's raw bytes to a fresh sibling file under base_dir,
     named uniquely by this run's run_id so it can never collide with (or be
@@ -1052,8 +1121,8 @@ def build_parser() -> argparse.ArgumentParser:
                             "new_discoveries_total count (both numbers are always in the JSON body regardless).")
     scan.add_argument("--allow-cross-project-cluster", action="store_true",
                        dest="allow_cross_project_cluster",
-                       help="Let noise rule A cluster content-duplicates across DIFFERENT projects "
-                            "(default: clustering is scoped to within one project_id).")
+                       help="Let noise rule A cluster content-duplicates across DIFFERENT scanned "
+                            "roots (default: clustering is scoped to within one root_real_path).")
     scan.add_argument("--json", action="store_true", help="Print the run summary as one JSON object to stdout.")
     scan.add_argument("--quiet", action="store_true", help="Suppress human-readable text; rely on the exit code.")
     scan.set_defaults(func=cmd_scan_entry)
@@ -1294,12 +1363,30 @@ def cmd_scan(args: argparse.Namespace) -> int:
         # forward here -- see test_hit_that_disappears_from_disk_is_not_
         # carried_forward, which this must continue to satisfy.
         current_hit_ids = {h["hit_id"] for h in all_hits}
-        carried_forward_hits: list[dict] = [
-            rec for hit_id, rec in existing_map.items()
-            if hit_id not in current_hit_ids
-            and isinstance(rec, dict)
-            and rec.get("root_real_path") not in scanned_real_paths
-        ]
+        carried_forward_hits: list[dict] = []
+        carried_forward_not_redetected_count = 0
+        for hit_id, rec in existing_map.items():
+            if hit_id in current_hit_ids or not isinstance(rec, dict):
+                continue
+            if rec.get("root_real_path") not in scanned_real_paths:
+                carried_forward_hits.append(rec)
+                continue
+            # P2-1 (max-tier Gate C re-review): the root WAS scanned this
+            # run, but this run's own signal detection did not happen to
+            # reproduce this hit -- e.g. a noise rule (C/D) toggled between
+            # this run and the one that produced the record, pruning the
+            # directory this run without the underlying file having moved;
+            # or a transient read error (EMFILE/ENFILE/EACCES) on this one
+            # file during a large --all-projects walk. Neither is positive
+            # evidence the file is gone. Only a TERMINAL-state record is
+            # worth this extra on-disk check -- a `pending` record not
+            # redetected here carries no human-authored state to lose and
+            # simply reappears fresh the next time it IS redetected.
+            if rec.get("state") not in TERMINAL_STATES:
+                continue
+            if not _hit_is_positively_gone_or_changed(rec, args.max_file_bytes):
+                carried_forward_hits.append(rec)
+                carried_forward_not_redetected_count += 1
 
         scope_payload = {
             "explicit_roots": [str(p) for p in explicit_roots.values()],
@@ -1331,7 +1418,17 @@ def cmd_scan(args: argparse.Namespace) -> int:
             "dirs_pruned_by_sensible_exclude": sum(s["dirs_pruned"] for s in per_root_stats),
             "dirs_pruned_by_noise_rule": dirs_pruned_by_noise_rule,
             "states_preserved_from_previous_terminal_run": preserved_count,
-            "hits_carried_forward_from_unscanned_projects": len(carried_forward_hits),
+            "hits_carried_forward_from_unscanned_projects": len(carried_forward_hits) - carried_forward_not_redetected_count,
+            # P2-1 (max-tier Gate C re-review): a SEPARATE bucket from the
+            # field above -- these hits' roots WERE scanned this run, but
+            # this run's own signal detection did not happen to reproduce
+            # them (a noise rule toggle, or a transient read error), and
+            # on-disk evidence did not positively show the file gone or
+            # changed. Kept distinct so a reader can tell "this project
+            # wasn't in scope" apart from "this project WAS scanned but one
+            # of its hits wasn't redetected" -- see
+            # _hit_is_positively_gone_or_changed().
+            "hits_carried_forward_scanned_but_not_redetected": carried_forward_not_redetected_count,
             "existing_hits_file_status": existing_status,
             "existing_hits_file_reason": existing_reason,
             "existing_hits_file_backup_path": existing_hits_backup_path,
