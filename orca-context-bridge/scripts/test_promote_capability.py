@@ -974,6 +974,104 @@ class ApproveOrcaContextWikiTests(PromoteCapabilityTestCase):
             "the unrelated file must remain staged for the caller's own future commit",
         )
 
+    def test_approve_missing_staged_content_md_leaves_wiki_byte_identical_and_repo_clean(self) -> None:
+        # round-fix P0 regression: _approve_orca_context_wiki() used to check
+        # whether the staged content.md still existed AFTER
+        # invoke_wiki_edit_guard() had already rewritten the target
+        # project's real wiki/orca-context-wiki.json on disk (appended
+        # page + bumped content_version). Because that exception then
+        # propagated out of the function before git_commit_paths() ever
+        # ran, the mutated wiki file was left sitting on disk, modified and
+        # UNCOMMITTED, in the fake project's own git tree -- exactly the
+        # AUTHORITY_TRACKED_PATHS NACK shape ("an uncommitted tracked path
+        # under a project's wiki/") this codebase otherwise takes care to
+        # avoid. Deleting the staged content.md out from under an
+        # otherwise-untampered, has_content_md=True candidate (it can
+        # disappear between draft and approve for any reason) and then
+        # calling approve must now be refused with NOTHING on disk ever
+        # touched.
+        proj = self.make_project("proj-a", wiki_content_version=1)
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+
+        content_md_source = pc.content_md_path(pc.PROMOTION_ROOT, "proj-a", candidate_id)
+        self.assertTrue(content_md_source.is_file())
+        content_md_source.unlink()
+
+        wiki_path = proj / "wiki" / "orca-context-wiki.json"
+        before_bytes = wiki_path.read_bytes()
+        before_hash = pc._sha256_hex(before_bytes)
+        status_before = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(status_before.strip(), "", "fixture project must start with a clean working tree")
+
+        code, result, _err = run_cli_json(
+            ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+        )
+        self.assertEqual(code, 4, result)
+        self.assertEqual(result["reason"], "staged_content_md_missing")
+
+        # The wiki file must be COMPLETELY UNCHANGED -- not just "no page
+        # added": byte-for-byte identical to before, verified via both a
+        # direct comparison and an independent hash.
+        after_bytes = wiki_path.read_bytes()
+        self.assertEqual(before_bytes, after_bytes, "wiki file must be byte-for-byte identical, not just missing the new page")
+        self.assertEqual(before_hash, pc._sha256_hex(after_bytes))
+
+        # knowledge_final must never have been created either.
+        self.assertFalse((proj / "wiki" / "knowledge").exists())
+
+        # The fake project's git tree must show ZERO uncommitted changes --
+        # this is the actual NACK-shaped signal the bug produced.
+        status_after = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(status_after.strip(), "", "target project's git tree must be clean after a failed approve, never left modified-and-uncommitted")
+
+        # The candidate record's own bookkeeping must clearly reflect that
+        # approve did NOT succeed: still pending_approval, no approve_result,
+        # not silently stuck in some ambiguous in-between state.
+        record_path = pc.candidate_path(pc.PROMOTION_ROOT, "proj-a", candidate_id)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["status"], "pending_approval")
+        self.assertNotIn("approve_result", record)
+
+    def test_approve_knowledge_dir_permission_failure_leaves_wiki_byte_identical_and_repo_clean(self) -> None:
+        # "cheap-validate-first" ordering, applied to the OTHER late check
+        # this same function used to run after invoke_wiki_edit_guard():
+        # resolve_knowledge_md_path() itself (containment checks + the
+        # wiki/knowledge/ mkdir) also used to run only after the guard had
+        # already rewritten the wiki file. Making wiki/ read-only so that
+        # mkdir fails with a permission error must be refused BEFORE any
+        # write to the wiki file too, for the same reason as the missing-
+        # content.md case above.
+        proj = self.make_project("proj-a", wiki_content_version=1)
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+
+        wiki_dir = proj / "wiki"
+        wiki_path = wiki_dir / "orca-context-wiki.json"
+        before_bytes = wiki_path.read_bytes()
+
+        os.chmod(str(wiki_dir), 0o500)
+        self.addCleanup(os.chmod, str(wiki_dir), 0o700)
+        try:
+            code, result, _err = run_cli_json(
+                ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+            )
+        finally:
+            os.chmod(str(wiki_dir), 0o700)
+
+        self.assertEqual(code, 4, result)
+        self.assertEqual(result["reason"], "target_write_permission_denied")
+
+        after_bytes = wiki_path.read_bytes()
+        self.assertEqual(before_bytes, after_bytes, "wiki file must be byte-for-byte identical after a knowledge-dir permission failure")
+
+        status_after = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(status_after.strip(), "", "target project's git tree must be clean after a failed approve")
+
+        record_path = pc.candidate_path(pc.PROMOTION_ROOT, "proj-a", candidate_id)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["status"], "pending_approval")
+
 
 # ---------------------------------------------------------------------------
 # Approve-time record re-validation (P0 regression): a candidate record file

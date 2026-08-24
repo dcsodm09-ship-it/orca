@@ -133,18 +133,26 @@ already staged in the target repo for something unrelated.
   see KNOWN LIMITATIONS below for the residual risk this narrower guarantee
   still leaves.
 
-  "orca-context-wiki.json": build the candidate new payload (content_version
-  incremented by exactly 1, since every write here adds a page) -> pin this
-  script's own copy of wiki_edit_guard.py's SHA-256 the first time this run
-  needs it -> subprocess-invoke wiki_edit_guard.py's own `--apply --json`
-  (its semantic-diff / content_version bookkeeping logic is NOT copied here
-  -- see "WHY wiki_edit_guard.py IS CALLED, NOT COPIED" below) -> re-verify
-  the pinned hash is unchanged immediately before that invocation, refusing
-  fail-closed on any mismatch -> stage `content.md` (if the candidate has
-  one) into `wiki/knowledge/<id>.md` -> by default, `git add` + `git commit`
-  in the TARGET project's own repo in the SAME call, eliminating the
-  "written but not committed" NACK window that hit this same plan for real
-  twice (M1, M7) -- `--no-commit` is an explicit, doubly-named escape hatch.
+  "orca-context-wiki.json": if the candidate has a staged `content.md`,
+  confirm it still exists and read it into memory, and resolve+containment-
+  check its final `wiki/knowledge/<id>.md` destination -- all BEFORE
+  anything below touches the target wiki file, closing a round-fix P0 where
+  a missing staged `content.md` used to be discovered only after the wiki
+  file below had already been rewritten, leaving it modified-and-
+  uncommitted with no matching "approved" record -> build the candidate new
+  payload (content_version incremented by exactly 1, since every write here
+  adds a page) -> pin this script's own copy of wiki_edit_guard.py's
+  SHA-256 the first time this run needs it -> subprocess-invoke
+  wiki_edit_guard.py's own `--apply --json` (its semantic-diff /
+  content_version bookkeeping logic is NOT copied here -- see "WHY
+  wiki_edit_guard.py IS CALLED, NOT COPIED" below) -> re-verify the pinned
+  hash is unchanged immediately before that invocation, refusing fail-closed
+  on any mismatch -> write the already-read `content.md` bytes (if the
+  candidate has one) to the already-resolved `wiki/knowledge/<id>.md` path
+  -> by default, `git add` + `git commit` in the TARGET project's own repo
+  in the SAME call, eliminating the "written but not committed" NACK window
+  that hit this same plan for real twice (M1, M7) -- `--no-commit` is an
+  explicit, doubly-named escape hatch.
   -> detect whether the target project's own
   reviewed-startup-pack-manifest.json pins this exact path, and if so, print
   an UNSUPPRESSABLE notice that its next SessionStart will fail closed until
@@ -2022,6 +2030,45 @@ def _approve_orca_context_wiki(
     if do_commit and not is_git_repo(real_path):
         raise PromoteFatal("target_project_not_a_git_repo", str(real_path))
 
+    # round-fix P0: this whole block used to run AFTER invoke_wiki_edit_guard()
+    # below -- i.e. after the target project's real wiki/orca-context-wiki.json
+    # had ALREADY been rewritten on disk. A missing staged content.md (e.g. it
+    # disappeared between draft and approve for any reason) was then only
+    # discovered once that write had already landed, and the exception raised
+    # here propagated out of this function before reaching git_commit_paths(),
+    # leaving the wiki file modified-and-uncommitted in the target project's
+    # git tree with no matching "approved" candidate record to show for it --
+    # the exact AUTHORITY_TRACKED_PATHS NACK class ("an uncommitted tracked
+    # path under a project's wiki/") this codebase otherwise takes care to
+    # avoid. Moved here, before ANY write to the target wiki file, so a
+    # missing/invalid staged content.md is refused cleanly with nothing on
+    # disk ever touched.
+    #
+    # Also read the content.md bytes into memory now (not just is_file()),
+    # and resolve+precompute knowledge_final/knowledge_md_relpath now too
+    # (pure path arithmetic, no filesystem write): everything about the
+    # knowledge_final write that CAN be checked/prepared without touching the
+    # target wiki file is done here. That leaves the actual
+    # atomic_write_in_dir() disk write (further below, after the guard call)
+    # as the only thing that can still fail once the guard has already run --
+    # a much narrower failure surface (disk-full/permission/race) than "the
+    # source file might not even exist" or "the destination path might not
+    # resolve", which is what used to be checked at that late point.
+    knowledge_final: Path | None = None
+    knowledge_md_relpath: str | None = None
+    content_md_bytes: bytes | None = None
+    if record.get("has_content_md"):
+        content_md_source = content_md_path(ensure_promotion_root(), record["target_project"], record["candidate_id"])
+        if not content_md_source.is_file():
+            raise PromoteFatal("staged_content_md_missing", str(content_md_source))
+        knowledge_final = resolve_knowledge_md_path(real_path, record["id"])
+        content_md_bytes = content_md_source.read_bytes()
+        # knowledge_final is a fully .resolve()d path; real_path (straight
+        # from catalog.json) may not be (e.g. this machine's own
+        # /var -> /private/var) -- relative_to() needs both sides in the
+        # same basis, same class of bug documented on resolve_wiki_target_path().
+        knowledge_md_relpath = str(knowledge_final.relative_to(real_path.resolve(strict=False)))
+
     old_raw, identity = read_with_identity(wiki_path, MAX_WIKI_BYTES)
     old_payload = _load_json_object(old_raw, label="target_orca_context_wiki")
 
@@ -2059,19 +2106,9 @@ def _approve_orca_context_wiki(
     verify_wiki_edit_guard_sha256(guard_path, pinned_sha256)
     guard_result = invoke_wiki_edit_guard(guard_path, wiki_path, new_payload)
 
-    knowledge_md_relpath: str | None = None
-    content_md_source = None
-    if record.get("has_content_md"):
-        content_md_source = content_md_path(ensure_promotion_root(), record["target_project"], record["candidate_id"])
-        if not content_md_source.is_file():
-            raise PromoteFatal("staged_content_md_missing", str(content_md_source))
-        knowledge_final = resolve_knowledge_md_path(real_path, record["id"])
-        atomic_write_in_dir(knowledge_final, content_md_source.read_bytes())
-        # knowledge_final is a fully .resolve()d path; real_path (straight
-        # from catalog.json) may not be (e.g. this machine's own
-        # /var -> /private/var) -- relative_to() needs both sides in the
-        # same basis, same class of bug documented on resolve_wiki_target_path().
-        knowledge_md_relpath = str(knowledge_final.relative_to(real_path.resolve(strict=False)))
+    if knowledge_final is not None:
+        assert content_md_bytes is not None
+        atomic_write_in_dir(knowledge_final, content_md_bytes)
 
     requires_resign = check_requires_manifest_resign(real_path, "wiki/orca-context-wiki.json")
 
@@ -2272,13 +2309,24 @@ def _verify_record_matches_found_location(root: Path, record: dict[str, Any], re
         twice on disk with contradictory status and a write has landed in a
         project nobody approved it for.
       - a tampered "candidate_id" makes content_md_path() look for the
-        staged content.md under the WRONG id-named subdirectory, which is
-        only discovered *after* _approve_orca_context_wiki() has already
-        written the new page into the target project's real wiki file and
-        bumped its content_version -- a partial, uncommitted write with no
-        matching "approved" candidate record to show for it. The same
-        tampered field also corrupts _terminal_transition's ledger/record
-        the same way "target_project" does.
+        staged content.md under the WRONG id-named subdirectory. Before the
+        later round-fix that moved that lookup's is_file() check to run
+        BEFORE any write to the target project's real wiki file (see
+        _approve_orca_context_wiki()'s own comments), this was only
+        discovered *after* that function had already written the new page
+        into the target project's real wiki file and bumped its
+        content_version -- a partial, uncommitted write with no matching
+        "approved" candidate record to show for it. That specific ordering
+        gap is now closed, but this check remains the load-bearing defense
+        for the sibling "tampered target_project" variant above, which the
+        ordering fix does nothing for (a tampered target_project makes
+        _approve_orca_context_wiki() mutate a completely different, merely
+        catalog-known project's real wiki file well before any
+        content_md_path() lookup ever runs) -- and is kept as defense in
+        depth rather than relying on write-ordering alone to do this check's
+        job. The same tampered candidate_id field also corrupts
+        _terminal_transition's ledger/record the same way "target_project"
+        does.
 
     Recomputing the expected path from the record's own fields with the
     exact same containment-checked helper draft/amend use to create it
