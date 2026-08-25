@@ -43,20 +43,26 @@ project-root-resolution pattern every other M8 tool in this codebase
 already uses (never a fresh `orca repo list` / `worktree list` call) -- and
 prints an unsuppressible stderr warning before scanning starts.
 
-M8-2 AUTHORIZATION NOTICE ON EVERY DEFAULT-PATH WRITE
+M8-2 STAGING-BY-DEFAULT + AUTHORIZATION NOTICE ON EVERY PRODUCTION-PATH WRITE
 ----------------------------------------------------------------------------
-`scan` still runs and writes normally regardless -- this is a visibility/
-audit-trail improvement, not a new gate, and not a refusal. But whenever the
-resolved output_dir is still this module's own literal production default
-(`_PRODUCTION_DEFAULT_OUTPUT_DIR`, a frozen copy of `DEFAULT_OUTPUT_DIR` --
-see that constant's own comment for why the two are kept distinct), `scan`
-prints one unsuppressible stderr line before writing, same mechanism as the
-`--all-projects` warning above: M8-2's own independent authorization gate
-(design 3.3.3) has not been granted (Gate C measured 44-72% false positives
-on real data, cited above), so discovery-hits.json should not be treated as
-production-authoritative by anything that reads it. A caller who redirects
-output elsewhere (today, only this file's own test suite, by rebinding the
-mutable `DEFAULT_OUTPUT_DIR` name) sees nothing here.
+2026-08-25 unification with Gate B's own staging-by-default convention:
+`DEFAULT_OUTPUT_DIR` is now `_STAGING_DEFAULT_OUTPUT_DIR` (a deliberately
+non-production-named sibling directory), not the real production default --
+`scan` only reaches the real `_PRODUCTION_DEFAULT_OUTPUT_DIR` when the
+caller passes `--authorize-production-write`, which flips the DEFAULT
+itself (this file has no output-path override flag, so there is no
+separate "explicit path equals production" refusal case -- see
+review_capability_candidates.py/check_cross_project_compatibility.py for
+that variant). `scan` still runs and writes normally regardless of which
+default is in effect -- this notice is a visibility/audit-trail
+improvement, not a new refusal gate. Whenever the resolved output_dir
+IS the real production default (via the flag, or a test rebinding both
+constants equal), `scan` prints one unsuppressible stderr line before
+writing, same mechanism as the `--all-projects` warning above: M8-2's own
+independent authorization gate (design 3.3.3) has not been granted (Gate C
+measured 44-72% false positives on real data, cited above), so
+discovery-hits.json should not be treated as production-authoritative by
+anything that reads it even when the flag is used.
 
 NOISE RULES (A-D), EACH INDEPENDENTLY TOGGLEABLE
 ----------------------------------------------------------------------------
