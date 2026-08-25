@@ -483,6 +483,32 @@ def _atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+def _write_all_bytes(fd: int, payload: bytes) -> None:
+    """os.write(fd, payload) does not guarantee the full payload is written
+    in one call -- POSIX permits a short write for a regular file (this
+    project's own round-6-fix final-gate review empirically demonstrated a
+    genuine short write on this exact machine via RLIMIT_FSIZE: os.write()
+    returned fewer bytes than requested with no exception raised). The
+    caller of this function relies on the tmp file it writes being either
+    the COMPLETE intended payload or absent -- silently accepting a short
+    write here would let a truncated, invalid-JSON tmp file get
+    os.rename()'d onto the live wiki file while the caller still reports
+    success (this was a real, reproduced P1: `approve` reported
+    `status: approved` and even `git_committed: true` while the tracked
+    wiki file held truncated JSON). Loop until every byte is written; a
+    zero-progress write (or any OSError from a subsequent write, e.g. the
+    OS refusing further writes past a resource limit) raises immediately so
+    the caller's existing `except BaseException: unlink tmp; raise` cleanup
+    fires -- fail-closed, matching every other write path in this module,
+    rather than fail-open with a silently truncated result."""
+    view = memoryview(payload)
+    while view:
+        n = os.write(fd, view)
+        if n == 0:
+            raise OSError("short write: os.write() returned 0 (no forward progress)")
+        view = view[n:]
+
+
 def _atomic_write_via_dir_fd(dir_fd: int, name: str, text: str, *, mode: int) -> None:
     """Same tmp-file+rename discipline as _atomic_write_text, but every
     operation is anchored to an already-open directory file descriptor
@@ -527,7 +553,7 @@ def _atomic_write_via_dir_fd(dir_fd: int, name: str, text: str, *, mode: int) ->
     fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
     try:
         try:
-            os.write(fd, payload)
+            _write_all_bytes(fd, payload)
             os.fsync(fd)
             try:
                 os.fchmod(fd, mode)

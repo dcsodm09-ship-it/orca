@@ -2685,5 +2685,210 @@ class InvokeWikiEditGuardStaleGuardReasonTests(unittest.TestCase):
         self.assertEqual(ctx.exception.details, "the real guard refusal reason")
 
 
+class AtomicWriteInDirShortWriteRegressionTests(unittest.TestCase):
+    """round-6-fix P1 (final-gate dedicated review, Grok, 2026-08-25): the
+    sibling short-write bug found in wiki_edit_guard.py's
+    _atomic_write_via_dir_fd() -- an unchecked os.write(fd, payload) that
+    silently accepts a short write and still renames the truncated tmp
+    file onto the live target -- was copied into THIS file's own
+    atomic_write_in_dir() when wiki_edit_guard.py's dir-fd technique was
+    written by mirroring this exact function. Fixed identically via
+    _write_all_bytes()."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="promote-cap-shortwrite-"))
+        self.addCleanup(shutil.rmtree, str(self.tmp), ignore_errors=True)
+
+    def test_write_all_bytes_raises_on_zero_progress_short_write(self) -> None:
+        fd, path = tempfile.mkstemp(dir=str(self.tmp))
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        payload = b"x" * 100
+        real_write = os.write
+        calls = {"n": 0}
+
+        def short_write(fd_, data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd_, data[:40])
+            return 0
+
+        with mock.patch.object(pc.os, "write", side_effect=short_write):
+            with self.assertRaises(OSError):
+                pc._write_all_bytes(fd, payload)
+        os.close(fd)
+
+    def test_atomic_write_in_dir_refuses_rather_than_truncates_on_short_write(self) -> None:
+        target_dir = self.tmp / "wiki"
+        target_dir.mkdir()
+        filename = "reusable-capabilities.json"
+        final_path = target_dir / filename
+        original_bytes = b'{"schema_version": 1, "capabilities": []}\n'
+        final_path.write_bytes(original_bytes)
+
+        new_payload = b'{"schema_version": 1, "capabilities": [{"id": "x"}]}\n'
+        real_write = os.write
+        calls = {"n": 0}
+
+        def short_write(fd_, data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd_, data[: max(1, len(data) - 20)])
+            return 0
+
+        dir_fd = os.open(str(target_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            with mock.patch.object(pc.os, "write", side_effect=short_write):
+                with self.assertRaises(OSError):
+                    pc.atomic_write_in_dir(final_path, new_payload, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+
+        # The live target file must be COMPLETELY untouched, and no
+        # leftover tmp file next to it.
+        self.assertEqual(final_path.read_bytes(), original_bytes)
+        leftovers = [p for p in target_dir.iterdir() if p.name != filename]
+        self.assertEqual(leftovers, [], f"leftover tmp files: {leftovers}")
+
+    def test_atomic_write_in_dir_path_mode_also_refuses_on_short_write(self) -> None:
+        # Same regression, non-dir_fd (plain path) branch of the function.
+        target_dir = self.tmp / "knowledge"
+        target_dir.mkdir()
+        final_path = target_dir / "notes.md"
+        original_bytes = b"# original\n"
+        final_path.write_bytes(original_bytes)
+
+        new_payload = b"# a brand new, longer replacement body\n"
+        real_write = os.write
+        calls = {"n": 0}
+
+        def short_write(fd_, data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd_, data[: max(1, len(data) - 10)])
+            return 0
+
+        with mock.patch.object(pc.os, "write", side_effect=short_write):
+            with self.assertRaises(OSError):
+                pc.atomic_write_in_dir(final_path, new_payload)
+
+        self.assertEqual(final_path.read_bytes(), original_bytes)
+        leftovers = [p for p in target_dir.iterdir() if p.name != "notes.md"]
+        self.assertEqual(leftovers, [], f"leftover tmp files: {leftovers}")
+
+
+class RemainingShortWriteSitesRegressionTests(unittest.TestCase):
+    """2026-08-25, found by Grok's re-gate of the atomic_write_in_dir/
+    _atomic_write_via_dir_fd fix above: this module has THREE more
+    call sites sharing the identical unchecked-os.write() shape --
+    atomic_write_within() (candidate record JSON under PROMOTION_ROOT),
+    acquire_lock() (the lock-file bookkeeping stamp), and append_ledger()
+    (the audit-trail JSONL). None of these were the originally-reported P1
+    (that was specifically the wiki file, via atomic_write_in_dir), but
+    they are the same bug class in the same file and get the same fix."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="promote-cap-remaining-shortwrite-"))
+        self.addCleanup(shutil.rmtree, str(self.tmp), ignore_errors=True)
+
+    def test_atomic_write_within_refuses_rather_than_truncates(self) -> None:
+        base_dir = self.tmp / "records"
+        base_dir.mkdir()
+        final_path = base_dir / "cand-x.json"
+        original_bytes = b'{"status": "pending_approval"}\n'
+        final_path.write_bytes(original_bytes)
+
+        new_payload = b'{"status": "approved", "approved_by": "someone"}\n'
+        real_write = os.write
+        calls = {"n": 0}
+
+        def short_write(fd_, data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd_, data[: max(1, len(data) - 15)])
+            return 0
+
+        with mock.patch.object(pc.os, "write", side_effect=short_write):
+            with self.assertRaises(OSError):
+                pc.atomic_write_within(base_dir, final_path, new_payload)
+
+        self.assertEqual(final_path.read_bytes(), original_bytes)
+        leftovers = [p for p in base_dir.iterdir() if p.name != "cand-x.json"]
+        self.assertEqual(leftovers, [], f"leftover tmp files: {leftovers}")
+
+    def test_acquire_lock_refuses_rather_than_leaves_truncated_stamp(self) -> None:
+        base_dir = self.tmp / "lockdir"
+        base_dir.mkdir()
+        real_write = os.write
+        calls = {"n": 0}
+
+        def short_write(fd_, data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd_, data[:5])
+            return 0
+
+        with mock.patch.object(pc.os, "write", side_effect=short_write):
+            with self.assertRaises(pc.PromoteFatal):
+                pc.acquire_lock(base_dir)
+
+        # No lock file left behind in a half-written state -- os.open()
+        # already created it, but acquire_lock's own OSError branch here
+        # does not attempt cleanup of the lock file itself (unlike the
+        # tmp+rename writers, there is no separate tmp name); assert only
+        # what the fix actually changes: it must not silently report
+        # success with a truncated stamp, and a second real attempt must
+        # not be blocked forever by a corrupt-but-present lock file older
+        # than LOCK_STALE_SECONDS having been created. Here we only assert
+        # the immediate failure is clean and named.
+        lock_path = base_dir / pc.LOCK_NAME
+        if lock_path.exists():
+            content = lock_path.read_bytes()
+            # Whatever partial bytes exist (if any survived the mocked
+            # short write), they must not be reported as a successful lock
+            # acquisition by the caller -- already covered by assertRaises
+            # above; this is just documenting the on-disk state honestly.
+            self.assertLessEqual(len(content), 5)
+
+    def test_append_ledger_short_write_raises_instead_of_silent_truncation(self) -> None:
+        root = self.tmp / "promo-root"
+        root.mkdir()
+        entry = {"event": "approved", "candidate_id": "cand-y", "detail": "x" * 40}
+        real_write = os.write
+        calls = {"n": 0}
+
+        def short_write(fd_, data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd_, data[: max(1, len(data) - 10)])
+            return 0
+
+        with mock.patch.object(pc.os, "write", side_effect=short_write):
+            with self.assertRaises(OSError):
+                pc.append_ledger(root, entry)
+
+    def test_write_all_bytes_loops_across_all_three_call_sites_normal_case(self) -> None:
+        # Sanity: the normal (non-adversarial) path for all three functions
+        # still works byte-for-byte after routing through _write_all_bytes.
+        base_dir = self.tmp / "normal"
+        base_dir.mkdir()
+        final_path = base_dir / "cand-z.json"
+        payload = b'{"status": "approved"}\n'
+        pc.atomic_write_within(base_dir, final_path, payload)
+        self.assertEqual(final_path.read_bytes(), payload)
+
+        lock_dir = self.tmp / "normal-lock"
+        lock_dir.mkdir()
+        lock_path = pc.acquire_lock(lock_dir)
+        self.assertTrue(lock_path.is_file())
+        pc.release_lock(lock_path)
+
+        ledger_root = self.tmp / "normal-ledger"
+        ledger_root.mkdir()
+        pc.append_ledger(ledger_root, {"event": "test"})
+        ledger_path = ledger_root / pc.LEDGER_NAME
+        self.assertTrue(ledger_path.is_file())
+        self.assertIn("test", ledger_path.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()

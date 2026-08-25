@@ -496,7 +496,7 @@ def atomic_write_within(base_dir: Path, final_path: Path, payload: bytes) -> Non
     fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         try:
-            os.write(fd, payload)
+            _write_all_bytes(fd, payload)
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -523,7 +523,7 @@ def acquire_lock(base_dir: Path) -> Path:
         try:
             fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             try:
-                os.write(fd, json.dumps({"pid": os.getpid(), "started_at": now_iso()}).encode("utf-8"))
+                _write_all_bytes(fd, json.dumps({"pid": os.getpid(), "started_at": now_iso()}).encode("utf-8"))
                 os.fsync(fd)
             finally:
                 os.close(fd)
@@ -572,15 +572,33 @@ def ensure_promotion_root() -> Path:
 
 def append_ledger(root: Path, entry: dict[str, Any]) -> None:
     """Append-only. Never rewrites, never truncates; a partial line from a
-    prior crash is a pre-existing on-disk fact this function does not try to
-    repair -- only future append targets matter for a ledger."""
+    prior crash (process killed mid-write, before this function's own
+    os.fsync()/os.close() ever run) is a pre-existing on-disk fact this
+    function does not try to repair -- only future append targets matter
+    for a ledger.
+
+    Uses _write_all_bytes() (round-6-fix P1 sibling, 2026-08-25 -- see that
+    helper's own docstring) rather than a bare os.write(): unlike the
+    tmp-file+rename writers elsewhere in this module, there is no tmp file
+    to roll back here (this is a direct O_APPEND write to the live ledger),
+    so this fix does not add a rollback that didn't exist before. What it
+    does add: (a) a short-but-recoverable write (the OS accepted fewer
+    bytes than requested even though more capacity exists, e.g. an
+    interrupted syscall) now correctly continues and completes the full
+    line instead of leaving it silently truncated, and (b) a write that
+    genuinely cannot complete (e.g. disk truly full) now raises to the
+    caller instead of silently reporting success with a truncated JSON
+    line in the ledger -- the caller can then react (this file's own
+    cmd_draft/cmd_approve/etc. already treat an append_ledger() failure as
+    fatal), rather than the corruption going unnoticed until the ledger is
+    later read back."""
     ledger_final, reason = write_only_within(root, str(root / LEDGER_NAME))
     if reason or ledger_final is None:
         raise PromoteFatal("ledger_path_invalid", reason or "invalid_path")
     line = _sanitize_line_separators(json.dumps(entry, ensure_ascii=False)) + "\n"
     fd = os.open(str(ledger_final), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
     try:
-        os.write(fd, line.encode("utf-8"))
+        _write_all_bytes(fd, line.encode("utf-8"))
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -1548,6 +1566,35 @@ def resolve_knowledge_md_path(project_root: Path, page_id: str) -> Path:
     return knowledge_final
 
 
+def _write_all_bytes(fd: int, payload: bytes) -> None:
+    """os.write(fd, payload) does not guarantee the full payload is written
+    in one call -- POSIX permits a short write for a regular file (round-6
+    of the wiki_edit_guard.py TOCTOU fix's dedicated final-gate review
+    empirically reproduced a genuine short write on this exact machine via
+    RLIMIT_FSIZE: os.write() returned fewer bytes than requested with no
+    exception raised, and wiki_edit_guard.py's own dir-fd writer -- which
+    copies this exact function's technique -- silently rename()'d the
+    truncated tmp file onto the live tracked wiki file while approve still
+    reported `status: approved` and `git_committed: true`). This function
+    has the identical unchecked-os.write() shape and is used for the
+    knowledge-body write, so it gets the identical fix even though the
+    knowledge .md target is untracked (lower blast radius than the tracked
+    wiki file, but a silently truncated knowledge body is still a real
+    defect, not a hypothetical one, given the sibling bug was just proven
+    live). Loop until every byte is written; a zero-progress write (or any
+    OSError from a subsequent write) raises immediately so the caller's
+    existing `except BaseException: unlink tmp; raise` cleanup fires --
+    fail-closed, not a silently truncated success. See
+    wiki_edit_guard.py's own _write_all_bytes() for the sibling copy (copy,
+    don't import, per this codebase's convention)."""
+    view = memoryview(payload)
+    while view:
+        n = os.write(fd, view)
+        if n == 0:
+            raise OSError("short write: os.write() returned 0 (no forward progress)")
+        view = view[n:]
+
+
 def atomic_write_in_dir(final_path: Path, payload: bytes, *, dir_fd: int | None = None) -> None:
     """Same tmp-file+os.replace discipline as atomic_write_within, but for
     a write target OUTSIDE this tool's own PROMOTION_ROOT (the target
@@ -1612,7 +1659,7 @@ def atomic_write_in_dir(final_path: Path, payload: bytes, *, dir_fd: int | None 
         raise PromoteFatal("target_write_permission_denied", str(exc)) from exc
     try:
         try:
-            os.write(fd, payload)
+            _write_all_bytes(fd, payload)
             os.fsync(fd)
         finally:
             os.close(fd)
