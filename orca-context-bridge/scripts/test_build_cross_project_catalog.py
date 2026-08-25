@@ -2837,5 +2837,49 @@ class NoBytecodeInProjectTreeTests(unittest.TestCase):
         self.assertLess(source.index(marker), source.index(real_import))
 
 
+class AcquireLockUncreatableConsistencyTests(unittest.TestCase):
+    """2026-08-26: this file was the one outlier among the 6 M8 gate
+    scripts' identical (copy, don't import) acquire_lock() functions --
+    the other 5 (build_mention_evidence.py, check_cross_project_
+    compatibility.py, discover_capability_candidates.py,
+    detect_capability_changes.py, review_capability_candidates.py) all
+    name a genuine lock-creation OSError as "lock_uncreatable" instead of
+    letting it propagate untyped; this file did not. Mirrors
+    test_detect_capability_changes.py's
+    test_readonly_output_dir_raises_named_lock_uncreatable_not_generic_error,
+    adapted for CatalogFatal's single-field constructor (this file embeds
+    detail in the reason string via f"lock_uncreatable:{exc}" rather than
+    a separate details field, matching this file's own existing
+    f"enumeration_failed:{label}"-style convention -- so this test checks
+    startswith(), not exact equality)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="catalog-lock-test-"))
+        self.addCleanup(shutil.rmtree, str(self.tmp), ignore_errors=True)
+
+    @unittest.skipIf(os.name != "posix" or os.geteuid() == 0, "permission bits meaningless as root / non-posix")
+    def test_readonly_catalog_dir_raises_named_lock_uncreatable_not_generic_error(self) -> None:
+        catalog_dir = self.tmp / "catalog-dir"
+        os.makedirs(str(catalog_dir), mode=0o700, exist_ok=True)
+        os.chmod(str(catalog_dir), 0o500)
+        try:
+            with self.assertRaises(bcpc.CatalogFatal) as ctx:
+                bcpc.acquire_lock(catalog_dir)
+            self.assertTrue(
+                ctx.exception.reason.startswith("lock_uncreatable"),
+                f"expected reason to start with 'lock_uncreatable', got {ctx.exception.reason!r}",
+            )
+        finally:
+            os.chmod(str(catalog_dir), 0o700)
+
+    def test_normal_lock_acquire_and_release_unaffected(self) -> None:
+        catalog_dir = self.tmp / "catalog-dir-normal"
+        catalog_dir.mkdir()
+        lock_path = bcpc.acquire_lock(catalog_dir)
+        self.assertTrue(lock_path.is_file())
+        bcpc.release_lock(lock_path)
+        self.assertFalse(lock_path.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

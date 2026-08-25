@@ -1914,6 +1914,20 @@ def acquire_lock(catalog_dir: Path) -> Path:
                     pass
                 continue
             raise CatalogFatal("lock_held")
+        except OSError as exc:
+            # Anything other than "already exists" -- most commonly
+            # PermissionError on a read-only catalog_dir -- is a genuine
+            # failure to create the lock, not a lock-held race. Name it
+            # explicitly (exit 4, "lock_uncreatable") instead of letting it
+            # propagate as a generic unexpected_error. Mirrors the identical
+            # branch in this repo's other 5 M8 gate scripts (copy, don't
+            # import) -- this file was the one outlier missing it (an
+            # earlier attempt to add it here during an unrelated punch-list
+            # pass was reverted because that pass was explicitly scoped
+            # away from this already-hardened file; today's short-write fix
+            # already touches this same function, so adding the matching
+            # branch now is in-scope, not a drive-by).
+            raise CatalogFatal(f"lock_uncreatable:{exc}")
     raise CatalogFatal("lock_held")
 
 
