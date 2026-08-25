@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """discover_capability_candidates.py -- M8-2 auto-scan discovery (Gate C).
 
-STATUS: staged candidate under m8-gate-c-STAGED-review-only/, not yet
-deployed to any project's orca-context-bridge/scripts/. Not registered in
-any hook. Never invoked from SessionStart -- this tool does full-tree
+STATUS: deployed to orca-context-bridge/scripts/ (and mirrored to
+~/.agents/skills/orca-context-bridge/scripts/), but not registered in any
+hook. Never invoked from SessionStart -- this tool does full-tree
 filesystem walks, an order of magnitude heavier than M4's fixed
 three-filename-per-project read, and the design (M8-DESIGN-FINAL-2026-08-23
 3.3) is explicit that it must be even MORE careful than M4 about never being

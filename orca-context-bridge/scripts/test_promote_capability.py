@@ -305,13 +305,13 @@ class KindValuesCrossFileEqualityTests(unittest.TestCase):
         self.assertEqual(tuple(pc.KIND_VALUES), tuple(vrc.KIND_VALUES))
 
     def test_kind_values_matches_build_cross_project_catalog(self) -> None:
-        # build_cross_project_catalog.py is not symlinked into this staging
-        # scripts/ dir (only validate_reusable_capabilities.py and
-        # wiki_edit_guard.py are), so fall back to the real deployed
-        # skill's copy. Skip gracefully if it is not present in this
-        # environment rather than failing a test on an unrelated deployment
-        # gap.
+        # build_cross_project_catalog.py is a real sibling of this test
+        # file in this repo's scripts/ dir; prefer that, falling back to
+        # the installed skill copy for environments where only the
+        # installed copy is present. Skip gracefully if neither is found
+        # rather than failing a test on an unrelated deployment gap.
         candidate_paths = [
+            Path(__file__).resolve().parent / "build_cross_project_catalog.py",
             Path.home() / ".agents" / "skills" / "orca-context-bridge" / "scripts" / "build_cross_project_catalog.py",
         ]
         found = next((p for p in candidate_paths if p.is_file()), None)

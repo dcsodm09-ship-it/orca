@@ -894,7 +894,8 @@ def build_parser() -> argparse.ArgumentParser:
         "continuous relevance score (exact matches score highest; see the module docstring's "
         "RANKING section for the diversity-decay case where that is not an absolute guarantee).",
         description="Search capabilities[] (id/name/summary) and wiki_pages[] (id/title/summary) in "
-        "catalog.json. Exit 0 = matched, 1 = no match, 2 = usage error, 4 = catalog unavailable.",
+        "catalog.json. Exit 0 = matched, 1 = no match, 2 = usage error, 3 = partial search (no match, "
+        "one of the two lists was unusable), 4 = catalog unavailable.",
     )
     search.add_argument("keyword", type=str, help="Keyword to look for. Matched case-insensitively as a substring.")
     search.add_argument(

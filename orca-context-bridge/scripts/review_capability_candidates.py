@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """review_capability_candidates.py -- M8-2 discovery-hit triage (Gate C).
 
-STATUS: staged candidate under m8-gate-c-STAGED-review-only/, companion to
-discover_capability_candidates.py in the same directory. Not deployed, not
-registered in any hook.
+STATUS: deployed to orca-context-bridge/scripts/, companion to
+discover_capability_candidates.py in the same directory. Not registered in
+any hook.
 
 WHAT THIS TOOL IS ALLOWED TO TOUCH, AND WHY THAT MATTERS
 ----------------------------------------------------------------------------

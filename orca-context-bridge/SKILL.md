@@ -935,8 +935,8 @@ keyword case-insensitively as a substring of:
 
 | entry type | identity fields | text field |
 |---|---|---|
-| capability | `id`, `name` | `summary` |
-| wiki page | `id`, `title` | `summary` |
+| capability | `id`, `name`, `project_id`, `global_id` | `summary` |
+| wiki page | `id`, `title`, `project_id`, `global_id` | `summary` |
 
 Each hit is classified into one of three bands, best first: `exact` (the
 keyword *is* the id, name, or title), `identity-substring` (it occurs inside
@@ -976,6 +976,7 @@ the text:
 | `0` | at least one match |
 | `1` | no match — nothing in the catalog uses that word (grep's convention; mind `set -e`) |
 | `2` | usage error, e.g. an empty keyword |
+| `3` | no match, but the search was **partial** — one of `capabilities[]`/`wiki_pages[]` was missing or not a list, so only the other one was actually searched |
 | `4` | **could not look**: catalog missing, unreadable, or unparseable |
 
 `1` and `4` are deliberately different. "I found nothing" and "I could not
@@ -1156,9 +1157,11 @@ false "confirmed none" whenever a reverse-index row disagrees with itself
 (declared `in_degree` not matching what it could actually resolve).
 
 Both are pure detection/query tools with no automation wired to them: no
-hook calls either one, and neither one publishes anything — the M8 gates
-that would (auto-scan discovery, auto-publish, executing a third project's
-own compatibility command) are separately authorized, later steps.
+hook calls either one, and neither one publishes anything — the tools that
+would (auto-scan discovery in Gate C, auto-publish in Gate B, executing a
+third project's own compatibility command in Gate D, documented in the
+following sections) each still require their own separate authorization
+before real use.
 
 ### Promoting a capability across projects (M8 Gate B — deployed, not registered)
 
@@ -1286,9 +1289,15 @@ python3 <skill-dir>/scripts/check_cross_project_compatibility.py run \
 ```
 
 It only runs a project's own declared `check_command` from that project's
-own `wiki/compat-check.json` (`check_command` argv list, `timeout_seconds`,
-`reviewed_by`, `reviewed_at` — all required, all hand-authored and
-git-committed by that project). There is no `--authorize-all`: every
+own `wiki/compat-check.json` (`depends_on_ref`, `check_command` argv list,
+`timeout_seconds`, `reviewed_by`, `reviewed_at` — all required, all
+hand-authored and git-committed by that project). `depends_on_ref` must be
+written as the exact catalog `global_id` string it is meant to match
+(`<project_id>#<capability-id>` for a capability, `<project_id>#page:<page-id>`
+for a wiki page) — the reusable-capabilities dependency grammar
+(`script:foo.py` / `proj:script:foo.py`) is a different, incompatible
+spelling and will simply never match, silently skipping the check with
+`no_matching_checks` rather than erroring. There is no `--authorize-all`: every
 `--authorize-project` must already be in the `affected` set computed from
 `--global-id` (Gate A's own reverse-index query), execution is
 `shell=False` with an explicit argv, `wiki/compat-check.json` is re-read
