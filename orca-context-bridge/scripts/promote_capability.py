@@ -540,6 +540,13 @@ def acquire_lock(base_dir: Path) -> Path:
                     pass
                 continue
             raise PromoteFatal("lock_held")
+        except OSError as exc:
+            # Anything other than "already exists" -- most commonly
+            # PermissionError on a read-only base_dir -- is a genuine
+            # failure to create the lock, not a lock-held race. Name it
+            # explicitly (exit 4, "lock_uncreatable") instead of letting it
+            # propagate as a generic unexpected_error.
+            raise PromoteFatal("lock_uncreatable", str(exc))
     raise PromoteFatal("lock_held")
 
 
@@ -1738,10 +1745,20 @@ def pin_wiki_edit_guard_sha256() -> tuple[Path, str]:
 
 
 def verify_wiki_edit_guard_sha256(guard_path: Path, pinned_sha256: str) -> None:
-    """Called immediately before the subprocess invocation. If the file's
-    content no longer matches what was pinned earlier in this same run,
-    refuse fail-closed rather than trusting a binary this process cannot
-    account for."""
+    """NOT called immediately before the subprocess invocation, despite an
+    earlier version of this docstring claiming otherwise (caught by an
+    independent review). The one and only call site is immediately after
+    pin_wiki_edit_guard_sha256() at this function's own call site, BEFORE
+    the knowledge-body write (atomic_write_in_dir) and well before
+    invoke_wiki_edit_guard() actually spawns the subprocess ~130 lines
+    later -- see the round-5-fix comment block above invoke_wiki_edit_guard()
+    for why that later re-check re-validates wiki_path containment/identity
+    but does NOT re-hash this guard binary. If the file's content no longer
+    matches what was pinned moments earlier in this same run, refuse
+    fail-closed rather than trusting a binary this process cannot account
+    for -- but note the window this actually covers is the pin/verify pair
+    itself, not the pin-to-subprocess-spawn window a reader might assume
+    from the two calls' names alone."""
     try:
         data = guard_path.read_bytes()
     except OSError as exc:

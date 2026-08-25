@@ -2388,6 +2388,21 @@ class ConcurrencyLockTests(PromoteCapabilityTestCase):
         acquired_count = sum(1 for r in results if r == "acquired")
         self.assertEqual(acquired_count, 1, results)
 
+    @unittest.skipIf(os.name != "posix" or os.geteuid() == 0, "permission bits meaningless as root / non-posix")
+    def test_readonly_base_dir_raises_named_lock_uncreatable_not_generic_error(self) -> None:
+        # Mirrors build_mention_evidence.py's acquire_lock() OSError branch:
+        # a read-only base_dir must surface as a NAMED PromoteFatal reason,
+        # not propagate as an untyped OSError reported as unexpected_error.
+        base_dir = self.tmp / "lock-readonly-dir"
+        base_dir.mkdir()
+        os.chmod(str(base_dir), 0o500)
+        try:
+            with self.assertRaises(pc.PromoteFatal) as ctx:
+                pc.acquire_lock(base_dir)
+            self.assertEqual(ctx.exception.reason, "lock_uncreatable")
+        finally:
+            os.chmod(str(base_dir), 0o700)
+
 
 # ---------------------------------------------------------------------------
 # Isolation tests -- the critical safety-boundary proof for this delivery
