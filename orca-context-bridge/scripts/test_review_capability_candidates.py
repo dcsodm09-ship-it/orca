@@ -16,6 +16,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import review_capability_candidates as rcc  # noqa: E402
@@ -776,6 +777,94 @@ class EndToEndTests(unittest.TestCase):
         payload = json.loads(out)
         self.assertEqual(payload["count"], 1)
         self.assertEqual(payload["hits"][0]["hit_id"], hit["hit_id"])
+
+
+class AtomicWriteWithinShortWriteRegressionTests(unittest.TestCase):
+    """Ported round-6-fix P1 (final-gate dedicated review, Grok,
+    2026-08-25): the sibling short-write bug found in
+    wiki_edit_guard.py's _atomic_write_via_dir_fd() and
+    promote_capability.py's atomic_write_in_dir() -- an unchecked
+    os.write(fd, payload) that silently accepts a short write and still
+    renames the truncated tmp file onto the live target -- was also
+    present in this file's own atomic_write_within() (and acquire_lock()'s
+    lock-stamp write). POSIX permits os.write() to return fewer bytes than
+    requested for a regular file; a truncated hits/output JSON document
+    could otherwise land on the live target while the caller still reports
+    success. Fixed via _write_all_bytes(), which loops os.write() until the
+    full payload lands and raises immediately on zero forward progress."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="rcc-shortwrite-"))
+        self.addCleanup(shutil.rmtree, str(self.tmp), ignore_errors=True)
+
+    def test_write_all_bytes_raises_on_zero_progress_short_write(self) -> None:
+        fd, path = tempfile.mkstemp(dir=str(self.tmp))
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        payload = b"x" * 100
+        real_write = os.write
+        calls = {"n": 0}
+
+        def short_write(fd_, data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd_, data[:40])  # short: only 40 of 100
+            return 0  # no forward progress on the retry -- must raise, not spin
+
+        with mock.patch.object(rcc.os, "write", side_effect=short_write):
+            with self.assertRaises(OSError):
+                rcc._write_all_bytes(fd, payload)
+        os.close(fd)
+
+    def test_write_all_bytes_loops_to_completion_on_multiple_short_writes(self) -> None:
+        fd, path = tempfile.mkstemp(dir=str(self.tmp))
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        payload = b"y" * 100
+        real_write = os.write
+        chunks = [30, 30, 40]  # sums to 100 -- must NOT raise, must write it all
+
+        def chunked_write(fd_, data):
+            n = chunks.pop(0)
+            return real_write(fd_, data[:n])
+
+        with mock.patch.object(rcc.os, "write", side_effect=chunked_write):
+            rcc._write_all_bytes(fd, payload)
+        os.close(fd)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    def test_atomic_write_within_refuses_rather_than_truncates_on_short_write(self) -> None:
+        # End-to-end through atomic_write_within() itself (not just the
+        # helper in isolation): a short write must never result in the tmp
+        # file being renamed onto the live target.
+        base_dir = self.tmp / "hits"
+        base_dir.mkdir()
+        final_path = base_dir / "discovery-hits.json"
+        original_bytes = b'{"schema_version": 1, "hits": []}\n'
+        final_path.write_bytes(original_bytes)
+
+        new_payload = b'{"schema_version": 1, "hits": [{"hit_id": "x"}]}\n'
+        real_write = os.write
+        calls = {"n": 0}
+
+        def short_write(fd_, data):
+            # First call: write most of it but not all (a genuine short
+            # write). Every call after that returns 0 -- no forward
+            # progress at all, simulating a persistent condition (e.g. a
+            # resource limit already at capacity), not just a slow one.
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd_, data[: max(1, len(data) - 20)])
+            return 0
+
+        with mock.patch.object(rcc.os, "write", side_effect=short_write):
+            with self.assertRaises(OSError):
+                rcc.atomic_write_within(base_dir, final_path, new_payload)
+
+        # The live target file must be COMPLETELY untouched -- not renamed
+        # over with truncated content, and no leftover tmp file next to it.
+        self.assertEqual(final_path.read_bytes(), original_bytes)
+        leftovers = [p for p in base_dir.iterdir() if p.name != final_path.name]
+        self.assertEqual(leftovers, [], f"leftover tmp files: {leftovers}")
 
 
 if __name__ == "__main__":

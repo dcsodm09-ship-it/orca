@@ -877,13 +877,37 @@ def write_only_within(base_dir: Path, path_value: object) -> tuple[Path | None, 
     return resolved_path, None
 
 
+def _write_all_bytes(fd: int, payload: bytes) -> None:
+    """os.write(fd, payload) does not guarantee the full payload is written
+    in one call -- POSIX permits a short write for a regular file (this
+    project's own round of final-gate review empirically demonstrated a
+    genuine short write on this exact machine via RLIMIT_FSIZE: os.write()
+    returned fewer bytes than requested with no exception raised). The
+    caller of this function relies on the tmp file it writes being either
+    the COMPLETE intended payload or absent -- silently accepting a short
+    write here would let a truncated, invalid-JSON tmp file get
+    os.replace()'d/os.rename()'d onto the live target while the caller
+    still reports success. Loop until every byte is written; a
+    zero-progress write raises immediately so the caller's existing
+    `except BaseException: unlink tmp; raise` cleanup fires -- fail-closed
+    rather than fail-open with a silently truncated result. Copied (not
+    imported) from wiki_edit_guard.py's _write_all_bytes(), per this
+    codebase's own convention."""
+    view = memoryview(payload)
+    while view:
+        n = os.write(fd, view)
+        if n == 0:
+            raise OSError("short write: os.write() returned 0 (no forward progress)")
+        view = view[n:]
+
+
 def atomic_write_within(base_dir: Path, final_path: Path, payload: bytes) -> None:
     """Copied verbatim from promote_capability.py's atomic_write_within()."""
     tmp_path = final_path.parent / f".{final_path.name}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
     fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         try:
-            os.write(fd, payload)
+            _write_all_bytes(fd, payload)
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -965,7 +989,7 @@ def acquire_lock(base_dir: Path) -> Path:
         try:
             fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             try:
-                os.write(fd, json.dumps({"pid": os.getpid(), "started_at": now_iso()}).encode("utf-8"))
+                _write_all_bytes(fd, json.dumps({"pid": os.getpid(), "started_at": now_iso()}).encode("utf-8"))
                 os.fsync(fd)
             finally:
                 os.close(fd)

@@ -2318,5 +2318,106 @@ class ProjectRootIndexHardeningTests(unittest.TestCase):
         self.assertEqual(warnings, [])
 
 
+class ShortWriteRegressionTests(unittest.TestCase):
+    """atomic_write_within() and acquire_lock() called the raw os.write(fd,
+    payload) and discarded its return value. POSIX permits os.write() to
+    return fewer bytes than requested for a regular file -- empirically
+    reproduced on this exact machine via RLIMIT_FSIZE with no exception
+    raised -- and the old code then unconditionally os.fsync()'d and
+    os.replace()'d the truncated tmp file onto the LIVE target while the
+    caller still reported success. Fixed via _write_all_bytes(), which loops
+    os.write() until the full payload lands and raises immediately on zero
+    forward progress. Mirrors wiki_edit_guard.py's ShortWriteRegressionTests
+    and promote_capability.py's AtomicWriteInDirShortWriteRegressionTests."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="ccc-shortwrite-"))
+        self.addCleanup(shutil.rmtree, str(self.tmp), ignore_errors=True)
+
+    def test_write_all_bytes_raises_on_zero_progress_write(self) -> None:
+        fd, path = tempfile.mkstemp(dir=str(self.tmp))
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        payload = b"x" * 100
+        calls = {"n": 0}
+        real_write = os.write
+
+        def short_write(fd_, data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd_, data[:40])  # short: only 40 of 100
+            return 0  # no forward progress on the retry -- must raise, not spin
+
+        with mock.patch.object(ccc.os, "write", side_effect=short_write):
+            with self.assertRaises(OSError):
+                ccc._write_all_bytes(fd, payload)
+        os.close(fd)
+
+    def test_write_all_bytes_loops_to_completion_on_multiple_short_writes(self) -> None:
+        fd, path = tempfile.mkstemp(dir=str(self.tmp))
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        payload = b"y" * 100
+        real_write = os.write
+        chunks = [30, 30, 40]  # sums to 100 -- must NOT raise, must write it all
+
+        def chunked_write(fd_, data):
+            n = chunks.pop(0)
+            return real_write(fd_, data[:n])
+
+        with mock.patch.object(ccc.os, "write", side_effect=chunked_write):
+            ccc._write_all_bytes(fd, payload)
+        os.close(fd)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    def test_atomic_write_within_refuses_rather_than_truncates_live_target(self) -> None:
+        # End-to-end through atomic_write_within() itself (not just the
+        # helper in isolation): a short write must never result in the tmp
+        # file being renamed onto the live target, and the live target must
+        # be left byte-identical with no leftover tmp file.
+        base_dir = self.tmp / "out"
+        base_dir.mkdir()
+        final_path = base_dir / "target.json"
+        original_bytes = b'{"content_version": 1}\n'
+        final_path.write_bytes(original_bytes)
+
+        new_payload = b'{"content_version": 2, "padding": "' + (b"z" * 200) + b'"}\n'
+        real_write = os.write
+        calls = {"n": 0}
+
+        def short_write(fd_, data):
+            # First call: write most of it but not all (a genuine short
+            # write). Every call after that returns 0 -- no forward
+            # progress at all, simulating a persistent condition (e.g. a
+            # resource limit already at capacity), not just a slow one.
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd_, data[: max(1, len(data) - 50)])
+            return 0
+
+        with mock.patch.object(ccc.os, "write", side_effect=short_write):
+            with self.assertRaises(OSError):
+                ccc.atomic_write_within(base_dir, final_path, new_payload)
+
+        self.assertEqual(final_path.read_bytes(), original_bytes)
+        leftovers = [p for p in base_dir.iterdir() if p.name != final_path.name]
+        self.assertEqual(leftovers, [], f"leftover tmp files: {leftovers}")
+
+    def test_acquire_lock_refuses_rather_than_leaves_silently_truncated_stamp(self) -> None:
+        base_dir = self.tmp / "lockdir"
+        base_dir.mkdir()
+        real_write = os.write
+        calls = {"n": 0}
+
+        def short_write(fd_, data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd_, data[: max(1, len(data) - 5)])
+            return 0
+
+        with mock.patch.object(ccc.os, "write", side_effect=short_write):
+            with self.assertRaises(ccc.CheckFatal):
+                ccc.acquire_lock(base_dir)
+
+
 if __name__ == "__main__":
     unittest.main()

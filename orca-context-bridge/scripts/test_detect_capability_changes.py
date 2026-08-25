@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -632,6 +633,78 @@ class ReadOnlyFleetIsolationTests(unittest.TestCase):
                     full.relative_to(self.output_dir)
                 except ValueError:
                     self.fail(f"unexpected write outside manifests-output: {full}")
+
+
+class ShortWriteRegressionTests(unittest.TestCase):
+    """P1 (this module's own atomic_write_within() had the same unchecked
+    os.write(fd, payload) bug already found and fixed today in
+    wiki_edit_guard.py's _write_all_bytes() / promote_capability.py's
+    atomic_write_in_dir(), via an adversarial Grok final-gate review).
+    POSIX permits os.write() to return fewer bytes than requested for a
+    regular file -- empirically reproduced on this exact machine via
+    RLIMIT_FSIZE with no exception raised -- and the old code then
+    unconditionally os.fsync()'d and os.replace()'d the truncated tmp file
+    onto the LIVE capability-content-hashes.json / capability-changes.json
+    output while the caller still reported success. Fixed via
+    _write_all_bytes(), which loops os.write() until the full payload
+    lands and raises immediately on zero forward progress."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dcc-shortwrite-"))
+        self.addCleanup(shutil.rmtree, str(self.tmp), ignore_errors=True)
+
+    def test_write_all_bytes_raises_on_zero_progress_short_write(self) -> None:
+        fd, path = tempfile.mkstemp(dir=str(self.tmp))
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        payload = b"x" * 100
+        real_write = os.write
+        calls = {"n": 0}
+
+        def short_write(fd_, data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd_, data[:40])  # short: only 40 of 100
+            return 0  # no forward progress on the retry -- must raise, not spin
+
+        with mock.patch.object(dcc.os, "write", side_effect=short_write):
+            with self.assertRaises(OSError):
+                dcc._write_all_bytes(fd, payload)
+        os.close(fd)
+
+    def test_full_atomic_write_within_refuses_rather_than_truncates(self) -> None:
+        # End-to-end through atomic_write_within() itself (not just the
+        # helper in isolation): a short write must never result in the tmp
+        # file being renamed onto the live output target, and the original
+        # target must survive completely untouched.
+        output_dir = self.tmp / "out"
+        output_dir.mkdir()
+        final_path = output_dir / dcc.HASHES_NAME
+        original_bytes = b'{"content_version": 1}\n'
+        final_path.write_bytes(original_bytes)
+
+        new_payload = b'{"content_version": 2}\n'
+        real_write = os.write
+        calls = {"n": 0}
+
+        def short_write(fd_, data):
+            # First call: write most of it but not all (a genuine short
+            # write). Every call after that returns 0 -- no forward
+            # progress at all, simulating a persistent condition (e.g. a
+            # resource limit already at capacity), not just a slow one.
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd_, data[: max(1, len(data) - 5)])
+            return 0
+
+        with mock.patch.object(dcc.os, "write", side_effect=short_write):
+            with self.assertRaises(OSError):
+                dcc.atomic_write_within(output_dir, final_path, new_payload)
+
+        # The live output file must be COMPLETELY untouched -- not renamed
+        # over with truncated content, and no leftover tmp file next to it.
+        self.assertEqual(final_path.read_bytes(), original_bytes)
+        leftovers = [p for p in output_dir.iterdir() if p.name != dcc.HASHES_NAME]
+        self.assertEqual(leftovers, [], f"leftover tmp files: {leftovers}")
 
 
 if __name__ == "__main__":

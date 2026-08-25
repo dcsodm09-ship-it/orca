@@ -748,6 +748,28 @@ def _encode_json(payload: dict) -> bytes:
     return _sanitize_line_separators(text).encode("utf-8")
 
 
+def _write_all_bytes(fd: int, payload: bytes) -> None:
+    """os.write(fd, payload) does not guarantee the full payload is written
+    in one call -- POSIX permits a short write for a regular file (this
+    project's own round-6-fix final-gate review empirically demonstrated a
+    genuine short write on this exact machine via RLIMIT_FSIZE: os.write()
+    returned fewer bytes than requested with no exception raised). The
+    caller of this function relies on the tmp file it writes being either
+    the COMPLETE intended payload or absent -- silently accepting a short
+    write here would let a truncated, invalid-JSON tmp file get
+    os.replace()'d onto the live mention-evidence.json while the caller
+    still reports success. Loop until every byte is written; a
+    zero-progress write raises immediately so the caller's existing
+    `except BaseException: unlink tmp; raise` cleanup fires -- fail-closed
+    rather than fail-open with a silently truncated result."""
+    view = memoryview(payload)
+    while view:
+        n = os.write(fd, view)
+        if n == 0:
+            raise OSError("short write: os.write() returned 0 (no forward progress)")
+        view = view[n:]
+
+
 def atomic_write_within(output_dir: Path, final_path: Path, payload: bytes) -> None:
     """Tempfile + O_EXCL + json.load()-back self-validation + os.replace.
 
@@ -757,12 +779,16 @@ def atomic_write_within(output_dir: Path, final_path: Path, payload: bytes) -> N
     previous good output. A write that produced truncated or corrupt bytes
     must never become the visible mention-evidence.json -- see
     test_atomic_write_self_validation_failure_leaves_previous_file_untouched.
+
+    The raw os.write() call is also wrapped via _write_all_bytes() (see its
+    docstring) so a short write raises instead of silently landing a
+    truncated tmp file.
     """
     tmp_path = final_path.parent / f".{final_path.name}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
     fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         try:
-            os.write(fd, payload)
+            _write_all_bytes(fd, payload)
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -798,10 +824,21 @@ def acquire_lock(output_dir: Path) -> Path:
         try:
             fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             try:
-                os.write(fd, json.dumps({"pid": os.getpid(), "started_at": now_iso()}).encode("utf-8"))
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+                try:
+                    _write_all_bytes(fd, json.dumps({"pid": os.getpid(), "started_at": now_iso()}).encode("utf-8"))
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except BaseException:
+                # A short/failed write here must not leave a corrupt lock
+                # file behind to be misread by a future stale-lock check --
+                # same fail-closed discipline as atomic_write_within's own
+                # cleanup path.
+                try:
+                    os.unlink(str(lock_path))
+                except OSError:
+                    pass
+                raise
             return lock_path
         except FileExistsError:
             try:

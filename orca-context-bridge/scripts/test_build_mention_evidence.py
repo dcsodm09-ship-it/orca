@@ -18,6 +18,7 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import sys
 
@@ -746,6 +747,97 @@ class AtomicWriteSelfValidationTests(BaseTempDirTestCase):
         # No leftover temp file either.
         leftovers = [p for p in self.out_dir.iterdir() if p.name.startswith(f".{bme.OUTPUT_NAME}.tmp-")]
         self.assertEqual(leftovers, [])
+
+
+# ---------------------------------------------------------------------------
+# Short-write regression (ported from wiki_edit_guard.py / promote_capability.py's
+# own round-6-fix final-gate finding, 2026-08-25): atomic_write_within() called
+# the raw os.write(fd, payload) and discarded its return value. POSIX permits
+# os.write() to return fewer bytes than requested for a regular file --
+# empirically reproduced on this exact machine via RLIMIT_FSIZE with no
+# exception raised -- and the old code then unconditionally os.fsync()'d and
+# os.replace()'d the truncated tmp file onto the LIVE mention-evidence.json
+# while the caller still reported success. Fixed via _write_all_bytes(),
+# which loops os.write() until the full payload lands and raises immediately
+# on zero forward progress.
+# ---------------------------------------------------------------------------
+
+
+class ShortWriteRegressionTests(BaseTempDirTestCase):
+    def test_write_all_bytes_detects_and_raises_on_short_write(self) -> None:
+        fd, path = tempfile.mkstemp(dir=str(self.tmp))
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        payload = b"x" * 100
+        calls = {"n": 0}
+        real_write = os.write
+
+        def short_write(fd_, data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd_, data[:40])  # short: only 40 of 100
+            return 0  # no forward progress on the retry -- must raise, not spin
+
+        with mock.patch.object(bme.os, "write", side_effect=short_write):
+            with self.assertRaises(OSError):
+                bme._write_all_bytes(fd, payload)
+        os.close(fd)
+        # Whatever landed before the raise is irrelevant -- the CALLER
+        # (atomic_write_within) is responsible for treating this as a
+        # failure and never renaming the tmp file onto the live name; this
+        # test only proves _write_all_bytes() itself cannot silently
+        # succeed on a short write.
+
+    def test_write_all_bytes_loops_to_completion_on_multiple_short_writes(self) -> None:
+        fd, path = tempfile.mkstemp(dir=str(self.tmp))
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        payload = b"y" * 100
+        real_write = os.write
+        chunks = [30, 30, 40]  # sums to 100 -- must NOT raise, must write it all
+
+        def chunked_write(fd_, data):
+            n = chunks.pop(0)
+            return real_write(fd_, data[:n])
+
+        with mock.patch.object(bme.os, "write", side_effect=chunked_write):
+            bme._write_all_bytes(fd, payload)
+        os.close(fd)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    def test_full_atomic_write_within_refuses_rather_than_truncates(self) -> None:
+        # End-to-end through atomic_write_within() itself (not just the
+        # helper in isolation): a short write must never result in the tmp
+        # file being renamed onto the live mention-evidence.json.
+        good_path = self.write_catalog(make_catalog(capabilities=[make_cap("p1", "a")]))
+        code, _, _ = _run_main(["build", "--catalog", str(good_path), "--quiet"])
+        self.assertEqual(code, 0)
+        final_path = self.out_dir / bme.OUTPUT_NAME
+        original_bytes = final_path.read_bytes()
+        json.loads(original_bytes)  # sanity: really is valid JSON
+
+        real_write = os.write
+        calls = {"n": 0}
+
+        def short_write(fd_, data):
+            # First call: write most of it but not all (a genuine short
+            # write). Every call after that returns 0 -- no forward
+            # progress at all, simulating a persistent condition (e.g. a
+            # resource limit already at capacity), not just a slow one.
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd_, data[: max(1, len(data) - 10)])
+            return 0
+
+        with mock.patch.object(bme.os, "write", side_effect=short_write):
+            with self.assertRaises(OSError):
+                bme.atomic_write_within(self.out_dir, final_path, bme._encode_json({"a": 1}))
+
+        # The live mention-evidence.json must be COMPLETELY untouched -- not
+        # renamed over with truncated content, and no leftover tmp file
+        # next to it.
+        self.assertEqual(final_path.read_bytes(), original_bytes)
+        leftovers = [p for p in self.out_dir.iterdir() if p.name.startswith(f".{bme.OUTPUT_NAME}.tmp-")]
+        self.assertEqual(leftovers, [], f"leftover tmp files: {leftovers}")
 
 
 # ---------------------------------------------------------------------------
