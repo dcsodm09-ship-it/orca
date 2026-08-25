@@ -32,42 +32,54 @@ writes, generator exit-code semantics, and a mandatory OS-level read-only
 isolation test -- none of which the prototype needed (it never wrote
 anywhere but its own --out-dir).
 
-OUTPUT: A FIXED ABSOLUTE PATH, NOT Path(__file__)-RELATIVE
+OUTPUT: STAGING BY DEFAULT, NOT Path(__file__)-RELATIVE
 --------------------------------------------------------------------------
+Real production path (only reached via `--authorize-production-write`):
 `/Volumes/Extreme SSD/Orca/manifests/cross-project-catalog/mention-evidence.json`
 -- the SAME directory catalog.json itself lives in (not a subdirectory),
 because this artifact is catalog.json's sibling: a second, independently
-locked derived file next to the first. DEFAULT_OUTPUT_DIR below is an
-ABSOLUTE constant for the same reason build_cross_project_catalog.py's own
-DEFAULT_OUTPUT_DIR and detect_capability_changes.py's DEFAULT_OUTPUT_DIR are
-absolute constants: a `Path(__file__)`-relative pin is correct only while a
-script lives in a scratch staging area outside every project's tracked
-tree -- once relocated into a project's own `orca-context-bridge/scripts/`
-(this tool's eventual home), that same relative pin would silently create a
-new, untracked directory INSIDE a project's own tracked path, which is
-exactly the AUTHORITY_TRACKED_PATHS trap this codebase has hit three times
-already (Gate A's DEFAULT_OUTPUT_DIR, Gate B's test suite's REAL_REPO_ROOT,
-and a near-miss in Gate D). There is no flag to point this tool's output
-anywhere else; the test suite redirects the pin by rebinding the
-module-level DEFAULT_OUTPUT_DIR constant itself, exactly as
+locked derived file next to the first.
+
+Default (no flags given):
+`/Volumes/Extreme SSD/Orca/manifests/mention-evidence-pending-authorization/mention-evidence.json`
+-- a new staging directory, unified with Gate B's (promote_capability.py)
+staging-by-default convention: reaching the real production path now
+requires an explicit `--authorize-production-write` flag on `build`, not
+just accepting a printed warning.
+
+DEFAULT_OUTPUT_DIR / _PRODUCTION_DEFAULT_OUTPUT_DIR /
+_STAGING_DEFAULT_OUTPUT_DIR below are ABSOLUTE constants for the same
+reason build_cross_project_catalog.py's own DEFAULT_OUTPUT_DIR and
+detect_capability_changes.py's DEFAULT_OUTPUT_DIR are absolute constants: a
+`Path(__file__)`-relative pin is correct only while a script lives in a
+scratch staging area outside every project's tracked tree -- once
+relocated into a project's own `orca-context-bridge/scripts/` (this tool's
+eventual home), that same relative pin would silently create a new,
+untracked directory INSIDE a project's own tracked path, which is exactly
+the AUTHORITY_TRACKED_PATHS trap this codebase has hit three times already
+(Gate A's DEFAULT_OUTPUT_DIR, Gate B's test suite's REAL_REPO_ROOT, and a
+near-miss in Gate D). The test suite redirects the pin by rebinding the
+module-level DEFAULT_OUTPUT_DIR (and, where needed,
+_PRODUCTION_DEFAULT_OUTPUT_DIR) constants themselves, exactly as
 detect_capability_changes.py's own test suite documents doing.
 
-M8-1 AUTHORIZATION NOTICE ON EVERY DEFAULT-PATH WRITE
+M8-1 AUTHORIZATION NOTICE ON EVERY PRODUCTION-PATH WRITE
 --------------------------------------------------------------------------
 `build` still runs and writes normally regardless -- this is a visibility/
 audit-trail improvement, not a new gate, and not a refusal. But whenever the
-resolved output_dir is still this module's own literal production default
-(`_PRODUCTION_DEFAULT_OUTPUT_DIR`, a frozen copy of `DEFAULT_OUTPUT_DIR` --
-see that constant's own comment for why the two are kept distinct), `build`
-prints one unsuppressible stderr line before writing, the same mechanism
-discover_capability_candidates.py uses for its own `--all-projects`
-warning: M8-1's own independent authorization gate (design 3.2.4) has not
-been granted (Gate C's real-data run produced only 3 candidate edges, all
-same-project, zero cross-project -- see module docstring above), so
-mention-evidence.json should not be treated as production-authoritative by
-anything that reads it. A caller who redirects output elsewhere (today,
-only this file's own test suite, by rebinding the mutable
-`DEFAULT_OUTPUT_DIR` name) sees nothing here.
+resolved output_dir is this module's own literal production default
+(`_PRODUCTION_DEFAULT_OUTPUT_DIR`, a frozen constant kept distinct from the
+mutable `DEFAULT_OUTPUT_DIR` -- see that constant's own comment for why),
+`build` prints one unsuppressible stderr line before writing, the same
+mechanism discover_capability_candidates.py uses for its own
+`--all-projects` warning: M8-1's own independent authorization gate (design
+3.2.4) has not been granted (Gate C's real-data run produced only 3
+candidate edges, all same-project, zero cross-project -- see module
+docstring above), so mention-evidence.json should not be treated as
+production-authoritative by anything that reads it. Since the default is
+now staging, this notice in practice only fires when
+`--authorize-production-write` is passed (or a test rebinds the two
+constants equal to each other).
 
 LOCKING: A DEDICATED LOCK, NOT catalog.json's OWN .catalog.lock
 --------------------------------------------------------------------------
@@ -161,14 +173,22 @@ OUTPUT_SCHEMA_VERSION = 1
 # before build_cross_project_catalog.py has ever run, in which case it must
 # not silently fall back to a permissive umask-derived mode.
 DEFAULT_CATALOG_PATH = Path("/Volumes/Extreme SSD/Orca/manifests/cross-project-catalog/catalog.json")
-DEFAULT_OUTPUT_DIR = Path("/Volumes/Extreme SSD/Orca/manifests/cross-project-catalog")
-# Frozen copy of the literal default above, kept distinct from the mutable
-# DEFAULT_OUTPUT_DIR name tests rebind (see module docstring's OUTPUT
-# section) so a run can tell "still pointed at the real production default"
-# apart from "a test (or, in principle, a future --output-dir flag)
-# redirected me elsewhere" -- see the authorization notice print in
-# cmd_build().
-_PRODUCTION_DEFAULT_OUTPUT_DIR = DEFAULT_OUTPUT_DIR
+# Frozen literal for the REAL production output directory. Kept distinct
+# from the mutable DEFAULT_OUTPUT_DIR name tests rebind (see module
+# docstring's OUTPUT section) so a run can tell "actually pointed at the
+# real production default" apart from "a test (or a staging default, or a
+# future --output-dir flag) redirected me elsewhere" -- see the
+# authorization notice print in cmd_build(). This constant's VALUE never
+# changes; only what DEFAULT_OUTPUT_DIR resolves to by default does
+# (staging-by-default, see _STAGING_DEFAULT_OUTPUT_DIR below and the
+# --authorize-production-write flag).
+_PRODUCTION_DEFAULT_OUTPUT_DIR = Path("/Volumes/Extreme SSD/Orca/manifests/cross-project-catalog")
+# New staging default (M8 staging-by-default unification): writing here
+# requires no special authorization since it is NOT the production path.
+# Reaching the real production path above now requires the explicit
+# --authorize-production-write flag on `build` (see cmd_build()).
+_STAGING_DEFAULT_OUTPUT_DIR = Path("/Volumes/Extreme SSD/Orca/manifests/mention-evidence-pending-authorization")
+DEFAULT_OUTPUT_DIR = _STAGING_DEFAULT_OUTPUT_DIR
 OUTPUT_NAME = "mention-evidence.json"
 LOCK_NAME = ".mention-evidence.lock"
 LOCK_STALE_SECONDS = 300
@@ -894,6 +914,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"Path to catalog.json (read-only; default: {DEFAULT_CATALOG_PATH}).",
     )
+    build.add_argument(
+        "--authorize-production-write",
+        action="store_true",
+        help="Write to the real production default "
+        f"({_PRODUCTION_DEFAULT_OUTPUT_DIR}) instead of the staging default "
+        f"({_STAGING_DEFAULT_OUTPUT_DIR}) when no explicit output path is given.",
+    )
     build.add_argument("--json", action="store_true", help="Print the run summary as one JSON object to stdout.")
     build.add_argument("--quiet", action="store_true", help="Suppress human-readable text; rely on the exit code.")
     return parser
@@ -945,7 +972,10 @@ def cmd_build(args: argparse.Namespace) -> int:
         "stopwords_cjk_count": len(STOPWORDS_CJK),
     }
 
-    output_dir = DEFAULT_OUTPUT_DIR
+    if getattr(args, "authorize_production_write", False):
+        output_dir = _PRODUCTION_DEFAULT_OUTPUT_DIR
+    else:
+        output_dir = DEFAULT_OUTPUT_DIR
     if output_dir == _PRODUCTION_DEFAULT_OUTPUT_DIR:
         # Unsuppressible, same mechanism as discover_capability_candidates.
         # py's own --all-projects warning: no --quiet gate, printed

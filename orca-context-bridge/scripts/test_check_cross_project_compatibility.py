@@ -2419,5 +2419,151 @@ class ShortWriteRegressionTests(unittest.TestCase):
                 ccc.acquire_lock(base_dir)
 
 
+# ===========================================================================
+# Staging-by-default authorization gate for the "run" subcommand's output
+# root (unification with Gate B's PROMOTION_ROOT convention).
+# ===========================================================================
+
+
+class CliRunProductionAuthorizationTest(unittest.TestCase):
+    """Isolation convention used throughout this file's sibling test module
+    (test_build_mention_evidence.py, lines ~100-106) and this module's own
+    CliRunSmokeTest: rebind the module-level default-path constants directly
+    in setUp/tearDown, never touch the real production path."""
+
+    def setUp(self) -> None:
+        self._orig_staging = ccc.COMPAT_RUNS_ROOT
+        self._orig_production = ccc._PRODUCTION_DEFAULT_COMPAT_RUNS_ROOT
+        self.tmp = Path(tempfile.mkdtemp(prefix="ccc-run-authz-"))
+        self.staging_root = self.tmp / "staging" / "compat-runs-pending-authorization"
+        self.production_root = self.tmp / "production" / "compat-runs"
+        ccc.COMPAT_RUNS_ROOT = self.staging_root
+        ccc._PRODUCTION_DEFAULT_COMPAT_RUNS_ROOT = self.production_root
+
+    def tearDown(self) -> None:
+        ccc.COMPAT_RUNS_ROOT = self._orig_staging
+        ccc._PRODUCTION_DEFAULT_COMPAT_RUNS_ROOT = self._orig_production
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_catalog(self, tmp: Path) -> tuple[Path, str]:
+        dep_dir = make_project_dir(tmp, "dep")
+        global_id = "t#x"
+        write_compat_check(
+            dep_dir, [make_check_entry(depends_on_ref=global_id, check_command=[sys.executable, "-c", "pass"])]
+        )
+        catalog = make_affected_catalog(global_id, "dep", projects=[make_project_row("dep", dep_dir)])
+        catalog_path = tmp / "catalog.json"
+        _write_json(catalog_path, catalog)
+        return catalog_path, global_id
+
+    def test_default_invocation_writes_under_staging_root(self) -> None:
+        catalog_path, global_id = self._make_catalog(self.tmp)
+        code, out, err = _run_main(
+            [
+                "run",
+                "--global-id",
+                global_id,
+                "--authorize-project",
+                "dep",
+                "--catalog",
+                str(catalog_path),
+            ]
+        )
+        self.assertEqual(code, 0, out + err)
+        payload = json.loads(out)
+        self.assertEqual(payload["exit_code"], 0)
+        self.assertTrue(self.staging_root.exists())
+        self.assertFalse(self.production_root.exists())
+        self.assertNotIn("NOTICE", err)
+
+    def test_default_invocation_with_authorize_flag_writes_under_production_root(self) -> None:
+        catalog_path, global_id = self._make_catalog(self.tmp)
+        code, out, err = _run_main(
+            [
+                "run",
+                "--global-id",
+                global_id,
+                "--authorize-project",
+                "dep",
+                "--catalog",
+                str(catalog_path),
+                "--authorize-production-write",
+            ]
+        )
+        self.assertEqual(code, 0, out + err)
+        payload = json.loads(out)
+        self.assertEqual(payload["exit_code"], 0)
+        self.assertTrue(self.production_root.exists())
+        self.assertFalse(self.staging_root.exists())
+        self.assertIn("NOTICE", err)
+
+    def test_explicit_production_path_without_flag_is_refused(self) -> None:
+        catalog_path, global_id = self._make_catalog(self.tmp)
+        code, out, err = _run_main(
+            [
+                "run",
+                "--global-id",
+                global_id,
+                "--authorize-project",
+                "dep",
+                "--catalog",
+                str(catalog_path),
+                "--compat-runs-root",
+                str(self.production_root),
+            ]
+        )
+        self.assertEqual(code, 4, out + err)
+        payload = json.loads(out)
+        self.assertEqual(payload["reason"], "compat_runs_root_production_write_not_authorized")
+        self.assertFalse(self.production_root.exists())
+
+    def test_explicit_production_path_with_flag_succeeds(self) -> None:
+        catalog_path, global_id = self._make_catalog(self.tmp)
+        code, out, err = _run_main(
+            [
+                "run",
+                "--global-id",
+                global_id,
+                "--authorize-project",
+                "dep",
+                "--catalog",
+                str(catalog_path),
+                "--compat-runs-root",
+                str(self.production_root),
+                "--authorize-production-write",
+            ]
+        )
+        self.assertEqual(code, 0, out + err)
+        payload = json.loads(out)
+        self.assertEqual(payload["exit_code"], 0)
+        self.assertTrue(self.production_root.exists())
+        self.assertIn("NOTICE", err)
+
+    def test_explicit_non_production_path_still_works_without_flag(self) -> None:
+        """Regression: an explicit override to some other, non-production,
+        non-staging location continues to work freely with no flag needed
+        (unchanged behavior)."""
+        catalog_path, global_id = self._make_catalog(self.tmp)
+        other_root = self.tmp / "elsewhere" / "runs"
+        code, out, err = _run_main(
+            [
+                "run",
+                "--global-id",
+                global_id,
+                "--authorize-project",
+                "dep",
+                "--catalog",
+                str(catalog_path),
+                "--compat-runs-root",
+                str(other_root),
+            ]
+        )
+        self.assertEqual(code, 0, out + err)
+        payload = json.loads(out)
+        self.assertEqual(payload["exit_code"], 0)
+        self.assertTrue(other_root.exists())
+        self.assertNotIn("NOTICE", err)
+
+
 if __name__ == "__main__":
     unittest.main()

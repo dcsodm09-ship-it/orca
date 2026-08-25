@@ -304,13 +304,20 @@ OUTPUT_SCHEMA_VERSION = 1
 # module docstring's WRITE SURFACE section. Tests redirect this by rebinding
 # the module-level constant itself, exactly as detect_capability_changes.py's
 # own test suite documents doing.
-DEFAULT_OUTPUT_DIR = Path("/Volumes/Extreme SSD/Orca/manifests/capability-discovery")
-# Frozen copy of the literal default above, kept distinct from the mutable
+# NEW staging default: M8-2's own independent authorization gate has not
+# been granted (see module docstring's M8-2 AUTHORIZATION NOTICE section
+# and the 2026-08-23 unification decision extending Gate B's staging-by-
+# default convention to Gate C). Unqualified default output now goes here,
+# not to the real production path.
+_STAGING_DEFAULT_OUTPUT_DIR = Path("/Volumes/Extreme SSD/Orca/manifests/capability-discovery-pending-authorization")
+DEFAULT_OUTPUT_DIR = _STAGING_DEFAULT_OUTPUT_DIR
+# Frozen copy of the real production literal, kept distinct from the mutable
 # DEFAULT_OUTPUT_DIR name tests rebind (see WRITE SURFACE section) so a run
 # can tell "still pointed at the real production default" apart from "a test
 # (or, in principle, a future --output-dir flag) redirected me elsewhere" --
-# see the M8_AUTHORIZATION_NOTICE print in cmd_scan().
-_PRODUCTION_DEFAULT_OUTPUT_DIR = DEFAULT_OUTPUT_DIR
+# see the M8_AUTHORIZATION_NOTICE print in cmd_scan(). Reaching this path now
+# requires passing --authorize-production-write explicitly.
+_PRODUCTION_DEFAULT_OUTPUT_DIR = Path("/Volumes/Extreme SSD/Orca/manifests/capability-discovery")
 DEFAULT_CATALOG_PATH = "/Volumes/Extreme SSD/Orca/manifests/cross-project-catalog/catalog.json"
 HITS_NAME = "discovery-hits.json"
 RUNS_DIR_NAME = "runs"
@@ -1176,6 +1183,12 @@ def build_parser() -> argparse.ArgumentParser:
                             "roots (default: clustering is scoped to within one root_real_path).")
     scan.add_argument("--json", action="store_true", help="Print the run summary as one JSON object to stdout.")
     scan.add_argument("--quiet", action="store_true", help="Suppress human-readable text; rely on the exit code.")
+    scan.add_argument("--authorize-production-write", action="store_true",
+                       dest="authorize_production_write",
+                       help="Write to the real production output path "
+                            "(manifests/capability-discovery/) instead of the "
+                            "staging default. Required to reach production when "
+                            "no other output-path override exists.")
     scan.set_defaults(func=cmd_scan_entry)
 
     return parser
@@ -1328,7 +1341,10 @@ def cmd_scan(args: argparse.Namespace) -> int:
     new_discoveries_default = new_discoveries_incl if args.include_round_artifacts_in_summary else new_discoveries_excl
     new_by_signal_default = new_by_signal_incl if args.include_round_artifacts_in_summary else new_by_signal_excl
 
-    output_dir = DEFAULT_OUTPUT_DIR
+    if getattr(args, "authorize_production_write", False):
+        output_dir = _PRODUCTION_DEFAULT_OUTPUT_DIR
+    else:
+        output_dir = DEFAULT_OUTPUT_DIR
     if output_dir == _PRODUCTION_DEFAULT_OUTPUT_DIR:
         # Unsuppressible, same mechanism as the --all-projects warning above:
         # no --quiet gate, printed unconditionally before any write. This

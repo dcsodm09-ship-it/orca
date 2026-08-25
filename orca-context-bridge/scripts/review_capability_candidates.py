@@ -171,6 +171,12 @@ sys.dont_write_bytecode = True
 # design 3.0.2 "only copy, do not import": these two tools must keep
 # independent trust surfaces even though they read/write the same file).
 DEFAULT_OUTPUT_DIR = Path("/Volumes/Extreme SSD/Orca/manifests/capability-discovery")
+# New staging-by-default location (M8-2 staging-default unification, see
+# review_capability_candidates.py's sibling files' identical change). Must
+# match discover_capability_candidates.py's own literal exactly, character
+# for character, since both tools read/write the same discovery-hits.json
+# under whichever directory is currently in effect.
+STAGING_DEFAULT_OUTPUT_DIR = Path("/Volumes/Extreme SSD/Orca/manifests/capability-discovery-pending-authorization")
 HITS_NAME = "discovery-hits.json"
 # Frozen copy of the literal default path `mark` writes to absent
 # --hits-path, computed once at import time so it can never drift even if
@@ -364,8 +370,14 @@ def release_lock(lock_path: Path | None) -> None:
 # ---------------------------------------------------------------------------
 
 
-def default_hits_path() -> Path:
-    return DEFAULT_OUTPUT_DIR / HITS_NAME
+def default_hits_path(authorize_production_write: bool) -> Path:
+    """The path used when the caller did not pass an explicit --hits-path.
+    Staging-by-default (M8-2 unification): absent --authorize-production-write
+    this resolves under STAGING_DEFAULT_OUTPUT_DIR, not the real production
+    DEFAULT_OUTPUT_DIR. Passing the flag with no explicit path flips the
+    DEFAULT itself to production -- it is not merely an override-unlock."""
+    base = DEFAULT_OUTPUT_DIR if authorize_production_write else STAGING_DEFAULT_OUTPUT_DIR
+    return base / HITS_NAME
 
 
 def load_hits_document(path: Path) -> dict[str, Any]:
@@ -436,7 +448,7 @@ def _matches_filters(hit: dict[str, Any], args: argparse.Namespace) -> bool:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    hits_path = Path(args.hits_path) if args.hits_path else default_hits_path()
+    hits_path = Path(args.hits_path) if args.hits_path else default_hits_path(args.authorize_production_write)
     try:
         doc = load_hits_document(hits_path)
     except ReviewFatal as exc:
@@ -457,7 +469,7 @@ def cmd_show(args: argparse.Namespace) -> int:
     if not hit_id:
         return _emit_error(args, 2, "empty_hit_id")
 
-    hits_path = Path(args.hits_path) if args.hits_path else default_hits_path()
+    hits_path = Path(args.hits_path) if args.hits_path else default_hits_path(args.authorize_production_write)
     try:
         doc = load_hits_document(hits_path)
     except ReviewFatal as exc:
@@ -516,7 +528,23 @@ def cmd_mark(args: argparse.Namespace) -> int:
     # `choices=`, which exits 2 itself on an invalid value before this
     # function ever runs -- see module docstring's EXIT CODES section.
 
-    hits_path = Path(args.hits_path) if args.hits_path else default_hits_path()
+    hits_path = Path(args.hits_path) if args.hits_path else default_hits_path(args.authorize_production_write)
+
+    # Staging-by-default (M8-2 unification): an EXPLICIT --hits-path that
+    # resolves (by realpath) to the frozen production default is refused
+    # unless --authorize-production-write is also given. This is a policy
+    # refusal, not a shape/existence check, so it runs first -- ahead of the
+    # basename/parent-dir checks below. Only applies when --hits-path was
+    # actually passed: the no-flag default case is already handled by
+    # default_hits_path() routing to STAGING_DEFAULT_OUTPUT_DIR above, not by
+    # this refusal.
+    if args.hits_path and not args.authorize_production_write:
+        if os.path.realpath(str(hits_path)) == os.path.realpath(str(_PRODUCTION_DEFAULT_HITS_PATH)):
+            return _emit_error(
+                args, 2, "production_write_requires_authorization",
+                f"--hits-path resolves to the production default ({_PRODUCTION_DEFAULT_HITS_PATH}); "
+                "pass --authorize-production-write to write there",
+            )
 
     # `mark` must never be the reason a directory tree springs into
     # existence somewhere the caller didn't already have one. Two
@@ -694,6 +722,10 @@ def build_parser() -> argparse.ArgumentParser:
     list_p.add_argument("--signal-type", type=str, default=None, dest="signal_type")
     list_p.add_argument("--duplicates-only", action="store_true", dest="duplicates_only")
     list_p.add_argument("--hits-path", type=str, default=None, dest="hits_path")
+    list_p.add_argument("--authorize-production-write", action="store_true", dest="authorize_production_write",
+                         help="Read-only command, but shares default_hits_path() with mark: pass this to make "
+                              "the no-path-given default resolve to the real production discovery-hits.json "
+                              "instead of the staging default.")
     list_p.add_argument("--json", action="store_true")
     list_p.add_argument("--quiet", action="store_true")
     list_p.set_defaults(func=cmd_list)
@@ -701,6 +733,10 @@ def build_parser() -> argparse.ArgumentParser:
     show_p = subparsers.add_parser("show", help="Read-only: show one discovery hit by hit_id.")
     show_p.add_argument("--hit-id", type=str, required=True, dest="hit_id")
     show_p.add_argument("--hits-path", type=str, default=None, dest="hits_path")
+    show_p.add_argument("--authorize-production-write", action="store_true", dest="authorize_production_write",
+                         help="Read-only command, but shares default_hits_path() with mark: pass this to make "
+                              "the no-path-given default resolve to the real production discovery-hits.json "
+                              "instead of the staging default.")
     show_p.add_argument("--json", action="store_true")
     show_p.add_argument("--quiet", action="store_true")
     show_p.set_defaults(func=cmd_show)
@@ -716,6 +752,10 @@ def build_parser() -> argparse.ArgumentParser:
                               "sharing the same content_sha256 (default: cluster application is scoped to the "
                               "named hit's own root_real_path).")
     mark_p.add_argument("--hits-path", type=str, default=None, dest="hits_path")
+    mark_p.add_argument("--authorize-production-write", action="store_true", dest="authorize_production_write",
+                         help="Allow default_hits_path()/--hits-path to resolve to the real production "
+                              "discovery-hits.json path (default: default falls back to the staging dir, and an "
+                              "explicit --hits-path pointing at production is refused).")
     mark_p.add_argument("--json", action="store_true")
     mark_p.add_argument("--quiet", action="store_true")
     mark_p.set_defaults(func=cmd_mark)

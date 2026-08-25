@@ -193,7 +193,18 @@ DEFAULT_TIMEOUT_CEILING_SECONDS = 300.0
 # has already caused two real incidents in this exact codebase this week
 # (Gate A's DEFAULT_OUTPUT_DIR, Gate B's own test suite's REAL_REPO_ROOT) --
 # this is deliberately not a third.
-COMPAT_RUNS_ROOT = Path("/Volumes/Extreme SSD/Orca/manifests/compat-runs")
+#
+# Staging-by-default (unification with Gate B's PROMOTION_ROOT convention):
+# COMPAT_RUNS_ROOT is now a staging default with the "-pending-authorization"
+# suffix, matching promote_capability.py's naming pattern. The real,
+# eventual production path is frozen separately in
+# _PRODUCTION_DEFAULT_COMPAT_RUNS_ROOT below (mirroring Gate C's
+# _PRODUCTION_DEFAULT_OUTPUT_DIR). Reaching it requires either an explicit
+# --compat-runs-root pointing at it plus --authorize-production-write, or
+# --authorize-production-write alone with no explicit override -- never just
+# doing nothing, which is what used to default straight to production.
+_PRODUCTION_DEFAULT_COMPAT_RUNS_ROOT = Path("/Volumes/Extreme SSD/Orca/manifests/compat-runs")
+COMPAT_RUNS_ROOT = Path("/Volumes/Extreme SSD/Orca/manifests/compat-runs-pending-authorization")
 
 # Copied from promote_capability.py's LOCK_NAME/LOCK_STALE_SECONDS/
 # acquire_lock()/release_lock() -- see the "run" subcommand section below.
@@ -2222,6 +2233,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"Output root for this run's per-project result files. Default: {COMPAT_RUNS_ROOT}.",
     )
+    run.add_argument(
+        "--authorize-production-write",
+        action="store_true",
+        dest="authorize_production_write",
+        help=(
+            "Allow this run's default output root to resolve to the real "
+            f"production path ({_PRODUCTION_DEFAULT_COMPAT_RUNS_ROOT}) instead of the "
+            f"staging default ({COMPAT_RUNS_ROOT}), and allow an explicit "
+            "--compat-runs-root that resolves to that same production path."
+        ),
+    )
     return parser
 
 
@@ -2327,8 +2349,33 @@ def cmd_run(args: argparse.Namespace) -> int:
             compat_runs_root, reason = _validate_compat_runs_root_override(expanded)
             if compat_runs_root is None:
                 raise CheckFatal(reason, str(expanded))
+            if (
+                not getattr(args, "authorize_production_write", False)
+                and compat_runs_root.resolve(strict=False)
+                == _PRODUCTION_DEFAULT_COMPAT_RUNS_ROOT.resolve(strict=False)
+            ):
+                raise CheckFatal(
+                    "compat_runs_root_production_write_not_authorized",
+                    str(compat_runs_root),
+                )
+        elif getattr(args, "authorize_production_write", False):
+            compat_runs_root = _PRODUCTION_DEFAULT_COMPAT_RUNS_ROOT
         else:
             compat_runs_root = COMPAT_RUNS_ROOT
+
+        if (
+            compat_runs_root.resolve(strict=False)
+            == _PRODUCTION_DEFAULT_COMPAT_RUNS_ROOT.resolve(strict=False)
+        ):
+            print(
+                "NOTICE: writing to "
+                f"{_PRODUCTION_DEFAULT_COMPAT_RUNS_ROOT}, this tool's own real "
+                "production compat-runs root, not its staging default "
+                f"({COMPAT_RUNS_ROOT}) -- because --authorize-production-write "
+                "was given (or an explicit --compat-runs-root pointed at it "
+                "with that flag set).",
+                file=sys.stderr,
+            )
         result = run_compatibility_checks(
             catalog,
             global_id=args.global_id,

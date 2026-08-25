@@ -713,6 +713,70 @@ class ProductionPathAuthorizationNoticeTests(BaseTempDirTestCase):
         self.assertNotIn("M8-1's independent authorization gate", err)
 
 
+class StagingByDefaultConstantsTests(unittest.TestCase):
+    """Non-filesystem-touching checks that the staging-by-default wiring is
+    correct at the constant level, without ever rebinding DEFAULT_OUTPUT_DIR
+    (BaseTempDirTestCase.setUp already does that for every other test in
+    this file, which would make an unrebound assertion here misleading)."""
+
+    def test_staging_default_literal_matches_spec(self) -> None:
+        self.assertEqual(
+            bme._STAGING_DEFAULT_OUTPUT_DIR,
+            Path("/Volumes/Extreme SSD/Orca/manifests/mention-evidence-pending-authorization"),
+        )
+
+    def test_production_default_literal_unchanged(self) -> None:
+        self.assertEqual(
+            bme._PRODUCTION_DEFAULT_OUTPUT_DIR,
+            Path("/Volumes/Extreme SSD/Orca/manifests/cross-project-catalog"),
+        )
+
+    def test_staging_and_production_defaults_are_distinct(self) -> None:
+        self.assertNotEqual(bme._STAGING_DEFAULT_OUTPUT_DIR, bme._PRODUCTION_DEFAULT_OUTPUT_DIR)
+
+
+class AuthorizeProductionWriteFlagTests(BaseTempDirTestCase):
+    """--authorize-production-write is what flips the DEFAULT from staging
+    to production; omitting it must use DEFAULT_OUTPUT_DIR (the staging
+    default in real runs, or BaseTempDirTestCase's tempdir here) even when
+    the frozen production constant is reachable/rebound elsewhere."""
+
+    def test_authorize_production_write_flag_resolves_to_frozen_production_constant(self) -> None:
+        orig_frozen = bme._PRODUCTION_DEFAULT_OUTPUT_DIR
+        bme._PRODUCTION_DEFAULT_OUTPUT_DIR = self.out_dir
+        try:
+            path = self.write_catalog(make_catalog(capabilities=[make_cap("p1", "lonely")]))
+            code, _out, err = _run_main(
+                ["build", "--catalog", str(path), "--authorize-production-write", "--quiet"]
+            )
+        finally:
+            bme._PRODUCTION_DEFAULT_OUTPUT_DIR = orig_frozen
+        self.assertEqual(code, 0, err)
+        self.assertTrue((self.out_dir / bme.OUTPUT_NAME).exists())
+        self.assertIn("NOTICE", err)
+
+    def test_default_without_flag_does_not_use_frozen_production_even_when_available(self) -> None:
+        # Two DISTINCT temp roots: self.out_dir (DEFAULT_OUTPUT_DIR, set by
+        # BaseTempDirTestCase.setUp) and a separate tempdir the frozen
+        # production constant is rebound to. Omitting the flag must land in
+        # self.out_dir, never in the production-rebind root, proving the
+        # flag -- not mere reachability of the frozen constant -- is what
+        # selects production.
+        other_root = Path(tempfile.mkdtemp(prefix="bme-test-prod-"))
+        orig_frozen = bme._PRODUCTION_DEFAULT_OUTPUT_DIR
+        bme._PRODUCTION_DEFAULT_OUTPUT_DIR = other_root
+        try:
+            path = self.write_catalog(make_catalog(capabilities=[make_cap("p1", "lonely")]))
+            code, _out, err = _run_main(["build", "--catalog", str(path), "--quiet"])
+        finally:
+            bme._PRODUCTION_DEFAULT_OUTPUT_DIR = orig_frozen
+            shutil.rmtree(other_root, ignore_errors=True)
+        self.assertEqual(code, 0, err)
+        self.assertTrue((self.out_dir / bme.OUTPUT_NAME).exists())
+        self.assertFalse((other_root / bme.OUTPUT_NAME).exists())
+        self.assertNotIn("NOTICE", err)
+
+
 # ---------------------------------------------------------------------------
 # Atomic write self-validation: a round-trip failure must not corrupt the
 # previously-good file (simulated write failure via monkeypatched _encode_json)

@@ -845,6 +845,70 @@ class ProductionPathAuthorizationNoticeTests(BaseTestCase):
         self.assertNotIn("M8-2's independent authorization gate", err)
 
 
+class StagingByDefaultTests(unittest.TestCase):
+    """Locks the module-level default in place: with nothing else touched,
+    DEFAULT_OUTPUT_DIR must resolve to the NEW staging path, not the real
+    production path. Lightweight/no filesystem I/O -- deliberately not a
+    BaseTestCase subclass so it exercises the real, unrebound module state."""
+
+    def test_default_output_dir_is_staging_not_production(self) -> None:
+        self.assertEqual(dcc.DEFAULT_OUTPUT_DIR, dcc._STAGING_DEFAULT_OUTPUT_DIR)
+        self.assertNotEqual(dcc.DEFAULT_OUTPUT_DIR, dcc._PRODUCTION_DEFAULT_OUTPUT_DIR)
+        self.assertEqual(
+            dcc._STAGING_DEFAULT_OUTPUT_DIR,
+            Path("/Volumes/Extreme SSD/Orca/manifests/capability-discovery-pending-authorization"),
+        )
+        self.assertEqual(
+            dcc._PRODUCTION_DEFAULT_OUTPUT_DIR,
+            Path("/Volumes/Extreme SSD/Orca/manifests/capability-discovery"),
+        )
+
+
+class AuthorizeProductionWriteFlagTests(BaseTestCase):
+    """--authorize-production-write must flip the DEFAULT itself to the real
+    production path (not just unlock some override) -- exercised entirely
+    against a temporarily-rebound _PRODUCTION_DEFAULT_OUTPUT_DIR tmp dir,
+    never the real production path on disk."""
+
+    def test_authorize_production_write_flag_flips_default_to_production(self) -> None:
+        prod_tmp = self.tmp / "rebound-production"
+        orig_frozen = dcc._PRODUCTION_DEFAULT_OUTPUT_DIR
+        dcc._PRODUCTION_DEFAULT_OUTPUT_DIR = prod_tmp
+        try:
+            proj = self.tmp / "proj"
+            self.make_knowledge_md(proj, "reports/a.md")
+            catalog = self.tmp / "catalog.json"
+            _write_json(catalog, make_catalog())
+            code, _, err = _run_main(
+                self.scan_argv([proj], catalog, quiet=True, authorize_production_write=True)
+            )
+        finally:
+            dcc._PRODUCTION_DEFAULT_OUTPUT_DIR = orig_frozen
+        self.assertEqual(code, 0, err)
+        self.assertIn("NOTICE", err)
+        # Output landed under the rebound production tmp dir, not under
+        # self.output_dir (the staging tmp dir BaseTestCase.setUp installed).
+        self.assertTrue((prod_tmp / dcc.HITS_NAME).exists())
+        self.assertFalse((self.output_dir / dcc.HITS_NAME).exists())
+
+    def test_without_flag_default_stays_on_staging_even_with_production_rebound(self) -> None:
+        prod_tmp = self.tmp / "rebound-production"
+        orig_frozen = dcc._PRODUCTION_DEFAULT_OUTPUT_DIR
+        dcc._PRODUCTION_DEFAULT_OUTPUT_DIR = prod_tmp
+        try:
+            proj = self.tmp / "proj"
+            self.make_knowledge_md(proj, "reports/a.md")
+            catalog = self.tmp / "catalog.json"
+            _write_json(catalog, make_catalog())
+            code, _, err = _run_main(self.scan_argv([proj], catalog, quiet=True))
+        finally:
+            dcc._PRODUCTION_DEFAULT_OUTPUT_DIR = orig_frozen
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("NOTICE", err)
+        self.assertTrue((self.output_dir / dcc.HITS_NAME).exists())
+        self.assertFalse((prod_tmp / dcc.HITS_NAME).exists())
+
+
 # ---------------------------------------------------------------------------
 # Catalog baseline dedup + staleness
 # ---------------------------------------------------------------------------

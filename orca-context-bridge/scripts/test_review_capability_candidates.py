@@ -536,6 +536,7 @@ class ProductionPathAuthorizationNoticeTests(unittest.TestCase):
 
         code, out, err = _run_rcc([
             "mark", "--hit-id", "a", "--state", "dismissed", "--marked-by", "tester",
+            "--authorize-production-write",
         ])
         self.assertEqual(code, 0, err)
         self.assertIn("NOTICE", err)
@@ -576,7 +577,7 @@ class ProductionPathAuthorizationNoticeTests(unittest.TestCase):
 
         code, out, err = _run_rcc([
             "mark", "--hit-id", "a", "--state", "dismissed", "--marked-by", "tester",
-            "--hits-path", str(aliased_path),
+            "--hits-path", str(aliased_path), "--authorize-production-write",
         ])
         self.assertEqual(code, 0, err)
         self.assertIn("NOTICE", err)
@@ -594,9 +595,125 @@ class ProductionPathAuthorizationNoticeTests(unittest.TestCase):
 
         code, out, err = _run_rcc([
             "mark", "--hit-id", "a", "--state", "dismissed", "--marked-by", "tester",
+            "--authorize-production-write",
         ])
         self.assertEqual(code, 4, err)
         self.assertNotIn("NOTICE", err)
+
+
+class StagingByDefaultTests(unittest.TestCase):
+    """M8-2 staging-default unification: absent --hits-path AND absent
+    --authorize-production-write, mark/list/show must resolve under the new
+    STAGING_DEFAULT_OUTPUT_DIR, never under the real production
+    DEFAULT_OUTPUT_DIR. Follows the same isolation convention as
+    ProductionPathAuthorizationNoticeTests: rebind the module constants to a
+    fresh tempdir in setUp/tearDown, never touch the real production path."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="rcc-staging-"))
+        self._orig_output_dir = rcc.DEFAULT_OUTPUT_DIR
+        self._orig_staging_dir = rcc.STAGING_DEFAULT_OUTPUT_DIR
+        self._orig_frozen_path = rcc._PRODUCTION_DEFAULT_HITS_PATH
+
+    def tearDown(self) -> None:
+        rcc.DEFAULT_OUTPUT_DIR = self._orig_output_dir
+        rcc.STAGING_DEFAULT_OUTPUT_DIR = self._orig_staging_dir
+        rcc._PRODUCTION_DEFAULT_HITS_PATH = self._orig_frozen_path
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_default_with_no_flag_and_no_hits_path_resolves_to_staging_dir(self) -> None:
+        fake_staging_dir = self.tmp / "staging-output"
+        fake_staging_dir.mkdir()
+        fake_production_dir = self.tmp / "production-output"
+        fake_production_dir.mkdir()
+        rcc.STAGING_DEFAULT_OUTPUT_DIR = fake_staging_dir
+        rcc.DEFAULT_OUTPUT_DIR = fake_production_dir
+        rcc._PRODUCTION_DEFAULT_HITS_PATH = fake_production_dir / rcc.HITS_NAME
+        _write_json(fake_staging_dir / rcc.HITS_NAME, make_hits_doc([make_hit("a")]))
+
+        code, out, err = _run_rcc([
+            "mark", "--hit-id", "a", "--state", "dismissed", "--marked-by", "tester",
+        ])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("NOTICE", err)
+        doc = json.loads((fake_staging_dir / rcc.HITS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(doc["hits"][0]["state"], "dismissed")
+        # Nothing should have been written into the (separate) production dir.
+        self.assertFalse((fake_production_dir / rcc.HITS_NAME).exists())
+
+    def test_default_with_authorization_flag_resolves_to_production_dir(self) -> None:
+        fake_staging_dir = self.tmp / "staging-output"
+        fake_staging_dir.mkdir()
+        fake_production_dir = self.tmp / "production-output"
+        fake_production_dir.mkdir()
+        rcc.STAGING_DEFAULT_OUTPUT_DIR = fake_staging_dir
+        rcc.DEFAULT_OUTPUT_DIR = fake_production_dir
+        rcc._PRODUCTION_DEFAULT_HITS_PATH = fake_production_dir / rcc.HITS_NAME
+        _write_json(fake_production_dir / rcc.HITS_NAME, make_hits_doc([make_hit("a")]))
+
+        code, out, err = _run_rcc([
+            "mark", "--hit-id", "a", "--state", "dismissed", "--marked-by", "tester",
+            "--authorize-production-write",
+        ])
+        self.assertEqual(code, 0, err)
+        self.assertIn("NOTICE", err)
+        doc = json.loads((fake_production_dir / rcc.HITS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(doc["hits"][0]["state"], "dismissed")
+
+    def test_mark_refuses_explicit_production_hits_path_without_authorization(self) -> None:
+        fake_production_dir = self.tmp / "production-output"
+        fake_production_dir.mkdir()
+        rcc.DEFAULT_OUTPUT_DIR = fake_production_dir
+        rcc._PRODUCTION_DEFAULT_HITS_PATH = fake_production_dir / rcc.HITS_NAME
+        production_hits_path = fake_production_dir / rcc.HITS_NAME
+        _write_json(production_hits_path, make_hits_doc([make_hit("a")]))
+        before = production_hits_path.read_bytes()
+
+        code, out, err = _run_rcc([
+            "mark", "--hit-id", "a", "--state", "dismissed", "--marked-by", "tester",
+            "--hits-path", str(production_hits_path),
+        ])
+        self.assertEqual(code, 2)
+        self.assertIn("production_write_requires_authorization", err)
+        self.assertEqual(production_hits_path.read_bytes(), before)
+
+    def test_mark_explicit_production_hits_path_succeeds_with_authorization(self) -> None:
+        fake_production_dir = self.tmp / "production-output"
+        fake_production_dir.mkdir()
+        rcc.DEFAULT_OUTPUT_DIR = fake_production_dir
+        rcc._PRODUCTION_DEFAULT_HITS_PATH = fake_production_dir / rcc.HITS_NAME
+        production_hits_path = fake_production_dir / rcc.HITS_NAME
+        _write_json(production_hits_path, make_hits_doc([make_hit("a")]))
+
+        code, out, err = _run_rcc([
+            "mark", "--hit-id", "a", "--state", "dismissed", "--marked-by", "tester",
+            "--hits-path", str(production_hits_path), "--authorize-production-write",
+        ])
+        self.assertEqual(code, 0, err)
+        self.assertIn("NOTICE", err)
+        doc = json.loads(production_hits_path.read_text(encoding="utf-8"))
+        self.assertEqual(doc["hits"][0]["state"], "dismissed")
+
+    def test_explicit_non_production_hits_path_needs_no_authorization_flag(self) -> None:
+        # Regression: an explicit --hits-path to some genuinely different,
+        # non-production, non-staging location continues to work with no
+        # flag needed -- unchanged behavior. (Already exercised implicitly by
+        # every other test in this file that passes --hits-path into a plain
+        # tempdir with no flag, e.g. ListShowTests; this test makes the
+        # regression explicit per the staging-by-default spec.)
+        other_dir = self.tmp / "some-other-location"
+        other_dir.mkdir()
+        other_hits_path = other_dir / rcc.HITS_NAME
+        _write_json(other_hits_path, make_hits_doc([make_hit("a")]))
+
+        code, out, err = _run_rcc([
+            "mark", "--hit-id", "a", "--state", "dismissed", "--marked-by", "tester",
+            "--hits-path", str(other_hits_path),
+        ])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("NOTICE", err)
+        doc = json.loads(other_hits_path.read_text(encoding="utf-8"))
+        self.assertEqual(doc["hits"][0]["state"], "dismissed")
 
 
 # ---------------------------------------------------------------------------
