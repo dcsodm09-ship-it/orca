@@ -1363,6 +1363,21 @@ class RunEndToEndTests(unittest.TestCase):
         self.assertEqual(spy.call_count, 1)
         self.assertEqual(result["exit_code"], 0, result)
 
+    @unittest.skipIf(os.name != "posix" or os.geteuid() == 0, "permission bits meaningless as root / non-posix")
+    def test_readonly_base_dir_raises_named_lock_uncreatable_not_generic_error(self) -> None:
+        # Mirrors build_mention_evidence.py's acquire_lock() OSError branch:
+        # a read-only base_dir must surface as a NAMED CheckFatal reason,
+        # not propagate as an untyped OSError reported as unexpected_error.
+        base_dir = self.tmp / "lock-readonly-dir"
+        base_dir.mkdir()
+        os.chmod(str(base_dir), 0o500)
+        try:
+            with self.assertRaises(ccc.CheckFatal) as ctx:
+                ccc.acquire_lock(base_dir)
+            self.assertEqual(ctx.exception.reason, "lock_uncreatable")
+        finally:
+            os.chmod(str(base_dir), 0o700)
+
 
 # ---------------------------------------------------------------------------
 # CLI wiring smoke test
@@ -2047,6 +2062,228 @@ class CompatRunsRootAbsoluteTests(unittest.TestCase):
             payload = json.loads(out)
             self.assertEqual(payload["reason"], "compat_runs_root_not_absolute")
             self.assertFalse((tmp / "relative-runs").exists())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_legitimate_tempdir_redirection_still_works(self) -> None:
+        # The non-adversarial case this flag exists for at all: a plain,
+        # real, absolute tempdir with no symlink anywhere in it -- the
+        # exact pattern this test suite's own RunEndToEndTests/CliRunSmoke
+        # Test fixtures already rely on via self.runs_root / tmp / "runs".
+        # Must keep passing unchanged by the new validation.
+        tmp = Path(tempfile.mkdtemp(prefix="ccc-realroot-"))
+        try:
+            dep_dir = make_project_dir(tmp, "dep")
+            global_id = "t#x"
+            write_compat_check(
+                dep_dir, [make_check_entry(depends_on_ref=global_id, check_command=[sys.executable, "-c", "pass"])]
+            )
+            catalog = make_affected_catalog(global_id, "dep", projects=[make_project_row("dep", dep_dir)])
+            catalog_path = tmp / "catalog.json"
+            _write_json(catalog_path, catalog)
+            runs_root = tmp / "runs"
+            code, out, err = _run_main(
+                [
+                    "run",
+                    "--global-id",
+                    global_id,
+                    "--authorize-project",
+                    "dep",
+                    "--catalog",
+                    str(catalog_path),
+                    "--compat-runs-root",
+                    str(runs_root),
+                ]
+            )
+            self.assertEqual(code, 0, out + err)
+            payload = json.loads(out)
+            self.assertEqual(payload["exit_code"], 0)
+            self.assertTrue(runs_root.is_dir())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_compat_runs_root_that_is_itself_a_symlink_is_rejected(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="ccc-symroot-"))
+        try:
+            dep_dir = make_project_dir(tmp, "dep")
+            global_id = "t#x"
+            write_compat_check(
+                dep_dir, [make_check_entry(depends_on_ref=global_id, check_command=[sys.executable, "-c", "pass"])]
+            )
+            catalog = make_affected_catalog(global_id, "dep", projects=[make_project_row("dep", dep_dir)])
+            catalog_path = tmp / "catalog.json"
+            _write_json(catalog_path, catalog)
+
+            real_target = tmp / "actual-elsewhere"
+            real_target.mkdir()
+            symlinked_root = tmp / "runs-symlink"
+            symlinked_root.symlink_to(real_target, target_is_directory=True)
+
+            code, out, err = _run_main(
+                [
+                    "run",
+                    "--global-id",
+                    global_id,
+                    "--authorize-project",
+                    "dep",
+                    "--catalog",
+                    str(catalog_path),
+                    "--compat-runs-root",
+                    str(symlinked_root),
+                ]
+            )
+            self.assertEqual(code, 4, out + err)
+            payload = json.loads(out)
+            self.assertEqual(payload["reason"], "compat_runs_root_symlink_component")
+            # Nothing should have been written through the symlink.
+            self.assertEqual(list(real_target.iterdir()), [])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_compat_runs_root_with_a_symlink_component_partway_through_is_rejected(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="ccc-symmid-"))
+        try:
+            dep_dir = make_project_dir(tmp, "dep")
+            global_id = "t#x"
+            write_compat_check(
+                dep_dir, [make_check_entry(depends_on_ref=global_id, check_command=[sys.executable, "-c", "pass"])]
+            )
+            catalog = make_affected_catalog(global_id, "dep", projects=[make_project_row("dep", dep_dir)])
+            catalog_path = tmp / "catalog.json"
+            _write_json(catalog_path, catalog)
+
+            real_parent = tmp / "actual-parent"
+            real_parent.mkdir()
+            symlinked_parent = tmp / "parent-symlink"
+            symlinked_parent.symlink_to(real_parent, target_is_directory=True)
+            # The symlink is only a MIDDLE component -- "runs" itself is a
+            # perfectly ordinary, not-yet-existing final segment appended
+            # after it.
+            compat_runs_root = symlinked_parent / "runs"
+
+            code, out, err = _run_main(
+                [
+                    "run",
+                    "--global-id",
+                    global_id,
+                    "--authorize-project",
+                    "dep",
+                    "--catalog",
+                    str(catalog_path),
+                    "--compat-runs-root",
+                    str(compat_runs_root),
+                ]
+            )
+            self.assertEqual(code, 4, out + err)
+            payload = json.loads(out)
+            self.assertEqual(payload["reason"], "compat_runs_root_symlink_component")
+            self.assertEqual(list(real_parent.iterdir()), [])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_point_of_use_validation_rejects_symlink_even_bypassing_the_cli(self) -> None:
+        # Fix-round regression test (review finding P2-A, reproduced): the
+        # symlink check used to live ONLY in cmd_run's CLI-flag parsing --
+        # a caller that reaches run_compatibility_checks() (the actual
+        # write path, via ensure_compat_runs_root()) by any other route,
+        # exactly like this test does, got NO validation at all. Calls
+        # run_compatibility_checks() directly, the same way _run_compat()
+        # does everywhere else in this file, deliberately skipping cmd_run
+        # and its CLI-layer check entirely.
+        tmp = Path(tempfile.mkdtemp(prefix="ccc-pou-symroot-"))
+        try:
+            dep_dir = make_project_dir(tmp, "dep")
+            global_id = "t#x"
+            write_compat_check(
+                dep_dir, [make_check_entry(depends_on_ref=global_id, check_command=[sys.executable, "-c", "pass"])]
+            )
+            catalog = make_affected_catalog(global_id, "dep", projects=[make_project_row("dep", dep_dir)])
+
+            real_target = tmp / "actual-elsewhere"
+            real_target.mkdir()
+            symlinked_root = tmp / "runs-symlink"
+            symlinked_root.symlink_to(real_target, target_is_directory=True)
+
+            result = _run_compat(
+                catalog=catalog, global_id=global_id, authorize_project=["dep"], compat_runs_root=symlinked_root
+            )
+            self.assertEqual(result["exit_code"], 4, result)
+            self.assertEqual(result["reason"], "compat_runs_root_symlink_component")
+            # Nothing should have been written through the symlink.
+            self.assertEqual(list(real_target.iterdir()), [])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_compat_runs_root_unsafe_segment_dotdot_is_rejected(self) -> None:
+        # P4 test-coverage gap closed: _absolute_path_has_unsafe_segment()
+        # was reachable (confirmed by manual inspection in review) but had
+        # no test exercising it through the public validator.
+        tmp = Path(tempfile.mkdtemp(prefix="ccc-unsafeseg-"))
+        try:
+            dep_dir = make_project_dir(tmp, "dep")
+            global_id = "t#x"
+            write_compat_check(
+                dep_dir, [make_check_entry(depends_on_ref=global_id, check_command=[sys.executable, "-c", "pass"])]
+            )
+            catalog = make_affected_catalog(global_id, "dep", projects=[make_project_row("dep", dep_dir)])
+            catalog_path = tmp / "catalog.json"
+            _write_json(catalog_path, catalog)
+
+            traversal_root = tmp / "runs" / ".." / "escaped"
+            code, out, err = _run_main(
+                [
+                    "run",
+                    "--global-id",
+                    global_id,
+                    "--authorize-project",
+                    "dep",
+                    "--catalog",
+                    str(catalog_path),
+                    "--compat-runs-root",
+                    str(traversal_root),
+                ]
+            )
+            self.assertEqual(code, 4, out + err)
+            payload = json.loads(out)
+            self.assertEqual(payload["reason"], "compat_runs_root_unsafe_segment")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_symlink_ancestor_with_preexisting_leaf_is_a_known_open_residual(self) -> None:
+        # Documents (does NOT celebrate) the accepted residual named in
+        # _nearest_existing_ancestor_is_symlink()'s own docstring, and
+        # independently confirmed still open by review: if an attacker's
+        # symlink ancestor ALSO has the final leaf directory pre-created
+        # through it (as opposed to the leaf not existing yet, which IS
+        # caught -- see test_compat_runs_root_with_a_symlink_component_
+        # partway_through_is_rejected above), the nearest-existing-ancestor
+        # walk stops at that already-real leaf and never inspects the
+        # symlink above it. This test pins that this is CURRENT, KNOWN
+        # behavior (so a future change either closes it deliberately, with
+        # this test updated, or a regression here is caught immediately) --
+        # it is not an assertion that this is acceptable.
+        tmp = Path(tempfile.mkdtemp(prefix="ccc-residual-"))
+        try:
+            dep_dir = make_project_dir(tmp, "dep")
+            global_id = "t#x"
+            write_compat_check(
+                dep_dir, [make_check_entry(depends_on_ref=global_id, check_command=[sys.executable, "-c", "pass"])]
+            )
+            catalog = make_affected_catalog(global_id, "dep", projects=[make_project_row("dep", dep_dir)])
+
+            real_parent = tmp / "actual-parent"
+            real_parent.mkdir()
+            (real_parent / "runs").mkdir()  # attacker pre-creates the leaf through the real target
+            symlinked_parent = tmp / "parent-symlink"
+            symlinked_parent.symlink_to(real_parent, target_is_directory=True)
+            compat_runs_root = symlinked_parent / "runs"
+
+            result = _run_compat(
+                catalog=catalog, global_id=global_id, authorize_project=["dep"], compat_runs_root=compat_runs_root
+            )
+            self.assertEqual(result["exit_code"], 0, result)
+            written = list((real_parent / "runs").rglob("*.json"))
+            self.assertTrue(written, "expected the known residual: output written through the attacker's symlink")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

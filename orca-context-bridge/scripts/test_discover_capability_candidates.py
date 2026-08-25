@@ -797,6 +797,54 @@ class ScopeTests(BaseTestCase):
 
 
 # ---------------------------------------------------------------------------
+# M8-2 authorization notice on a default-path write
+# ---------------------------------------------------------------------------
+
+
+class ProductionPathAuthorizationNoticeTests(BaseTestCase):
+    """`scan` never refuses to run or write -- this is a visibility notice,
+    not a gate (see module docstring's M8-2 AUTHORIZATION NOTICE section).
+    Every other test in this file redirects DEFAULT_OUTPUT_DIR to a tempdir
+    (BaseTestCase.setUp) without ever touching the frozen
+    _PRODUCTION_DEFAULT_OUTPUT_DIR reference, so the two constants already
+    differ and the notice never fires for them -- that is exactly
+    test_notice_absent_when_output_dir_is_redirected below, made explicit.
+    To exercise the "still at the real production default" branch without
+    ever writing to the real production path on disk, this test also
+    redirects the frozen constant itself to the SAME tempdir as the mutable
+    one, reproducing the equality condition cmd_scan() checks."""
+
+    def test_notice_printed_when_output_dir_equals_frozen_production_default(self) -> None:
+        orig_frozen = dcc._PRODUCTION_DEFAULT_OUTPUT_DIR
+        dcc._PRODUCTION_DEFAULT_OUTPUT_DIR = dcc.DEFAULT_OUTPUT_DIR
+        try:
+            proj = self.tmp / "proj"
+            self.make_knowledge_md(proj, "reports/a.md")
+            catalog = self.tmp / "catalog.json"
+            _write_json(catalog, make_catalog())
+            code, _, err = _run_main(self.scan_argv([proj], catalog, quiet=True))
+        finally:
+            dcc._PRODUCTION_DEFAULT_OUTPUT_DIR = orig_frozen
+        self.assertEqual(code, 0, err)
+        self.assertIn("NOTICE", err)
+        self.assertIn("M8-2's independent authorization gate", err)
+        self.assertIn("44%-72%", err)
+
+    def test_notice_absent_when_output_dir_is_redirected(self) -> None:
+        # BaseTestCase.setUp already redirected DEFAULT_OUTPUT_DIR away from
+        # the frozen _PRODUCTION_DEFAULT_OUTPUT_DIR -- this is every other
+        # test in this file's own default condition, made explicit here.
+        proj = self.tmp / "proj"
+        self.make_knowledge_md(proj, "reports/a.md")
+        catalog = self.tmp / "catalog.json"
+        _write_json(catalog, make_catalog())
+        code, _, err = _run_main(self.scan_argv([proj], catalog, quiet=True))
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("NOTICE", err)
+        self.assertNotIn("M8-2's independent authorization gate", err)
+
+
+# ---------------------------------------------------------------------------
 # Catalog baseline dedup + staleness
 # ---------------------------------------------------------------------------
 
@@ -1329,6 +1377,21 @@ class LockTests(BaseTestCase):
 
         self.assertEqual(results.count("acquired"), 1, results)
         self.assertEqual(results.count("failed:lock_held"), 1, results)
+
+    @unittest.skipIf(os.name != "posix" or os.geteuid() == 0, "permission bits meaningless as root / non-posix")
+    def test_readonly_base_dir_raises_named_lock_uncreatable_not_generic_error(self) -> None:
+        # Mirrors build_mention_evidence.py's acquire_lock() OSError branch:
+        # a read-only base_dir must surface as a NAMED DiscoverFatal reason,
+        # not propagate as an untyped OSError reported as unexpected_error.
+        base_dir = self.tmp / "lock-readonly-dir"
+        base_dir.mkdir()
+        os.chmod(str(base_dir), 0o500)
+        try:
+            with self.assertRaises(dcc.DiscoverFatal) as ctx:
+                dcc.acquire_lock(base_dir)
+            self.assertEqual(ctx.exception.reason, "lock_uncreatable")
+        finally:
+            os.chmod(str(base_dir), 0o700)
 
 
 # ---------------------------------------------------------------------------

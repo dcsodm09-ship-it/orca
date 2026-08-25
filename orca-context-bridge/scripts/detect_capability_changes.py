@@ -702,6 +702,15 @@ def acquire_lock(output_dir: Path) -> Path:
                     pass
                 continue
             raise DetectFatal("lock_held")
+        except OSError as exc:
+            # Anything other than "already exists" -- most commonly
+            # PermissionError on a read-only output_dir -- is a genuine
+            # failure to create the lock, not a lock-held race. Name it
+            # explicitly (exit 4, "lock_uncreatable") instead of letting it
+            # propagate past cmd_build() to main()'s generic
+            # unexpected_error catch-all, which the docstring's exit-4 list
+            # already promises callers a named reason for.
+            raise DetectFatal("lock_uncreatable", str(exc))
     raise DetectFatal("lock_held")
 
 

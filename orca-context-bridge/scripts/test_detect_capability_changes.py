@@ -453,6 +453,20 @@ class CliTests(unittest.TestCase):
         code2, _, _ = _run_main(["detect", "--catalog", str(self.catalog_path), "--quiet"])
         self.assertEqual(code2, 0)
 
+    @unittest.skipIf(os.name != "posix" or os.geteuid() == 0, "permission bits meaningless as root / non-posix")
+    def test_readonly_output_dir_raises_named_lock_uncreatable_not_generic_error(self) -> None:
+        # Mirrors build_mention_evidence.py's acquire_lock() OSError branch:
+        # a read-only output_dir must surface as a NAMED DetectFatal reason,
+        # not propagate as an untyped OSError reported as unexpected_error.
+        os.makedirs(str(self.output_dir), mode=0o700, exist_ok=True)
+        os.chmod(str(self.output_dir), 0o500)
+        try:
+            with self.assertRaises(dcc.DetectFatal) as ctx:
+                dcc.acquire_lock(self.output_dir)
+            self.assertEqual(ctx.exception.reason, "lock_uncreatable")
+        finally:
+            os.chmod(str(self.output_dir), 0o700)
+
 
 # ---------------------------------------------------------------------------
 # write_only_within guard truth table

@@ -714,6 +714,144 @@ def _has_symlink_component(path: Path, root: Path) -> bool:
     return False
 
 
+def _nearest_existing_ancestor_is_symlink(path: Path) -> bool:
+    """Walks UPWARD from `path` itself (not downward from some already-
+    trusted root, unlike _has_symlink_component() above -- there is no such
+    root here, see _validate_compat_runs_root_override() below) until it
+    finds the first path node that exists on disk AT ALL, symlink or not
+    (os.path.lexists -- a symlink counts as "existing" here even if its
+    target is missing), and reports whether THAT node is itself a symlink.
+
+    Deliberately does NOT keep walking past that point, and this is the
+    load-bearing design decision, not an oversight: existence is prefix-
+    closed on a real filesystem (a child cannot exist unless its parent
+    does), so once the walk finds ANY existing node, every ancestor above
+    it is guaranteed to exist too -- including, on this OS, `/var` and
+    `/tmp` themselves, which are themselves symlinks to `/private/var` and
+    `/private/tmp` (`ls -ld /var` on any stock macOS install). Every
+    tempdir this codebase's own test suite creates via `tempfile.mkdtemp()`
+    -- and the pattern this flag exists to let a real caller redirect to --
+    therefore ALREADY has a symlink several levels up by construction. A
+    check that kept walking to the filesystem root would reject that
+    entirely legitimate case (confirmed empirically: it did, in an earlier
+    version of this function, break this file's own CliRunSmokeTest).
+
+    Stopping at the nearest existing node instead draws the boundary in
+    the one place that distinguishes "pre-existing OS/filesystem state
+    this invocation had no hand in and is not what --compat-runs-root is
+    asking this tool to evaluate" from "state that is specifically part of
+    what this compat-runs-root value points at": mkdtemp()'s own freshly
+    created directory is a REAL directory (never a symlink), so the walk
+    up from a not-yet-created leaf like ".../mkdtemp-dir/runs" stops right
+    there and never reaches `/var` at all. An attacker-planted symlink
+    sitting at or below that same boundary -- exactly the two shapes this
+    file's own regression tests construct: the requested directory itself
+    IS the symlink, or an ancestor of it that the not-yet-existing
+    requested leaf sits under is -- IS the nearest existing node the walk
+    finds, and is reported.
+
+    Accepted residual (named explicitly, not silently -- and, after
+    independent review, corrected here to state its severity honestly
+    rather than argue it down): if an attacker can ALSO pre-populate the
+    real, final requested directory itself (through their own symlink,
+    made to look exactly like an ordinary already-used compat-runs-root),
+    the walk stops at that already-real leaf without ever inspecting the
+    symlinked ancestor above it, and this reproduces reliably (confirmed
+    by independent review, not theoretical). Closing that would require
+    rejecting every OS-level symlink ancestor too, which is exactly the
+    /var/tmp case this function exists to keep working -- there is no
+    known way to tell "an attacker's symlink" from "/tmp itself, which is
+    always a symlink on macOS" from filesystem structure alone, without a
+    hardcoded allowlist of specific OS symlinks this fix round does not
+    attempt. Do NOT read the "unpredictable uuid4() run_id" fact below as
+    a mitigation that makes this residual low-impact: it is equally true
+    in the CLOSED base case (symlink ancestor, leaf not yet created) as in
+    this OPEN one, so it does not distinguish their severity -- if it
+    doesn't make the base case acceptable to leave open (it doesn't; that
+    is exactly what this fix round closes), it doesn't make this residual
+    acceptable either. What actually happens once an attacker clears this
+    bar: every subsequent write for this run (the whole COMPAT_RUNS_ROOT/
+    <run_id>/ tree, not one file) lands inside a directory tree the
+    attacker already fully owns end to end -- the same class of impact as
+    the closed case, just gated on the attacker also being able to
+    pre-create the leaf directory (a capability whoever can plant the
+    symlink already has, since they own its target). This is a real,
+    currently-open gap that a future round should close with an explicit
+    trust anchor (e.g. hardcoding the resolved identity of /private/var
+    and /private/tmp as pre-approved OS symlinks and rejecting every other
+    symlink found anywhere in the full ancestor chain), not a residual
+    that can be waved off as already low-impact."""
+    candidate = path
+    while True:
+        if os.path.lexists(str(candidate)):
+            return candidate.is_symlink()
+        parent = candidate.parent
+        if parent == candidate:
+            return False  # reached the filesystem root without finding anything
+        candidate = parent
+
+
+def _absolute_path_has_unsafe_segment(path: Path) -> bool:
+    """Rejects a literal '.' or '..' path segment anywhere after the
+    leading anchor. Not a symlink concern by itself, but this path becomes
+    a directory this tool creates and writes into (ensure_compat_runs_root,
+    _allocate_run_id) -- lexical navigation tricks are refused outright
+    here, the same "belt" layer _resolve_check_cwd() already applies to the
+    `cwd` field."""
+    return any(part in (".", "..") for part in path.parts[1:])
+
+
+def _validate_compat_runs_root_override(path: Path) -> tuple[Path | None, str | None]:
+    """Validates a caller-supplied --compat-runs-root the same way every
+    other absolute-path input this file accepts from outside is validated
+    (module-section invariant #2, above cmd_run's own docstring): absolute,
+    no unsafe lexical segment, and no symlink at the nearest point where
+    the path actually touches disk (see _nearest_existing_ancestor_is_
+    symlink()'s own docstring for exactly what that does and does not
+    catch, and why).
+
+    Fix-round addition (previously-flagged gap): this flag used to only
+    require is_absolute() here in the CLI layer. Precision on what that
+    gap actually was (corrected after independent review found the first
+    write-up overstated it): the requested root being a symlink ITSELF was
+    already caught, just later and by a different code path --
+    ensure_compat_runs_root()'s pre-fix os.path.islink() check after its
+    own os.makedirs(..., exist_ok=True), reason "compat_runs_root_is_
+    symlink", nothing written. What was genuinely, completely unhandled
+    was an ANCESTOR of a not-yet-created root being a symlink (e.g.
+    `--compat-runs-root /some/attacker-symlink/runs` where "runs" itself
+    does not exist yet): os.makedirs() walks straight through that
+    ancestor and creates "runs" wherever the symlink actually points, and
+    the old post-creation check only ever looked at the leaf ("runs")
+    itself -- never a symlink -- so nothing caught it. Every subsequent
+    per-project output write (_compat_run_output_path / atomic_write_
+    within) then landed wherever that symlink pointed, entirely outside
+    this tool's own COMPAT_RUNS_ROOT tree, with no containment check
+    catching it either. This function closes both the (already-partially-
+    handled) root-itself case and the (previously wide-open) ancestor
+    case under one reason, and is now also called from ensure_compat_
+    runs_root() itself (see that function's own docstring) so the check
+    runs at the point of use, not only in the CLI layer.
+
+    Deliberately NOT required to be a descendant of the module's own
+    default COMPAT_RUNS_ROOT: design doc 3.0.1 says every M8 output
+    directory independently pins its own root -- Gate D is the one gate
+    that deliberately keeps an override switch (its own test suite needs
+    to redirect this to a tempdir outside the default entirely), so the
+    fix here is to make the flag safe, not to remove or narrow what it can
+    point at. The actual risk this closes is a symlink-based redirection
+    trick, or an unvalidated/relative path landing somewhere unintended
+    (e.g. inside a project's own tracked tree without anyone noticing) --
+    not "pointing at a different root at all"."""
+    if not path.is_absolute():
+        return None, "compat_runs_root_not_absolute"
+    if _absolute_path_has_unsafe_segment(path):
+        return None, "compat_runs_root_unsafe_segment"
+    if _nearest_existing_ancestor_is_symlink(path):
+        return None, "compat_runs_root_symlink_component"
+    return path.absolute(), None
+
+
 def write_only_within(base_dir: Path, path_value: object) -> tuple[Path | None, str | None]:
     if not isinstance(path_value, (str, Path)) or not str(path_value):
         return None, "invalid_path"
@@ -844,6 +982,13 @@ def acquire_lock(base_dir: Path) -> Path:
                     pass
                 continue
             raise CheckFatal("lock_held")
+        except OSError as exc:
+            # Anything other than "already exists" -- most commonly
+            # PermissionError on a read-only base_dir -- is a genuine
+            # failure to create the lock, not a lock-held race. Name it
+            # explicitly (exit 4, "lock_uncreatable") instead of letting it
+            # propagate as a generic unexpected_error.
+            raise CheckFatal("lock_uncreatable", str(exc))
     raise CheckFatal("lock_held")
 
 
@@ -857,11 +1002,34 @@ def release_lock(lock_path: Path | None) -> None:
 
 
 def ensure_compat_runs_root(root: Path) -> None:
+    """Fix-round change (review finding P2-A, reproduced): this is the
+    actual WRITE path -- run_compatibility_checks calls this directly, and
+    every subsequent per-project output write descends from the directory
+    it creates here. Pre-fix, the symlink/segment validation lived ONLY in
+    cmd_run (the CLI entrypoint), so calling run_compatibility_checks
+    directly -- exactly what this file's own test suite's _run_compat()-
+    style helpers do, and what any future non-CLI caller would do -- took
+    NO validation at all, no matter how compat_runs_root got there. That
+    is module-section invariant #2's own rule (re-validate a
+    filesystem-path field immediately before the specific use, even if it
+    was already validated earlier for a different purpose): the CLI-level
+    check in cmd_run is a fast-fail convenience, not a substitute for the
+    check at the point where the directory is actually created and
+    subsequently written into. Re-running the same validator here also
+    shrinks (does not eliminate -- see the post-creation check below and
+    _nearest_existing_ancestor_is_symlink's own docstring) the TOCTOU
+    window between cmd_run's check and this function's os.makedirs()."""
+    _, reason = _validate_compat_runs_root_override(root)
+    if reason is not None:
+        raise CheckFatal(reason, str(root))
     try:
         os.makedirs(str(root), mode=0o700, exist_ok=True)
     except OSError as exc:
         raise CheckFatal("compat_runs_root_uncreatable", str(exc)) from exc
     if os.path.islink(str(root)):
+        # Defense in depth, kept from the pre-fix code: closes the narrow
+        # window between the pre-creation check above and this os.makedirs()
+        # call -- an attacker racing a symlink into place in between.
         raise CheckFatal("compat_runs_root_is_symlink")
 
 
@@ -2109,16 +2277,34 @@ def cmd_run(args: argparse.Namespace) -> int:
     try:
         catalog_path = Path(args.catalog).expanduser() if args.catalog else DEFAULT_CATALOG_PATH
         catalog = load_catalog(catalog_path)
-        compat_runs_root = Path(args.compat_runs_root).expanduser() if args.compat_runs_root else COMPAT_RUNS_ROOT
-        if not compat_runs_root.is_absolute():
-            # Fix-round addition (adversarial review, path-and-containment
-            # P3-4): the DEFAULT is hardcoded absolute (COMPAT_RUNS_ROOT
-            # above), but the --compat-runs-root FLAG itself accepted a
-            # relative value with no check, landing output relative to
-            # wherever this process happened to be launched from -- the
-            # same "staging location != deployed location" incident class
-            # this codebase has already hit twice this week.
-            raise CheckFatal("compat_runs_root_not_absolute", str(compat_runs_root))
+        if args.compat_runs_root:
+            # Fix-round addition (previously-flagged gap): the DEFAULT is
+            # hardcoded absolute and trusted (COMPAT_RUNS_ROOT above, never
+            # itself re-validated here), but the --compat-runs-root FLAG
+            # used to accept ANY absolute path with no further check --
+            # neither a relative-path guard (P3-4, still enforced below,
+            # now inside the same validator) nor any symlink-containment
+            # check at all. _validate_compat_runs_root_override() applies
+            # the same absolute + no-unsafe-segment + no-symlink-component
+            # discipline this file already applies to every other
+            # caller-supplied path (write_only_within / _resolve_check_cwd
+            # / _read_compat_check's own symlink-component check on the
+            # read side) -- see that function's own docstring for why this
+            # does not also require the override to be a descendant of the
+            # literal default. This CLI-level call is a fast-fail
+            # convenience only (a bad --compat-runs-root is rejected before
+            # this process even attempts to resolve the affected set) --
+            # ensure_compat_runs_root() below re-runs the identical
+            # validator at the actual point of use (fix-round change,
+            # review finding P2-A), so a caller that reaches
+            # run_compatibility_checks() by any other path still gets the
+            # real check.
+            expanded = Path(args.compat_runs_root).expanduser()
+            compat_runs_root, reason = _validate_compat_runs_root_override(expanded)
+            if compat_runs_root is None:
+                raise CheckFatal(reason, str(expanded))
+        else:
+            compat_runs_root = COMPAT_RUNS_ROOT
         result = run_compatibility_checks(
             catalog,
             global_id=args.global_id,

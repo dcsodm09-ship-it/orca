@@ -17,7 +17,7 @@ copy, the four false-positive gates, the declared-dependency exclusion, the
 confidence rule) is a byte-for-byte-equivalent port of
 `m8-gate-c-validation-STAGED-review-only/scripts/mention_evidence_prototype.py`,
 the throwaway analysis script the M8 Gate-C real-data validation
-(`M8-GATE-C-VALIDATION-REPORT-2026-08-23.md` section 1) was actually run
+(`m8-gate-c-validation-STAGED-review-only/M8-GATE-C-VALIDATION-REPORT-2026-08-23.md` section 1) was actually run
 against. The point of that front-loaded validation was to measure THIS
 algorithm's false-positive behavior on real data -- porting a different
 algorithm here would silently invalidate the only real-data check this
@@ -51,6 +51,23 @@ and a near-miss in Gate D). There is no flag to point this tool's output
 anywhere else; the test suite redirects the pin by rebinding the
 module-level DEFAULT_OUTPUT_DIR constant itself, exactly as
 detect_capability_changes.py's own test suite documents doing.
+
+M8-1 AUTHORIZATION NOTICE ON EVERY DEFAULT-PATH WRITE
+--------------------------------------------------------------------------
+`build` still runs and writes normally regardless -- this is a visibility/
+audit-trail improvement, not a new gate, and not a refusal. But whenever the
+resolved output_dir is still this module's own literal production default
+(`_PRODUCTION_DEFAULT_OUTPUT_DIR`, a frozen copy of `DEFAULT_OUTPUT_DIR` --
+see that constant's own comment for why the two are kept distinct), `build`
+prints one unsuppressible stderr line before writing, the same mechanism
+discover_capability_candidates.py uses for its own `--all-projects`
+warning: M8-1's own independent authorization gate (design 3.2.4) has not
+been granted (Gate C's real-data run produced only 3 candidate edges, all
+same-project, zero cross-project -- see module docstring above), so
+mention-evidence.json should not be treated as production-authoritative by
+anything that reads it. A caller who redirects output elsewhere (today,
+only this file's own test suite, by rebinding the mutable
+`DEFAULT_OUTPUT_DIR` name) sees nothing here.
 
 LOCKING: A DEDICATED LOCK, NOT catalog.json's OWN .catalog.lock
 --------------------------------------------------------------------------
@@ -145,6 +162,13 @@ OUTPUT_SCHEMA_VERSION = 1
 # not silently fall back to a permissive umask-derived mode.
 DEFAULT_CATALOG_PATH = Path("/Volumes/Extreme SSD/Orca/manifests/cross-project-catalog/catalog.json")
 DEFAULT_OUTPUT_DIR = Path("/Volumes/Extreme SSD/Orca/manifests/cross-project-catalog")
+# Frozen copy of the literal default above, kept distinct from the mutable
+# DEFAULT_OUTPUT_DIR name tests rebind (see module docstring's OUTPUT
+# section) so a run can tell "still pointed at the real production default"
+# apart from "a test (or, in principle, a future --output-dir flag)
+# redirected me elsewhere" -- see the authorization notice print in
+# cmd_build().
+_PRODUCTION_DEFAULT_OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 OUTPUT_NAME = "mention-evidence.json"
 LOCK_NAME = ".mention-evidence.lock"
 LOCK_STALE_SECONDS = 300
@@ -885,6 +909,22 @@ def cmd_build(args: argparse.Namespace) -> int:
     }
 
     output_dir = DEFAULT_OUTPUT_DIR
+    if output_dir == _PRODUCTION_DEFAULT_OUTPUT_DIR:
+        # Unsuppressible, same mechanism as discover_capability_candidates.
+        # py's own --all-projects warning: no --quiet gate, printed
+        # unconditionally before any write. Only fires when output_dir is
+        # still this module's literal production default -- a caller (today,
+        # only this file's own test suite, by rebinding DEFAULT_OUTPUT_DIR
+        # itself) who has redirected output elsewhere sees nothing here.
+        print(
+            "NOTICE: writing to manifests/cross-project-catalog/mention-evidence.json, this tool's own "
+            "default production path. M8-1's independent authorization gate (M8-DESIGN-FINAL-2026-08-23.md "
+            "section 3.2.4) has not been granted: the Gate C validation run against the real catalog.json "
+            "produced only 3 candidate edges total, all 3 same-project and 0 cross-project "
+            "(m8-gate-c-validation-STAGED-review-only/M8-GATE-C-VALIDATION-REPORT-2026-08-23.md section 1). This output should not be treated as "
+            "production-authoritative by anything that reads it.",
+            file=sys.stderr,
+        )
     try:
         os.makedirs(str(output_dir), mode=0o700, exist_ok=True)
     except OSError as exc:

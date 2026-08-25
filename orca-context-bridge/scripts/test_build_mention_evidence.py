@@ -670,6 +670,49 @@ class ZeroEdgesStillSuccessTests(BaseTempDirTestCase):
 
 
 # ---------------------------------------------------------------------------
+# M8-1 authorization notice on a default-path write
+# ---------------------------------------------------------------------------
+
+
+class ProductionPathAuthorizationNoticeTests(BaseTempDirTestCase):
+    """`build` never refuses to run or write -- this is a visibility notice,
+    not a gate (see module docstring's M8-1 AUTHORIZATION NOTICE section).
+    Every other test in this file redirects DEFAULT_OUTPUT_DIR to a tempdir
+    (BaseTempDirTestCase.setUp) without ever touching the frozen
+    _PRODUCTION_DEFAULT_OUTPUT_DIR reference, so the two constants already
+    differ and the notice never fires for them -- that is exactly
+    test_notice_absent_when_output_dir_is_redirected below, made explicit.
+    To exercise the "still at the real production default" branch without
+    ever writing to the real production path on disk, this test also
+    redirects the frozen constant itself to the SAME tempdir as the mutable
+    one, reproducing the equality condition cmd_build() checks."""
+
+    def test_notice_printed_when_output_dir_equals_frozen_production_default(self) -> None:
+        orig_frozen = bme._PRODUCTION_DEFAULT_OUTPUT_DIR
+        bme._PRODUCTION_DEFAULT_OUTPUT_DIR = bme.DEFAULT_OUTPUT_DIR
+        try:
+            path = self.write_catalog(make_catalog(capabilities=[make_cap("p1", "lonely")]))
+            code, _out, err = _run_main(["build", "--catalog", str(path), "--quiet"])
+        finally:
+            bme._PRODUCTION_DEFAULT_OUTPUT_DIR = orig_frozen
+        self.assertEqual(code, 0, err)
+        self.assertIn("NOTICE", err)
+        self.assertIn("M8-1's independent authorization gate", err)
+        self.assertIn("3 candidate edges", err)
+
+    def test_notice_absent_when_output_dir_is_redirected(self) -> None:
+        # BaseTempDirTestCase.setUp already redirected DEFAULT_OUTPUT_DIR
+        # away from the frozen _PRODUCTION_DEFAULT_OUTPUT_DIR -- this is
+        # every other test in this file's own default condition, made
+        # explicit here.
+        path = self.write_catalog(make_catalog(capabilities=[make_cap("p1", "lonely")]))
+        code, _out, err = _run_main(["build", "--catalog", str(path), "--quiet"])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("NOTICE", err)
+        self.assertNotIn("M8-1's independent authorization gate", err)
+
+
+# ---------------------------------------------------------------------------
 # Atomic write self-validation: a round-trip failure must not corrupt the
 # previously-good file (simulated write failure via monkeypatched _encode_json)
 # ---------------------------------------------------------------------------

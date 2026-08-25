@@ -93,6 +93,28 @@ discovery-hits.json` unconditionally created `wiki/` and
 run that went on to fail -- see cmd_mark()'s own inline comment for the
 full writeup.
 
+M8-2 AUTHORIZATION NOTICE ON EVERY DEFAULT-PATH WRITE
+----------------------------------------------------------------------------
+`mark` still runs and writes normally regardless -- this is a visibility/
+audit-trail improvement, not a new gate, and not a refusal. But whenever the
+realpath of --hits-path (or its default, absent that flag) resolves to the
+same file as this module's own literal production default
+(`_PRODUCTION_DEFAULT_HITS_PATH`, a frozen copy of
+`DEFAULT_OUTPUT_DIR / HITS_NAME`) -- compared by `os.path.realpath()`, not
+literal string/Path equality, so an aliased spelling of the same production
+file (a `..` segment, a symlink hop) cannot dodge it -- `mark` prints one
+unsuppressible stderr line, the same mechanism discover_capability_
+candidates.py uses for its own `--all-projects` warning: M8-2's own
+independent authorization gate (design 3.3.3) has not been granted (Gate C
+measured a 44-72% false-positive rate on real data), so discovery-hits.json
+should not be treated as production-authoritative by anything that reads
+it. A caller who passes an explicit --hits-path pointing elsewhere sees
+nothing here. The check runs after `mark` has confirmed the target
+directory exists and isn't a symlink (so it never announces a write against
+a directory that provably doesn't exist yet) but before the write itself,
+so the printed line describes an attempt, not a completed write -- a later
+failure (e.g. `unknown_hit_id`) can still leave nothing written.
+
 EXIT CODES
 ----------------------------------------------------------------------------
 `list` / `show` follow the query/decision "query" family (M8 design 3.0.2):
@@ -150,6 +172,14 @@ sys.dont_write_bytecode = True
 # independent trust surfaces even though they read/write the same file).
 DEFAULT_OUTPUT_DIR = Path("/Volumes/Extreme SSD/Orca/manifests/capability-discovery")
 HITS_NAME = "discovery-hits.json"
+# Frozen copy of the literal default path `mark` writes to absent
+# --hits-path, computed once at import time so it can never drift even if
+# something later rebinds the module-level DEFAULT_OUTPUT_DIR name (this
+# file's own test suite never does that -- it always passes an explicit
+# --hits-path -- but the frozen copy keeps the comparison correct regardless
+# of how a caller redirected). See the M8-2 authorization notice in
+# cmd_mark().
+_PRODUCTION_DEFAULT_HITS_PATH = DEFAULT_OUTPUT_DIR / HITS_NAME
 LOCK_NAME = ".discovery.lock"
 LOCK_STALE_SECONDS = 300
 
@@ -288,6 +318,13 @@ def acquire_lock(base_dir: Path) -> Path:
                     pass
                 continue
             raise ReviewFatal("lock_held")
+        except OSError as exc:
+            # Anything other than "already exists" -- most commonly
+            # PermissionError on a read-only base_dir -- is a genuine
+            # failure to create the lock, not a lock-held race. Name it
+            # explicitly (exit 4, "lock_uncreatable") instead of letting it
+            # propagate as a generic unexpected_error.
+            raise ReviewFatal("lock_uncreatable", str(exc))
     raise ReviewFatal("lock_held")
 
 
@@ -494,6 +531,44 @@ def cmd_mark(args: argparse.Namespace) -> int:
         return _emit_error(args, 4, "hits_file_missing", str(hits_path))
     if os.path.islink(str(output_dir)):
         return _emit_error(args, 4, "output_dir_is_symlink")
+
+    # Notice placed here, not before the two directory checks above: printing
+    # it any earlier announced a write against a target directory that
+    # provably did not exist yet (confirmed by direct reproduction against
+    # this machine's real, hits-file-less manifests/capability-discovery/) --
+    # a caller would see "writing to ..." immediately followed by exit 4
+    # hits_file_missing with nothing ever written. From this point on the
+    # target directory is known to exist and isn't a symlink, so the notice
+    # now describes a write that can actually reach the write_only_within /
+    # acquire_lock / load_hits_document path below (it can still fail later,
+    # e.g. unknown_hit_id -- this is a "we're about to attempt it" notice,
+    # not a post-hoc confirmation).
+    #
+    # Compared by realpath, not by the literal Path object: a caller who
+    # spells the same production file via a different-but-equivalent path
+    # (e.g. an explicit --hits-path containing a `..` segment, or a symlink
+    # hop) must not silently dodge the notice below just because the
+    # unresolved strings differ. Confirmed by direct reproduction: an
+    # aliased spelling of the real production path used to compare unequal
+    # here (notice suppressed) while still resolving to, and writing, the
+    # exact same on-disk file. realpath() is safe to call on a path whose
+    # final component does not exist yet -- it only needs existing
+    # ancestors to resolve symlinks, which is all this check does.
+    if os.path.realpath(str(hits_path)) == os.path.realpath(str(_PRODUCTION_DEFAULT_HITS_PATH)):
+        # Unsuppressible, same mechanism as discover_capability_candidates.
+        # py's own --all-projects warning: no --quiet gate, printed
+        # unconditionally before any write. Only fires when hits_path is
+        # still this module's literal production default -- a caller who
+        # passed an explicit --hits-path pointing elsewhere (every test in
+        # this file's own suite does) sees nothing here.
+        print(
+            "NOTICE: writing to manifests/capability-discovery/discovery-hits.json, this tool's own "
+            "default production path. M8-2's independent authorization gate (M8-DESIGN-FINAL-2026-08-23.md "
+            "section 3.3.3) has not been granted: the Gate C validation run measured a 44%-72% AI-judged "
+            "false-positive rate on a real 25-item sample (m8-gate-c-validation-STAGED-review-only/M8-GATE-C-VALIDATION-REPORT-2026-08-23.md section 2). "
+            "This output should not be treated as production-authoritative by anything that reads it.",
+            file=sys.stderr,
+        )
 
     hits_final, reason = write_only_within(output_dir, str(hits_path))
     if reason or hits_final is None:

@@ -43,6 +43,21 @@ project-root-resolution pattern every other M8 tool in this codebase
 already uses (never a fresh `orca repo list` / `worktree list` call) -- and
 prints an unsuppressible stderr warning before scanning starts.
 
+M8-2 AUTHORIZATION NOTICE ON EVERY DEFAULT-PATH WRITE
+----------------------------------------------------------------------------
+`scan` still runs and writes normally regardless -- this is a visibility/
+audit-trail improvement, not a new gate, and not a refusal. But whenever the
+resolved output_dir is still this module's own literal production default
+(`_PRODUCTION_DEFAULT_OUTPUT_DIR`, a frozen copy of `DEFAULT_OUTPUT_DIR` --
+see that constant's own comment for why the two are kept distinct), `scan`
+prints one unsuppressible stderr line before writing, same mechanism as the
+`--all-projects` warning above: M8-2's own independent authorization gate
+(design 3.3.3) has not been granted (Gate C measured 44-72% false positives
+on real data, cited above), so discovery-hits.json should not be treated as
+production-authoritative by anything that reads it. A caller who redirects
+output elsewhere (today, only this file's own test suite, by rebinding the
+mutable `DEFAULT_OUTPUT_DIR` name) sees nothing here.
+
 NOISE RULES (A-D), EACH INDEPENDENTLY TOGGLEABLE
 ----------------------------------------------------------------------------
 All four are ANNOTATIONS or PRUNES, never silent drops of a hit record that
@@ -290,6 +305,12 @@ OUTPUT_SCHEMA_VERSION = 1
 # the module-level constant itself, exactly as detect_capability_changes.py's
 # own test suite documents doing.
 DEFAULT_OUTPUT_DIR = Path("/Volumes/Extreme SSD/Orca/manifests/capability-discovery")
+# Frozen copy of the literal default above, kept distinct from the mutable
+# DEFAULT_OUTPUT_DIR name tests rebind (see WRITE SURFACE section) so a run
+# can tell "still pointed at the real production default" apart from "a test
+# (or, in principle, a future --output-dir flag) redirected me elsewhere" --
+# see the M8_AUTHORIZATION_NOTICE print in cmd_scan().
+_PRODUCTION_DEFAULT_OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 DEFAULT_CATALOG_PATH = "/Volumes/Extreme SSD/Orca/manifests/cross-project-catalog/catalog.json"
 HITS_NAME = "discovery-hits.json"
 RUNS_DIR_NAME = "runs"
@@ -981,6 +1002,13 @@ def acquire_lock(base_dir: Path) -> Path:
                     pass
                 continue
             raise DiscoverFatal("lock_held")
+        except OSError as exc:
+            # Anything other than "already exists" -- most commonly
+            # PermissionError on a read-only base_dir -- is a genuine
+            # failure to create the lock, not a lock-held race. Name it
+            # explicitly (exit 4, "lock_uncreatable") instead of letting it
+            # propagate as a generic unexpected_error.
+            raise DiscoverFatal("lock_uncreatable", str(exc))
     raise DiscoverFatal("lock_held")
 
 
@@ -1180,7 +1208,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         print(
             "WARNING: --all-projects resolves scan roots from catalog.json's projects[].real_path and "
             "walks every one of them. Real per-project cost measured 14 files/0.6ms to 67,821 files/2.1s "
-            "in the M8-2 Gate C validation run (M8-GATE-C-VALIDATION-REPORT-2026-08-23.md section 2.4); a "
+            "in the M8-2 Gate C validation run (m8-gate-c-validation-STAGED-review-only/M8-GATE-C-VALIDATION-REPORT-2026-08-23.md section 2.4); a "
             "full-fleet extrapolation was explicitly left unresolved (\"seconds to ~5.5 minutes\"). This "
             "may take anywhere in that range depending on fleet size.",
             file=sys.stderr,
@@ -1278,6 +1306,21 @@ def cmd_scan(args: argparse.Namespace) -> int:
     new_by_signal_default = new_by_signal_incl if args.include_round_artifacts_in_summary else new_by_signal_excl
 
     output_dir = DEFAULT_OUTPUT_DIR
+    if output_dir == _PRODUCTION_DEFAULT_OUTPUT_DIR:
+        # Unsuppressible, same mechanism as the --all-projects warning above:
+        # no --quiet gate, printed unconditionally before any write. This
+        # only fires when output_dir is still this module's literal
+        # production default -- a caller (today, only this file's own test
+        # suite, by rebinding DEFAULT_OUTPUT_DIR itself) who has redirected
+        # output elsewhere sees nothing here.
+        print(
+            "NOTICE: writing to manifests/capability-discovery/discovery-hits.json, this tool's own "
+            "default production path. M8-2's independent authorization gate (M8-DESIGN-FINAL-2026-08-23.md "
+            "section 3.3.3) has not been granted: the Gate C validation run measured a 44%-72% AI-judged "
+            "false-positive rate on a real 25-item sample (m8-gate-c-validation-STAGED-review-only/M8-GATE-C-VALIDATION-REPORT-2026-08-23.md section 2). "
+            "This output should not be treated as production-authoritative by anything that reads it.",
+            file=sys.stderr,
+        )
     try:
         os.makedirs(str(output_dir), mode=0o700, exist_ok=True)
     except OSError as exc:

@@ -497,6 +497,108 @@ class MarkWriteSurfaceConfinementTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# M8-2 authorization notice on a default-path write
+# ---------------------------------------------------------------------------
+
+
+class ProductionPathAuthorizationNoticeTests(unittest.TestCase):
+    """`mark` never refuses to run or write -- this is a visibility notice,
+    not a gate (see module docstring's M8-2 AUTHORIZATION NOTICE section).
+    Every other test in this file passes an explicit --hits-path pointing
+    at a tempdir, which already differs from the frozen
+    _PRODUCTION_DEFAULT_HITS_PATH reference, so the notice never fires for
+    them -- that is exactly test_notice_absent_when_hits_path_is_redirected
+    below, made explicit. To exercise the "still at the real production
+    default" branch without ever touching the real production path on disk,
+    the positive test redirects BOTH the mutable DEFAULT_OUTPUT_DIR (so
+    default_hits_path() resolves under a tempdir) and the frozen
+    _PRODUCTION_DEFAULT_HITS_PATH (to that same tempdir path) before
+    omitting --hits-path entirely, reproducing the equality condition
+    cmd_mark() checks."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="rcc-notice-"))
+        self._orig_output_dir = rcc.DEFAULT_OUTPUT_DIR
+        self._orig_frozen_path = rcc._PRODUCTION_DEFAULT_HITS_PATH
+
+    def tearDown(self) -> None:
+        rcc.DEFAULT_OUTPUT_DIR = self._orig_output_dir
+        rcc._PRODUCTION_DEFAULT_HITS_PATH = self._orig_frozen_path
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_notice_printed_when_hits_path_equals_frozen_production_default(self) -> None:
+        fake_output_dir = self.tmp / "manifests-output"
+        fake_output_dir.mkdir()
+        rcc.DEFAULT_OUTPUT_DIR = fake_output_dir
+        rcc._PRODUCTION_DEFAULT_HITS_PATH = fake_output_dir / rcc.HITS_NAME
+        _write_json(fake_output_dir / rcc.HITS_NAME, make_hits_doc([make_hit("a")]))
+
+        code, out, err = _run_rcc([
+            "mark", "--hit-id", "a", "--state", "dismissed", "--marked-by", "tester",
+        ])
+        self.assertEqual(code, 0, err)
+        self.assertIn("NOTICE", err)
+        self.assertIn("M8-2's independent authorization gate", err)
+        self.assertIn("44%-72%", err)
+
+    def test_notice_absent_when_hits_path_is_redirected(self) -> None:
+        # Every real test in this file passes an explicit --hits-path
+        # pointing at a tempdir file, distinct from the (untouched, still
+        # real-production) _PRODUCTION_DEFAULT_HITS_PATH -- this is that
+        # same default condition, made explicit.
+        hits_path = self.tmp / rcc.HITS_NAME
+        _write_json(hits_path, make_hits_doc([make_hit("a")]))
+        code, out, err = _run_rcc([
+            "mark", "--hit-id", "a", "--state", "dismissed", "--marked-by", "tester",
+            "--hits-path", str(hits_path),
+        ])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("NOTICE", err)
+        self.assertNotIn("M8-2's independent authorization gate", err)
+
+    def test_notice_fires_for_an_aliased_spelling_of_the_same_production_path(self) -> None:
+        # Adversarial-review P3: the comparison used to be literal Path/string
+        # equality, so a caller who spelled the exact same on-disk production
+        # file via a `..` detour compared unequal (notice suppressed) while
+        # still writing that same file. It must now be caught by realpath().
+        fake_output_dir = self.tmp / "manifests-output"
+        fake_output_dir.mkdir()
+        rcc.DEFAULT_OUTPUT_DIR = fake_output_dir
+        rcc._PRODUCTION_DEFAULT_HITS_PATH = fake_output_dir / rcc.HITS_NAME
+        _write_json(fake_output_dir / rcc.HITS_NAME, make_hits_doc([make_hit("a")]))
+
+        detour = self.tmp / "elsewhere"
+        detour.mkdir()
+        aliased_path = detour / ".." / "manifests-output" / rcc.HITS_NAME
+        self.assertNotEqual(Path(aliased_path), rcc._PRODUCTION_DEFAULT_HITS_PATH)
+        self.assertEqual(os.path.realpath(str(aliased_path)), os.path.realpath(str(rcc._PRODUCTION_DEFAULT_HITS_PATH)))
+
+        code, out, err = _run_rcc([
+            "mark", "--hit-id", "a", "--state", "dismissed", "--marked-by", "tester",
+            "--hits-path", str(aliased_path),
+        ])
+        self.assertEqual(code, 0, err)
+        self.assertIn("NOTICE", err)
+
+    def test_notice_not_printed_when_target_directory_does_not_exist(self) -> None:
+        # Adversarial-review P3: the notice used to print unconditionally
+        # before checking the target directory exists, so it could announce
+        # a write ("NOTICE: writing to ...") immediately followed by exit 4
+        # hits_file_missing with nothing ever written. The notice must now
+        # come after that existence check, so a doomed call prints no notice.
+        fake_output_dir = self.tmp / "manifests-output-missing"
+        rcc.DEFAULT_OUTPUT_DIR = fake_output_dir
+        rcc._PRODUCTION_DEFAULT_HITS_PATH = fake_output_dir / rcc.HITS_NAME
+        self.assertFalse(fake_output_dir.exists())
+
+        code, out, err = _run_rcc([
+            "mark", "--hit-id", "a", "--state", "dismissed", "--marked-by", "tester",
+        ])
+        self.assertEqual(code, 4, err)
+        self.assertNotIn("NOTICE", err)
+
+
+# ---------------------------------------------------------------------------
 # Lock: same file, acquire/release, stale recovery
 # ---------------------------------------------------------------------------
 
@@ -568,6 +670,21 @@ class LockTests(BaseTestCase):
 
         self.assertEqual(results.count("acquired"), 1, results)
         self.assertEqual(results.count("failed:lock_held"), 1, results)
+
+    @unittest.skipIf(os.name != "posix" or os.geteuid() == 0, "permission bits meaningless as root / non-posix")
+    def test_readonly_base_dir_raises_named_lock_uncreatable_not_generic_error(self) -> None:
+        # Mirrors build_mention_evidence.py's acquire_lock() OSError branch:
+        # a read-only base_dir must surface as a NAMED ReviewFatal reason,
+        # not propagate as an untyped OSError reported as unexpected_error.
+        base_dir = self.tmp / "lock-readonly-dir"
+        base_dir.mkdir()
+        os.chmod(str(base_dir), 0o500)
+        try:
+            with self.assertRaises(rcc.ReviewFatal) as ctx:
+                rcc.acquire_lock(base_dir)
+            self.assertEqual(ctx.exception.reason, "lock_uncreatable")
+        finally:
+            os.chmod(str(base_dir), 0o700)
 
 
 # ---------------------------------------------------------------------------
