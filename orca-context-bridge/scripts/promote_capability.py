@@ -1772,33 +1772,110 @@ def verify_wiki_edit_guard_sha256(guard_path: Path, pinned_sha256: str) -> None:
         )
 
 
-def invoke_wiki_edit_guard(guard_path: Path, wiki_path: Path, new_payload: dict[str, Any]) -> dict[str, Any]:
+def _open_wiki_dir_fd_for_guard(real_path: Path) -> int:
+    """round-6-fix: open a directory file descriptor for the target
+    project's wiki/ directory, O_NOFOLLOW, so the open itself refuses
+    outright if "wiki" has, in the brief unavoidable gap since
+    _approve_orca_context_wiki()'s own re-checks just above this call,
+    already become a symlink -- same technique as
+    _resolve_knowledge_md_path_and_dir_fd()'s own dir_fd open a few
+    hundred lines above (round-4-fix), applied here to the wiki/ directory
+    itself rather than wiki/knowledge/. The caller (this function's one
+    call site) MUST perform the guard invocation through this fd
+    (invoke_wiki_edit_guard(..., wiki_dir_fd=...)), never by falling back
+    to passing wiki_path as a plain string -- doing so would silently
+    reopen exactly the window this fd exists to close. The caller owns the
+    fd and must close it once the subprocess call returns, whether it
+    succeeded or raised (see _approve_orca_context_wiki()'s finally
+    block).
+
+    Deliberately a THIN, single-purpose function (unlike
+    _resolve_knowledge_md_path_and_dir_fd(), which also does its own
+    containment resolution/validation): by the time this is called,
+    _approve_orca_context_wiki() has already validated wiki/'s containment
+    via resolve_wiki_target_path() at function entry and re-validated via
+    _has_symlink_component()/identity_unchanged() immediately before this
+    call -- this function's only job is to turn that already-validated
+    directory into a fd as fast as possible, not to re-derive or
+    re-justify containment itself.
+    """
+    wiki_dir = real_path / "wiki"
+    try:
+        return os.open(str(wiki_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except PermissionError as exc:
+        raise PromoteFatal("target_write_permission_denied", str(exc)) from exc
+    except OSError as exc:
+        raise PromoteFatal("wiki_dir_unopenable_for_guard", str(exc)) from exc
+
+
+def invoke_wiki_edit_guard(
+    guard_path: Path,
+    wiki_path: Path,
+    new_payload: dict[str, Any],
+    *,
+    wiki_dir_fd: int | None = None,
+) -> dict[str, Any]:
     """Runs wiki_edit_guard.py --apply --acknowledge-resign-pending --json
     against new_payload. Returns its parsed JSON body. Raises PromoteFatal
     for any I/O-level failure to even run the subprocess, or an unexpected
     exit code; raises PromoteValidationError for the guard's own refusal
-    (its exit 2)."""
+    (its exit 2).
+
+    wiki_dir_fd (round-6-fix, optional): when given, the guard is invoked
+    in its dir-fd mode (--wiki-dir-fd/--wiki-name) instead of
+    --wiki <path>. wiki_path is used ONLY to derive wiki_path.name (the
+    basename passed as --wiki-name) in that case -- its directory
+    component is never passed to the subprocess by string, and wiki_dir_fd
+    (already open, already validated by the caller -- see
+    _open_wiki_dir_fd_for_guard()) is handed to the child via pass_fds so
+    it anchors every filesystem operation to that fd rather than
+    re-resolving "wiki/<name>" by path string. See wiki_edit_guard.py's own
+    module docstring "round-6 fix" note for the receiving side of this
+    contract. When wiki_dir_fd is None (the default), behavior is
+    byte-for-byte identical to before this parameter existed."""
     fd, tmp_name = tempfile.mkstemp(prefix="promote-wiki-candidate-", suffix=".json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(new_payload, handle, ensure_ascii=False)
         try:
-            proc = subprocess.run(
-                [
+            if wiki_dir_fd is not None:
+                argv = [
                     sys.executable,
                     str(guard_path),
-                    "--wiki",
-                    str(wiki_path),
+                    "--wiki-dir-fd",
+                    str(wiki_dir_fd),
+                    "--wiki-name",
+                    wiki_path.name,
                     "--new",
                     tmp_name,
                     "--apply",
                     "--acknowledge-resign-pending",
                     "--json",
-                ],
-                capture_output=True,
-                timeout=60,
-                text=True,
-            )
+                ]
+                proc = subprocess.run(
+                    argv,
+                    capture_output=True,
+                    timeout=60,
+                    text=True,
+                    pass_fds=(wiki_dir_fd,),
+                )
+            else:
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        str(guard_path),
+                        "--wiki",
+                        str(wiki_path),
+                        "--new",
+                        tmp_name,
+                        "--apply",
+                        "--acknowledge-resign-pending",
+                        "--json",
+                    ],
+                    capture_output=True,
+                    timeout=60,
+                    text=True,
+                )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise PromoteFatal("wiki_edit_guard_invocation_failed", str(exc)) from exc
     finally:
@@ -1815,7 +1892,19 @@ def invoke_wiki_edit_guard(guard_path: Path, wiki_path: Path, new_payload: dict[
     if proc.returncode == 0:
         return body
     if proc.returncode == 2:
-        raise PromoteValidationError("wiki_edit_guard_refused", body.get("reason") if isinstance(body, dict) else proc.stderr)
+        # round-6-fix P2-1 (dedicated review): body is {} whenever the
+        # guard's stdout was empty or non-JSON -- and {}.get("reason") is
+        # None, a valid dict lookup, not a reason to skip proc.stderr. A
+        # stale co-deployed guard that doesn't understand --wiki-dir-fd/
+        # --wiki-name argparse-errors on exit 2 with nothing on stdout and
+        # the real explanation on stderr; without this fallback the
+        # operator sees reason=None and a misleading
+        # "wiki_edit_guard_refused" label that reads as "your write was
+        # rejected" rather than "the guard binary is stale/mismatched" --
+        # exactly the confusion likely to push an operator toward
+        # hand-editing the wiki, the bypass this guard exists to prevent.
+        reason = body.get("reason") if isinstance(body, dict) else None
+        raise PromoteValidationError("wiki_edit_guard_refused", reason or proc.stderr.strip())
     raise PromoteFatal(
         "wiki_edit_guard_unexpected_exit",
         f"exit {proc.returncode}: {body.get('reason') if isinstance(body, dict) else proc.stderr.strip()}",
@@ -2369,29 +2458,90 @@ def _approve_orca_context_wiki(
         #      out from under this process), which check 1 would not
         #      detect on its own.
         #
-        # This narrows the window to the true minimum: between this
-        # re-check and wiki_edit_guard.py's OWN os.open()/.resolve() call
-        # inside its own subprocess, moments later. Fully eliminating even
-        # that residual window would require modifying wiki_edit_guard.py
-        # itself (e.g. to accept an already-opened file descriptor, or use
-        # O_NOFOLLOW internally instead of Path.resolve()) -- EXPLICITLY
-        # OUT OF SCOPE here: wiki_edit_guard.py is a separately-maintained,
-        # SHA-256-pinned, already-hardened dependency this codebase
-        # deliberately does not modify or duplicate (design doc 3.0.2's
-        # named "call, don't copy" exception -- see the section header
-        # above invoke_wiki_edit_guard()). Modifying it needs its own
-        # dedicated review, not a drive-by change bundled into this fix.
-        # This residual gap is accepted as a known, accepted limitation --
-        # not silently ignored -- and is now bounded by a single
-        # subprocess's own startup latency instead of spanning this whole
-        # function's knowledge-body write and everything else that used to
-        # run in between.
+        # round-5's own text used to end here noting a residual window
+        # between this re-check and wiki_edit_guard.py's OWN
+        # os.open()/.resolve() call inside its own subprocess, bounded by
+        # that subprocess's startup latency (~54ms, dedicated-review-
+        # measured) and empirically demonstrated winnable (10/20 file-swap,
+        # 20/20 directory-swap). round-6-fix (2026-08-25, user-authorized,
+        # dedicated review): that residual is now closed by giving
+        # wiki_edit_guard.py a NEW, OPTIONAL dir-fd mode
+        # (--wiki-dir-fd/--wiki-name) instead of passing it a path string
+        # to re-resolve. Immediately after the two re-checks directly
+        # above -- as little code as possible in between, same discipline
+        # as those checks themselves -- open a directory file descriptor
+        # for the target project's wiki/ directory with O_NOFOLLOW
+        # (_open_wiki_dir_fd_for_guard()), pass it to the guard subprocess
+        # via pass_fds, and pass the wiki file's plain basename instead of
+        # its full path. wiki_edit_guard.py's own dir-fd mode then anchors
+        # BOTH its read of the current file and its atomic write of the
+        # new one to that fd (dir_fd=), never re-resolving "wiki/<name>" by
+        # string at all -- so a rename/symlink-swap of "wiki" itself after
+        # this os.open() call cannot redirect the guard's work no matter
+        # how long the child process takes to start, and a symlink-swap of
+        # the wiki FILE's own name (within an otherwise-untouched wiki/
+        # directory) makes the guard's own O_NOFOLLOW open of that name
+        # fail closed rather than follow it -- see wiki_edit_guard.py's own
+        # module docstring "round-6 fix" note for the receiving side, and
+        # this codebase's "copy, don't import" convention: the dir_fd
+        # TECHNIQUE is copied from atomic_write_in_dir()/
+        # _resolve_knowledge_md_path_and_dir_fd() above (same os.rename()-
+        # not-os.replace() dir_fd gotcha applies there too), never a shared
+        # import between the two files.
+        #
+        # What remains, precisely: the two re-checks below still run
+        # against a freshly-built path string (_has_symlink_component) and
+        # the file identity captured earlier (identity_unchanged) -- there
+        # is an irreducible handful of Python bytecode instructions between
+        # those checks returning and the os.open() call that follows them,
+        # not a subprocess spawn. What happens in that narrow gap depends
+        # on what "wiki" is swapped FOR (dedicated-review P3-1, round-6,
+        # re-derived and reproduced independently rather than taken on
+        # faith): (a) a SYMLINK swap of "wiki" makes the os.open() call
+        # itself fail outright (O_NOFOLLOW refuses to traverse a symlink),
+        # refusing with a clean PromoteFatal -- not a silent follow; (b) a
+        # REAL-DIRECTORY swap of "wiki" (a brand-new, non-symlink directory
+        # created under the same name) is NOT something O_NOFOLLOW can see
+        # -- confirmed empirically: the os.open() call below succeeds
+        # against the substituted real directory exactly as it would
+        # against the original one. This is bounded, not a write-escape --
+        # the substituted directory is still a real directory that must
+        # itself resolve to somewhere on this filesystem, and since it was
+        # created AS "real_path / wiki" it is, by construction, still
+        # inside the target project's own directory tree, so the guard's
+        # write still lands inside the project, just not in the original
+        # "wiki" directory's original inode. (c) A wiki FILE-only swap
+        # (wiki/ itself untouched) is caught by wiki_edit_guard.py's own
+        # O_NOFOLLOW open of the basename within the now-already-pinned
+        # dir_fd, which likewise refuses rather than follows a symlink
+        # there. Once os.open() below returns successfully, the fd it
+        # hands back is permanently anchored to whichever directory inode
+        # it actually opened -- (a)'s original one, or (b)'s substituted
+        # one -- for as long as it stays open, regardless of anything that
+        # happens to the name "wiki" afterwards; the only further TOCTOU
+        # window is (c)'s already-covered file-level race, which is
+        # fail-closed, not fail-open. Net effect: a real, malicious swap
+        # can no longer make approve report success while data lands
+        # OUTSIDE the target project, in any variant -- worst case (b) is
+        # a write to an unintended real directory still bounded by the
+        # project root, not an escape; every other variant either lands
+        # correctly inside the project or approve refuses cleanly. See
+        # test_wiki_dir_fd_symlink_swap_after_recheck_refused_or_safe in
+        # test_promote_capability.py for the reproduction of this exact
+        # scenario against the fixed code.
         if _has_symlink_component((real_path / "wiki" / wiki_path.name).absolute(), real_path.absolute()):
             raise PromoteFatal("wiki_path_symlink_introduced", str(wiki_path))
         if not identity_unchanged(wiki_path, identity):
             raise PromoteFatal("concurrent_modification_detected", str(wiki_path))
 
-        guard_result = invoke_wiki_edit_guard(guard_path, wiki_path, new_payload)
+        wiki_dir_fd_for_guard = _open_wiki_dir_fd_for_guard(real_path)
+        try:
+            guard_result = invoke_wiki_edit_guard(guard_path, wiki_path, new_payload, wiki_dir_fd=wiki_dir_fd_for_guard)
+        finally:
+            try:
+                os.close(wiki_dir_fd_for_guard)
+            except OSError:
+                pass
     finally:
         if knowledge_dir_fd is not None:
             try:

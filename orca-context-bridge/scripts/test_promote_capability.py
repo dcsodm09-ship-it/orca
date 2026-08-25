@@ -1343,6 +1343,108 @@ class ApproveOrcaContextWikiTests(PromoteCapabilityTestCase):
         ).stdout.strip()
         self.assertEqual(git_head_before, git_head_after, "no commit must have happened against the fake project")
 
+    def test_wiki_dir_fd_symlink_swap_after_recheck_refused_or_safe(self) -> None:
+        # round-6-fix verification: the two tests immediately above
+        # reproduce a swap injected via atomic_write_in_dir (the
+        # knowledge-body write), which runs BEFORE the round-5 re-checks
+        # -- those re-checks already catch a swap injected that early, on
+        # both round-5 code and this round's. The TRUE round-5 residual
+        # (what a dedicated review actually measured and won 10/20 and
+        # 20/20) is the window AFTER those re-checks pass and
+        # _open_wiki_dir_fd_for_guard() has already opened its dir_fd, but
+        # BEFORE the guard subprocess actually touches the filesystem --
+        # dominated by that subprocess's own startup latency. This test
+        # injects the swap at exactly that point: hooking
+        # pc.subprocess.run (invoke_wiki_edit_guard()'s own call, the
+        # first subprocess.run call whose argv names wiki_edit_guard.py)
+        # to perform the swap immediately before delegating to the real
+        # subprocess.run -- i.e. as late as this process can possibly act,
+        # right before the real work the residual concerns actually
+        # begins in a genuine concurrent attacker.
+        proj = self.make_project("proj-a", wiki_content_version=1)
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+
+        wiki_dir = proj / "wiki"
+        wiki_path = wiki_dir / "orca-context-wiki.json"
+        before_bytes = wiki_path.read_bytes()
+
+        outside_dir = Path(tempfile.mkdtemp(prefix="promote-cap-outside-dirfd-"))
+        self.addCleanup(shutil.rmtree, str(outside_dir), ignore_errors=True)
+        outside_wiki_copy = outside_dir / "orca-context-wiki.json"
+        outside_wiki_copy.write_bytes(before_bytes)
+
+        moved_aside = proj / "wiki-real"
+        real_subprocess_run = pc.subprocess.run
+        swap_state = {"done": False}
+
+        def swap_then_run(argv, *args, **kwargs):
+            if not swap_state["done"] and any("wiki_edit_guard.py" in str(a) for a in argv):
+                swap_state["done"] = True
+                # THE attack: by now, _open_wiki_dir_fd_for_guard() has
+                # ALREADY opened a directory fd anchored to wiki/'s
+                # current inode (this is the fd this very subprocess.run
+                # call is about to pass into the child via pass_fds).
+                # Swap "wiki" itself for a symlink to an OUTSIDE
+                # directory holding a decoy copy, as late as possible
+                # before the child actually runs.
+                os.rename(str(wiki_dir), str(moved_aside))
+                wiki_dir.symlink_to(outside_dir, target_is_directory=True)
+            return real_subprocess_run(argv, *args, **kwargs)
+
+        with mock.patch.object(pc.subprocess, "run", side_effect=swap_then_run):
+            code, result, _err = run_cli_json(
+                ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+            )
+
+        # THE critical assertion, unconditionally: the outside decoy must
+        # NEVER be mutated, no matter what approve reports.
+        self.assertEqual(outside_wiki_copy.read_bytes(), before_bytes, "the outside decoy copy must never be mutated")
+
+        # approve must not silently pretend nothing happened, but it also
+        # must not report a false story. Since the dir_fd was already
+        # pinned to the ORIGINAL wiki/ directory's inode before the swap,
+        # the guard's own read/write (through that fd, by basename only)
+        # is completely unaffected by the later rename+symlink of the
+        # NAME "wiki" -- so the write itself succeeds, correctly, in the
+        # ORIGINAL directory (now reachable at its post-swap name).
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result["status"], "approved")
+        self.assertEqual(result["new_content_version"], 2)
+
+        real_wiki_path = moved_aside / "orca-context-wiki.json"
+        self.assertTrue(real_wiki_path.is_file(), "the real write must have landed in the ORIGINALLY-opened directory")
+        real_doc = json.loads(real_wiki_path.read_bytes().decode("utf-8"))
+        self.assertEqual(real_doc["meta"]["content_version"], 2)
+        self.assertEqual(len(real_doc["pages"]), 1)
+        self.assertEqual(real_doc["pages"][0]["id"], "x-algo-notes")
+
+        real_knowledge_md = moved_aside / "knowledge" / "x-algo-notes.md"
+        self.assertTrue(real_knowledge_md.is_file())
+        self.assertIn("正文内容", real_knowledge_md.read_text(encoding="utf-8"))
+
+        # The LATER git-commit step operates on "wiki/orca-context-wiki.json"
+        # by NAME (git has no dir_fd-anchoring concept), and "wiki" is now
+        # a symlink pointing OUTSIDE the repository -- git itself refuses
+        # a pathspec that crosses a symlink out of the worktree ("fatal:
+        # pathspec '...' is beyond a symbolic link"), so the commit
+        # candidly fails. This is exactly the module docstring's own
+        # documented, already-accepted limitation ("if the wiki write
+        # succeeds but the subsequent git commit fails ... write is NOT
+        # rolled back ... approve reports this candidly") -- not a new
+        # failure mode this fix introduces, and never a false claim that
+        # the outside decoy was what got committed.
+        self.assertFalse(result["git_committed"])
+        self.assertIsNone(result["git_commit_sha"])
+        self.assertIsNotNone(result.get("git_commit_error"))
+
+        # The candidate DID transition to approved (the write really did
+        # succeed, safely, inside the project) -- record reflects that
+        # honestly, consistent with the CLI's own reported result.
+        record_path = pc.candidate_path(pc.PROMOTION_ROOT, "proj-a", candidate_id)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["status"], "approved")
+
 
 class KnowledgeDirFdTocTouTests(unittest.TestCase):
     """round-4-fix regression: a dedicated Grok final gate demonstrated
@@ -2523,6 +2625,64 @@ class ExitCodeCoverageTests(PromoteCapabilityTestCase):
         code2, result2, _e2 = run_cli_json(["draft", "--from-json", str(input_path), "--catalog", str(self.tmp / "missing-catalog.json")])
         self.assertEqual(code2, 4)
         self.assertEqual(result2["reason"], "catalog_missing")
+
+
+class InvokeWikiEditGuardStaleGuardReasonTests(unittest.TestCase):
+    """round-6-fix P2-1 (dedicated review): a stale, co-deployed guard that
+    doesn't understand --wiki-dir-fd/--wiki-name argparse-errors on exit 2
+    with an empty stdout and the real explanation on stderr. body.get is
+    still a valid call on the resulting {} and returns None, which is NOT
+    the same thing as "no reason to report" -- proc.stderr must be
+    consulted whenever the guard's own JSON body didn't carry one, or the
+    operator sees a bare "wiki_edit_guard_refused" with no message at all,
+    misread as their own write being rejected rather than a stale binary."""
+
+    def test_empty_stdout_on_exit_2_falls_back_to_stderr(self) -> None:
+        class FakeCompletedProcess:
+            returncode = 2
+            stdout = ""
+            stderr = "wiki_edit_guard.py: error: unrecognized arguments: --wiki-dir-fd 3 --wiki-name w.json\n"
+
+        with mock.patch.object(pc.subprocess, "run", return_value=FakeCompletedProcess()):
+            with self.assertRaises(pc.PromoteValidationError) as ctx:
+                pc.invoke_wiki_edit_guard(
+                    Path("/nonexistent/wiki_edit_guard.py"),
+                    Path("/nonexistent/wiki/orca-context-wiki.json"),
+                    {"meta": {"content_version": 1, "updated_at": "2026-01-01T00:00:00Z"}},
+                )
+        self.assertEqual(ctx.exception.reason, "wiki_edit_guard_refused")
+        self.assertIsNotNone(ctx.exception.details)
+        self.assertIn("unrecognized arguments", ctx.exception.details)
+
+    def test_non_json_stdout_on_exit_2_falls_back_to_stderr(self) -> None:
+        class FakeCompletedProcess:
+            returncode = 2
+            stdout = "not json at all"
+            stderr = "some other real refusal reason\n"
+
+        with mock.patch.object(pc.subprocess, "run", return_value=FakeCompletedProcess()):
+            with self.assertRaises(pc.PromoteValidationError) as ctx:
+                pc.invoke_wiki_edit_guard(
+                    Path("/nonexistent/wiki_edit_guard.py"),
+                    Path("/nonexistent/wiki/orca-context-wiki.json"),
+                    {"meta": {"content_version": 1, "updated_at": "2026-01-01T00:00:00Z"}},
+                )
+        self.assertIn("some other real refusal reason", ctx.exception.details)
+
+    def test_real_reason_in_json_body_still_wins_over_stderr(self) -> None:
+        class FakeCompletedProcess:
+            returncode = 2
+            stdout = json.dumps({"ok": False, "reason": "the real guard refusal reason"})
+            stderr = "should not be surfaced when body already has a reason\n"
+
+        with mock.patch.object(pc.subprocess, "run", return_value=FakeCompletedProcess()):
+            with self.assertRaises(pc.PromoteValidationError) as ctx:
+                pc.invoke_wiki_edit_guard(
+                    Path("/nonexistent/wiki_edit_guard.py"),
+                    Path("/nonexistent/wiki/orca-context-wiki.json"),
+                    {"meta": {"content_version": 1, "updated_at": "2026-01-01T00:00:00Z"}},
+                )
+        self.assertEqual(ctx.exception.details, "the real guard refusal reason")
 
 
 if __name__ == "__main__":

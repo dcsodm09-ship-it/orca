@@ -68,6 +68,51 @@ design's second, event-after layer. Treat "all wiki edits go through this
 guard's --apply" as a documented convention this repo's operators/agents
 must follow, not a technical guarantee this module enforces on its own.
 
+round-6 fix (2026-08-25): this module's standalone CLI used to accept only
+`--wiki <path>` and immediately do `.expanduser().resolve(strict=False)` on
+it (see main()) before ever reading or writing the file -- resolving
+FOLLOWS a symlink at the final path component, which erases, before any
+protection could matter, the one piece of information ("this name is a
+symlink, not a regular file") that would let a caller refuse it. A
+dedicated review of promote_capability.py's approve path (the one caller
+that matters in production) measured this as a real, empirically-winnable
+race: swap the target project's wiki/orca-context-wiki.json (or wiki/
+itself) for a symlink to an outside location in the window between
+promote_capability.py's own last re-check and this subprocess's own path
+resolution, and the write lands outside the project while approve still
+reports success. Two independent hardenings were added for this, neither
+changing guard_wiki_write()'s validation logic at all:
+  1. A NEW, OPTIONAL dir-fd mode (`--wiki-dir-fd`/`--wiki-name`, additive,
+     mutually exclusive with `--wiki`): the caller passes an
+     already-opened, already-validated directory file descriptor for the
+     wiki file's PARENT directory (obtained with O_NOFOLLOW at the exact
+     instant its own containment check passed) via subprocess pass_fds,
+     plus the wiki file's plain basename. Every filesystem operation this
+     module performs in that mode -- the read of the current file and the
+     atomic write of the new one -- is anchored to that fd (dir_fd=) and
+     never re-resolves or re-opens "wiki/<name>" by path string. A dir_fd
+     stays pinned to the directory's inode regardless of what its name
+     later resolves to, so a rename/symlink-swap of that name (or any
+     ancestor of it) after the fd was opened cannot redirect these
+     operations -- see promote_capability.py's own
+     `_open_wiki_dir_fd_for_guard()`/`invoke_wiki_edit_guard()` for the
+     caller side of this contract.
+  2. The EXISTING standalone `--wiki <path>` mode was independently
+     hardened too, at zero behavioral cost to the normal case: the wiki
+     path's own final component is no longer collapsed through
+     Path.resolve() before use (only its parent directory is, same as
+     before, for path normalization), and the read of it uses O_NOFOLLOW.
+     A manual/standalone invocation now refuses outright (a clean usage
+     error, not a silent follow) if the wiki file itself has been swapped
+     for a symlink -- it cannot protect against a swap of an ANCESTOR
+     directory the way the dir-fd mode can, since a standalone invocation
+     has no pre-validated fd for anything above the file itself.
+Neither hardening changes `--wiki <path>` standalone behavior for a wiki
+file that is a plain regular file (the overwhelmingly common case, and the
+only case this module's own manual re-sign procedure and SKILL.md exercise
+by hand) -- see CliRealBytesTests/DirFdModeTests in
+test_wiki_edit_guard.py.
+
 Out of scope for this module (left for a separately-scoped follow-up):
   - The full per-page/per-link timestamp migration (created_at, verified_at,
     verification_status, source_mtime, migration_sequence, source_missing).
@@ -85,8 +130,10 @@ import hashlib
 import json
 import os
 import shlex
+import stat
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -387,10 +434,22 @@ def _atomic_write_text(path: Path, text: str) -> None:
     write, which happens to be a no-op on POSIX but was an implicit
     platform coincidence, not a guarantee -- paired with the read side's
     matching fix, see _read_json_object_with_raw()).
+
+    Mode detection uses lstat(), not stat() (round-6 fix): stat() follows
+    a symlink, so if `path`'s final component has been swapped for a
+    symlink since this function's caller last looked, a plain stat() would
+    silently adopt the OUTSIDE target's mode bits for the brand-new file
+    this function is about to create in its place. This is not itself a
+    write-escape (see the module docstring's round-6 note: os.replace()
+    on a destination that is a symlink replaces the link's own directory
+    entry, it never writes through to the link's target -- confirmed
+    empirically), only an unnecessary information leak on top of that, and
+    is closed here at zero cost to the normal (regular-file) case.
     """
     path = path.expanduser()
     try:
-        mode = path.stat().st_mode & 0o777
+        lst = path.lstat()
+        mode = 0o600 if stat.S_ISLNK(lst.st_mode) else lst.st_mode & 0o777
     except OSError:
         mode = 0o600
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
@@ -424,11 +483,71 @@ def _atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+def _atomic_write_via_dir_fd(dir_fd: int, name: str, text: str, *, mode: int) -> None:
+    """Same tmp-file+rename discipline as _atomic_write_text, but every
+    operation is anchored to an already-open directory file descriptor
+    (dir_fd=) instead of a path string (round-6 fix -- see the module
+    docstring's round-6 note, and promote_capability.py's own
+    atomic_write_in_dir(), which this function deliberately mirrors: same
+    technique, copied not imported, per this codebase's convention).
+
+    `name` is used ONLY as a dir_fd-relative name -- never joined into a
+    Path or re-resolved -- so a rename/symlink-swap of `name` (or of
+    whatever directory `dir_fd` used to be reachable under) after the
+    caller obtained dir_fd cannot redirect this write: dir_fd stays pinned
+    to the specific directory inode the caller validated at open time,
+    completely independent of what that directory's name resolves to
+    afterwards.
+
+    os.replace() has no dir_fd-capable form on this platform (confirmed
+    empirically, same finding promote_capability.py's atomic_write_in_dir
+    already documents: os.replace not in os.supports_dir_fd even though
+    os.rename is). os.rename() is used instead, which is safe here because
+    this whole function already assumes POSIX (O_NOFOLLOW/os.O_DIRECTORY
+    do not exist on Windows either) and POSIX's rename(2) already
+    atomically replaces an existing destination -- the exact guarantee
+    os.replace() exists to add on top of os.rename() only for Windows.
+    """
+    if os.sep in name or name in (".", ".."):
+        # Cannot happen given how this module's own callers build `name`
+        # (always the single-component --wiki-name CLI argument, validated
+        # in main() before this function is ever reached) -- asserted
+        # explicitly anyway since this string is used directly as a
+        # dir_fd-relative name.
+        raise _CliUsageError(f"invalid dir_fd-relative wiki filename: {name!r}")
+    payload = text.encode("utf-8")
+    tmp_name = f".{name}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
+
+    def _unlink_tmp() -> None:
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except OSError:
+            pass
+
+    fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    try:
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+            try:
+                os.fchmod(fd, mode)
+            except OSError:
+                pass
+        finally:
+            os.close(fd)
+        os.rename(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        _unlink_tmp()
+        raise
+
+
 class _CliUsageError(ValueError):
     """A CLI-level usage/IO/JSON problem -- distinct from a guard refusal."""
 
 
-def _read_json_object_with_raw(source: str, *, label: str) -> tuple[dict[str, Any], str]:
+def _read_json_object_with_raw(
+    source: str, *, label: str, no_follow_symlinks: bool = False
+) -> tuple[dict[str, Any], str]:
     """Read and parse a JSON object, returning (payload, raw_text_as_read).
 
     The raw text is the actual bytes as they exist at `source` right now --
@@ -446,10 +565,36 @@ def _read_json_object_with_raw(source: str, *, label: str) -> tuple[dict[str, An
     the two bugs this module's round-2 fixes closed, caught in round 3.
     stdin has no newline-translation concern the way a file path does --
     sys.stdin.read() is left as-is.).
+
+    no_follow_symlinks (round-6 fix): when True, `source` is opened with
+    O_NOFOLLOW instead of going through Path.read_bytes() -- the read
+    fails outright (a clean _CliUsageError, not a silent follow) if
+    `source`'s own final path component is a symlink. Used by main() only
+    for the CURRENT wiki file in standalone `--wiki <path>` mode -- see the
+    module docstring's round-6 note for why this only protects the file's
+    own name, not an ancestor directory's.
     """
     try:
         if source == "-":
             raw = sys.stdin.read()
+        elif no_follow_symlinks:
+            flags = os.O_RDONLY | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(str(Path(source).expanduser()), flags)
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise OSError(f"{source} is not a regular file")
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(fd, 1 << 20)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            finally:
+                os.close(fd)
+            raw = b"".join(chunks).decode("utf-8")
         else:
             raw = Path(source).expanduser().read_bytes().decode("utf-8")
     except OSError as exc:
@@ -466,6 +611,54 @@ def _read_json_object_with_raw(source: str, *, label: str) -> tuple[dict[str, An
 def _read_json_object(source: str, *, label: str) -> dict[str, Any]:
     payload, _raw = _read_json_object_with_raw(source, label=label)
     return payload
+
+
+def _read_json_object_via_dir_fd(dir_fd: int, name: str, *, label: str) -> tuple[dict[str, Any], str, int]:
+    """dir-fd-mode counterpart to _read_json_object_with_raw() (round-6
+    fix): reads `name` as a single path component relative to an already-
+    open, already-validated directory file descriptor, with O_NOFOLLOW, so
+    the read refuses outright if `name` is a symlink rather than following
+    it -- and never re-resolves or re-opens any path string for the
+    directory component at all, since dir_fd already IS that validated
+    directory. Returns (payload, raw_text_as_read, current_mode) --
+    current_mode (the existing file's permission bits) lets main() preserve
+    them on the write, mirroring _atomic_write_text's own mode-preservation
+    for the standalone path.
+    """
+    if os.sep in name or name in (".", ".."):
+        raise _CliUsageError(f"--wiki-name must be a single path component, got {name!r}")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise _CliUsageError(f"could not read {label} via --wiki-dir-fd for {name!r}: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise _CliUsageError(f"{label} at {name!r} is not a regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except OSError as exc:
+        raise _CliUsageError(f"could not read {label} via --wiki-dir-fd for {name!r}: {exc}") from exc
+    finally:
+        os.close(fd)
+    try:
+        raw = b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _CliUsageError(f"{label} at {name!r} is not valid utf-8: {exc}") from exc
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise _CliUsageError(f"{label} at {name!r} is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise _CliUsageError(f"{label} at {name!r} must be a JSON object at the top level")
+    return payload, raw, st.st_mode & 0o777
 
 
 def resolve_default_wiki_path() -> Path:
@@ -523,6 +716,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="path to the current wiki JSON (default: inferred from this script's location)",
     )
     parser.add_argument(
+        "--wiki-dir-fd",
+        type=int,
+        metavar="N",
+        help=(
+            "round-6: an already-open directory file descriptor number (inherited via "
+            "subprocess pass_fds) for the wiki file's PARENT directory -- every filesystem "
+            "operation is anchored to this fd instead of a path string. Must be given together "
+            "with --wiki-name; mutually exclusive with --wiki. See the module docstring's "
+            "round-6 note."
+        ),
+    )
+    parser.add_argument(
+        "--wiki-name",
+        metavar="BASENAME",
+        help="round-6: the wiki file's plain basename within --wiki-dir-fd's directory (single path component)",
+    )
+    parser.add_argument(
         "--bootstrap",
         action="store_true",
         help="allow the one-time meta bootstrap on a wiki that has no meta key yet",
@@ -548,9 +758,46 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
+    # round-6: --wiki-dir-fd/--wiki-name is a NEW, OPTIONAL, additive mode --
+    # both must be given together, and never combined with --wiki. Validated
+    # here, before either mode does any I/O, so a malformed combination
+    # fails as a clean usage error (exit 4) rather than an inconsistent
+    # partial code path further down.
+    using_dir_fd = args.wiki_dir_fd is not None or args.wiki_name is not None
+    if using_dir_fd and (args.wiki_dir_fd is None or args.wiki_name is None):
+        _emit_error(args, exit_code=4, reason="--wiki-dir-fd and --wiki-name must both be given together")
+        return 4
+    if using_dir_fd and args.wiki is not None:
+        _emit_error(args, exit_code=4, reason="--wiki cannot be combined with --wiki-dir-fd/--wiki-name")
+        return 4
+
+    old_mode: int | None = None
     try:
-        wiki_path = args.wiki.expanduser().resolve(strict=False) if args.wiki else resolve_default_wiki_path()
-        old_payload, old_raw_text = _read_json_object_with_raw(str(wiki_path), label="current wiki")
+        if using_dir_fd:
+            # wiki_path here is a DISPLAY-ONLY stand-in -- never used for
+            # any actual filesystem operation in this mode, since dir_fd
+            # already IS the validated, non-symlink-followed directory and
+            # every operation below stays anchored to it by name, never by
+            # re-resolving a path string (see the module docstring's
+            # round-6 note).
+            wiki_path = Path(args.wiki_name)
+            old_payload, old_raw_text, old_mode = _read_json_object_via_dir_fd(
+                args.wiki_dir_fd, args.wiki_name, label="current wiki"
+            )
+        else:
+            # round-6: the final path component is deliberately NOT resolved
+            # here -- only the parent directory is (same as this module has
+            # always done for path normalization). Resolving the final
+            # component would follow a symlink planted there and silently
+            # operate on whatever it points to from here on, which is
+            # exactly the residual this fix closes -- see the module
+            # docstring's round-6 note.
+            wiki_arg = args.wiki.expanduser() if args.wiki else resolve_default_wiki_path()
+            wiki_dir_resolved = wiki_arg.parent.resolve(strict=False)
+            wiki_path = wiki_dir_resolved / wiki_arg.name
+            old_payload, old_raw_text = _read_json_object_with_raw(
+                str(wiki_path), label="current wiki", no_follow_symlinks=True
+            )
         new_payload = _read_json_object(args.new, label="candidate wiki")
     except _CliUsageError as exc:
         _emit_error(args, exit_code=4, reason=str(exc))
@@ -581,15 +828,21 @@ def main(argv: list[str] | None = None) -> int:
     observed_sha256: str | None = None
     if args.apply:
         try:
-            _atomic_write_text(wiki_path, new_serialized)
-        except OSError as exc:
+            if using_dir_fd:
+                assert old_mode is not None
+                _atomic_write_via_dir_fd(args.wiki_dir_fd, args.wiki_name, new_serialized, mode=old_mode)
+            else:
+                _atomic_write_text(wiki_path, new_serialized)
+        except (OSError, _CliUsageError) as exc:
             # Round-2 P3 fix: an uncaught OSError here (e.g. an
             # unwritable/missing parent directory) previously escaped as a
             # raw traceback and a bare exit 1, outside the documented
             # 0/2/3/4 exit-code contract and with no --json output at all.
             # guard_wiki_write() already returned successfully -- the
             # candidate itself was fine -- so this is a usage/IO failure,
-            # not a guard refusal.
+            # not a guard refusal. round-6: _CliUsageError is caught here
+            # too since _atomic_write_via_dir_fd raises it for the (should
+            # be unreachable, but asserted defensively) invalid-name case.
             _emit_error(args, exit_code=4, reason=f"could not write {wiki_path}: {exc}")
             return 4
         written = True
@@ -625,7 +878,7 @@ def main(argv: list[str] | None = None) -> int:
                     "acknowledged": bool(args.acknowledge_resign_pending),
                     "old_content_version": old_version,
                     "new_content_version": new_version,
-                    "wiki_path": str(wiki_path),
+                    "wiki_path": f"<wiki-dir-fd {args.wiki_dir_fd}>/{args.wiki_name}" if using_dir_fd else str(wiki_path),
                     "observed_sha256": observed_sha256,
                     "exit_code": exit_code,
                 },
