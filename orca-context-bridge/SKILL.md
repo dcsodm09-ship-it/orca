@@ -902,9 +902,19 @@ file that any manual run legitimately rewrites would make
 
 ### Keeping the catalog current
 
-Nothing triggers this build. There is no hook, no watcher, no SessionStart
-integration — editing a project's wiki file does not update the catalog,
-and the catalog does not notice. Re-run the build by hand:
+**Corrected 2026-08-27** (this section previously said "nothing triggers
+this build" and "no SessionStart integration" — that is no longer true;
+see "Announcing the catalog at session start" below for the live
+mechanism). `catalog_session_hint.py` is a live, registered SessionStart
+hook that checks the catalog's age on every session start and, once it is
+past `--stale-after-hours` (default 6h), spawns a detached
+`build_cross_project_catalog.py build --quiet` rebuild in the background
+without waiting on it. That covers staleness *by age*, not by content:
+editing a project's wiki file does not itself notify the hook or the
+catalog, so a change made while the catalog is still within its freshness
+window sits unpicked-up until the next stale-triggered rebuild. Run the
+build by hand whenever you need the catalog current immediately rather
+than eventually:
 
 - after adding or editing any of the three wiki files in any project;
 - after a project is added to or removed from Orca;
@@ -912,9 +922,8 @@ and the catalog does not notice. Re-run the build by hand:
   the catalog.
 
 Check `verified_at` in `catalog.json` before relying on it; if it predates
-the change you are reasoning about, rebuild first. Wiring this into
-SessionStart is a later, separately reviewed step — until then, treat the
-catalog's age as something you verify rather than assume.
+the change you are reasoning about, rebuild first rather than waiting for
+the next stale-triggered background rebuild.
 
 ### Searching the catalog
 
@@ -1020,10 +1029,20 @@ python3 <skill-dir>/scripts/catalog_session_hint.py hook
 python3 <skill-dir>/scripts/catalog_session_hint.py print-registration
 ```
 
-**Status: built and tested, deliberately NOT registered.** Wiring it into
-`~/.claude/settings.json` is a separate, explicitly-authorized deployment
-step. `print-registration` *prints* the snippet to stdout and never writes
-it — the script contains no settings-file writer at all.
+**Status: live and registered (corrected 2026-08-27; this line previously
+said "deliberately NOT registered").** Since 2026-08-23 this hook is wired
+into `~/.claude/settings.json`'s `hooks.SessionStart` as its own array
+element — alongside the pre-existing verified-context entry, matching the
+registration rule below — and fires on every Claude Code session start on
+this account. `print-registration` still only *prints* the snippet to
+stdout and never writes it — the script itself carries no settings-file
+writer — so the installed entry was added by a human, not by this command;
+re-run `print-registration` and diff it against the installed command
+before changing either one. As of 2026-08-27 the generator itself always
+includes `--no-compat-spawn` in its printed snippet (added 2026-08-26 for
+Gate D below, and the generator was fixed the next day to match) — the two
+no longer drift on this specific flag, but still diff before changing
+either, since nothing prevents a future edit to one side alone.
 
 Line 1 appears whenever the catalog parses:
 
@@ -1316,11 +1335,28 @@ output, since Tier-2's raw execution output has a different trust level.
 actually reviewed it, only the fact that the declaration had to be
 committed into that project's own git history to take effect.
 
-**Not yet true**: this has never been run against any real project's
-`wiki/compat-check.json` — no project in this fleet has adopted that file
-yet, and this tool is not registered in any hook or SessionStart path. Per
-the design doc (§4), Gate D is the highest-risk of the four gates — the
+**Corrected 2026-08-27**: this tool itself has never been run against any
+real project's `wiki/compat-check.json` — no project in this fleet has
+adopted that file yet. But this section previously also said "this tool is
+not registered in any hook or SessionStart path", which conflates two
+separate facts and is no longer accurate as written. Gate D's own
+unattended auto-trigger (added 2026-08-26 — see `spawn_compat_check()` /
+`maybe_run_and_render_compat_checks()` in `catalog_session_hint.py`) is
+wired into that same script, which is itself the live, registered
+SessionStart hook described above. **The registration is live.** What
+keeps it from actually firing today is two separate, independent gates,
+both currently closed, not an absence of registration:
+
+1. the live `~/.claude/settings.json` command passes `--no-compat-spawn`,
+   a coarse kill switch that disables only this one spawn path (ordinary
+   catalog rebuilds via `spawn_rebuild()` are unaffected by it);
+2. even with that flag removed, `spawn_compat_check()` additionally
+   requires `is_compat_auto_run_authorized()` — a human-granted,
+   per-project, hash-pinned authorization tied to that project's own
+   current `wiki/compat-check.json` bytes — and no project has granted it.
+
+Per the design doc (§4), Gate D is the highest-risk of the four gates — the
 only one that executes third-party code — and depends on Gate A's output;
 it is not itself authorized for real use, and running it against a real
-project is a separate decision, not a byproduct of this documentation
-existing.
+project, or removing either of the two gates above, is a separate
+decision, not a byproduct of this documentation existing.
