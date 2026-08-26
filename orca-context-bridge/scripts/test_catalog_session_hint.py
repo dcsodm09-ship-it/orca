@@ -1681,8 +1681,14 @@ class GateDAutoTriggerTests(unittest.TestCase):
         auth_dir.mkdir(parents=True, exist_ok=True)
         (auth_dir / "compat-auto-run-authorization.json").write_text(
             json.dumps({
-                "schema_version": 1,
+                # schema_version 2 (2026-08-27 "Variant 2" fix): a
+                # schema-1 marker is now unauthorized outright. None of
+                # this check_command's own argv ([sys.executable, "-c",
+                # "pass"]) resolves to a real file inside project_root, so
+                # its referenced_file_hashes is legitimately empty.
+                "schema_version": 2,
                 "authorized_compat_check_sha256": hashlib.sha256(check_bytes).hexdigest(),
+                "referenced_file_hashes": {},
                 "authorized_at": "2026-08-23T00:00:00Z",
                 "authorized_by": "test",
             }, ensure_ascii=False),
@@ -2025,12 +2031,18 @@ class IsCompatAutoRunAuthorizedTests(unittest.TestCase):
         self.check_path.write_bytes(payload)
         return payload
 
-    def _authorize(self, check_bytes: bytes) -> None:
+    def _authorize(self, check_bytes: bytes, referenced_file_hashes: "dict | None" = None) -> None:
+        # schema_version 2 (2026-08-27 "Variant 2" fix) -- a schema-1
+        # marker is now deliberately unauthorized outright (see
+        # test_wrong_schema_version_is_unauthorized's own sibling coverage
+        # for that on-disk shape); every fixture in this class represents a
+        # human who authorized under the CURRENT scheme.
         self.auth_dir.mkdir(parents=True, exist_ok=True)
         self.auth_path.write_text(
             json.dumps({
-                "schema_version": 1,
+                "schema_version": 2,
                 "authorized_compat_check_sha256": hashlib.sha256(check_bytes).hexdigest(),
+                "referenced_file_hashes": referenced_file_hashes if referenced_file_hashes is not None else {},
                 "authorized_at": "2026-08-23T00:00:00Z",
                 "authorized_by": "test",
             }),
@@ -2048,6 +2060,45 @@ class IsCompatAutoRunAuthorizedTests(unittest.TestCase):
         check_bytes = self._write_check()
         self._authorize(check_bytes)
         self.assertTrue(csh.is_compat_auto_run_authorized(self._catalog(), "proj/alpha"))
+
+    def test_matching_hash_with_referenced_script_is_authorized(self) -> None:
+        """The non-empty-referenced-file-set sibling of test_matching_hash_
+        is_authorized: a check_command that references a real, project-
+        owned script is authorized when that script's hash matches too."""
+        (self.project_root / "check.py").write_text("pass\n", encoding="utf-8")
+        check_bytes = self._write_check(json.dumps({
+            "schema_version": 1,
+            "checks": [{
+                "id": "chk", "depends_on_ref": "x", "cwd": ".",
+                "check_command": ["python3", "check.py"],
+                "timeout_seconds": 30, "reviewed_by": "a", "reviewed_at": "2026-08-23T00:00:00Z",
+            }],
+        }).encode("utf-8"))
+        referenced_hash = hashlib.sha256((self.project_root / "check.py").read_bytes()).hexdigest()
+        self._authorize(check_bytes, referenced_file_hashes={"check.py": referenced_hash})
+        self.assertTrue(csh.is_compat_auto_run_authorized(self._catalog(), "proj/alpha"))
+
+    def test_editing_the_referenced_script_after_authorization_is_unauthorized(self) -> None:
+        """Task-spec regression (c)'s sibling for the pre-check's OWN
+        duplicated logic: compat-check.json is untouched here -- only the
+        script file it names is edited after authorization."""
+        (self.project_root / "check.py").write_text("print('original')\n", encoding="utf-8")
+        check_bytes = self._write_check(json.dumps({
+            "schema_version": 1,
+            "checks": [{
+                "id": "chk", "depends_on_ref": "x", "cwd": ".",
+                "check_command": ["python3", "check.py"],
+                "timeout_seconds": 30, "reviewed_by": "a", "reviewed_at": "2026-08-23T00:00:00Z",
+            }],
+        }).encode("utf-8"))
+        referenced_hash = hashlib.sha256((self.project_root / "check.py").read_bytes()).hexdigest()
+        self._authorize(check_bytes, referenced_file_hashes={"check.py": referenced_hash})
+        self.assertTrue(csh.is_compat_auto_run_authorized(self._catalog(), "proj/alpha"))
+        (self.project_root / "check.py").write_text("print('TAMPERED')\n", encoding="utf-8")
+        self.assertFalse(
+            csh.is_compat_auto_run_authorized(self._catalog(), "proj/alpha"),
+            "editing the referenced script must revoke this pre-check's authorization too",
+        )
 
     def test_edited_compat_check_after_authorization_is_unauthorized(self) -> None:
         check_bytes = self._write_check()
@@ -2110,6 +2161,13 @@ class IsCompatAutoRunAuthorizedTests(unittest.TestCase):
             ccc.AUTO_RUN_AUTHORIZATION_RELATIVE_PATH.parts,
         )
         self.assertEqual(csh._AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION, ccc.AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION)
+        # 2026-08-27 extension ("Variant 2" fix): the two files must also
+        # agree on the referenced-file hashing bound -- otherwise they could
+        # reach different authorized/not-authorized answers for the
+        # identical on-disk state (one file's pre-check accepting a
+        # referenced file as safely hashable while the authoritative
+        # implementation refuses it as too large, or vice versa).
+        self.assertEqual(csh._MAX_REFERENCED_CHECK_FILE_BYTES, ccc.MAX_REFERENCED_CHECK_FILE_BYTES)
 
 
 class ReadSmallGuardedFileDirFdHardeningTests(unittest.TestCase):
@@ -2688,8 +2746,26 @@ class NoWritePathTests(unittest.TestCase):
         self.assertEqual(len(entry["hooks"]), 1)
         self.assertEqual(entry["hooks"][0]["timeout"], csh.REGISTRATION_TIMEOUT)
         self.assertIn("catalog_session_hint.py", entry["hooks"][0]["command"])
-        self.assertTrue(entry["hooks"][0]["command"].endswith(" hook"))
+        # 2026-08-27 fix: the printed command now always carries
+        # --no-compat-spawn (see test_print_registration_always_includes_
+        # no_compat_spawn below for the dedicated regression) -- it is
+        # appended right after "hook", so the command no longer bare-ends
+        # with " hook" the way it did before that fix.
+        self.assertTrue(entry["hooks"][0]["command"].endswith(" hook --no-compat-spawn"))
         self.assertNotIn("--knowledge-root", entry["hooks"][0]["command"])
+
+    def test_print_registration_always_includes_no_compat_spawn(self) -> None:
+        """2026-08-27 fix (task item 4): a human who pastes this printed
+        snippet verbatim into settings.json must not silently get Gate D's
+        background auto-trigger enabled by default -- the snippet always
+        carries --no-compat-spawn now. Regression: this assertion fails
+        against the pre-fix registration_entry(), which never emitted the
+        flag at all."""
+        code, out, err = run_subprocess(["print-registration"])
+        self.assertEqual(code, 0)
+        command = json.loads(out)["hooks"][0]["command"]
+        tokens = shlex.split(command)
+        self.assertIn("--no-compat-spawn", tokens)
 
     def test_print_registration_quotes_a_path_with_spaces(self) -> None:
         code, out, err = run_subprocess(

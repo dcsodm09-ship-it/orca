@@ -10,6 +10,7 @@ Run with:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -162,6 +163,33 @@ def make_check_entry(
         "reviewed_by": reviewed_by,
         "reviewed_at": reviewed_at,
     }
+
+
+def write_allowed_check_script(project_dir: Path, body: str = "pass", name: str = "chk_script.py") -> list:
+    """Writes a REAL, project-owned script file directly under `project_dir`
+    (its own shebang pinned to THIS test process's own interpreter) and
+    returns a check_command that satisfies is_check_command_allowlisted()'s
+    rule (b) -- argv[0] itself resolving to a file inside project_root --
+    for use anywhere a test needs a check_command that authorize-auto-run
+    will actually accept.
+
+    Deliberately does NOT use `[sys.executable, "-c", body]` (the shape
+    every OTHER fixture in this file still uses for the many tests that
+    never go through authorize-auto-run/is_check_command_allowlisted at
+    all): rule (a)'s "interpreter + project script" path would require
+    argv[0]'s basename to be exactly "python3", which sys.executable's
+    basename on a real machine is not guaranteed to be (e.g. "python3.14"
+    on this one) -- rule (b) sidesteps that entirely by not caring what the
+    interpreter is named, only that the script file itself resolves inside
+    project_root."""
+    script_path = project_dir / name
+    script_path.write_text(f"#!{sys.executable}\n{body}\n", encoding="utf-8")
+    script_path.chmod(0o700)
+    # A slash-free argv[0] is resolved via a PATH search by execvp(), NOT
+    # relative to cwd (confirmed empirically: a bare "chk_script.py" here
+    # fails with ENOENT even though it exists in the check's own cwd) --
+    # "./" makes it an explicit relative path instead.
+    return [f"./{name}"]
 
 
 def _run_compat(**kwargs) -> dict:
@@ -2626,7 +2654,13 @@ class AutoRunAuthorizationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="ccc-authz-"))
         self.project_root = make_project_dir(self.tmp, "p")
-        write_compat_check(self.project_root, [make_check_entry()])
+        # NOT make_check_entry()'s bare default ([sys.executable, "-c",
+        # "pass"]): authorize-auto-run now refuses to pin authorization for
+        # an inline `-c` invocation (is_check_command_allowlisted) -- every
+        # test in this class that actually calls authorize-auto-run needs
+        # an allowlisted check_command instead.
+        self.allowed_command = write_allowed_check_script(self.project_root)
+        write_compat_check(self.project_root, [make_check_entry(check_command=self.allowed_command)])
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -2646,6 +2680,13 @@ class AutoRunAuthorizationTests(unittest.TestCase):
         self.assertEqual(marker["authorized_by"], "alice")
         _doc, _reason, current_sha256 = ccc._read_compat_check(self.project_root)
         self.assertEqual(marker["authorized_compat_check_sha256"], current_sha256)
+        # Widened-hash fix (2026-08-27): the referenced script file itself
+        # is ALSO pinned by its own sha256, keyed by its project-relative
+        # path (normalized -- "./chk_script.py" in the command becomes
+        # "chk_script.py" as a key), alongside compat-check.json's own hash.
+        script_relkey = str(Path(self.allowed_command[0]))
+        expected_script_hash = hashlib.sha256((self.project_root / script_relkey).read_bytes()).hexdigest()
+        self.assertEqual(marker["referenced_file_hashes"], {script_relkey: expected_script_hash})
         self.assertTrue(ccc.is_auto_run_authorized(self.project_root)[0])
 
     def test_authorize_refuses_an_invalid_compat_check_document(self) -> None:
@@ -2670,13 +2711,20 @@ class AutoRunAuthorizationTests(unittest.TestCase):
         write_compat_check(self.project_root, [make_check_entry(check_command=["/bin/echo", "different"])])
         authorized, reason = ccc.is_auto_run_authorized(self.project_root)
         self.assertFalse(authorized)
+        # The document's own bytes changed (a different check_command was
+        # written), so compat-check.json's own sha256 mismatch is caught
+        # before this function ever gets to comparing referenced-file
+        # hashes -- unaffected by the fact that "/bin/echo" itself would
+        # also separately fail the (unrelated, authorize-time-only)
+        # check_command allowlist.
         self.assertEqual(reason, "auto_run_authorization_hash_mismatch")
 
     def test_re_authorizing_after_an_edit_pins_the_new_hash(self) -> None:
         _run_main(
             ["authorize-auto-run", "--project-root", str(self.project_root), "--authorized-by", "alice", "--quiet"]
         )
-        write_compat_check(self.project_root, [make_check_entry(check_command=["/bin/echo", "different"])])
+        new_command = write_allowed_check_script(self.project_root, body="print('v2')", name="chk_script_v2.py")
+        write_compat_check(self.project_root, [make_check_entry(check_command=new_command)])
         code, out, err = _run_main(
             ["authorize-auto-run", "--project-root", str(self.project_root), "--authorized-by", "bob", "--quiet"]
         )
@@ -2742,7 +2790,11 @@ class AutoRunAuthorizationDirFdHardeningTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="ccc-authz-dirfd-"))
         self.project_root = make_project_dir(self.tmp, "p")
-        write_compat_check(self.project_root, [make_check_entry()])
+        # See AutoRunAuthorizationTests.setUp's own comment: authorize-
+        # auto-run now refuses a bare `-c` invocation.
+        write_compat_check(
+            self.project_root, [make_check_entry(check_command=write_allowed_check_script(self.project_root))]
+        )
         self.outside = self.tmp / "outside-target"
         self.outside.mkdir()
 
@@ -2851,8 +2903,11 @@ class RequireAutoRunAuthorizationTests(unittest.TestCase):
     def test_authorized_project_still_executes_when_flag_set(self) -> None:
         global_id = "t#x"
         dep_dir = make_project_dir(self.tmp, "dep")
+        # authorize-auto-run refuses to pin `-c`; use an allowlisted,
+        # project-owned script instead (see write_allowed_check_script's own
+        # docstring for why this is a script file, not [python3, "-c", ...]).
         write_compat_check(
-            dep_dir, [make_check_entry(depends_on_ref=global_id, check_command=[sys.executable, "-c", "pass"])]
+            dep_dir, [make_check_entry(depends_on_ref=global_id, check_command=write_allowed_check_script(dep_dir))]
         )
         self._authorize(dep_dir)
         catalog = make_affected_catalog(global_id, "dep", projects=[make_project_row("dep", dep_dir)])
@@ -2873,8 +2928,13 @@ class RequireAutoRunAuthorizationTests(unittest.TestCase):
         write_compat_check(
             bad_dir, [make_check_entry(depends_on_ref=global_id, check_command=[sys.executable, "-c", "pass"])]
         )
+        # proj-good goes through authorize-auto-run below, so it needs an
+        # allowlisted check_command; proj-bad is deliberately left
+        # unauthorized and never reaches allowlist enforcement either way,
+        # so its plain `-c` fixture is untouched.
         write_compat_check(
-            good_dir, [make_check_entry(depends_on_ref=global_id, check_command=[sys.executable, "-c", "pass"])]
+            good_dir,
+            [make_check_entry(depends_on_ref=global_id, check_command=write_allowed_check_script(good_dir))],
         )
         self._authorize(good_dir)  # proj-bad deliberately left unauthorized
         row = make_reverse_row(
@@ -2952,6 +3012,328 @@ class RequireAutoRunAuthorizationTests(unittest.TestCase):
         payload = json.loads(out)
         self.assertEqual(payload["projects"][0]["outcome"], "skipped", out + err)
         self.assertFalse(marker.exists())
+
+
+class CheckCommandAllowlistTests(unittest.TestCase):
+    """is_check_command_allowlisted() -- 2026-08-27 cross-audit fix. Direct
+    unit tests over the pure function itself, independent of the
+    authorize-auto-run/execution wiring (covered by the classes below)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="ccc-allowlist-"))
+        self.project_root = make_project_dir(self.tmp, "p")
+        self.resolved_cwd = self.project_root.resolve()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_script(self, name: str = "chk.py", body: str = "pass") -> None:
+        (self.project_root / name).write_text(body, encoding="utf-8")
+
+    def test_curl_denied_regardless_of_arguments(self) -> None:
+        allowed, reason = ccc.is_check_command_allowlisted(
+            ["curl", "https://example.com"], self.project_root, self.resolved_cwd
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "network_binary_denied")
+
+    def test_every_network_denylist_binary_is_denied(self) -> None:
+        for binary in (
+            "curl", "wget", "wget2", "curlie", "xh", "httpie", "http", "https",
+            "nc", "ncat", "netcat", "socat", "ssh", "scp", "sftp", "rsync",
+            "telnet", "ftp", "tftp", "osascript",
+        ):
+            with self.subTest(binary=binary):
+                allowed, reason = ccc.is_check_command_allowlisted([binary, "x"], self.project_root, self.resolved_cwd)
+                self.assertFalse(allowed)
+                self.assertEqual(reason, "network_binary_denied")
+
+    def test_bash_dash_c_denied(self) -> None:
+        allowed, reason = ccc.is_check_command_allowlisted(
+            ["bash", "-c", "echo hi"], self.project_root, self.resolved_cwd
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "shell_dash_c_denied")
+
+    def test_sh_zsh_dash_shells_dash_c_denied(self) -> None:
+        for shell in ("sh", "zsh", "dash"):
+            with self.subTest(shell=shell):
+                allowed, reason = ccc.is_check_command_allowlisted(
+                    [shell, "-c", "echo hi"], self.project_root, self.resolved_cwd
+                )
+                self.assertFalse(allowed)
+                self.assertEqual(reason, "shell_dash_c_denied")
+
+    def test_bash_without_dash_c_falls_through_to_not_allowlisted(self) -> None:
+        """bash is not in _ALLOWED_CHECK_INTERPRETERS at all -- without -c
+        it is refused via the generic "not a project script either" path,
+        not the shell-specific denylist reason (both refuse; this pins
+        WHICH reason, since a bare "bash" name is never itself a file
+        inside project_root)."""
+        allowed, reason = ccc.is_check_command_allowlisted(["bash", "script.sh"], self.project_root, self.resolved_cwd)
+        self.assertFalse(allowed)
+        self.assertNotEqual(reason, "shell_dash_c_denied")
+
+    def test_python_and_python3_dash_c_denied(self) -> None:
+        for interp in ("python", "python3"):
+            with self.subTest(interp=interp):
+                allowed, reason = ccc.is_check_command_allowlisted(
+                    [interp, "-c", "import os"], self.project_root, self.resolved_cwd
+                )
+                self.assertFalse(allowed)
+                self.assertEqual(reason, "inline_code_flag_denied")
+
+    def test_node_dash_e_denied(self) -> None:
+        allowed, reason = ccc.is_check_command_allowlisted(
+            ["node", "-e", "console.log(1)"], self.project_root, self.resolved_cwd
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "inline_code_flag_denied")
+
+    def test_bare_python3_repl_denied(self) -> None:
+        allowed, reason = ccc.is_check_command_allowlisted(["python3"], self.project_root, self.resolved_cwd)
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "bare_interpreter_repl_or_stdin")
+
+    def test_lone_dash_stdin_script_argument_denied(self) -> None:
+        allowed, reason = ccc.is_check_command_allowlisted(["python3", "-"], self.project_root, self.resolved_cwd)
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "stdin_script_argument")
+
+    def test_allowed_python3_plus_project_script(self) -> None:
+        self._write_script("chk.py")
+        allowed, reason = ccc.is_check_command_allowlisted(["python3", "chk.py"], self.project_root, self.resolved_cwd)
+        self.assertTrue(allowed, reason)
+        self.assertEqual(reason, "allowed_interpreter_plus_project_script")
+
+    def test_allowed_node_plus_project_script(self) -> None:
+        self._write_script("chk.js", body="console.log(1)")
+        allowed, reason = ccc.is_check_command_allowlisted(["node", "chk.js"], self.project_root, self.resolved_cwd)
+        self.assertTrue(allowed, reason)
+
+    def test_python3_script_argument_traversal_refused(self) -> None:
+        allowed, reason = ccc.is_check_command_allowlisted(
+            ["python3", "../outside.py"], self.project_root, self.resolved_cwd
+        )
+        self.assertFalse(allowed)
+
+    def test_python3_script_argument_missing_file_refused(self) -> None:
+        allowed, reason = ccc.is_check_command_allowlisted(["python3", "nope.py"], self.project_root, self.resolved_cwd)
+        self.assertFalse(allowed)
+
+    def test_python3_absolute_script_argument_refused(self) -> None:
+        self._write_script("chk.py")
+        allowed, reason = ccc.is_check_command_allowlisted(
+            ["python3", str(self.project_root / "chk.py")], self.project_root, self.resolved_cwd
+        )
+        self.assertFalse(allowed)
+
+    def test_python3_flag_before_script_argument_refused(self) -> None:
+        self._write_script("chk.py")
+        allowed, reason = ccc.is_check_command_allowlisted(
+            ["python3", "-O", "chk.py"], self.project_root, self.resolved_cwd
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "unexpected_flag_before_script_argument")
+
+    def test_allowed_direct_project_owned_script(self) -> None:
+        self._write_script("chk.sh", body="#!/bin/sh\necho hi\n")
+        allowed, reason = ccc.is_check_command_allowlisted(["chk.sh"], self.project_root, self.resolved_cwd)
+        self.assertTrue(allowed, reason)
+        self.assertEqual(reason, "allowed_project_owned_script")
+
+    def test_symlinked_project_script_refused(self) -> None:
+        real_target = self.tmp / "outside-script.py"
+        real_target.write_text("pass", encoding="utf-8")
+        (self.project_root / "link.py").symlink_to(real_target)
+        allowed, reason = ccc.is_check_command_allowlisted(["link.py"], self.project_root, self.resolved_cwd)
+        self.assertFalse(allowed)
+
+    def test_unknown_argv0_not_a_project_file_refused(self) -> None:
+        allowed, reason = ccc.is_check_command_allowlisted(
+            ["some-random-tool"], self.project_root, self.resolved_cwd
+        )
+        self.assertFalse(allowed)
+        self.assertTrue(reason.startswith("argv0_not_allowlisted_interpreter_and_not_project_script"), reason)
+
+    def test_malformed_check_command_refused(self) -> None:
+        allowed, reason = ccc.is_check_command_allowlisted([], self.project_root, self.resolved_cwd)
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "check_command_malformed")
+
+
+class AuthorizeAutoRunAllowlistRegressionTests(unittest.TestCase):
+    """Task-spec regression (a): authorize-auto-run refuses to pin
+    authorization for a check_command shape the allowlist would refuse to
+    execute unattended anyway -- curl, bash -c, and python -c as three
+    separate cases."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="ccc-authz-allowlist-"))
+        self._counter = 0
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _authorize_with(self, check_command: list) -> tuple[int, str, str, Path]:
+        self._counter += 1
+        project_root = make_project_dir(self.tmp, f"p{self._counter}")
+        write_compat_check(project_root, [make_check_entry(check_command=check_command)])
+        code, out, err = _run_main(
+            ["authorize-auto-run", "--project-root", str(project_root), "--authorized-by", "alice", "--quiet"]
+        )
+        return code, out, err, project_root
+
+    def test_curl_refused(self) -> None:
+        code, out, err, project_root = self._authorize_with(["curl", "https://example.com"])
+        self.assertEqual(code, 4, out + err)
+        self.assertFalse((project_root / ccc.AUTO_RUN_AUTHORIZATION_RELATIVE_PATH).exists())
+
+    def test_bash_dash_c_refused(self) -> None:
+        code, out, err, project_root = self._authorize_with(["bash", "-c", "echo hi"])
+        self.assertEqual(code, 4, out + err)
+        self.assertFalse((project_root / ccc.AUTO_RUN_AUTHORIZATION_RELATIVE_PATH).exists())
+
+    def test_python_dash_c_refused(self) -> None:
+        code, out, err, project_root = self._authorize_with(["python3", "-c", "pass"])
+        self.assertEqual(code, 4, out + err)
+        self.assertFalse((project_root / ccc.AUTO_RUN_AUTHORIZATION_RELATIVE_PATH).exists())
+
+    def test_allowed_command_authorizes_and_hashes_the_referenced_script(self) -> None:
+        """Task-spec regression (b): authorize-auto-run succeeds, and
+        correctly hashes the referenced script file, for an allowed
+        command."""
+        project_root = make_project_dir(self.tmp, "p-good")
+        command = write_allowed_check_script(project_root, body="pass", name="check.py")
+        write_compat_check(project_root, [make_check_entry(check_command=command)])
+        code, out, err = _run_main(
+            ["authorize-auto-run", "--project-root", str(project_root), "--authorized-by", "alice", "--json"]
+        )
+        self.assertEqual(code, 0, out + err)
+        marker = json.loads((project_root / ccc.AUTO_RUN_AUTHORIZATION_RELATIVE_PATH).read_text(encoding="utf-8"))
+        expected_hash = hashlib.sha256((project_root / "check.py").read_bytes()).hexdigest()
+        self.assertEqual(marker["referenced_file_hashes"], {"check.py": expected_hash})
+        self.assertTrue(ccc.is_auto_run_authorized(project_root)[0])
+
+
+class ReferencedScriptTamperRegressionTests(unittest.TestCase):
+    """Task-spec regression (c) -- THE "Variant 2" gap the 4-model design
+    review named: compat-check.json's own bytes are untouched, but the
+    SCRIPT FILE its check_command names is swapped out after authorization.
+    This is the specific case that must FAIL against the pre-fix code
+    (schema-1 marker, hashing only compat-check.json's own bytes) and PASS
+    after this fix (schema-2 marker + referenced_file_hashes)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="ccc-tamper-"))
+        self.project_root = make_project_dir(self.tmp, "p")
+        self.command = write_allowed_check_script(self.project_root, body="print('original')", name="check.py")
+        write_compat_check(self.project_root, [make_check_entry(check_command=self.command)])
+        code, out, err = _run_main(
+            ["authorize-auto-run", "--project-root", str(self.project_root), "--authorized-by", "alice", "--quiet"]
+        )
+        assert code == 0, out + err
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_authorized_before_any_tampering(self) -> None:
+        self.assertTrue(ccc.is_auto_run_authorized(self.project_root)[0])
+
+    def test_editing_the_referenced_script_after_authorization_revokes_it(self) -> None:
+        """THE regression: compat-check.json is NOT touched at all here --
+        only the script file it points at is edited. Pre-fix, is_auto_run_
+        authorized() only ever compared compat-check.json's own hash (still
+        identical) and would have returned True here -- a silent, real gap
+        between "authorized" and "what this pin actually still covers"."""
+        (self.project_root / "check.py").write_text("print('TAMPERED')\n", encoding="utf-8")
+        authorized, reason = ccc.is_auto_run_authorized(self.project_root)
+        self.assertFalse(authorized, "editing the referenced script must revoke authorization")
+        self.assertEqual(reason, "referenced_file_hash_mismatch")
+
+    def test_deleting_the_referenced_script_after_authorization_revokes_it(self) -> None:
+        (self.project_root / "check.py").unlink()
+        authorized, reason = ccc.is_auto_run_authorized(self.project_root)
+        self.assertFalse(authorized)
+        self.assertEqual(reason, "referenced_file_set_changed")
+
+    def test_pointing_check_command_at_a_new_unhashed_file_revokes_it(self) -> None:
+        """The third named failure shape: compat-check.json changes to
+        reference a DIFFERENT (also real, also allowlisted) file that was
+        never part of the original authorization's hashed set."""
+        new_command = write_allowed_check_script(self.project_root, body="print('new')", name="other.py")
+        write_compat_check(self.project_root, [make_check_entry(check_command=new_command)])
+        authorized, reason = ccc.is_auto_run_authorized(self.project_root)
+        self.assertFalse(authorized)
+        # compat-check.json's OWN bytes also changed here (a different
+        # check_command was written), so its sha256 mismatches first --
+        # still a correct revocation, just via the outer gate rather than
+        # the referenced-file-set gate specifically.
+        self.assertEqual(reason, "auto_run_authorization_hash_mismatch")
+
+
+class SandboxWrapperTests(unittest.TestCase):
+    """run_one_check_sandboxed() -- task-spec item 3 and regression (e).
+    Real, unmocked probes against sandbox-exec on this actual machine (see
+    the module comment above run_one_check_sandboxed() in check_cross_
+    project_compatibility.py for how these same three properties were
+    first verified manually). Skipped outright if sandbox-exec is not
+    present -- reported, not silently assumed, per task scope."""
+
+    def setUp(self) -> None:
+        if not ccc.sandbox_exec_is_available():
+            self.skipTest("sandbox-exec not available on this machine")
+        self.tmp = Path(tempfile.mkdtemp(prefix="ccc-sandbox-"))
+        self.scratch_dir = self.tmp / "scratch"
+        self.scratch_dir.mkdir()
+        self.outside_dir = self.tmp / "outside"
+        self.outside_dir.mkdir()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_write_inside_scratch_dir_succeeds(self) -> None:
+        target = self.scratch_dir / "ok.txt"
+        outcome = ccc.run_one_check_sandboxed(
+            [sys.executable, "-c", f"open({str(target)!r}, 'w').write('ok')"],
+            self.tmp, 10.0, self.scratch_dir,
+        )
+        self.assertTrue(outcome["sandboxed"])
+        self.assertEqual(outcome["exit_code"], 0, outcome["stderr"])
+        self.assertEqual(target.read_text(encoding="utf-8"), "ok")
+
+    def test_write_outside_scratch_dir_is_denied(self) -> None:
+        target = self.outside_dir / "bad.txt"
+        outcome = ccc.run_one_check_sandboxed(
+            [sys.executable, "-c", f"open({str(target)!r}, 'w').write('bad')"],
+            self.tmp, 10.0, self.scratch_dir,
+        )
+        self.assertTrue(outcome["sandboxed"])
+        self.assertNotEqual(outcome["exit_code"], 0)
+        self.assertFalse(target.exists(), "sandbox must have refused the write, not silently allowed it")
+
+    def test_network_access_is_denied(self) -> None:
+        probe = (
+            "import socket\n"
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            "s.settimeout(3)\n"
+            "try:\n"
+            "    s.connect(('93.184.216.34', 80))\n"
+            "    print('CONNECTED')\n"
+            "except Exception as e:\n"
+            "    print('blocked:', type(e).__name__)\n"
+        )
+        outcome = ccc.run_one_check_sandboxed([sys.executable, "-c", probe], self.tmp, 10.0, self.scratch_dir)
+        self.assertTrue(outcome["sandboxed"])
+        self.assertEqual(outcome["exit_code"], 0, outcome["stderr"])
+        self.assertIn("blocked:", outcome["stdout"])
+        self.assertNotIn("CONNECTED", outcome["stdout"])
+
+    def test_unavailable_sandbox_exec_is_reported_not_assumed(self) -> None:
+        with mock.patch.object(ccc, "sandbox_exec_is_available", return_value=False):
+            outcome = ccc.run_one_check_sandboxed([sys.executable, "-c", "pass"], self.tmp, 5.0, self.scratch_dir)
+        self.assertFalse(outcome["sandboxed"])
+        self.assertIsNone(outcome["exit_code"])
 
 
 if __name__ == "__main__":

@@ -994,6 +994,189 @@ def _resolve_check_cwd(project_root: Path, relative: Any) -> tuple[Path | None, 
     return resolved_path, None
 
 
+# ---------------------------------------------------------------------------
+# check_command allowlist -- 2026-08-27 cross-audit "Variant 1" finding: the
+# authorize-auto-run marker (below) pins compat-check.json's own bytes, but
+# nothing ever constrained the SHAPE of a check_command a human could pin --
+# curl, osascript, `bash -c <anything>`, and a bare Python REPL over stdin
+# were all equally "authorizable" before this section existed. The fix: a
+# check_command is only ever eligible for unattended execution if it is
+# EITHER a small, named list of known-safe interpreters invoking a real
+# script file the project itself owns, OR a script file the project itself
+# owns, invoked directly (its own shebang decides the interpreter). Anything
+# that can execute arbitrary inline code via a flag, or is a known network/
+# exfiltration-capable binary, is refused outright regardless of arguments.
+#
+# Wired into TWO call sites (belt and suspenders): cmd_authorize_auto_run()
+# refuses to even PIN authorization for a bad entry, and
+# _execute_one_project_plan() re-checks it immediately before every Popen
+# when this run is operating under --require-auto-run-authorization, as
+# defense-in-depth against a hypothetical bug in the first gate. Deliberately
+# NOT applied to a plain, unqualified `run --authorize-project X`
+# (require_auto_run_authorization defaulting to False): that call shape is a
+# HUMAN directly taking responsibility for whatever check_command their own
+# project declares -- unrelated to the unattended-authorization gap this
+# section closes, and changing that long-standing, already-reviewed behavior
+# is out of scope here (see RequireAutoRunAuthorizationTests's own
+# "UNCHANGED by design" test for the property this preserves).
+# ---------------------------------------------------------------------------
+
+# Shells whose `-c` flag runs an arbitrary string as a full script -- refused
+# outright with -c present, regardless of what that string is. (Without -c,
+# invoking one of these by name still can't reach the "otherwise allowed"
+# branch below: none of them is in _ALLOWED_CHECK_INTERPRETERS, and a bare
+# name like "bash" is not itself a path into project_root either.)
+_SHELL_INLINE_CODE_DENYLIST = ("bash", "sh", "zsh", "dash")
+
+# Interpreters that can run arbitrary code via -c/-e, or drop into a REPL/
+# stdin-read with no script argument at all. python3 and node are ALSO the
+# two interpreters _ALLOWED_CHECK_INTERPRETERS permits below -- this denial
+# fires first and refuses those exact flags/shapes even for them.
+_INLINE_CODE_INTERPRETER_DENYLIST = ("python", "python3", "node")
+
+# Network- and exfiltration-capable binaries, refused outright regardless of
+# arguments -- an explicit, documented, easily-extended constant, not logic
+# scattered across the function below. Extend this tuple, not the function
+# body, to add a new one.
+_NETWORK_EXFIL_DENYLIST = (
+    "curl", "wget", "wget2", "curlie", "xh", "httpie", "http", "https",
+    "nc", "ncat", "netcat", "socat",
+    "ssh", "scp", "sftp", "rsync",
+    "telnet", "ftp", "tftp",
+    "osascript",
+)
+
+# The ONLY interpreter names the "interpreter + project-owned script"
+# allowance (case (a) below) ever matches. Deliberately short: anything else
+# must instead be a script the project owns, invoked directly (case (b)).
+_ALLOWED_CHECK_INTERPRETERS = ("python3", "node")
+
+
+def _resolve_argv_path_within_project_root(
+    value: Any, project_root: Path, resolved_cwd: Path
+) -> tuple[Path | None, str | None]:
+    """Resolves one argv element -- an interpreter's script argument, or
+    argv[0] itself when it is meant to name a project-owned script file --
+    with the same symlink-component + resolved containment discipline
+    _resolve_check_cwd() already applies to a check entry's declared `cwd`,
+    adapted for a FILE target. `value` is interpreted relative to
+    `resolved_cwd` (never project_root directly), because that is the
+    actual directory the OS resolves a relative argv element against once
+    _run_one_check() spawns this argv with cwd=resolved_cwd.
+
+    `resolved_cwd` is trusted to ALREADY be _resolve_check_cwd()'s own
+    return value (every call site in this file passes exactly that) --
+    i.e. already fully resolved and already proven inside project_root.
+    That is why containment here is checked entirely in the RESOLVED
+    namespace (`project_root.resolve()`, joined against `resolved_cwd`
+    directly) rather than mixing it with an unresolved `project_root.
+    absolute()`: on a real machine where project_root's own path crosses an
+    OS-level symlink (e.g. macOS's /tmp -> /private/tmp, the same gotcha
+    _nearest_existing_ancestor_is_symlink()'s docstring names for a
+    different reason), `resolved_cwd` and an unresolved `project_root.
+    absolute()` are textually DIFFERENT strings for the same real
+    directory -- comparing across that mix made an always-valid path
+    spuriously fail containment (caught empirically, not theoretically, by
+    this file's own test suite once it ran through a real tempfile.
+    mkdtemp() root).
+
+    A leading '/' is refused outright (fails closed) rather than resolved
+    as an absolute path: every OTHER path-shaped input this file accepts
+    from a check-command author (`cwd` itself, via _resolve_check_cwd) is
+    relative-only by the same rule, and there is no case in this schema
+    where a project needs to name a file outside its own tree."""
+    if not _is_str(value) or not value or _has_control_chars(value) or "\x00" in value:
+        return None, "argv_path_invalid"
+    if value.startswith("/"):
+        return None, "argv_path_must_be_relative"
+    if "\\" in value:
+        return None, "argv_path_invalid_characters"
+    segments = value.split("/")
+    if any(seg in ("", "..") for seg in segments):
+        return None, "argv_path_unsafe_segment"
+
+    resolved_root = project_root.resolve(strict=False)
+    candidate = resolved_cwd / value
+    try:
+        candidate.relative_to(resolved_root)
+    except ValueError:
+        return None, "argv_path_outside_project_root"
+    if _has_symlink_component(candidate, resolved_root):
+        return None, "argv_path_symlink_component"
+
+    resolved_path = candidate.resolve(strict=False)
+    try:
+        resolved_path.relative_to(resolved_root)
+    except ValueError:
+        return None, "argv_path_outside_project_root"
+
+    try:
+        st = os.stat(resolved_path, follow_symlinks=False)
+    except OSError:
+        return None, "argv_path_missing"
+    if not stat.S_ISREG(st.st_mode):
+        return None, "argv_path_not_a_regular_file"
+    return resolved_path, None
+
+
+def is_check_command_allowlisted(
+    check_command: list, project_root: Path, resolved_cwd: Path
+) -> tuple[bool, str]:
+    """True only if `check_command` is safe to authorize/execute
+    unattended -- see this section's own module comment for the full
+    rationale. Fails closed (False) on any ambiguous or unresolvable shape;
+    never allows by default."""
+    if not isinstance(check_command, list) or not check_command or not all(_is_str(a) for a in check_command):
+        return False, "check_command_malformed"
+
+    argv0 = check_command[0]
+    rest = check_command[1:]
+    # Lowercased for the denylist/allowlist NAME comparisons only (never for
+    # path resolution below): both binary names this repo cares about here
+    # are conventionally lowercase, and refusing "CURL" to slip past a
+    # case-sensitive comparison is strictly safer than the alternative.
+    argv0_name = os.path.basename(argv0).lower()
+
+    # Universal, interpreter-independent: a lone '-' as an argument is the
+    # conventional "read the script from stdin" spelling for python/node/
+    # many other interpreters, and stdin content here is never anything
+    # this file has reviewed or hashed.
+    if "-" in rest:
+        return False, "stdin_script_argument"
+
+    if argv0_name in _SHELL_INLINE_CODE_DENYLIST and "-c" in rest:
+        return False, "shell_dash_c_denied"
+
+    if argv0_name in _INLINE_CODE_INTERPRETER_DENYLIST:
+        if not rest:
+            return False, "bare_interpreter_repl_or_stdin"
+        if "-c" in rest or "-e" in rest:
+            return False, "inline_code_flag_denied"
+
+    if argv0_name in _NETWORK_EXFIL_DENYLIST:
+        return False, "network_binary_denied"
+
+    if argv0_name in _ALLOWED_CHECK_INTERPRETERS:
+        if not rest:
+            return False, "missing_script_argument"
+        script_arg = rest[0]
+        if script_arg.startswith("-"):
+            # Fails closed on an unrecognized flag ahead of the script
+            # argument (e.g. `python3 -O script.py`) rather than trying to
+            # enumerate every interpreter flag that does and does not
+            # change what actually executes.
+            return False, "unexpected_flag_before_script_argument"
+        resolved_script, reason = _resolve_argv_path_within_project_root(script_arg, project_root, resolved_cwd)
+        if resolved_script is None:
+            return False, f"interpreter_script_argument_invalid:{reason}"
+        return True, "allowed_interpreter_plus_project_script"
+
+    resolved_argv0, reason = _resolve_argv_path_within_project_root(argv0, project_root, resolved_cwd)
+    if resolved_argv0 is None:
+        return False, f"argv0_not_allowlisted_interpreter_and_not_project_script:{reason}"
+    return True, "allowed_project_owned_script"
+
+
 def _compat_run_output_path(run_dir: Path, project_id: str) -> tuple[Path | None, str | None]:
     """THE point-of-use re-validation (invariant #2 in the module-section
     docstring above): project_id is re-checked here, immediately before it
@@ -1382,8 +1565,95 @@ def _validate_compat_check_document(doc: Any, project_root: Path) -> tuple[list[
 # re-runs authorize-auto-run, by construction: there is no "authorize
 # forever" option and no way to authorize content that has not been read.
 AUTO_RUN_AUTHORIZATION_RELATIVE_PATH = Path(".orca") / "context" / "compat-auto-run-authorization.json"
-AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION = 1
+# Bumped 1 -> 2 (2026-08-27 cross-audit "Variant 2" fix): schema 1's marker
+# pinned ONLY compat-check.json's own bytes -- a script that document's own
+# check_command pointed at could be swapped out afterward with the pin never
+# noticing. Schema 2 adds "referenced_file_hashes" (see
+# _compute_all_referenced_file_hashes()) alongside the original field; a
+# schema-1 marker on disk now fails is_auto_run_authorized() outright
+# (schema_version mismatch) rather than being silently reinterpreted as
+# "authorized with an empty referenced-file set" -- an old marker genuinely
+# never had that field reviewed and must not be treated as if it had.
+AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION = 2
 MAX_AUTO_RUN_AUTHORIZATION_BYTES = 4096
+# A referenced file (a project-owned script check_command names) is hashed
+# via one bounded read, same cap this file already applies to compat-
+# check.json itself (MAX_COMPAT_CHECK_BYTES) -- large enough for any real
+# check script, small enough that hashing MAX_CHECKS_PER_COMPAT_DOCUMENT
+# worth of them can never be used to make authorize-auto-run or is_auto_run_
+# authorized() read an unbounded amount of data.
+MAX_REFERENCED_CHECK_FILE_BYTES = 2 * 1024 * 1024
+
+
+def _compute_referenced_file_hashes(
+    check_command: list, project_root: Path, resolved_cwd: Path
+) -> tuple[dict[str, str] | None, str | None]:
+    """For one check_command, sha256-hashes every argv ELEMENT that
+    resolves (via the SAME containment logic is_check_command_allowlisted()
+    uses) to a real file inside project_root -- not just argv[0]/argv[1],
+    so a project-owned config file or fixture passed as a later argument is
+    pinned too, not just the interpreter's own script argument.
+
+    Returns (None, reason) -- never a partial mapping -- the moment ANY
+    resolvable file cannot be safely hashed (unreadable, or too large for a
+    bounded read): a caller that authorized anyway on a partial mapping
+    would produce a marker that can never faithfully re-verify that file's
+    content, silently narrowing what "authorized" actually covers."""
+    resolved_root = project_root.resolve(strict=False)
+    hashes: dict[str, str] = {}
+    for value in check_command:
+        resolved_path, _reason = _resolve_argv_path_within_project_root(value, project_root, resolved_cwd)
+        if resolved_path is None:
+            continue
+        try:
+            relative_key = str(resolved_path.relative_to(resolved_root))
+        except ValueError:  # pragma: no cover -- unreachable given the resolver's own containment check
+            continue
+        try:
+            st = os.stat(resolved_path, follow_symlinks=False)
+        except OSError:
+            return None, f"referenced_file_unreadable:{relative_key}"
+        if st.st_size > MAX_REFERENCED_CHECK_FILE_BYTES:
+            return None, f"referenced_file_too_large:{relative_key}"
+        try:
+            with open(resolved_path, "rb") as fh:
+                payload = fh.read(MAX_REFERENCED_CHECK_FILE_BYTES + 1)
+        except OSError:
+            return None, f"referenced_file_unreadable:{relative_key}"
+        if len(payload) > MAX_REFERENCED_CHECK_FILE_BYTES:
+            return None, f"referenced_file_too_large:{relative_key}"
+        digest = hashlib.sha256(payload).hexdigest()
+        existing = hashes.get(relative_key)
+        if existing is not None and existing != digest:
+            return None, f"referenced_file_hash_disagreement:{relative_key}"
+        hashes[relative_key] = digest
+    return hashes, None
+
+
+def _compute_all_referenced_file_hashes(
+    entries: list, project_root: Path
+) -> tuple[dict[str, str] | None, str | None]:
+    """Merges _compute_referenced_file_hashes() over every validated check
+    entry (as produced by _validate_compat_check_document()), re-resolving
+    each entry's own `cwd` FRESH from its raw string -- same discipline as
+    _execute_one_project_plan's own per-entry re-resolution, and for the
+    same reason: trusting an earlier resolution here would let a sibling
+    entry's own check_command have rewritten what a LATER entry's cwd
+    points at before this function ever looks at it."""
+    merged: dict[str, str] = {}
+    for entry in entries:
+        resolved_cwd, cwd_reason = _resolve_check_cwd(project_root, entry["raw_cwd"])
+        if resolved_cwd is None:
+            return None, f"referenced_file_cwd_unresolvable:{cwd_reason}"
+        per_entry, reason = _compute_referenced_file_hashes(entry["check_command"], project_root, resolved_cwd)
+        if per_entry is None:
+            return None, reason
+        for key, value in per_entry.items():
+            existing = merged.get(key)
+            if existing is not None and existing != value:
+                return None, f"referenced_file_hash_disagreement:{key}"
+            merged[key] = value
+    return merged, None
 
 
 def _read_auto_run_authorization(project_root: Path) -> tuple[Any, str | None]:
@@ -1423,15 +1693,30 @@ def _read_auto_run_authorization(project_root: Path) -> tuple[Any, str | None]:
 def is_auto_run_authorized(project_root: Path) -> tuple[bool, str]:
     """The single question the auto-trigger must ask before it is allowed
     to spawn `run` unattended: has a human explicitly authorized THIS
-    project's CURRENT wiki/compat-check.json content, by its exact hash?
-    Both reads are fresh (no caching) so an edit made a second ago is
-    already enough to revoke a stale authorization -- this is the whole
-    point, not a race to close."""
-    _check_doc, check_reason, current_sha256 = _read_compat_check(project_root)
+    project's CURRENT wiki/compat-check.json content, by its exact hash --
+    AND every file its check_command(s) reference, by their own exact
+    hashes too (2026-08-27 "Variant 2" fix: the compat-check.json hash
+    alone says nothing about a SCRIPT FILE the document points at being
+    swapped out after authorization). Every read here is fresh (no
+    caching) so an edit made a second ago is already enough to revoke a
+    stale authorization -- this is the whole point, not a race to close."""
+    check_doc, check_reason, current_sha256 = _read_compat_check(project_root)
     if check_reason is not None:
         return False, check_reason
     if current_sha256 is None:
         return False, "compat_check_unhashable"
+
+    # Structural re-validation is required here (not just for compat-check
+    # .json's own bytes) to even know WHICH argv entries are referenced
+    # files worth hashing -- this mirrors run_compatibility_checks()'s own
+    # Phase-1 validation, over the same fresh read.
+    validated, violation_reason = _validate_compat_check_document(check_doc, project_root)
+    if violation_reason is not None:
+        return False, f"compat_check_invalid_for_auth:{violation_reason}"
+    computed_referenced_hashes, ref_reason = _compute_all_referenced_file_hashes(validated, project_root)
+    if computed_referenced_hashes is None:
+        return False, ref_reason
+
     auth_doc, auth_reason = _read_auto_run_authorization(project_root)
     if auth_reason is not None:
         return False, auth_reason
@@ -1442,6 +1727,22 @@ def is_auto_run_authorized(project_root: Path) -> tuple[bool, str]:
     authorized_sha256 = auth_doc.get("authorized_compat_check_sha256")
     if not _is_str(authorized_sha256) or authorized_sha256 != current_sha256:
         return False, "auto_run_authorization_hash_mismatch"
+
+    stored_referenced_hashes = auth_doc.get("referenced_file_hashes")
+    if not isinstance(stored_referenced_hashes, dict):
+        return False, "auto_run_authorization_missing_referenced_file_hashes"
+    # Fails closed on ALL THREE shapes the task spec names: a previously-
+    # referenced file now missing (its key would be absent from `computed`
+    # -- resolution fails on a missing file -- so the set comparison below
+    # catches it), a changed hash (the per-key comparison), or a NEW file
+    # now referenced that was never previously hashed (a key present in
+    # `computed` but absent from `stored` -- also the set comparison).
+    if set(stored_referenced_hashes.keys()) != set(computed_referenced_hashes.keys()):
+        return False, "referenced_file_set_changed"
+    for key, expected_hash in stored_referenced_hashes.items():
+        if not _is_str(expected_hash) or computed_referenced_hashes.get(key) != expected_hash:
+            return False, "referenced_file_hash_mismatch"
+
     return True, "authorized"
 
 
@@ -1517,6 +1818,25 @@ def cmd_authorize_auto_run(args: argparse.Namespace) -> int:
     if violation_reason is not None:
         return _emit_error(args, 4, "compat_check_invalid", violation_reason)
 
+    # 2026-08-27 cross-audit fix: a human must not even be OFFERED
+    # "authorize" for a check_command shape this file would refuse to run
+    # unattended anyway (arbitrary shell/inline-code execution, a known
+    # network/exfiltration binary, ...) -- see is_check_command_allowlisted()
+    # and its own module comment for the full rationale.
+    for entry in validated:
+        allowed, allow_reason = is_check_command_allowlisted(
+            entry["check_command"], project_root, entry["resolved_cwd"]
+        )
+        if not allowed:
+            return _emit_error(args, 4, "check_command_not_allowlisted", f"{entry['id']}:{allow_reason}")
+
+    # 2026-08-27 cross-audit "Variant 2" fix: pin every referenced file's own
+    # hash too, not just compat-check.json's -- see _compute_all_referenced_
+    # file_hashes()'s own docstring.
+    referenced_file_hashes, ref_reason = _compute_all_referenced_file_hashes(validated, project_root)
+    if referenced_file_hashes is None:
+        return _emit_error(args, 4, "referenced_file_hash_computation_failed", ref_reason)
+
     if not getattr(args, "quiet", False) and not getattr(args, "json", False):
         print(f"About to authorize unattended auto-run of {len(validated)} check(s) declared in")
         print(f"  {project_root / 'wiki' / 'compat-check.json'}  (sha256 {sha256_hex})")
@@ -1545,6 +1865,7 @@ def cmd_authorize_auto_run(args: argparse.Namespace) -> int:
     payload = {
         "schema_version": AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION,
         "authorized_compat_check_sha256": sha256_hex,
+        "referenced_file_hashes": referenced_file_hashes,
         "authorized_at": now.isoformat(),
         "authorized_by": args.authorized_by,
     }
@@ -1914,6 +2235,140 @@ def _run_one_check(argv: list[str], cwd: Path, timeout_seconds: float) -> dict[s
 
 
 # ---------------------------------------------------------------------------
+# Optional sandboxed execution -- NOT wired into any live call site (task
+# scope: build and test in isolation; a FUTURE stage may wire this into
+# _execute_one_project_plan() as a --sandbox opt-in). Verified empirically on
+# this real machine (macOS 27.0 / build 26A5378n) rather than assumed:
+# `sandbox-exec` IS present at /usr/bin/sandbox-exec and DOES still function,
+# but its own man page marks it DEPRECATED with no drop-in replacement for
+# this exact use case (Apple's suggested alternative, "App Sandbox", is an
+# entitlement-based mechanism for signed app bundles and does not apply to
+# confining an arbitrary already-declared check_command). Three real,
+# unmocked probes on this machine confirmed the profile below actually
+# enforces what it claims:
+#   1. a narrow `file-read*` scope limited to project_root + the interpreter
+#      binary's own literal path broke ordinary interpreter STARTUP outright
+#      (`execvp() ... failed: Operation not permitted`) -- launching python3
+#      needs to read its own Frameworks/shared-library tree, which is
+#      impractical to enumerate. `file-read*` is therefore allowed broadly;
+#      only WRITES and NETWORK are actually confined, which is also where
+#      the real risk this wrapper exists to contain actually lives.
+#   2. a `(subpath "/tmp/...")` write-allow directive silently matched
+#      NOTHING -- not even a write inside the intended scratch dir -- because
+#      macOS's /tmp is itself a symlink to /private/tmp (the exact gotcha
+#      this file's own _nearest_existing_ancestor_is_symlink() docstring
+#      names for a different reason). build_sandbox_profile_text() resolves
+#      the scratch dir with Path.resolve() before embedding it for this
+#      reason.
+#   3. with both of the above fixed, a real subprocess under this profile
+#      could write inside its own resolved scratch dir, could NOT write
+#      anywhere else (PermissionError), and could NOT reach the network via
+#      either a DNS-based request or a raw-IP socket connect (both raised
+#      inside the sandboxed process, not merely failed to resolve a name).
+# ---------------------------------------------------------------------------
+
+SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec"
+
+
+def sandbox_exec_is_available() -> bool:
+    """True only on a real, present, executable /usr/bin/sandbox-exec.
+    Checked at the fixed system path rather than via a PATH search --
+    this file's existing convention (_DEFAULT_CHECK_PATH is never trusted
+    to a caller-controlled PATH either)."""
+    return sys.platform == "darwin" and os.path.isfile(SANDBOX_EXEC_PATH) and os.access(SANDBOX_EXEC_PATH, os.X_OK)
+
+
+def _seatbelt_string_literal(value: str) -> "str | None":
+    """Renders `value` as a Scheme string literal for a seatbelt profile,
+    REFUSING (None) rather than attempting to escape a `"`, a backslash, or
+    a control character -- none of which a real project_root/compat-runs-
+    root path should ever contain (this file already refuses control
+    characters in every OTHER path-shaped input via _has_control_chars()).
+    Getting this escaping wrong would silently build a profile that does
+    not enforce what its caller believes it enforces, which is worse than
+    refusing to build one at all."""
+    if not isinstance(value, str) or not value or _has_control_chars(value) or '"' in value or "\\" in value:
+        return None
+    return f'"{value}"'
+
+
+def build_sandbox_profile_text(scratch_dir: Path) -> "str | None":
+    """Builds the seatbelt profile text for run_one_check_sandboxed():
+    deny everything by default and deny network explicitly; allow the
+    process to actually launch (process-fork/process-exec) and read
+    anything (see the module comment above for why a narrower read scope
+    broke ordinary interpreter startup in real testing); allow writes ONLY
+    under `scratch_dir`'s own RESOLVED path (see the module comment's
+    gotcha #2 for why the resolved, not literal, path is required on this
+    OS). Returns None if `scratch_dir` cannot be safely embedded as a
+    profile literal -- the caller must treat that as "cannot sandbox",
+    never as "sandbox with an empty/default write scope"."""
+    resolved_scratch = scratch_dir.resolve(strict=False)
+    literal = _seatbelt_string_literal(str(resolved_scratch))
+    if literal is None:
+        return None
+    return (
+        "(version 1)\n"
+        "(deny default)\n"
+        "(deny network*)\n"
+        "(allow process-fork)\n"
+        "(allow process-exec)\n"
+        "(allow file-read*)\n"
+        f"(allow file-write*\n  (subpath {literal}))\n"
+        "(allow sysctl-read)\n"
+        "(allow mach-lookup)\n"
+        "(allow iokit-get-properties)\n"
+    )
+
+
+def run_one_check_sandboxed(
+    argv: list[str], cwd: Path, timeout_seconds: float, scratch_dir: Path
+) -> dict[str, Any]:
+    """Optional, NOT-wired-in sibling of _run_one_check(): runs the exact
+    same argv under the exact same timeout/output-capture/process-group-kill
+    discipline (by delegating to _run_one_check() itself for everything
+    except the argv prefix), wrapped in `sandbox-exec -p <profile> --`  so
+    the check_command cannot reach the network at all and cannot write
+    anywhere outside `scratch_dir`.
+
+    Callers must create `scratch_dir` themselves before calling this
+    (mirroring _run_one_check's own "cwd must already exist" contract) --
+    intended to be a fresh directory under the run's own compat-runs
+    staging root, never a shared or pre-existing one.
+
+    Returns the same shape _run_one_check() does, plus "sandboxed": True on
+    an actual sandboxed attempt, or a "refused" result (mirroring _run_one_
+    check's own non-finite-timeout guard shape) with "sandboxed": False if
+    sandbox-exec is unavailable on this OS, argv is malformed, or the
+    profile could not be safely built."""
+
+    def _refused(message: str) -> dict[str, Any]:
+        return {
+            "exit_code": None,
+            "timed_out": False,
+            "duration_seconds": 0.0,
+            "stdout": "",
+            "stdout_truncated": False,
+            "stderr": message,
+            "stderr_truncated": False,
+            "sandboxed": False,
+        }
+
+    if not sandbox_exec_is_available():
+        return _refused("refusing to run sandboxed: sandbox-exec is not available on this OS")
+    if not isinstance(argv, list) or not argv or not all(_is_str(a) for a in argv):
+        return _refused("refusing to run sandboxed: argv malformed")
+    profile_text = build_sandbox_profile_text(scratch_dir)
+    if profile_text is None:
+        return _refused("refusing to run sandboxed: scratch_dir path unsafe for a seatbelt profile literal")
+
+    sandboxed_argv = [SANDBOX_EXEC_PATH, "-p", profile_text, *argv]
+    result = _run_one_check(sandboxed_argv, cwd, timeout_seconds)
+    result["sandboxed"] = True
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Catalog freshness -- copied (not imported) from query_catalog.py's own
 # search_catalog() freshness block: verified_at missing, unparseable, OR
 # ahead of this clock all count as stale. Unprovable freshness must never
@@ -2145,9 +2600,22 @@ def _execute_one_project_plan(
     run_dir: Path,
     global_id: str,
     timeout_ceiling_seconds: float,
+    enforce_check_command_allowlist: bool = False,
 ) -> dict[str, Any]:
     """Phase 2 for one project whose Phase 1 (_load_one_project_plan)
-    returned ready=True: actually run its selected check_command(s)."""
+    returned ready=True: actually run its selected check_command(s).
+
+    `enforce_check_command_allowlist` -- False for every existing, already-
+    reviewed call shape (a human invoking `run` directly): unchanged by
+    design (see RequireAutoRunAuthorizationTests's own "UNCHANGED by design"
+    test). run_compatibility_checks() sets it True for a project only when
+    this run is operating under --require-auto-run-authorization AND that
+    project has ALREADY passed is_auto_run_authorized() -- at which point
+    this is pure defense-in-depth (2026-08-27 cross-audit): even if
+    cmd_authorize_auto_run()'s own allowlist gate had a bug that let a bad
+    check_command get pinned, this second, independent check -- right here,
+    immediately before the real Popen -- refuses that ONE check_command
+    rather than trusting the earlier gate."""
     result = plan["result"]
     project_root = plan["project_root"]
     checks_out: list[dict[str, Any]] = []
@@ -2185,6 +2653,32 @@ def _execute_one_project_plan(
                     }
                 )
                 continue
+
+            if enforce_check_command_allowlist:
+                allowed, allow_reason = is_check_command_allowlisted(entry["check_command"], project_root, fresh_cwd)
+                if not allowed:
+                    checks_out.append(
+                        {
+                            "id": entry["id"],
+                            "exit_code": None,
+                            "timed_out": False,
+                            "duration_seconds": 0.0,
+                            "stdout": "",
+                            "stdout_truncated": False,
+                            "stderr": (
+                                "check_command failed the unattended-execution allowlist "
+                                f"immediately before execution: {allow_reason}"
+                            ),
+                            "stderr_truncated": False,
+                            "check_command": list(entry["check_command"]),
+                            "resolved_cwd": str(fresh_cwd),
+                            "declared_timeout_seconds": entry["timeout_seconds"],
+                            "effective_timeout_seconds": min(entry["timeout_seconds"], timeout_ceiling_seconds),
+                            "reviewed_by": entry["reviewed_by"],
+                            "reviewed_at": entry["reviewed_at"],
+                        }
+                    )
+                    continue
 
             effective_timeout = min(entry["timeout_seconds"], timeout_ceiling_seconds)
             outcome = _run_one_check(entry["check_command"], fresh_cwd, effective_timeout)
@@ -2413,7 +2907,16 @@ def run_compatibility_checks(
                 continue
         project_results.append(
             _execute_one_project_plan(
-                plan, run_dir=run_dir, global_id=global_id, timeout_ceiling_seconds=timeout_ceiling_seconds
+                plan,
+                run_dir=run_dir,
+                global_id=global_id,
+                timeout_ceiling_seconds=timeout_ceiling_seconds,
+                # Defense-in-depth (2026-08-27 cross-audit), scoped to the
+                # SAME condition as the is_auto_run_authorized() re-check
+                # just above -- see _execute_one_project_plan's own
+                # docstring for why this must not apply to a plain,
+                # unqualified `run` invocation.
+                enforce_check_command_allowlist=require_auto_run_authorization,
             )
         )
 

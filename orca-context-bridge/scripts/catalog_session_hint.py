@@ -1199,9 +1199,22 @@ def claim_compat_trigger_slot(triggers_dir: Path, project_id: str, target_global
 # Any edit to compat-check.json after authorization changes its hash and
 # silently, correctly re-locks the trigger until a human re-authorizes.
 _AUTO_RUN_AUTHORIZATION_RELATIVE_PARTS = (".orca", "context", "compat-auto-run-authorization.json")
-_AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION = 1
+# Bumped 1 -> 2 in lockstep with check_cross_project_compatibility.py's own
+# AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION (2026-08-27 "Variant 2" fix: the
+# marker now ALSO pins every referenced script file's own hash, not just
+# compat-check.json's -- see is_compat_auto_run_authorized()'s own
+# docstring). TestAutoRunAuthorizationAgreesWithSource asserts these two
+# constants stay equal.
+_AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION = 2
 _MAX_AUTO_RUN_AUTHORIZATION_BYTES = 4096
 _MAX_COMPAT_CHECK_BYTES_FOR_AUTH_PRECHECK = 2 * 1024 * 1024
+# Kept equal (by the same anti-drift test) to check_cross_project_
+# compatibility.py's own MAX_REFERENCED_CHECK_FILE_BYTES -- otherwise the
+# two files could disagree on whether a given referenced file is "too large
+# to safely hash", which would let this pre-check and the authoritative
+# is_auto_run_authorized() reach different authorized/not-authorized
+# answers for the identical on-disk state.
+_MAX_REFERENCED_CHECK_FILE_BYTES = 2 * 1024 * 1024
 
 
 def _path_has_symlink_component(path: Path, root: Path) -> bool:
@@ -1321,13 +1334,204 @@ def _project_root_for_id(catalog: dict, project_id: str) -> "Path | None":
     return Path(chosen["real_path"])
 
 
+def _resolve_argv_path_for_hint(value: Any, project_root: Path, resolved_cwd: Path) -> "Path | None":
+    """Duplicated (in spirit, fail-closed/never-raises style matching this
+    file's existing duplicate helpers -- see _read_small_guarded_file's own
+    docstring for the established convention) from check_cross_project_
+    compatibility.py's _resolve_argv_path_within_project_root(). Returns
+    None on ANY ambiguity -- this pre-check only needs to know WHICH argv
+    entries point at project-owned files well enough to hash the same ones
+    authorize-auto-run pinned; a wrong or overly-conservative None here can
+    only make this pre-check refuse, never wrongly authorize. Collapsed to
+    a bare Path-or-None (no reason string) to match is_compat_auto_run_
+    authorized()'s own bool-only contract -- nothing here ever surfaces a
+    reason to a caller."""
+    try:
+        if not isinstance(value, str) or not value or "\x00" in value:
+            return None
+        if any(ord(ch) < 0x20 for ch in value):
+            return None
+        if value.startswith("/") or "\\" in value:
+            return None
+        segments = value.split("/")
+        if any(seg in ("", "..") for seg in segments):
+            return None
+
+        resolved_root = project_root.resolve(strict=False)
+        candidate = resolved_cwd / value
+        try:
+            candidate.relative_to(resolved_root)
+        except ValueError:
+            return None
+        if _path_has_symlink_component(candidate, resolved_root):
+            return None
+
+        resolved_path = candidate.resolve(strict=False)
+        try:
+            resolved_path.relative_to(resolved_root)
+        except ValueError:
+            return None
+
+        st = os.stat(resolved_path, follow_symlinks=False)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        return resolved_path
+    except _HookDeadline:
+        raise
+    except BaseException:
+        return None
+
+
+def _resolve_check_cwd_for_hint(project_root: Path, relative: Any) -> "Path | None":
+    """Duplicated (in spirit) from check_cross_project_compatibility.py's
+    _resolve_check_cwd() -- collapsed to Path-or-None, same rationale as
+    _resolve_argv_path_for_hint() above."""
+    try:
+        if not isinstance(relative, str) or not relative:
+            return None
+        if relative.startswith("/") or "\\" in relative or any(ord(ch) < 0x20 for ch in relative):
+            return None
+        segments = relative.split("/")
+        if any(seg == "" for seg in segments) or any(seg == ".." for seg in segments):
+            return None
+
+        resolved_root = project_root.resolve(strict=False)
+        candidate = resolved_root / relative
+        try:
+            candidate.relative_to(resolved_root)
+        except ValueError:
+            return None
+        if _path_has_symlink_component(candidate, resolved_root):
+            return None
+        resolved_path = candidate.resolve(strict=False)
+        try:
+            resolved_path.relative_to(resolved_root)
+        except ValueError:
+            return None
+        return resolved_path
+    except _HookDeadline:
+        raise
+    except BaseException:
+        return None
+
+
+def _extract_checks_for_hint(doc: Any) -> "list | None":
+    """Minimal, fail-closed shape check over a freshly-parsed compat-
+    check.json document -- just enough to know each entry's check_command
+    and cwd, the two fields _compute_referenced_file_hashes_for_hint()
+    needs. Deliberately narrower than check_cross_project_compatibility.
+    py's own _validate_compat_check_document() (no id/depends_on_ref/
+    timeout/reviewed_by/reviewed_at requirement): this pre-check's only
+    job is deciding whether to spawn `run`, which re-validates the FULL
+    schema authoritatively on its own regardless of what this function
+    decides. Returns None (fail closed) on any ambiguous shape rather than
+    skipping the offending entry -- an authorization pre-check must never
+    silently authorize against a PARTIAL reading of what it is authorizing."""
+    if not isinstance(doc, dict):
+        return None
+    checks = doc.get("checks")
+    if not isinstance(checks, list):
+        return None
+    extracted = []
+    for entry in checks:
+        if not isinstance(entry, dict):
+            return None
+        check_command = entry.get("check_command")
+        if not isinstance(check_command, list) or not check_command:
+            return None
+        if not all(isinstance(a, str) and a for a in check_command):
+            return None
+        cwd = entry.get("cwd")
+        if not isinstance(cwd, str) or not cwd:
+            return None
+        extracted.append({"check_command": check_command, "cwd": cwd})
+    return extracted
+
+
+def _compute_referenced_file_hashes_for_hint(
+    check_command: list, project_root: Path, resolved_cwd: Path
+) -> "dict | None":
+    """Duplicated (in spirit) from check_cross_project_compatibility.py's
+    _compute_referenced_file_hashes(): sha256 every argv element that
+    resolves to a real file inside project_root. Returns None (fail
+    closed) rather than a partial mapping the moment any resolvable file
+    cannot be safely read or exceeds _MAX_REFERENCED_CHECK_FILE_BYTES."""
+    try:
+        resolved_root = project_root.resolve(strict=False)
+        hashes: dict = {}
+        for value in check_command:
+            resolved_path = _resolve_argv_path_for_hint(value, project_root, resolved_cwd)
+            if resolved_path is None:
+                continue
+            try:
+                relative_key = str(resolved_path.relative_to(resolved_root))
+            except ValueError:
+                continue
+            # os.open, never builtins.open -- this file's own structural
+            # no-write-API test (test_no_write_api_appears_anywhere_in_the_
+            # source) enforces read-only-through-os.open as a hard rule for
+            # every function in this module, and this read is no exception.
+            # _resolve_argv_path_for_hint() already refused a symlinked
+            # path, so O_NOFOLLOW here is defense-in-depth, not the primary
+            # guard.
+            try:
+                fd = os.open(str(resolved_path), os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+            except OSError:
+                return None
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_REFERENCED_CHECK_FILE_BYTES:
+                    return None
+                payload = os.read(fd, _MAX_REFERENCED_CHECK_FILE_BYTES + 1)
+            finally:
+                os.close(fd)
+            if len(payload) > _MAX_REFERENCED_CHECK_FILE_BYTES:
+                return None
+            digest = hashlib.sha256(payload).hexdigest()
+            existing = hashes.get(relative_key)
+            if existing is not None and existing != digest:
+                return None
+            hashes[relative_key] = digest
+        return hashes
+    except _HookDeadline:
+        raise
+    except BaseException:
+        return None
+
+
+def _compute_all_referenced_file_hashes_for_hint(checks: list, project_root: Path) -> "dict | None":
+    """Merges _compute_referenced_file_hashes_for_hint() over every
+    extracted check entry, re-resolving each entry's own `cwd` fresh --
+    same discipline (and the same reason) as the authoritative _compute_
+    all_referenced_file_hashes()."""
+    merged: dict = {}
+    for entry in checks:
+        resolved_cwd = _resolve_check_cwd_for_hint(project_root, entry["cwd"])
+        if resolved_cwd is None:
+            return None
+        per_entry = _compute_referenced_file_hashes_for_hint(entry["check_command"], project_root, resolved_cwd)
+        if per_entry is None:
+            return None
+        for key, value in per_entry.items():
+            existing = merged.get(key)
+            if existing is not None and existing != value:
+                return None
+            merged[key] = value
+    return merged
+
+
 def is_compat_auto_run_authorized(catalog: dict, project_id: str) -> bool:
     """True only if a human has run check_cross_project_compatibility.py's
     `authorize-auto-run` for this exact project, against the exact bytes
-    wiki/compat-check.json currently holds. Fails closed on every
-    ambiguity -- unresolvable root, missing/unreadable/oversized/symlinked
-    file on either side, malformed JSON, wrong schema version, or a hash
-    that no longer matches -- never raises."""
+    wiki/compat-check.json currently holds AND every file its check_command
+    (s) reference, by their own exact hashes too (2026-08-27 "Variant 2"
+    fix -- see check_cross_project_compatibility.py's is_auto_run_
+    authorized() for the full rationale, duplicated here per this file's
+    own REUSE convention). Fails closed on every ambiguity -- unresolvable
+    root, missing/unreadable/oversized/symlinked file on either side,
+    malformed JSON, wrong schema version, a referenced file that is now
+    missing/changed/new-and-unhashed, or a hash that no longer matches --
+    never raises."""
     project_root = _project_root_for_id(catalog, project_id)
     if project_root is None or not project_root.is_dir():
         return False
@@ -1339,6 +1543,17 @@ def is_compat_auto_run_authorized(catalog: dict, project_id: str) -> bool:
     if check_bytes is None:
         return False
     current_sha256 = hashlib.sha256(check_bytes).hexdigest()
+
+    try:
+        check_doc = json.loads(check_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return False
+    checks_entries = _extract_checks_for_hint(check_doc)
+    if checks_entries is None:
+        return False
+    computed_referenced_hashes = _compute_all_referenced_file_hashes_for_hint(checks_entries, project_root)
+    if computed_referenced_hashes is None:
+        return False
 
     auth_path = project_root.joinpath(*_AUTO_RUN_AUTHORIZATION_RELATIVE_PARTS)
     auth_bytes = _read_small_guarded_file(auth_path, project_root, _MAX_AUTO_RUN_AUTHORIZATION_BYTES)
@@ -1353,7 +1568,18 @@ def is_compat_auto_run_authorized(catalog: dict, project_id: str) -> bool:
     if auth_doc.get("schema_version") != _AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION:
         return False
     authorized_sha256 = auth_doc.get("authorized_compat_check_sha256")
-    return isinstance(authorized_sha256, str) and authorized_sha256 == current_sha256
+    if not (isinstance(authorized_sha256, str) and authorized_sha256 == current_sha256):
+        return False
+
+    stored_referenced_hashes = auth_doc.get("referenced_file_hashes")
+    if not isinstance(stored_referenced_hashes, dict):
+        return False
+    if set(stored_referenced_hashes.keys()) != set(computed_referenced_hashes.keys()):
+        return False
+    for key, expected_hash in stored_referenced_hashes.items():
+        if not isinstance(expected_hash, str) or computed_referenced_hashes.get(key) != expected_hash:
+            return False
+    return True
 
 
 def spawn_compat_check(
@@ -2055,6 +2281,16 @@ def registration_entry(args: argparse.Namespace) -> dict:
         "-I",
         shlex.quote(str(Path(args.script_path))),
         "hook",
+        # 2026-08-27 fix: this printed/recommended snippet used to omit
+        # --no-compat-spawn entirely, meaning a human who pastes it verbatim
+        # into settings.json gets Gate D's background auto-trigger enabled
+        # by default with no explicit opt-in moment -- the opposite of this
+        # whole feature's own "human must explicitly decide" posture (see
+        # the module comment above spawn_compat_check() / --require-auto-
+        # run-authorization). Always included now; a human who has actually
+        # reviewed and wants the auto-trigger removes this flag themselves,
+        # which is a deliberate, visible edit rather than a silent default.
+        "--no-compat-spawn",
     ]
     if args.knowledge_root:
         command_parts.extend(["--knowledge-root", shlex.quote(str(Path(args.knowledge_root)))])
