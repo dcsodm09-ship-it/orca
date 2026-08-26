@@ -831,6 +831,42 @@ def _message_list(parsed: dict[str, Any] | None) -> list[Any]:
     return []
 
 
+def _extract_dispatch_id_from_worker_done(msg: dict[str, Any]) -> str | None:
+    """Structured-field extraction of the dispatch id a single `worker_done`
+    message actually reports -- exact field lookup, never a substring scan
+    of the whole serialized message. A raw `did in json.dumps(msg)` search
+    (the previous approach) false-positives whenever a watched id is a
+    PREFIX of another id present anywhere in the same message (e.g. watching
+    "dispatch-123" while the message mentions "dispatch-1234" in an
+    unrelated field). Checked shapes, in order: `dispatchId`/`dispatch_id`
+    directly on the message; the same keys inside a `payload` field, which
+    may arrive as a JSON-encoded string (the observed shape -- see
+    WaitCommandTests) or already as a nested dict; and a `dispatch` nested
+    object, mirroring `extract_dispatch_id()`'s own fallback shapes above."""
+    for key in ("dispatchId", "dispatch_id"):
+        value = msg.get(key)
+        if isinstance(value, str) and value:
+            return value
+    payload = msg.get("payload")
+    payload_obj: dict[str, Any] | None = None
+    if isinstance(payload, str):
+        payload_obj = _parse_json_loose(payload)
+    elif isinstance(payload, dict):
+        payload_obj = payload
+    if isinstance(payload_obj, dict):
+        for key in ("dispatchId", "dispatch_id"):
+            value = payload_obj.get(key)
+            if isinstance(value, str) and value:
+                return value
+    nested = msg.get("dispatch")
+    if isinstance(nested, dict):
+        for key in ("id", "dispatchId", "dispatch_id"):
+            value = nested.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
 def _find_matching_worker_done(parsed: dict[str, Any] | None, watched_ids: set[str]) -> dict[str, Any] | None:
     for msg in _message_list(parsed):
         if not isinstance(msg, dict):
@@ -838,12 +874,11 @@ def _find_matching_worker_done(parsed: dict[str, Any] | None, watched_ids: set[s
         msg_type = msg.get("type") or msg.get("message_type")
         if msg_type != "worker_done":
             continue
-        msg_text = json.dumps(msg, ensure_ascii=False)
-        for did in watched_ids:
-            if did and did in msg_text:
-                result = dict(msg)
-                result["_matched_dispatch_id"] = did
-                return result
+        found_id = _extract_dispatch_id_from_worker_done(msg)
+        if found_id and found_id in watched_ids:
+            result = dict(msg)
+            result["_matched_dispatch_id"] = found_id
+            return result
     return None
 
 
@@ -910,6 +945,35 @@ def _mark_journal_recovered_locked(matched_dispatch_id: str) -> None:
         )
 
 
+def _expand_watched_ids_with_remounts(watched_ids: set[str]) -> set[str]:
+    """Fold in any `remount_dispatch_ids` recorded against each watched id's
+    journal entry. A caller of `wait` only ever knows the ORIGINAL dispatch
+    id it passed to `start` -- but if that original submission hit the
+    false-positive stall, `_recover_from_stalled_false_positive()` mints a
+    brand-new dispatch id via a remounted worker-start, and the real,
+    eventual `worker_done` for the work carries THAT new id, never the
+    original. Without this expansion, `_find_matching_worker_done()` would
+    never match it and `wait` would time out even though the work genuinely
+    completed. Looked up fresh on every poll iteration (not once up front)
+    because a concurrent `start` call may still be mid-recovery -- and
+    therefore may mint a new remount id -- while this `wait` call is already
+    polling. Missing/unreadable journals are treated as "nothing to add",
+    never an error: a watched id with no journal at all is the common case
+    (its `start` never hit the stall in the first place)."""
+    expanded = set(watched_ids)
+    for did in list(watched_ids):
+        journal = find_journal_by_any_dispatch_id(did)
+        if journal is None:
+            continue
+        original = journal.get("original_dispatch_id")
+        if isinstance(original, str) and original:
+            expanded.add(original)
+        for remount_id in journal.get("remount_dispatch_ids") or []:
+            if isinstance(remount_id, str) and remount_id:
+                expanded.add(remount_id)
+    return expanded
+
+
 def cmd_wait(args: argparse.Namespace) -> int:
     watched_ids: set[str] = set(args.dispatch or [])
     timeout_ms = args.timeout_ms if args.timeout_ms is not None else DEFAULT_WAIT_TIMEOUT_MS
@@ -933,7 +997,12 @@ def cmd_wait(args: argparse.Namespace) -> int:
         proc = _orchestration_check(run_id=args.run, timeout_ms=chunk_ms)
         parsed = _parse_json_loose(proc.stdout)
 
-        revoked_hit = _find_capability_revoked_hit(parsed, watched_ids)
+        # Re-derived every iteration, not cached -- see
+        # _expand_watched_ids_with_remounts()'s own docstring for why a
+        # concurrent recovery mid-poll must still be picked up.
+        active_watched_ids = _expand_watched_ids_with_remounts(watched_ids)
+
+        revoked_hit = _find_capability_revoked_hit(parsed, active_watched_ids)
         if revoked_hit is not None:
             _print_json_stdout(
                 {
@@ -948,7 +1017,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
             )
             return EXIT_FAILURE
 
-        match = _find_matching_worker_done(parsed, watched_ids)
+        match = _find_matching_worker_done(parsed, active_watched_ids)
         if match is not None:
             matched_id = match.get("_matched_dispatch_id")
             # The ack id is the BATCH delivery id from this `check` call's
@@ -956,12 +1025,50 @@ def cmd_wait(args: argparse.Namespace) -> int:
             # -- a message's own "id" (e.g. "msg_...") is a different,
             # unrelated identifier and must not be used to ack.
             delivery_id = extract_delivery_id(parsed)
-            if isinstance(delivery_id, str) and delivery_id:
-                _orchestration_ack(run_id=args.run, delivery_id=delivery_id)
+            batch_messages = _message_list(parsed)
+            # `orca orchestration check --help` is explicit that --ack
+            # consumes the PRIOR WHOLE BATCH ("process every message before
+            # acknowledging") -- there is no per-message ack in the real
+            # CLI. Finding a match for OUR watched id(s) does not mean this
+            # call has processed every OTHER message the batch may also
+            # contain (a worker_done for a dispatch we are not watching, a
+            # question, an escalation); acking anyway would silently and
+            # permanently discard those. So we only ack when our matched
+            # message is the batch's ONLY message. Tradeoff, accepted
+            # deliberately: when other messages are present we leave the
+            # WHOLE batch (including our own already-found match) unacked,
+            # so a later `check` call -- from this process or another
+            # watcher -- will see it again; this may cost extra
+            # throughput/latency but never loses a sibling message.
+            ack_info: dict[str, Any]
+            if len(batch_messages) == 1:
+                if isinstance(delivery_id, str) and delivery_id:
+                    ack_proc = _orchestration_ack(run_id=args.run, delivery_id=delivery_id)
+                    ack_info = {"attempted": True, "ok": ack_proc.returncode == 0}
+                    if ack_proc.returncode != 0:
+                        ack_info["raw_stdout"] = ack_proc.stdout
+                        ack_info["raw_stderr"] = ack_proc.stderr
+                else:
+                    ack_info = {"attempted": False, "reason": "no_delivery_id_extracted"}
+            else:
+                ack_info = {
+                    "attempted": False,
+                    "reason": "batch_contains_other_messages",
+                    "batch_message_count": len(batch_messages),
+                }
             if matched_id:
                 _mark_journal_recovered_locked(matched_id)
-            _print_json_stdout({"ok": True, "matched_dispatch_id": matched_id, "message": match})
-            return EXIT_OK
+            ack_failed = ack_info.get("attempted") and not ack_info.get("ok", True)
+            result_payload = {
+                "ok": not ack_failed,
+                "matched_dispatch_id": matched_id,
+                "message": match,
+                "ack": ack_info,
+            }
+            if ack_failed:
+                result_payload["warning"] = "ack_failed"
+            _print_json_stdout(result_payload)
+            return EXIT_OK if not ack_failed else EXIT_FAILURE
         # No match this chunk -- loop again until the overall deadline.
 
 

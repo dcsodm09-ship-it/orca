@@ -375,6 +375,43 @@ class RealEnvelopeExtractionTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# `_find_matching_worker_done`: structured-field matching, not substring.
+# ---------------------------------------------------------------------------
+
+
+class MatchingHelperTests(unittest.TestCase):
+    def test_does_not_false_positive_on_watched_id_that_is_a_prefix_of_another(self) -> None:
+        # P2 regression: the previous implementation matched via
+        # `did in json.dumps(msg)` -- a raw substring search -- so watching
+        # "dispatch-1" would incorrectly match a message that only actually
+        # carries "dispatch-12" (a proper prefix relationship). Structured
+        # field extraction must compare the exact resolved id, not scan the
+        # serialized text.
+        message = {"id": "msg-p", "type": "worker_done", "payload": json.dumps({"dispatchId": "dispatch-12"})}
+        parsed = json.loads(ok_envelope({"messages": [message]}))
+        self.assertIsNone(
+            dg._find_matching_worker_done(parsed, {"dispatch-1"}),
+            "a watched id that is a strict prefix of the message's real id must never match",
+        )
+        # Sanity: the exact id still matches correctly.
+        match = dg._find_matching_worker_done(parsed, {"dispatch-12"})
+        self.assertIsNotNone(match)
+        self.assertEqual(match["_matched_dispatch_id"], "dispatch-12")
+
+    def test_matches_dispatch_id_nested_in_json_encoded_payload_string(self) -> None:
+        message = {"id": "msg-1", "type": "worker_done", "payload": json.dumps({"dispatchId": "d-1"})}
+        parsed = json.loads(ok_envelope({"messages": [message]}))
+        match = dg._find_matching_worker_done(parsed, {"d-1"})
+        self.assertIsNotNone(match)
+        self.assertEqual(match["_matched_dispatch_id"], "d-1")
+
+    def test_no_match_when_watched_id_absent_entirely(self) -> None:
+        message = {"id": "msg-1", "type": "worker_done", "payload": json.dumps({"dispatchId": "d-1"})}
+        parsed = json.loads(ok_envelope({"messages": [message]}))
+        self.assertIsNone(dg._find_matching_worker_done(parsed, {"d-completely-different"}))
+
+
+# ---------------------------------------------------------------------------
 # TerminalLock: real fcntl.flock semantics, no mocking.
 # ---------------------------------------------------------------------------
 
@@ -773,6 +810,95 @@ class WaitCommandTests(DispatchGuardTestCase):
         self.assertEqual(_key_for(ack_call), "check-ack")
         self.assertIn("delivery_abc", ack_call, "must ack using the batch deliveryId from result.deliveryId")
         self.assertNotIn("msg_1", ack_call, "must never ack using an unrelated per-message id")
+
+    def test_wait_does_not_ack_batch_containing_an_unrelated_sibling_message(self) -> None:
+        # P1 regression: the previous implementation found ONE matching
+        # worker_done and then acked the entire batch via the BATCH-level
+        # deliveryId -- silently discarding any OTHER message riding along
+        # in the same batch (a worker_done for a dispatch this call isn't
+        # watching, here "d-other-not-watched"). Confirmed against the real
+        # `orca orchestration check --help` text ("process every message
+        # before acknowledging" -- there is no per-message ack), the fix
+        # must refuse to ack while unrelated messages are still present.
+        matched_message = {"id": "msg_1", "type": "worker_done", "payload": json.dumps({"dispatchId": "d-1"})}
+        sibling_message = {
+            "id": "msg_2",
+            "type": "worker_done",
+            "payload": json.dumps({"dispatchId": "d-other-not-watched"}),
+        }
+        check_body = ok_envelope(
+            {
+                "runId": "run-1",
+                "deliveryId": "delivery_shared",
+                "messages": [matched_message, sibling_message],
+                "count": 2,
+            }
+        )
+        self.router.queue("check", cp([], 0, stdout=check_body))
+        # Deliberately NOT queuing "check-ack": if the code under test tried
+        # to ack this batch anyway, the router would raise on the unqueued
+        # call, failing this test outright.
+        code, out, _err = self.run_cli(["wait", "--run", "run-1", "--dispatch", "d-1", "--timeout-ms", "5000"])
+        self.assertEqual(code, dg.EXIT_OK)
+        self.assertIn("d-1", out)
+        self.assertEqual(
+            len(self.router.calls), 1, "must not attempt any ack call while the batch still has an unrelated message"
+        )
+        payload = json.loads(out)
+        self.assertFalse(payload["ack"]["attempted"])
+        self.assertEqual(payload["ack"]["reason"], "batch_contains_other_messages")
+
+    def test_wait_matches_via_remount_dispatch_id_when_only_original_was_watched(self) -> None:
+        # P1 regression: `_recover_from_stalled_false_positive()` mints a
+        # NEW dispatch id via a remounted worker-start and records it in the
+        # journal's remount_dispatch_ids[], but a caller of `wait` only ever
+        # passed the ORIGINAL id on the command line. Without folding the
+        # journal's remount ids into the active watched set, the remount's
+        # own real worker_done (which carries only the NEW id) can never
+        # match and `wait` would time out despite genuine completion.
+        dg.write_journal_atomic(
+            {
+                "original_dispatch_id": "orig-d-remount-wait",
+                "terminal_handle": "term-remount-wait",
+                "run_id": "run-remount",
+                "remount_count": 1,
+                "remount_dispatch_ids": ["remount-d-only"],
+                "created_at": "2026-08-01T00:00:00Z",
+                "last_attempt_at": "2026-08-01T00:00:00Z",
+                "captured_terminal_tail": "tail",
+                "status": "recovering",
+            }
+        )
+        message = {"id": "msg-r", "type": "worker_done", "payload": json.dumps({"dispatchId": "remount-d-only"})}
+        check_body = ok_envelope({"deliveryId": "delivery-remount", "messages": [message]})
+        self.router.queue("check", cp([], 0, stdout=check_body))
+        self.router.queue("check-ack", cp([], 0, stdout=ok_envelope({})))
+
+        code, out, _err = self.run_cli(
+            ["wait", "--run", "run-remount", "--dispatch", "orig-d-remount-wait", "--timeout-ms", "5000"]
+        )
+        self.assertEqual(
+            code, dg.EXIT_OK, "must recognize the remount's worker_done even though only the original id was watched"
+        )
+        self.assertIn("remount-d-only", out)
+
+    def test_wait_reports_failure_when_the_ack_call_itself_fails(self) -> None:
+        # P2 regression: cmd_wait previously called `_orchestration_ack(...)`
+        # and discarded its result entirely, so a real ack failure (stale
+        # delivery, transient orca-side error) was still reported as ok:true
+        # with exit 0.
+        message = {"id": "msg_1", "type": "worker_done", "payload": json.dumps({"dispatchId": "d-ackfail"})}
+        check_body = ok_envelope({"deliveryId": "delivery_ackfail", "messages": [message]})
+        self.router.queue("check", cp([], 0, stdout=check_body))
+        self.router.queue("check-ack", cp([], 1, stdout="", stderr="ack rejected: stale delivery"))
+
+        code, out, _err = self.run_cli(["wait", "--run", "run-1", "--dispatch", "d-ackfail", "--timeout-ms", "5000"])
+        self.assertNotEqual(code, dg.EXIT_OK, "must not silently report success when the ack itself failed")
+        payload = json.loads(out)
+        self.assertFalse(payload["ok"], "top-level ok must reflect the ack failure, not just the match")
+        self.assertEqual(payload.get("warning"), "ack_failed")
+        self.assertTrue(payload["ack"]["attempted"])
+        self.assertFalse(payload["ack"]["ok"])
 
     def test_wait_times_out_honestly(self) -> None:
         # Queue generously more empty-message responses than any plausible
