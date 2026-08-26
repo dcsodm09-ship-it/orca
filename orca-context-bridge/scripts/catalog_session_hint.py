@@ -1566,6 +1566,36 @@ def render_compat_result_line(results: list, shown: int) -> str:
     )
 
 
+def _is_compat_result_fresh(result: dict, dependency_last_verified_at: "datetime | None") -> bool:
+    """True iff an existing Gate D result document is still the answer to
+    TODAY's question about the dependency, not a stale answer to what the
+    dependency looked like before it was re-verified again.
+
+    A result is fresh iff its own `written_at` (the moment
+    check_cross_project_compatibility.py's `_finalize_project_result`
+    actually computed and persisted it -- see that function's docstring)
+    is at or after the dependency's CURRENT `last_verified_at` (the same
+    `theirs` timestamp freshness_hits() already parsed for this exact hit,
+    passed in here rather than re-derived). If the dependency was
+    re-verified AFTER the result was written, the result is answering a
+    question about a version of the dependency that no longer exists.
+
+    Missing/unparseable timestamps on either side count as "not fresh":
+    this function's only two callers treat "not fresh" identically to "no
+    result found at all" (fall through to the normal spawn path), so an
+    untrustworthy timestamp must never be the reason a result is trusted
+    forever -- the same "every uncertainty is silence" discipline the rest
+    of this module already applies, just resolved toward re-checking
+    rather than toward showing nothing.
+    """
+    if dependency_last_verified_at is None:
+        return False
+    written_at = _parse_utc_timestamp(result.get("written_at"))
+    if written_at is None:
+        return False
+    return written_at >= dependency_last_verified_at
+
+
 def handle_compat_hits(
     hits: list,
     project_id: "str | None",
@@ -1581,11 +1611,24 @@ def handle_compat_hits(
 
       1. find_latest_compat_result() -- regardless of the spawn decision, so
          an EARLIER invocation's result is still surfaced even when THIS
-         invocation's debounce suppresses a new spawn.
-      2. only if nothing was found: when spawning is allowed (see below) AND
-         project_id is real AND this project has a live, human-granted
-         is_compat_auto_run_authorized() AND the Gate D script is found on
-         disk, claim_compat_trigger_slot() then spawn_compat_check().
+         invocation's debounce suppresses a new spawn. A result found this
+         way is surfaced ONLY if _is_compat_result_fresh() agrees it was
+         computed at or after the dependency's CURRENT last_verified_at --
+         a result written before the dependency's most recent re-check is
+         treated exactly like "nothing found" (falls through to step 2)
+         rather than being shown forever just because a file happens to
+         exist for this (project_id, target_global_id) pair. This is what
+         lets a dependency that changes AGAIN, after an earlier check
+         already answered for it, actually get re-checked.
+      2. only if nothing FRESH was found: when spawning is allowed (see
+         below) AND project_id is real AND this project has a live,
+         human-granted is_compat_auto_run_authorized() AND the Gate D
+         script is found on disk, claim_compat_trigger_slot() then
+         spawn_compat_check() -- the existing debounce marker still gates
+         this identically regardless of WHY nothing fresh was found (no
+         file at all, or a stale one), so a staleness-triggered re-check
+         still only spawns once per debounce window, never once per hook
+         invocation.
 
     spawn_allowed = not args.no_spawn and not args.no_compat_spawn --
     --no-spawn already means "never start a background process from this
@@ -1622,11 +1665,20 @@ def handle_compat_hits(
     )
     spawn_allowed = not args.no_spawn and not args.no_compat_spawn
 
+    # target_dep_ts[target_global_id] is that dependency's CURRENT
+    # last_verified_at ("theirs" from freshness_hits()'s own tuple), used
+    # below to judge whether an existing result is still fresh. Captured
+    # from the FIRST hit naming each target: `theirs` is the dependency
+    # capability's own timestamp, so every hit sharing the same target
+    # already agrees on it -- this is a dedup of an already-consistent
+    # value, not a choice between conflicting ones.
     targets: list = []
+    target_dep_ts: dict = {}
     for hit in hits:
         target = hit[1]
         if target not in targets:
             targets.append(target)
+            target_dep_ts[target] = hit[2]
         if len(targets) >= MAX_COMPAT_TARGETS_PER_HOOK:
             break
 
@@ -1646,8 +1698,14 @@ def handle_compat_hits(
             found = find_latest_compat_result(compat_runs_root, project_id, target_global_id, started)
             if found is not None:
                 doc, path = found
-                results.append((target_global_id, doc, path))
-                continue
+                if _is_compat_result_fresh(doc, target_dep_ts.get(target_global_id)):
+                    results.append((target_global_id, doc, path))
+                    continue
+                # Stale: the dependency was re-verified again since this
+                # result was written. Deliberately NOT `continue`-ing here
+                # -- fall through to the same spawn-a-new-check path used
+                # when nothing was found at all, still gated by the
+                # debounce marker below.
             if not spawn_allowed or not project_id:
                 continue
             if auto_run_authorized == "unknown":

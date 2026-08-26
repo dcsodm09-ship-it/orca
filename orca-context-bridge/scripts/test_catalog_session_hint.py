@@ -1856,6 +1856,73 @@ class GateDAutoTriggerTests(unittest.TestCase):
         self.assertIn(csh.SENTINEL_COMPAT_RESULT, text)
         self.assertFalse(self._wait_for_marker(1.0), "a fresh debounce marker must suppress a second spawn")
 
+    def test_stale_existing_result_is_treated_as_not_found_and_a_new_run_is_spawned(self) -> None:
+        """The dependency (proj/beta#dep-b, last_verified_at 2026-01-01) was
+        re-verified AGAIN after an earlier Gate D result (written_at
+        2025-06-01, i.e. BEFORE that) was computed -- that earlier result
+        answered a question about a version of the dependency that no
+        longer exists. handle_compat_hits() must treat it exactly like "no
+        result found at all": never show it as current, and fall through
+        to spawning a fresh check (still subject to the usual debounce/
+        authorization gates, both satisfied here)."""
+        self._install_gate_d_stub()
+        write_catalog(self.catalog, self._stale_dep_catalog())
+        run_dir = self.compat_runs_root / ("b" * 32)
+        result_dir = run_dir / "proj"
+        result_dir.mkdir(parents=True)
+        (result_dir / "alpha.json").write_text(
+            json.dumps({
+                "global_id": "proj/beta#dep-b", "project_id": "proj/alpha", "outcome": "ok",
+                "project_root": str(self.project_root), "compat_check_sha256": "x",
+                "checks": [], "warnings": [],
+                "written_at": "2025-06-01T00:00:00Z",  # BEFORE the dependency's 2026-01-01 last_verified_at
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self._authorize_auto_run()
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0)
+        self.assertTrue(
+            self._wait_for_marker(10.0),
+            "a stale existing result must not block spawning a fresh Gate D check",
+        )
+        text = context_of(proc.stdout.decode("utf-8"))
+        self.assertNotIn(
+            csh.SENTINEL_COMPAT_RESULT, text,
+            "a result computed before the dependency's latest re-verification must never be shown as current",
+        )
+
+    def test_fresh_existing_result_is_shown_with_no_new_spawn(self) -> None:
+        """Regression guard for the unchanged common case: an existing
+        result computed AFTER the dependency's current last_verified_at is
+        still the right answer and must keep being shown, with no
+        redundant Gate D run. Authorization is granted here (unlike the
+        plain 'debounced' test above) precisely so that a wrongly-triggered
+        spawn -- were the freshness check to regress -- would actually
+        happen and be caught by the marker assertion."""
+        self._install_gate_d_stub()
+        write_catalog(self.catalog, self._stale_dep_catalog())
+        run_dir = self.compat_runs_root / ("c" * 32)
+        result_dir = run_dir / "proj"
+        result_dir.mkdir(parents=True)
+        (result_dir / "alpha.json").write_text(
+            json.dumps({
+                "global_id": "proj/beta#dep-b", "project_id": "proj/alpha", "outcome": "ok",
+                "project_root": str(self.project_root), "compat_check_sha256": "x",
+                "checks": [], "warnings": [],
+                "written_at": "2026-06-01T00:00:00Z",  # AFTER the dependency's 2026-01-01 last_verified_at
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self._authorize_auto_run()
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0)
+        text = context_of(proc.stdout.decode("utf-8"))
+        self.assertIn(csh.SENTINEL_COMPAT_RESULT, text)
+        self.assertFalse(
+            self._wait_for_marker(1.0), "a still-fresh existing result must not trigger a redundant spawn"
+        )
+
     def test_the_only_write_anywhere_is_the_one_debounce_marker(self) -> None:
         self._install_gate_d_stub()
         write_catalog(self.catalog, self._stale_dep_catalog())
