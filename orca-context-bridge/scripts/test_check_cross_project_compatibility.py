@@ -2674,5 +2674,235 @@ class AutoRunAuthorizationTests(unittest.TestCase):
         self.assertEqual(reason, "auto_run_authorization_symlink_component")
 
 
+class AutoRunAuthorizationDirFdHardeningTests(unittest.TestCase):
+    """2026-08-26 cross-audit P1: atomic_write_within()'s (and the plain
+    final_path.unlink() revoke used to use) os.open(str(path), ...,
+    O_NOFOLLOW) only ever guards the FINAL path component -- if auth_dir
+    itself (.orca/context) is swapped for a symlink to somewhere OUTSIDE
+    project_root in the gap between the earlier _has_symlink_component()
+    check and the write/unlink, that check alone cannot stop it: the write
+    (or unlink) would silently follow the swapped directory. Simulated
+    deterministically (no real thread race needed) by patching
+    _has_symlink_component to report "not a symlink" -- exactly what it
+    correctly would have reported an instant before the swap -- while
+    auth_dir ALREADY is a symlink by the time the write/unlink actually
+    happens. Proves the WRITE PATH itself now refuses, not just the earlier
+    (already-existing, already-tested) check."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="ccc-authz-dirfd-"))
+        self.project_root = make_project_dir(self.tmp, "p")
+        write_compat_check(self.project_root, [make_check_entry()])
+        self.outside = self.tmp / "outside-target"
+        self.outside.mkdir()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _swap_auth_dir_for_symlink_to_outside(self) -> None:
+        auth_dir = self.project_root / ".orca" / "context"
+        auth_dir.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(auth_dir)
+        auth_dir.symlink_to(self.outside, target_is_directory=True)
+
+    def test_authorize_write_refuses_a_racily_symlinked_auth_dir(self) -> None:
+        self._swap_auth_dir_for_symlink_to_outside()
+        with mock.patch.object(ccc, "_has_symlink_component", return_value=False):
+            code, out, err = _run_main(
+                [
+                    "authorize-auto-run", "--project-root", str(self.project_root),
+                    "--authorized-by", "alice", "--quiet",
+                ]
+            )
+        self.assertEqual(code, 4, out + err)
+        # The actual exploit this closes: pre-fix, the marker would have
+        # been silently written into `outside` (following the symlink)
+        # instead of the write refusing outright.
+        self.assertEqual(list(self.outside.iterdir()), [])
+
+    def test_revoke_refuses_a_racily_symlinked_auth_dir_and_does_not_touch_the_target(self) -> None:
+        code, out, err = _run_main(
+            ["authorize-auto-run", "--project-root", str(self.project_root), "--authorized-by", "alice", "--quiet"]
+        )
+        self.assertEqual(code, 0, out + err)
+        marker_bytes = (self.project_root / ccc.AUTO_RUN_AUTHORIZATION_RELATIVE_PATH).read_bytes()
+        # A decoy file an attacker's pre-staged `outside` directory might
+        # plausibly already contain -- if revoke ever followed the swapped
+        # symlink, THIS is the file it would delete instead of refusing.
+        decoy = self.outside / ccc.AUTO_RUN_AUTHORIZATION_RELATIVE_PATH.name
+        decoy.write_bytes(marker_bytes)
+        shutil.rmtree(self.project_root / ".orca" / "context")
+        (self.project_root / ".orca" / "context").symlink_to(self.outside, target_is_directory=True)
+        with mock.patch.object(ccc, "_has_symlink_component", return_value=False):
+            code, out, err = _run_main(
+                ["revoke-auto-run", "--project-root", str(self.project_root), "--quiet"]
+            )
+        self.assertEqual(code, 4, out + err)
+        self.assertTrue(decoy.exists(), "revoke must not have followed the symlink and deleted the decoy")
+
+
+class RequireAutoRunAuthorizationTests(unittest.TestCase):
+    """2026-08-26 cross-audit P1 (most severe finding): is_auto_run_
+    authorized() used to be reachable ONLY from catalog_session_hint.py's
+    own pre-check, never from run_compatibility_checks()/cmd_run() -- the
+    one code path that actually executes third-party check_command. That
+    left (a) a TOCTOU window between the hook's pre-check and the
+    subprocess's own fresh read, and (b) no authorization concept at all
+    for a human (or script) invoking `run --authorize-project X` directly.
+    --require-auto-run-authorization threads a FRESH, per-project, checked
+    immediately-before-Phase-2 re-check into run_compatibility_checks()
+    itself."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="ccc-reqauth-"))
+        self.runs_root = self.tmp / "runs"
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _authorize(self, project_root: Path) -> None:
+        code, out, err = _run_main(
+            ["authorize-auto-run", "--project-root", str(project_root), "--authorized-by", "test", "--quiet"]
+        )
+        self.assertEqual(code, 0, out + err)
+
+    def test_unauthorized_project_is_skipped_not_executed_when_flag_set(self) -> None:
+        global_id = "t#x"
+        dep_dir = make_project_dir(self.tmp, "dep")
+        marker = self.tmp / "ran.txt"
+        write_compat_check(
+            dep_dir,
+            [
+                make_check_entry(
+                    depends_on_ref=global_id,
+                    check_command=[sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"],
+                )
+            ],
+        )
+        # Deliberately left unauthorized.
+        catalog = make_affected_catalog(global_id, "dep", projects=[make_project_row("dep", dep_dir)])
+        result = _run_compat(
+            catalog=catalog,
+            global_id=global_id,
+            authorize_project=["dep"],
+            compat_runs_root=self.runs_root,
+            require_auto_run_authorization=True,
+        )
+        self.assertEqual(result["projects"][0]["outcome"], "skipped")
+        self.assertEqual(result["projects"][0]["checks"], [])
+        codes = [w["code"] for w in result["projects"][0]["warnings"]]
+        self.assertIn("auto_run_not_authorized", codes)
+        self.assertFalse(marker.exists(), "check_command must not have executed for an unauthorized project")
+        # Still produces a normal per-project result entry with its own
+        # output file -- a missing authorization is a per-project skip, not
+        # a run abort.
+        self.assertTrue(Path(result["projects"][0]["output_path"]).exists())
+
+    def test_authorized_project_still_executes_when_flag_set(self) -> None:
+        global_id = "t#x"
+        dep_dir = make_project_dir(self.tmp, "dep")
+        write_compat_check(
+            dep_dir, [make_check_entry(depends_on_ref=global_id, check_command=[sys.executable, "-c", "pass"])]
+        )
+        self._authorize(dep_dir)
+        catalog = make_affected_catalog(global_id, "dep", projects=[make_project_row("dep", dep_dir)])
+        result = _run_compat(
+            catalog=catalog,
+            global_id=global_id,
+            authorize_project=["dep"],
+            compat_runs_root=self.runs_root,
+            require_auto_run_authorization=True,
+        )
+        self.assertEqual(result["projects"][0]["outcome"], "ok")
+        self.assertEqual(result["projects"][0]["checks"][0]["exit_code"], 0)
+
+    def test_one_unauthorized_project_does_not_block_a_second_authorized_one(self) -> None:
+        global_id = "t#x"
+        bad_dir = make_project_dir(self.tmp, "proj-bad")
+        good_dir = make_project_dir(self.tmp, "proj-good")
+        write_compat_check(
+            bad_dir, [make_check_entry(depends_on_ref=global_id, check_command=[sys.executable, "-c", "pass"])]
+        )
+        write_compat_check(
+            good_dir, [make_check_entry(depends_on_ref=global_id, check_command=[sys.executable, "-c", "pass"])]
+        )
+        self._authorize(good_dir)  # proj-bad deliberately left unauthorized
+        row = make_reverse_row(
+            in_degree=2,
+            referencing_project_ids=["proj-bad", "proj-good"],
+            referenced_by=[
+                make_edge(project_id="proj-bad", capability_global_id="proj-bad#dep"),
+                make_edge(project_id="proj-good", capability_global_id="proj-good#dep"),
+            ],
+        )
+        catalog = make_catalog(
+            reverse_index={global_id: row},
+            projects=[make_project_row("proj-bad", bad_dir), make_project_row("proj-good", good_dir)],
+            verified_at=fresh_iso(),
+        )
+        result = _run_compat(
+            catalog=catalog,
+            global_id=global_id,
+            authorize_project=["proj-bad", "proj-good"],
+            compat_runs_root=self.runs_root,
+            require_auto_run_authorization=True,
+        )
+        by_id = {r["project_id"]: r for r in result["projects"]}
+        self.assertEqual(by_id["proj-bad"]["outcome"], "skipped")
+        self.assertIn("auto_run_not_authorized", [w["code"] for w in by_id["proj-bad"]["warnings"]])
+        self.assertEqual(by_id["proj-good"]["outcome"], "ok")
+        self.assertEqual(by_id["proj-good"]["checks"][0]["exit_code"], 0)
+        self.assertTrue(Path(by_id["proj-bad"]["output_path"]).exists())
+        self.assertTrue(Path(by_id["proj-good"]["output_path"]).exists())
+
+    def test_unauthorized_project_still_executes_when_flag_is_not_set(self) -> None:
+        """Human-invoked `run` without the flag is UNCHANGED by design --
+        this preserves existing direct-invocation behavior on purpose."""
+        global_id = "t#x"
+        dep_dir = make_project_dir(self.tmp, "dep")
+        write_compat_check(
+            dep_dir, [make_check_entry(depends_on_ref=global_id, check_command=[sys.executable, "-c", "pass"])]
+        )
+        # Deliberately NOT authorized, and require_auto_run_authorization
+        # deliberately omitted (defaults to False).
+        catalog = make_affected_catalog(global_id, "dep", projects=[make_project_row("dep", dep_dir)])
+        result = _run_compat(
+            catalog=catalog, global_id=global_id, authorize_project=["dep"], compat_runs_root=self.runs_root
+        )
+        self.assertEqual(result["projects"][0]["outcome"], "ok")
+        self.assertEqual(result["projects"][0]["checks"][0]["exit_code"], 0)
+
+    def test_cli_flag_is_threaded_into_run_compatibility_checks(self) -> None:
+        """CLI-level proof that argparse --require-auto-run-authorization
+        actually reaches run_compatibility_checks() via cmd_run(), not just
+        that the pure function respects its own keyword arg (covered
+        above)."""
+        global_id = "t#x"
+        dep_dir = make_project_dir(self.tmp, "dep")
+        marker = self.tmp / "ran-cli.txt"
+        write_compat_check(
+            dep_dir,
+            [
+                make_check_entry(
+                    depends_on_ref=global_id,
+                    check_command=[sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"],
+                )
+            ],
+        )
+        catalog = make_affected_catalog(global_id, "dep", projects=[make_project_row("dep", dep_dir)])
+        catalog_path = self.tmp / "catalog.json"
+        _write_json(catalog_path, catalog)
+        code, out, err = _run_main(
+            [
+                "run", "--global-id", global_id, "--authorize-project", "dep",
+                "--catalog", str(catalog_path), "--compat-runs-root", str(self.runs_root),
+                "--require-auto-run-authorization",
+            ]
+        )
+        payload = json.loads(out)
+        self.assertEqual(payload["projects"][0]["outcome"], "skipped", out + err)
+        self.assertFalse(marker.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1225,26 +1225,53 @@ def _read_small_guarded_file(path: Path, root: Path, max_bytes: int) -> "bytes |
     _read_compat_check()/_read_auto_run_authorization(): this pre-check
     only ever needs to hash or parse, never to distinguish WHY a read
     failed the way the authoritative tool does for its own error
-    reporting."""
+    reporting.
+
+    Fix-round addition (2026-08-26 cross-audit P1): os.open(str(path), ...,
+    O_NOFOLLOW) on a path STRING only guards the FINAL path component -- if
+    path.parent (.orca/context, or wiki) is swapped for a symlink to a
+    DIFFERENT, already-authorized project's directory in the gap between
+    the _path_has_symlink_component() check above and the open, the open
+    would silently follow it: this pre-check could then be tricked into
+    reading THAT project's files while believing it read this one's,
+    wrongly concluding the CURRENT project is authorized. Opening
+    path.parent as a directory fd with O_NOFOLLOW right now, then opening
+    the leaf filename relative to that fd (dir_fd=, i.e. an openat(2)),
+    anchors the leaf read to the SPECIFIC parent-directory inode just
+    confirmed not to be a symlink, not to whatever the name "path.parent"
+    resolves to a moment later -- same technique as check_cross_project_
+    compatibility.py's own dir-fd hardening for its auto-run-authorization
+    write path. Plain os/pathlib only (no new import): this file is
+    stdlib-only by its own test suite's enforced convention
+    (test_the_dependency_surface_is_stdlib_only)."""
     if _path_has_symlink_component(path, root):
         return None
     try:
-        fd = os.open(str(path), os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+        dir_fd = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except _HookDeadline:
         raise
     except BaseException:
         return None
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+        try:
+            fd = os.open(path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        except _HookDeadline:
+            raise
+        except BaseException:
             return None
-        raw = os.read(fd, max_bytes + 1)
-    except _HookDeadline:
-        raise
-    except BaseException:
-        return None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+                return None
+            raw = os.read(fd, max_bytes + 1)
+        except _HookDeadline:
+            raise
+        except BaseException:
+            return None
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        os.close(dir_fd)
     if len(raw) > max_bytes:
         return None
     return raw
@@ -1253,24 +1280,45 @@ def _read_small_guarded_file(path: Path, root: Path, max_bytes: int) -> "bytes |
 def _project_root_for_id(catalog: dict, project_id: str) -> "Path | None":
     """Best-effort project_id -> real_path lookup for the pre-check only.
     Deliberately simpler than check_cross_project_compatibility.py's own
-    build_project_root_index(): a wrong or missing answer here only makes
-    this pre-check conservatively refuse (fails closed, same as any other
-    unreadable state) -- Gate D's own `run`, if it is ever actually
-    spawned, resolves project roots fresh and authoritatively on its own."""
+    build_project_root_index() (no warnings collection, no import of that
+    module -- see the module docstring's REUSE convention): a wrong or
+    missing answer here only makes this pre-check conservatively refuse
+    (fails closed, same as any other unreadable state) -- Gate D's own
+    `run`, if it is ever actually spawned, resolves project roots fresh and
+    authoritatively on its own.
+
+    Fix-round addition (2026-08-26 cross-audit P1, Codex-found): this used
+    to return the FIRST matching row by plain iteration order. If the
+    catalog ever carries more than one row for the same project_id (e.g. a
+    stale/staging entry left alongside the real one), that could disagree
+    with build_project_root_index()'s authoritative tie-break -- this
+    pre-check authorizing against a DIFFERENT physical directory than the
+    one Gate D's own executor actually resolves and runs check_command
+    against. Replicated here is the identical tie-break RULE build_project_
+    root_index() applies (prefer the single row with status == "ok"; if
+    that is not unique, sort ALL candidate rows by real_path and take the
+    first) so the two functions can never disagree on which real_path a
+    project_id names, for any catalog shape."""
     rows = catalog.get("projects")
     if not isinstance(rows, list):
         return None
+    candidates: list[dict] = []
     for row in rows:
         if not isinstance(row, dict) or row.get("project_id") != project_id:
             continue
         real_path = row.get("real_path")
         if not isinstance(real_path, str) or not real_path:
             continue
-        candidate = Path(real_path)
-        if not candidate.is_absolute():
+        if not Path(real_path).is_absolute():
             continue
-        return candidate
-    return None
+        candidates.append(row)
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return Path(candidates[0]["real_path"])
+    ok_rows = [row for row in candidates if row.get("status") == "ok"]
+    chosen = ok_rows[0] if len(ok_rows) == 1 else sorted(candidates, key=lambda row: row["real_path"])[0]
+    return Path(chosen["real_path"])
 
 
 def is_compat_auto_run_authorized(catalog: dict, project_id: str) -> bool:
@@ -1331,6 +1379,24 @@ def spawn_compat_check(
     trigger's results advisory rather than a silent production write, and
     it is verified by a test that inspects the exact argv list, not just
     that "something" was spawned.
+
+    --require-auto-run-authorization IS always in this argv (2026-08-26
+    cross-audit P1, the mirror image of the property above): is_compat_
+    auto_run_authorized() above is only ever a PRE-check that decides
+    whether this function gets called at all -- once Gate D's own `run` is
+    actually spawned, it re-reads wiki/compat-check.json and the auth
+    marker fresh, on its own, for every --authorize-project it was given.
+    Without this flag threaded into `run`'s own execution path
+    (run_compatibility_checks -> is_auto_run_authorized, checked
+    immediately before each project's Phase 2), a human invoking
+    check_cross_project_compatibility.py run --authorize-project X directly
+    -- or a TOCTOU edit landing in the gap between this hook's pre-check and
+    the subprocess's own fresh read -- would execute with no authorization
+    concept in the one function that actually runs third-party
+    check_command at all. Hardcoded and unconditional, exactly like
+    --authorize-production-write's absence above: not a variable, not
+    conditionally appended, verified by a test that inspects the exact argv
+    list.
     """
     try:
         subprocess.Popen(  # noqa: S603 - fixed argv, no shell, no user input
@@ -1340,6 +1406,7 @@ def spawn_compat_check(
                 "--authorize-project", project_id,
                 "--catalog", str(catalog_path),
                 "--compat-runs-root", str(compat_runs_root),
+                "--require-auto-run-authorization",
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,

@@ -1485,9 +1485,18 @@ class CompatTriggerArgvTests(unittest.TestCase):
                 "--authorize-project", "proj/alpha",
                 "--catalog", "/fake/catalog.json",
                 "--compat-runs-root", str(csh.COMPAT_RUNS_ROOT),
+                "--require-auto-run-authorization",
             ],
         )
         self.assertNotIn("--authorize-production-write", argv)
+        # 2026-08-26 cross-audit P1: the mirror-image property of the
+        # assertion above -- this flag must ALWAYS be present, not just
+        # present in this one call's argv, so Gate D's own execution path
+        # re-checks authorization immediately before running third-party
+        # check_command, closing the TOCTOU window between this hook's own
+        # pre-check (is_compat_auto_run_authorized) and the subprocess's
+        # fresh read.
+        self.assertIn("--require-auto-run-authorization", argv)
         self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
         self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
@@ -1694,6 +1703,7 @@ class GateDAutoTriggerTests(unittest.TestCase):
         self.assertEqual(tokens[tokens.index("--compat-runs-root") + 1], str(self.compat_runs_root))
         self.assertEqual(tokens[tokens.index("--catalog") + 1], str(self.catalog))
         self.assertNotIn("--authorize-production-write", tokens)
+        self.assertIn("--require-auto-run-authorization", tokens)
         self.assertTrue(self.triggers_dir.is_dir())
         self.assertEqual(len(list(self.triggers_dir.iterdir())), 1, "exactly one debounce marker")
 
@@ -2033,6 +2043,97 @@ class IsCompatAutoRunAuthorizedTests(unittest.TestCase):
             ccc.AUTO_RUN_AUTHORIZATION_RELATIVE_PATH.parts,
         )
         self.assertEqual(csh._AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION, ccc.AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION)
+
+
+class ReadSmallGuardedFileDirFdHardeningTests(unittest.TestCase):
+    """2026-08-26 cross-audit P1: _read_small_guarded_file()'s
+    os.open(str(path), ..., O_NOFOLLOW) only ever guarded path's FINAL
+    component -- if path.parent (.orca/context, or wiki) is swapped for a
+    symlink to a DIFFERENT, already-authorized project's directory in the
+    gap between the earlier _path_has_symlink_component() check and this
+    open, the read would silently follow it, and is_compat_auto_run_
+    authorized() could be tricked into reading that OTHER project's bytes
+    while believing it read this project's own. Simulated deterministically
+    (no real thread race needed) by patching the check to report "not a
+    symlink" -- exactly what it correctly would have reported an instant
+    before the swap -- while the parent directory ALREADY is one by the
+    time the read actually happens."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="csh-readguard-dirfd-"))
+        self.root = self.tmp / "proj"
+        (self.root / "wiki").mkdir(parents=True)
+        self.other_root = self.tmp / "other-proj"
+        (self.other_root / "wiki").mkdir(parents=True)
+        (self.other_root / "wiki" / "compat-check.json").write_bytes(b"OTHER PROJECT CONTENT")
+
+    def tearDown(self) -> None:
+        _make_writable(self.tmp)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_racily_symlinked_parent_directory_is_refused_not_followed(self) -> None:
+        shutil.rmtree(self.root / "wiki")
+        (self.root / "wiki").symlink_to(self.other_root / "wiki", target_is_directory=True)
+        target = self.root / "wiki" / "compat-check.json"
+        with mock.patch.object(csh, "_path_has_symlink_component", return_value=False):
+            result = csh._read_small_guarded_file(target, self.root, 4096)
+        self.assertIsNone(result, "must fail closed, not silently read the OTHER project's file")
+
+    def test_an_unswapped_parent_directory_still_reads_normally(self) -> None:
+        """Negative control: the dir-fd hardening above must not break the
+        ordinary, non-adversarial read this function exists to perform."""
+        (self.root / "wiki" / "compat-check.json").write_bytes(b"MY OWN CONTENT")
+        target = self.root / "wiki" / "compat-check.json"
+        result = csh._read_small_guarded_file(target, self.root, 4096)
+        self.assertEqual(result, b"MY OWN CONTENT")
+
+
+class ProjectRootForIdTieBreakTests(unittest.TestCase):
+    """2026-08-26 cross-audit P1 (Codex-found, verified by direct read):
+    _project_root_for_id() used to return the FIRST matching projects[] row
+    by plain iteration order. check_cross_project_compatibility.py's own
+    authoritative build_project_root_index() -- the function Gate D's `run`
+    actually uses to resolve where it executes check_command -- instead
+    prefers a row with status == "ok", then tie-breaks by sorting ALL
+    candidate rows by real_path. If the catalog ever carries two rows for
+    the same project_id (a stale/staging entry beside the real one), the
+    two functions could disagree on which physical directory the id names,
+    letting this hook authorize against one directory while Gate D executes
+    against another. check_cross_project_compatibility.py is imported HERE,
+    in the test process only, purely as an anti-drift oracle -- never at
+    runtime by catalog_session_hint.py itself (this file has no such
+    import; test_the_dependency_surface_is_stdlib_only enforces that),
+    matching this suite's existing convention for query_catalog.py."""
+
+    def test_agrees_with_build_project_root_index_when_one_row_is_ok(self) -> None:
+        import check_cross_project_compatibility as ccc  # test process only
+
+        rows = [
+            _project(project_id="proj/alpha", real_path="/fixtures/zzz-stale", status="stale"),
+            _project(project_id="proj/alpha", real_path="/fixtures/aaa-real", status="ok"),
+        ]
+        catalog = make_catalog(projects=rows)
+        authoritative_roots, _warnings = ccc.build_project_root_index(catalog)
+        got = csh._project_root_for_id(catalog, "proj/alpha")
+        self.assertEqual(got, authoritative_roots["proj/alpha"])
+        self.assertEqual(str(got), "/fixtures/aaa-real")
+
+    def test_agrees_with_build_project_root_index_lexicographic_tie_break(self) -> None:
+        import check_cross_project_compatibility as ccc  # test process only
+
+        rows = [
+            _project(project_id="proj/alpha", real_path="/fixtures/zzz", status="stale"),
+            _project(project_id="proj/alpha", real_path="/fixtures/aaa", status="stale"),
+        ]
+        catalog = make_catalog(projects=rows)
+        authoritative_roots, _warnings = ccc.build_project_root_index(catalog)
+        got = csh._project_root_for_id(catalog, "proj/alpha")
+        self.assertEqual(got, authoritative_roots["proj/alpha"])
+        self.assertEqual(str(got), "/fixtures/aaa")
+
+    def test_single_row_is_unaffected(self) -> None:
+        catalog = make_catalog(projects=[_project(project_id="proj/alpha", real_path="/fixtures/only")])
+        self.assertEqual(csh._project_root_for_id(catalog, "proj/alpha"), Path("/fixtures/only"))
 
 
 class RenderCompatResultLineTests(unittest.TestCase):

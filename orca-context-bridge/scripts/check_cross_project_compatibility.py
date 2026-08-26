@@ -1425,6 +1425,60 @@ def is_auto_run_authorized(project_root: Path) -> tuple[bool, str]:
     return True, "authorized"
 
 
+def _open_auth_dir_fd(auth_dir: Path) -> int:
+    """Dir-fd-anchored open of .orca/context, mirroring promote_capability.py's
+    _open_wiki_dir_fd_for_guard() (same bug class: os.open(str(path), ...,
+    O_NOFOLLOW) on a path STRING only guards the FINAL path component, so an
+    ANCESTOR swapped to a symlink between an earlier _has_symlink_component()
+    check and a later by-name open/write would still be silently followed).
+    Scoped here to ONLY the two auto-run authorize/revoke write paths below
+    (2026-08-26 cross-audit P1) -- NOT a change to the generic
+    atomic_write_within() helper or its other call sites in this file, which
+    the same audit round left as an accepted, different risk profile.
+
+    O_NOFOLLOW + O_DIRECTORY: the open itself refuses outright if auth_dir
+    has, in the brief unavoidable gap since the caller's own
+    _has_symlink_component() check, already become a symlink. The caller
+    MUST perform its write/unlink through this fd by filename only, never by
+    re-walking "<project_root>/.orca/context" as a path string -- a dir_fd
+    stays pinned to the SPECIFIC directory inode open() returned, regardless
+    of what that name resolves to afterwards. The caller owns the fd and
+    must close it."""
+    return os.open(str(auth_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+
+def _atomic_write_via_dir_fd(dir_fd: int, filename: str, payload: bytes) -> None:
+    """Same tmp-file + atomic-rename discipline as atomic_write_within(),
+    anchored to an already-open directory fd instead of a path string --
+    copied (in spirit) from promote_capability.py's atomic_write_in_dir():
+    os.replace() has no dir_fd-capable form on this platform (os.replace not
+    in os.supports_dir_fd, even though os.rename is), so os.rename(...,
+    src_dir_fd=, dst_dir_fd=) is used instead -- safe here because this
+    whole codepath already assumes POSIX (O_NOFOLLOW/O_DIRECTORY do not
+    exist on Windows either), and POSIX rename(2) already atomically
+    replaces an existing destination, the exact guarantee os.replace() adds
+    on top of os.rename() only for Windows' sake."""
+    tmp_name = f".{filename}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
+    fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    try:
+        try:
+            _write_all_bytes(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(tmp_name, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+
+
 def cmd_authorize_auto_run(args: argparse.Namespace) -> int:
     """Human-invoked only -- never called from catalog_session_hint.py or
     any other unattended path. Reads the project's CURRENT wiki/compat-
@@ -1457,6 +1511,16 @@ def cmd_authorize_auto_run(args: argparse.Namespace) -> int:
     except OSError as exc:
         return _emit_error(args, 4, "auto_run_authorization_dir_uncreatable", str(exc))
 
+    # Fix-round addition (2026-08-26 cross-audit P1): open a dir_fd for
+    # auth_dir RIGHT NOW, immediately after the symlink-component check
+    # above, and perform the entire write through that fd below -- never by
+    # re-walking auth_dir/final_path as strings. See _open_auth_dir_fd()'s
+    # own docstring for exactly what TOCTOU window this closes.
+    try:
+        auth_dir_fd = _open_auth_dir_fd(auth_dir)
+    except OSError as exc:
+        return _emit_error(args, 4, "auto_run_authorization_dir_unopenable", str(exc))
+
     now = datetime.now(timezone.utc)
     payload = {
         "schema_version": AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION,
@@ -1465,11 +1529,12 @@ def cmd_authorize_auto_run(args: argparse.Namespace) -> int:
         "authorized_by": args.authorized_by,
     }
     body = (json.dumps(payload, ensure_ascii=False, indent=1) + "\n").encode("utf-8")
-    final_path = project_root / AUTO_RUN_AUTHORIZATION_RELATIVE_PATH
     try:
-        atomic_write_within(auth_dir, final_path, body)
+        _atomic_write_via_dir_fd(auth_dir_fd, AUTO_RUN_AUTHORIZATION_RELATIVE_PATH.name, body)
     except OSError as exc:
         return _emit_error(args, 4, "auto_run_authorization_write_failed", str(exc))
+    finally:
+        os.close(auth_dir_fd)
 
     if getattr(args, "json", False):
         print(_sanitize_line_separators(json.dumps({"ok": True, **payload}, ensure_ascii=False)))
@@ -1485,13 +1550,30 @@ def cmd_revoke_auto_run(args: argparse.Namespace) -> int:
     final_path = project_root / AUTO_RUN_AUTHORIZATION_RELATIVE_PATH
     if _has_symlink_component(final_path, project_root):
         return _emit_error(args, 4, "auto_run_authorization_symlink_component", str(final_path))
+
+    # Fix-round addition (2026-08-26 cross-audit P1): same dir-fd-anchored
+    # discipline as cmd_authorize_auto_run's write above, mirrored for the
+    # unlink -- a missing auth_dir is the ordinary "never authorized" state
+    # and reports the same idempotent "nothing to revoke" outcome a missing
+    # final_path used to.
+    auth_dir = final_path.parent
     try:
-        final_path.unlink()
-        revoked = True
+        auth_dir_fd = _open_auth_dir_fd(auth_dir)
     except FileNotFoundError:
         revoked = False
     except OSError as exc:
-        return _emit_error(args, 4, "auto_run_authorization_unlink_failed", str(exc))
+        return _emit_error(args, 4, "auto_run_authorization_dir_unopenable", str(exc))
+    else:
+        try:
+            os.unlink(AUTO_RUN_AUTHORIZATION_RELATIVE_PATH.name, dir_fd=auth_dir_fd)
+            revoked = True
+        except FileNotFoundError:
+            revoked = False
+        except OSError as exc:
+            return _emit_error(args, 4, "auto_run_authorization_unlink_failed", str(exc))
+        finally:
+            os.close(auth_dir_fd)
+
     if getattr(args, "json", False):
         print(_sanitize_line_separators(json.dumps({"ok": True, "revoked": revoked}, ensure_ascii=False)))
     elif not getattr(args, "quiet", False):
@@ -2163,6 +2245,7 @@ def run_compatibility_checks(
     allow_stale_catalog: bool,
     timeout_ceiling_seconds: float,
     compat_runs_root: Path,
+    require_auto_run_authorization: bool = False,
 ) -> dict[str, Any]:
     # --- usage-level validation first: these are independent of any data in
     # the catalog and independent of the clock, so they are checked before
@@ -2282,14 +2365,37 @@ def run_compatibility_checks(
         _load_one_project_plan(project_id=project_id, global_id=global_id, project_roots=project_roots)
         for project_id in authorized_sorted
     ]
-    project_results = [
-        _finalize_project_result(plan["result"], run_dir, global_id)
-        if not plan["ready"]
-        else _execute_one_project_plan(
-            plan, run_dir=run_dir, global_id=global_id, timeout_ceiling_seconds=timeout_ceiling_seconds
+    project_results: list[dict[str, Any]] = []
+    for plan in plans:
+        if not plan["ready"]:
+            project_results.append(_finalize_project_result(plan["result"], run_dir, global_id))
+            continue
+        # Fix-round addition (2026-08-26 cross-audit P1, "is_auto_run_
+        # authorized() is never called from the one function that actually
+        # executes third-party check_command"): re-checked FRESH, right here,
+        # immediately before Phase 2 begins for THIS specific project -- as
+        # close to the real execution as this loop can put it, to minimize
+        # the TOCTOU window between this read and _execute_one_project_plan's
+        # own Popen. Deliberately NOT hoisted to the top of this function
+        # (before the affected-set/freshness checks): doing so would widen,
+        # not narrow, the gap between "authorization was confirmed" and
+        # "check_command actually runs" for every other authorized project
+        # still ahead of this one in `plans`. A human invoking `run` directly
+        # never sets require_auto_run_authorization, so this branch is a
+        # pure no-op for that existing, intentionally-unchanged call shape.
+        if require_auto_run_authorization:
+            authorized, auth_reason = is_auto_run_authorized(plan["project_root"])
+            if not authorized:
+                result = plan["result"]
+                result["outcome"] = "skipped"
+                result["warnings"].append({"code": "auto_run_not_authorized", "message": auth_reason})
+                project_results.append(_finalize_project_result(result, run_dir, global_id))
+                continue
+        project_results.append(
+            _execute_one_project_plan(
+                plan, run_dir=run_dir, global_id=global_id, timeout_ceiling_seconds=timeout_ceiling_seconds
+            )
         )
-        for plan in plans
-    ]
 
     ok_count = sum(1 for r in project_results if r["outcome"] == "ok")
     skipped_count = sum(1 for r in project_results if r["outcome"] == "skipped")
@@ -2406,6 +2512,20 @@ def build_parser() -> argparse.ArgumentParser:
             f"production path ({_PRODUCTION_DEFAULT_COMPAT_RUNS_ROOT}) instead of the "
             f"staging default ({COMPAT_RUNS_ROOT}), and allow an explicit "
             "--compat-runs-root that resolves to that same production path."
+        ),
+    )
+    run.add_argument(
+        "--require-auto-run-authorization",
+        action="store_true",
+        dest="require_auto_run_authorization",
+        help=(
+            "For each --authorize-project, additionally require a live, human-granted "
+            "authorize-auto-run marker (is_auto_run_authorized()) immediately before that "
+            "project's check_command(s) actually execute -- unauthorized projects are "
+            "skipped (outcome 'skipped', reason auto_run_not_authorized) rather than run. "
+            "catalog_session_hint.py's unattended SessionStart trigger always passes this; "
+            "a human invoking `run` directly is UNCHANGED and does not need it (this flag "
+            "is additive, not a replacement for --authorize-project)."
         ),
     )
 
@@ -2571,6 +2691,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             allow_stale_catalog=args.allow_stale_catalog,
             timeout_ceiling_seconds=args.timeout_ceiling_seconds,
             compat_runs_root=compat_runs_root,
+            require_auto_run_authorization=getattr(args, "require_auto_run_authorization", False),
         )
     except CheckFatal as exc:
         result = _run_result(4, exc.reason, global_id=getattr(args, "global_id", None), message=exc.message)
