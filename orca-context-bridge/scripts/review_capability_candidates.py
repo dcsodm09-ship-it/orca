@@ -152,6 +152,12 @@ Run with:
         --state {triaged_for_promotion,dismissed} --marked-by NAME
         [--note TEXT] [--apply-to-duplicate-cluster] [--allow-cross-project-cluster]
         [--hits-path PATH] [--json]
+    review_capability_candidates.py auto-dismiss
+        --criterion {non_primary_duplicate,iteration_round_artifact} [--criterion ...]
+        --marked-by NAME [--note TEXT] [--hits-path PATH] [--json]
+        Bulk `mark ... --state dismissed` over every hit still `pending` and
+        matching at least one selected, already-computed noise signal --
+        never a hit already triaged (see cmd_auto_dismiss's own docstring).
 """
 from __future__ import annotations
 
@@ -191,6 +197,17 @@ LOCK_STALE_SECONDS = 300
 
 MARKABLE_STATES = ("triaged_for_promotion", "dismissed")
 MAX_HITS_FILE_BYTES = 64 * 1024 * 1024
+
+# auto-dismiss's own selector vocabulary: EACH ONE NAMES AN ALREADY-COMPUTED,
+# ALREADY-DETERMINISTIC field discover_capability_candidates.py's `scan`
+# already writes onto every hit record -- never a new heuristic invented
+# here. "non_primary_duplicate" reads `duplicate_of` (non-null means noise
+# rule A's content-duplicate clustering already identified this hit as a
+# byte-identical copy of some other, "primary" hit); "iteration_round_
+# artifact" reads the literal `"iteration_round_artifact"` tag noise rule B
+# already appends to `noise_signals`. See that file's own module docstring,
+# NOISE RULES A/B, for exactly how/when each field is set.
+AUTO_DISMISS_CRITERIA = ("non_primary_duplicate", "iteration_round_artifact")
 
 
 class ReviewFatal(Exception):
@@ -724,6 +741,140 @@ def cmd_mark(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# auto-dismiss -- bulk `mark ... --state dismissed`, but for every PENDING
+# hit matching an already-computed, already-deterministic noise signal in
+# one pass, instead of one --hit-id at a time. Deliberately wires up ONLY
+# the two noise fields discover_capability_candidates.py's `scan` already
+# computes per hit (`duplicate_of`, `noise_signals` containing
+# "iteration_round_artifact") -- see AUTO_DISMISS_CRITERIA's own comment.
+# No new heuristic is introduced here.
+# ---------------------------------------------------------------------------
+
+
+def _hit_matches_auto_dismiss_criteria(hit: dict[str, Any], criteria: set[str]) -> bool:
+    if "non_primary_duplicate" in criteria and hit.get("duplicate_of") is not None:
+        return True
+    if "iteration_round_artifact" in criteria and "iteration_round_artifact" in _noise_signals(hit):
+        return True
+    return False
+
+
+def cmd_auto_dismiss(args: argparse.Namespace) -> int:
+    marked_by = (args.marked_by or "").strip()
+    if not marked_by:
+        return _emit_error(args, 2, "empty_marked_by")
+    # argparse's own `choices=` already constrains each --criterion value to
+    # AUTO_DISMISS_CRITERIA (exit 2 on a bad one before this function ever
+    # runs, same convention as `mark --state`), but at least one is still
+    # required -- `action="append"` leaves this None/empty when the flag was
+    # never passed at all, and a criteria-less bulk pass has no well-defined
+    # meaning (it is not "match everything": that would silently dismiss
+    # hits this command was never told to touch).
+    criteria = set(args.criterion or [])
+    if not criteria:
+        return _emit_error(args, 2, "empty_criteria", "at least one --criterion is required")
+
+    hits_path = Path(args.hits_path) if args.hits_path else default_hits_path(args.authorize_production_write)
+
+    # Same write-surface confinement as `mark`, copied verbatim (see that
+    # function's own inline comments for the exact reproductions each check
+    # closes): production-write authorization, hits_path basename pinned to
+    # HITS_NAME, parent directory must already exist (never os.makedirs()'d
+    # into existence), and the same unsuppressible production-write notice.
+    if args.hits_path and not args.authorize_production_write:
+        if os.path.realpath(str(hits_path)) == os.path.realpath(str(_PRODUCTION_DEFAULT_HITS_PATH)):
+            return _emit_error(
+                args, 2, "production_write_requires_authorization",
+                f"--hits-path resolves to the production default ({_PRODUCTION_DEFAULT_HITS_PATH}); "
+                "pass --authorize-production-write to write there",
+            )
+
+    if hits_path.name != HITS_NAME:
+        return _emit_error(args, 2, "invalid_hits_path_name", f"--hits-path must name a file called {HITS_NAME!r}")
+
+    output_dir = hits_path.parent
+    if not output_dir.is_dir():
+        return _emit_error(args, 4, "hits_file_missing", str(hits_path))
+    if os.path.islink(str(output_dir)):
+        return _emit_error(args, 4, "output_dir_is_symlink")
+
+    if os.path.realpath(str(hits_path)) == os.path.realpath(str(_PRODUCTION_DEFAULT_HITS_PATH)):
+        print(
+            "NOTICE: writing to manifests/capability-discovery/discovery-hits.json, this tool's own "
+            "default production path. M8-2's independent authorization gate (M8-DESIGN-FINAL-2026-08-23.md "
+            "section 3.3.3) has not been granted: the Gate C validation run measured a 44%-72% AI-judged "
+            "false-positive rate on a real 25-item sample (m8-gate-c-validation-STAGED-review-only/M8-GATE-C-VALIDATION-REPORT-2026-08-23.md section 2). "
+            "This output should not be treated as production-authoritative by anything that reads it.",
+            file=sys.stderr,
+        )
+
+    hits_final, reason = write_only_within(output_dir, str(hits_path))
+    if reason or hits_final is None:
+        return _emit_error(args, 2, reason or "invalid_hits_path")
+
+    try:
+        lock_path = acquire_lock(output_dir)
+    except ReviewFatal as exc:
+        return _emit_error(args, 4, exc.reason, exc.message)
+
+    try:
+        try:
+            doc = load_hits_document(hits_final)
+        except ReviewFatal as exc:
+            return _emit_error(args, 4, exc.reason, exc.message)
+
+        good, _skipped = partial_hits(doc)
+
+        # Scoped to `state == "pending"` ONLY -- a hit a human already
+        # marked `triaged_for_promotion` must never be silently flipped to
+        # `dismissed` just because it also happens to match a noise signal
+        # (e.g. it is a content-duplicate of something else, but THIS copy
+        # is the one a human deliberately chose to promote). This bulk pass
+        # only ever touches hits nobody has triaged yet, exactly like a
+        # human running `mark` one at a time would only ever act on hits
+        # they haven't already decided about.
+        set_at = now_iso()
+        affected_ids: list[str] = []
+        for h in good:
+            if h.get("state") != "pending":
+                continue
+            if not _hit_matches_auto_dismiss_criteria(h, criteria):
+                continue
+            h["state"] = "dismissed"
+            h["state_note"] = args.note
+            h["state_set_by"] = marked_by
+            h["state_set_at"] = set_at
+            affected_ids.append(h["hit_id"])
+
+        # `good` holds the SAME dict objects as doc["hits"] (partial_hits()
+        # only filters, never copies), same as `mark` above -- mutating `h`
+        # already mutated doc["hits"] in place. Skip the write entirely when
+        # nothing matched: an unconditional atomic_write_within() here would
+        # still be correct (it would just rewrite byte-identical content),
+        # but skipping it avoids bumping the file's mtime/inode on a no-op
+        # run, which matters to any future caller that treats "the file
+        # changed" as itself meaningful.
+        if affected_ids:
+            atomic_write_within(output_dir, hits_final, _encode_json(doc))
+    finally:
+        release_lock(lock_path)
+
+    result = {
+        "ok": True,
+        "criteria": sorted(criteria),
+        "marked_by": marked_by,
+        "affected_hit_ids": affected_ids,
+        "affected_count": len(affected_ids),
+    }
+    if not args.quiet:
+        if args.json:
+            print(_sanitize_line_separators(json.dumps(result, ensure_ascii=False, indent=1)))
+        else:
+            print(f"auto-dismissed {len(affected_ids)} hit(s) matching {sorted(criteria)}: {', '.join(affected_ids) or '(none)'}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -779,6 +930,30 @@ def build_parser() -> argparse.ArgumentParser:
     mark_p.add_argument("--json", action="store_true")
     mark_p.add_argument("--quiet", action="store_true")
     mark_p.set_defaults(func=cmd_mark)
+
+    auto_dismiss_p = subparsers.add_parser(
+        "auto-dismiss",
+        help="Write: bulk-dismiss every PENDING hit matching an already-computed, already-deterministic "
+             "noise signal (content-duplicate / iteration-round-artifact) in one pass.",
+    )
+    auto_dismiss_p.add_argument(
+        "--criterion", action="append", dest="criterion", choices=list(AUTO_DISMISS_CRITERIA), default=None,
+        help="Repeatable. 'non_primary_duplicate' matches hits with duplicate_of already set (noise rule A); "
+             "'iteration_round_artifact' matches hits noise rule B already tagged in noise_signals. "
+             "At least one is required.",
+    )
+    auto_dismiss_p.add_argument("--marked-by", type=str, required=True, dest="marked_by")
+    auto_dismiss_p.add_argument("--note", type=str, default=None)
+    auto_dismiss_p.add_argument("--hits-path", type=str, default=None, dest="hits_path")
+    auto_dismiss_p.add_argument(
+        "--authorize-production-write", action="store_true", dest="authorize_production_write",
+        help="Allow default_hits_path()/--hits-path to resolve to the real production discovery-hits.json "
+             "path (default: default falls back to the staging dir, and an explicit --hits-path pointing at "
+             "production is refused).",
+    )
+    auto_dismiss_p.add_argument("--json", action="store_true")
+    auto_dismiss_p.add_argument("--quiet", action="store_true")
+    auto_dismiss_p.set_defaults(func=cmd_auto_dismiss)
 
     return parser
 

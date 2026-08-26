@@ -166,6 +166,48 @@ def make_catalog_file(
     catalog_path.write_text(json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def make_discovery_hit(
+    hit_id: str,
+    *,
+    state: str = "triaged_for_promotion",
+    project_id: str = "proj-a",
+    signal_type: str = "capability:script",
+    path: str | None = None,
+    kind: str = "file",
+    root_real_path: str | None = None,
+    content_sha256: str | None = "deadbeef",
+) -> dict:
+    """A minimal, schema-shaped discovery_capability_candidates.py hit
+    record -- field names/values copied from that script's own
+    annotate_hits_for_root()/scan_root(), not invented for this test file."""
+    return {
+        "hit_id": hit_id,
+        "project_id": project_id,
+        "project_id_is_catalog_match": True,
+        "root_source": "explicit",
+        "root_real_path": root_real_path if root_real_path is not None else f"/scan-roots/{project_id}",
+        "signal_type": signal_type,
+        "path": path or f"scripts/{hit_id}.py",
+        "kind": kind,
+        "content_sha256": content_sha256,
+        "content_hash_status": "ok",
+        "duplicate_of": None,
+        "noise_signals": [],
+        "is_new_discovery": True,
+        "already_in_catalog_baseline": False,
+        "state": state,
+        "state_note": "looks legit",
+        "state_set_by": "a human reviewer",
+        "state_set_at": "2026-08-23T00:00:00Z",
+    }
+
+
+def make_discovery_hits_file(path: Path, hits: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = {"schema_version": 1, "generated_at": "2026-08-23T00:00:00Z", "hits": hits}
+    path.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
 def run_cli(argv: list[str]) -> tuple[int, str, str]:
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -515,6 +557,236 @@ class DraftCommandTests(PromoteCapabilityTestCase):
         self.write_catalog({})
         code, result, _err = self.draft_capability("../../etc")
         self.assertEqual(code, 1)
+
+
+# ---------------------------------------------------------------------------
+# CLI: draft-from-discovery-hit -- the Gate C -> Gate B bridge
+# ---------------------------------------------------------------------------
+
+
+class DraftFromDiscoveryHitTests(PromoteCapabilityTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.hits_path = self.tmp / "discovery-hits.json"
+
+    def _draft_from_hit(self, hit_id: str, **argv_extra) -> tuple[int, dict, str]:
+        argv = [
+            "draft-from-discovery-hit",
+            "--hit-id", hit_id,
+            "--hits-path", str(self.hits_path),
+            "--catalog", str(self.catalog_path),
+        ]
+        for flag, value in argv_extra.items():
+            argv += [flag, value]
+        return run_cli_json(argv)
+
+    # -- (a) happy path: triaged_for_promotion -> correctly-shaped candidate,
+    # source.mechanism set to the new non-human value ---------------------
+
+    def test_capability_hit_produces_staged_candidate_with_discovery_source(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        make_discovery_hits_file(self.hits_path, [
+            make_discovery_hit("hit-1", project_id="proj-a", signal_type="capability:script", path="scripts/my_script.py"),
+        ])
+
+        code, result, err = self._draft_from_hit("hit-1")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(result["status"], "pending_approval")
+        self.assertEqual(result["target_project"], "proj-a")
+        self.assertEqual(result["proposed_target"], "reusable-capabilities.json")
+        self.assertEqual(result["discovery_hit_id"], "hit-1")
+
+        candidate_file = self.promotion_root / "proj-a" / f"{result['candidate_id']}.json"
+        self.assertTrue(candidate_file.is_file())
+        record = json.loads(candidate_file.read_text(encoding="utf-8"))
+        self.assertEqual(record["kind"], "script")
+        self.assertEqual(record["path"], "scripts/my_script.py")
+        self.assertEqual(record["status"], "pending_approval")
+        # THE key assertion for the --confirm-non-human-source bridge:
+        self.assertEqual(record["source"]["mechanism"], pc.DISCOVERY_SOURCE_MECHANISM)
+        self.assertNotEqual(record["source"]["mechanism"], "human")
+        self.assertEqual(record["source"]["discovery_hit_id"], "hit-1")
+
+    def test_knowledge_hit_produces_staged_wiki_candidate(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        make_discovery_hits_file(self.hits_path, [
+            make_discovery_hit(
+                "hit-2", project_id="proj-a", signal_type="knowledge:reports_dir",
+                path="reports/SOME-REPORT.md", kind="file",
+            ),
+        ])
+
+        code, result, err = self._draft_from_hit("hit-2")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(result["proposed_target"], "orca-context-wiki.json")
+
+        candidate_file = self.promotion_root / "proj-a" / f"{result['candidate_id']}.json"
+        record = json.loads(candidate_file.read_text(encoding="utf-8"))
+        self.assertEqual(record["path"], "reports/SOME-REPORT.md")
+        self.assertEqual(record["source"]["mechanism"], pc.DISCOVERY_SOURCE_MECHANISM)
+        # Knowledge hits reference an ALREADY-EXISTING project file; this
+        # bridge never invents wiki/knowledge/<id>.md content on their
+        # behalf.
+        self.assertFalse(record["has_content_md"])
+
+    # -- confirm the --confirm-non-human-source gate actually fires at
+    # approve time for a discovery-derived candidate, end to end ----------
+
+    def test_discovery_derived_candidate_requires_confirm_non_human_source_to_approve(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        # path must match make_fake_project()'s own default fixture file
+        # (scripts/my_script.py) -- approve's post-write self-check
+        # (validate_document with check_paths=True) requires the path to
+        # actually exist under the target project root.
+        make_discovery_hits_file(self.hits_path, [
+            make_discovery_hit("hit-1", project_id="proj-a", path="scripts/my_script.py"),
+        ])
+        code, result, err = self._draft_from_hit("hit-1")
+        self.assertEqual(code, 0, err)
+
+        code2, result2, _e2 = run_cli_json([
+            "approve", "--candidate-id", result["candidate_id"], "--catalog", str(self.catalog_path),
+            "--approved-by", "t", "--rationale", "r",
+        ])
+        self.assertEqual(code2, 2)
+        self.assertEqual(result2["reason"], "confirm_non_human_source_required")
+
+        code3, result3, err3 = run_cli_json([
+            "approve", "--candidate-id", result["candidate_id"], "--catalog", str(self.catalog_path),
+            "--approved-by", "t", "--rationale", "r", "--confirm-non-human-source",
+        ])
+        self.assertEqual(code3, 0, err3)
+
+    # -- (b) refuses a hit that is still 'pending' or 'dismissed' ----------
+
+    def test_refuses_pending_hit(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        make_discovery_hits_file(self.hits_path, [make_discovery_hit("hit-1", project_id="proj-a", state="pending")])
+        code, result, _err = self._draft_from_hit("hit-1")
+        self.assertEqual(code, 1)
+        self.assertEqual(result["reason"], "discovery_hit_not_triaged_for_promotion")
+        # No candidate must have been staged.
+        self.assertFalse((self.promotion_root / "proj-a").exists())
+
+    def test_refuses_dismissed_hit(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        make_discovery_hits_file(self.hits_path, [make_discovery_hit("hit-1", project_id="proj-a", state="dismissed")])
+        code, result, _err = self._draft_from_hit("hit-1")
+        self.assertEqual(code, 1)
+        self.assertEqual(result["reason"], "discovery_hit_not_triaged_for_promotion")
+        self.assertFalse((self.promotion_root / "proj-a").exists())
+
+    def test_refuses_unknown_hit_id(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        make_discovery_hits_file(self.hits_path, [make_discovery_hit("hit-1", project_id="proj-a")])
+        code, result, _err = self._draft_from_hit("does-not-exist")
+        self.assertEqual(code, 1)
+        self.assertEqual(result["reason"], "discovery_hit_not_found")
+
+    # -- (c) attempted-attack-shaped: a discovery hit about project A must
+    # never become a candidate whose target_project is project B ----------
+
+    def test_cli_has_no_target_project_override_flag_at_all(self) -> None:
+        """The structural fix: there is no --target-project (or equivalent)
+        flag on this subcommand's argparser, so an attacker cannot even
+        EXPRESS "draft this hit into a different project" via the CLI --
+        argparse itself refuses the attempt with its own usage error,
+        before promote_capability.py's own code ever runs (same convention
+        this repo already uses for review_capability_candidates.py's
+        `mark --state <bad-value>`, see that test suite's own
+        test_mark_invalid_state_value_is_usage_error_via_argparse)."""
+        proj_a = self.make_project("proj-a")
+        self.make_project("proj-b")
+        self.write_catalog({"proj-a": proj_a})
+        make_discovery_hits_file(self.hits_path, [make_discovery_hit("hit-1", project_id="proj-a")])
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+            pc.main([
+                "draft-from-discovery-hit",
+                "--hit-id", "hit-1",
+                "--hits-path", str(self.hits_path),
+                "--catalog", str(self.catalog_path),
+                "--target-project", "proj-b",  # the attempted attack
+            ])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("unrecognized arguments", err.getvalue())
+        # And nothing was staged into EITHER project's directory.
+        self.assertFalse((self.promotion_root / "proj-a").exists())
+        self.assertFalse((self.promotion_root / "proj-b").exists())
+
+    def test_internal_payload_builder_ignores_everything_but_the_hits_own_project_id(self) -> None:
+        """Defense-in-depth, independent of the CLI-surface test above:
+        even calling the internal payload-builder directly, the ONLY
+        field it reads to decide target_project is the hit's own
+        `project_id` -- there is no parameter, kwarg, or nested field this
+        function accepts that could redirect it to a different project.
+        A hit whose OWN project_id says "proj-a" always produces a
+        candidate targeting "proj-a", full stop."""
+        hit = make_discovery_hit("hit-1", project_id="proj-a")
+        # Simulate a tampered/attacker-influenced record carrying an
+        # unrelated-looking extra field that might, in a buggier
+        # implementation, have been mistaken for an override.
+        hit["target_project"] = "proj-b"
+        hit["forced_target_project"] = "proj-b"
+        payload = pc._draft_payload_from_discovery_hit(hit)
+        self.assertEqual(payload["target_project"], "proj-a")
+
+    def test_hit_with_missing_project_id_is_refused_not_silently_untargeted(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        hit = make_discovery_hit("hit-1", project_id="proj-a")
+        del hit["project_id"]
+        make_discovery_hits_file(self.hits_path, [hit])
+        code, result, _err = self._draft_from_hit("hit-1")
+        self.assertEqual(code, 1)
+        self.assertEqual(result["reason"], "discovery_hit_missing_project_id")
+
+    # -- read-only on discovery-hits.json itself ---------------------------
+
+    def test_does_not_mutate_discovery_hits_file(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        make_discovery_hits_file(self.hits_path, [make_discovery_hit("hit-1", project_id="proj-a")])
+        before = self.hits_path.read_bytes()
+        code, result, err = self._draft_from_hit("hit-1")
+        self.assertEqual(code, 0, err)
+        after = self.hits_path.read_bytes()
+        self.assertEqual(before, after)
+
+    # -- other usage/fatal errors -------------------------------------------
+
+    def test_empty_hit_id_is_usage_error(self) -> None:
+        code, result, _err = run_cli_json([
+            "draft-from-discovery-hit", "--hit-id", "  ", "--hits-path", str(self.hits_path),
+            "--catalog", str(self.catalog_path),
+        ])
+        self.assertEqual(code, 2)
+        self.assertEqual(result["reason"], "empty_hit_id")
+
+    def test_missing_hits_file_is_fatal(self) -> None:
+        code, result, _err = run_cli_json([
+            "draft-from-discovery-hit", "--hit-id", "hit-1", "--hits-path", str(self.hits_path),
+            "--catalog", str(self.catalog_path),
+        ])
+        self.assertEqual(code, 4)
+        self.assertEqual(result["reason"], "discovery_hits_missing")
+
+    def test_unsupported_signal_type_is_refused(self) -> None:
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        make_discovery_hits_file(self.hits_path, [
+            make_discovery_hit("hit-1", project_id="proj-a", signal_type="something-unrecognized"),
+        ])
+        code, result, _err = self._draft_from_hit("hit-1")
+        self.assertEqual(code, 1)
+        self.assertEqual(result["reason"], "discovery_hit_signal_type_unsupported")
 
 
 # ---------------------------------------------------------------------------

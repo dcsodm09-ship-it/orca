@@ -45,7 +45,8 @@ def _run_dcc(argv: list[str]) -> tuple[int, str, str]:
 def make_hit(hit_id: str, *, state: str = "pending", content_sha256: str | None = "hash-x",
              path: str | None = None, project_id: str = "p", root_real_path: str | None = None,
              signal_type: str = "capability:script",
-             noise_signals: list[str] | None = None) -> dict:
+             noise_signals: list[str] | None = None,
+             duplicate_of: str | None = None) -> dict:
     # root_real_path defaults to a value derived from project_id (NOT the
     # same field, just a convenient default so existing callers that only
     # ever set project_id keep behaving the same way as before P1-1's fix
@@ -61,7 +62,7 @@ def make_hit(hit_id: str, *, state: str = "pending", content_sha256: str | None 
         "path": path or f"scripts/{hit_id}.py",
         "content_sha256": content_sha256,
         "noise_signals": noise_signals or [],
-        "duplicate_of": None,
+        "duplicate_of": duplicate_of,
         "state": state,
         "state_note": None,
         "state_set_by": None,
@@ -439,6 +440,142 @@ class MarkTests(BaseTestCase):
         doc = self.read_hits()
         self.assertEqual(doc["hits"][0]["state"], "triaged_for_promotion")
         self.assertEqual(doc["hits"][0]["state_set_by"], "second-tester")
+
+
+# ---------------------------------------------------------------------------
+# auto-dismiss -- bulk dismiss over already-computed, already-deterministic
+# noise signals (duplicate_of / iteration_round_artifact), pending hits only.
+# ---------------------------------------------------------------------------
+
+
+class AutoDismissTests(BaseTestCase):
+    def test_only_touches_hits_matching_the_selected_criterion(self) -> None:
+        self.write_hits([
+            make_hit("dup", duplicate_of="primary-hit"),
+            make_hit("unrelated"),
+        ])
+        code, out, err = _run_rcc([
+            "auto-dismiss", "--criterion", "non_primary_duplicate", "--marked-by", "tester",
+            "--hits-path", str(self.hits_path), "--json",
+        ])
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertEqual(payload["affected_hit_ids"], ["dup"])
+
+        by_id = {h["hit_id"]: h for h in self.read_hits()["hits"]}
+        self.assertEqual(by_id["dup"]["state"], "dismissed")
+        self.assertEqual(by_id["dup"]["state_set_by"], "tester")
+        # (d) -- the hit that does NOT match the selected criterion must be
+        # left completely untouched, not just "not dismissed".
+        self.assertEqual(by_id["unrelated"]["state"], "pending")
+        self.assertIsNone(by_id["unrelated"]["state_set_by"])
+        self.assertIsNone(by_id["unrelated"]["state_set_at"])
+
+    def test_iteration_round_artifact_criterion(self) -> None:
+        self.write_hits([
+            make_hit("round-art", noise_signals=["iteration_round_artifact"]),
+            make_hit("normal-content-dup", duplicate_of="x"),  # different criterion, not selected
+        ])
+        code, out, err = _run_rcc([
+            "auto-dismiss", "--criterion", "iteration_round_artifact", "--marked-by", "tester",
+            "--hits-path", str(self.hits_path), "--json",
+        ])
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertEqual(payload["affected_hit_ids"], ["round-art"])
+        by_id = {h["hit_id"]: h for h in self.read_hits()["hits"]}
+        self.assertEqual(by_id["round-art"]["state"], "dismissed")
+        self.assertEqual(by_id["normal-content-dup"]["state"], "pending")
+
+    def test_multiple_criteria_are_ORed_together(self) -> None:
+        self.write_hits([
+            make_hit("dup", duplicate_of="primary"),
+            make_hit("round-art", noise_signals=["iteration_round_artifact"]),
+            make_hit("plain"),
+        ])
+        code, out, err = _run_rcc([
+            "auto-dismiss",
+            "--criterion", "non_primary_duplicate", "--criterion", "iteration_round_artifact",
+            "--marked-by", "tester", "--hits-path", str(self.hits_path), "--json",
+        ])
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertEqual(set(payload["affected_hit_ids"]), {"dup", "round-art"})
+        by_id = {h["hit_id"]: h for h in self.read_hits()["hits"]}
+        self.assertEqual(by_id["plain"]["state"], "pending")
+
+    def test_never_touches_an_already_triaged_hit_even_if_it_matches(self) -> None:
+        """(d), the important half: a hit a human already marked
+        triaged_for_promotion (or dismissed) must never be silently
+        re-touched by a bulk pass just because it also happens to match a
+        noise signal -- e.g. it's the primary a human deliberately chose to
+        promote despite (or because of) being part of a duplicate cluster
+        some OTHER copy of which got auto-dismissed."""
+        self.write_hits([
+            make_hit("promoted-anyway", state="triaged_for_promotion", duplicate_of="primary"),
+            make_hit("already-dismissed", state="dismissed", noise_signals=["iteration_round_artifact"]),
+        ])
+        code, out, err = _run_rcc([
+            "auto-dismiss",
+            "--criterion", "non_primary_duplicate", "--criterion", "iteration_round_artifact",
+            "--marked-by", "tester", "--hits-path", str(self.hits_path), "--json",
+        ])
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertEqual(payload["affected_hit_ids"], [])
+        by_id = {h["hit_id"]: h for h in self.read_hits()["hits"]}
+        self.assertEqual(by_id["promoted-anyway"]["state"], "triaged_for_promotion")
+        self.assertEqual(by_id["already-dismissed"]["state"], "dismissed")
+
+    def test_empty_criteria_is_usage_error(self) -> None:
+        self.write_hits([make_hit("a")])
+        code, out, err = _run_rcc([
+            "auto-dismiss", "--marked-by", "tester", "--hits-path", str(self.hits_path),
+        ])
+        self.assertEqual(code, 2)
+        self.assertIn("empty_criteria", err)
+        # Nothing was touched.
+        self.assertEqual(self.read_hits()["hits"][0]["state"], "pending")
+
+    def test_empty_marked_by_is_usage_error(self) -> None:
+        self.write_hits([make_hit("a", duplicate_of="x")])
+        code, out, err = _run_rcc([
+            "auto-dismiss", "--criterion", "non_primary_duplicate", "--marked-by", "  ",
+            "--hits-path", str(self.hits_path),
+        ])
+        self.assertEqual(code, 2)
+        self.assertIn("empty_marked_by", err)
+
+    def test_invalid_criterion_value_is_usage_error_via_argparse(self) -> None:
+        self.write_hits([make_hit("a")])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+            rcc.main([
+                "auto-dismiss", "--criterion", "not-a-real-criterion", "--marked-by", "tester",
+                "--hits-path", str(self.hits_path),
+            ])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_zero_matches_is_success_with_empty_affected_list(self) -> None:
+        self.write_hits([make_hit("a"), make_hit("b")])
+        code, out, err = _run_rcc([
+            "auto-dismiss", "--criterion", "non_primary_duplicate", "--marked-by", "tester",
+            "--hits-path", str(self.hits_path), "--json",
+        ])
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertEqual(payload["affected_hit_ids"], [])
+        by_id = {h["hit_id"]: h for h in self.read_hits()["hits"]}
+        self.assertEqual(by_id["a"]["state"], "pending")
+        self.assertEqual(by_id["b"]["state"], "pending")
+
+    def test_missing_file_is_fatal(self) -> None:
+        code, out, err = _run_rcc([
+            "auto-dismiss", "--criterion", "non_primary_duplicate", "--marked-by", "tester",
+            "--hits-path", str(self.hits_path),
+        ])
+        self.assertEqual(code, 4)
+        self.assertIn("hits_file_missing", err)
 
 
 # ---------------------------------------------------------------------------

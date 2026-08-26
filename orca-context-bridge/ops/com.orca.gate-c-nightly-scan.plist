@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.orca.gate-c-nightly-scan.plist -- TEMPLATE ONLY.
+
+  Not installed by anything in this repo. Nothing here has run
+  `launchctl load` on this file. A human decides whether/when to install
+  it, and does so themselves -- see gate-c-nightly-scan.sh's own header
+  comment (same directory) for the exact install/uninstall commands.
+
+  BEFORE INSTALLING, a human must edit the ProgramArguments path below:
+  it is a PLACEHOLDER ("/REPLACE/ME/...") on purpose, not a working path,
+  so this template cannot be loaded as-is by accident. Point it at wherever
+  gate-c-nightly-scan.sh actually lives on the machine this is installed on
+  (that script's own body still uses fixed absolute paths for the Python
+  tool and its output, independent of where the .sh itself is copied to).
+
+  StartCalendarInterval below runs this once daily at 03:00 local time --
+  "nightly", picked as an approximation of "idle time" simple enough to
+  review at a glance; launchd has no first-class "the machine is idle"
+  trigger the way some other schedulers do. RunAtLoad is deliberately
+  false: this job should not fire immediately just because a human loaded
+  the agent (or the machine rebooted) -- only at its scheduled time.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.orca.gate-c-nightly-scan</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/REPLACE/ME/WITH/THE/REAL/PATH/TO/gate-c-nightly-scan.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Best-effort niceness: this is a full-tree filesystem walk (see
+         discover_capability_candidates.py's own module docstring on real
+         measured cost, up to ~5.5 minutes fleet-wide) -- lower scheduling
+         priority and I/O priority so a nightly run does not compete with
+         foreground work if the machine happens to still be in use. -->
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <!-- gate-c-nightly-scan.sh already writes its own timestamped log file
+         under manifests/capability-discovery-pending-authorization/runs/;
+         these just catch anything launchd itself has to say about the job
+         (e.g. failure to exec at all) so it isn't silently lost. -->
+    <key>StandardOutPath</key>
+    <string>/tmp/com.orca.gate-c-nightly-scan.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/com.orca.gate-c-nightly-scan.launchd.log</string>
+</dict>
+</plist>

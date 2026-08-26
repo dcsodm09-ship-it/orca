@@ -21,6 +21,17 @@ Subcommands
         Hand-authored JSON in, one pending_approval candidate out. Read-only
         with respect to every project's own files; writes only inside this
         tool's own staging root (see PROMOTION_ROOT below).
+    draft-from-discovery-hit  --hit-id ID --catalog PATH [--hits-path PATH] [--json]
+        The Gate C -> Gate B bridge: reads one already-triaged
+        ("triaged_for_promotion") record out of discover_capability_
+        candidates.py's own discovery-hits.json (read-only -- never mutates
+        that file; review_capability_candidates.py `mark` remains the only
+        thing that changes a hit's own triage state) and drafts it through
+        the SAME validate/dedup/write path `draft` itself uses, with
+        `source.mechanism` forced to a non-"human" value so `approve`'s
+        `--confirm-non-human-source` gate applies. `target_project` is
+        always the hit's own `project_id` -- there is no flag on this
+        subcommand that can point it at a different project.
     amend    --target-project ID --target "<kind>:<name>" --add-depends-on REF
              --source STR --catalog PATH [--json]
         Sugar for `draft` that produces an `operation: "amend_depends_on"`
@@ -286,6 +297,36 @@ OPERATION_VALUES = ("create", "amend_depends_on")
 _CONTROL_CHARS = ("\n", "\r", "\t", chr(0x2028), chr(0x2029), "\x00")
 
 CANDIDATE_SCHEMA_VERSION = 1
+
+# ---------------------------------------------------------------------------
+# discover_capability_candidates.py's discovery-hits.json -- READ-ONLY from
+# this file's point of view (see `draft-from-discovery-hit` below). These are
+# independently-maintained copies of that script's own literal constants
+# (this codebase's "copy, don't import" convention, M8 design 3.0.2): every
+# tool that touches a shared path/name keeps its own trust surface. Must
+# match discover_capability_candidates.py's `_STAGING_DEFAULT_OUTPUT_DIR` /
+# `_PRODUCTION_DEFAULT_OUTPUT_DIR` / `HITS_NAME` character-for-character.
+# ---------------------------------------------------------------------------
+_DISCOVERY_HITS_NAME = "discovery-hits.json"
+_DISCOVERY_HIT_TRIAGE_STATE_REQUIRED = "triaged_for_promotion"
+DISCOVERY_SOURCE_MECHANISM = "discovery-scan"
+_DISCOVERY_STAGING_DEFAULT_HITS_PATH = (
+    Path("/Volumes/Extreme SSD/Orca/manifests/capability-discovery-pending-authorization") / _DISCOVERY_HITS_NAME
+)
+_DISCOVERY_PRODUCTION_DEFAULT_HITS_PATH = (
+    Path("/Volumes/Extreme SSD/Orca/manifests/capability-discovery") / _DISCOVERY_HITS_NAME
+)
+MAX_DISCOVERY_HITS_BYTES = 64 * 1024 * 1024
+
+# Discovery signal_type -> reusable-capabilities.json `kind`. Only the two
+# capability-shaped signals discover_capability_candidates.py actually emits
+# have an entry here; "config-pattern" (a real KIND_VALUES member) has no
+# discovery-side detector today and is deliberately not guessed at.
+_DISCOVERY_SIGNAL_TYPE_TO_CAPABILITY_KIND = {
+    "capability:script": "script",
+    "capability:skill": "skill",
+}
+_DISCOVERY_KNOWLEDGE_SIGNAL_PREFIX = "knowledge:"
 
 
 class PromoteFatal(Exception):
@@ -2032,6 +2073,18 @@ def cmd_draft(args: argparse.Namespace) -> dict[str, Any]:
         raise PromoteUsageError("from_json_unreadable", str(exc)) from exc
     payload = _load_json_object(raw, label="candidate_input")
 
+    return _draft_from_payload(payload, args.catalog)
+
+
+def _draft_from_payload(payload: dict[str, Any], catalog_path: str) -> dict[str, Any]:
+    """The actual validate -> dedup -> write body of `draft`, factored out
+    so `draft-from-discovery-hit` can reuse the EXACT SAME
+    validation/dedup/candidate-writing path instead of duplicating it (per
+    this round's explicit instruction) -- the only difference between the
+    two callers is where `payload` comes from: a hand-authored --from-json
+    file for `draft`, or a payload synthesized from an already-triaged
+    discovery-hits.json record for `draft-from-discovery-hit`
+    (see `_draft_payload_from_discovery_hit()`)."""
     target_project = _validate_target_project(payload.get("target_project"))
     proposed_target = payload.get("proposed_target")
     if proposed_target not in PROPOSED_TARGETS:
@@ -2043,7 +2096,7 @@ def cmd_draft(args: argparse.Namespace) -> dict[str, Any]:
     else:
         fields = validate_knowledge_candidate_input(payload)
 
-    catalog = load_catalog(Path(args.catalog).expanduser())
+    catalog = load_catalog(Path(catalog_path).expanduser())
     project_roots = build_project_root_index(catalog)
     target_project_known = target_project in project_roots
     depends_on_resolution = resolve_depends_on_against_catalog(catalog, target_project, fields["depends_on"])
@@ -2142,6 +2195,196 @@ def cmd_draft(args: argparse.Namespace) -> dict[str, Any]:
         "possible_revision_of": possible_revision_of,
         "depends_on_resolution": depends_on_resolution,
     }
+
+
+# ---------------------------------------------------------------------------
+# cmd_draft_from_discovery_hit -- the Gate C -> Gate B bridge.
+#
+# Reads ONE record out of discover_capability_candidates.py's own
+# discovery-hits.json, READ-ONLY (this command never writes a byte to that
+# file -- transitioning a hit's own `state` stays review_capability_
+# candidates.py `mark`'s job alone, per that file's own module docstring).
+# Refuses (fail-closed) unless the hit's own triage `state` is already
+# "triaged_for_promotion", then builds a normal draft payload from it and
+# hands that payload to `_draft_from_payload()` -- THE SAME validate/dedup/
+# write path `draft` itself uses, so a discovery-derived candidate is
+# structurally indistinguishable from a hand-authored one once staged,
+# except for its `source.mechanism` (forced to DISCOVERY_SOURCE_MECHANISM,
+# never "human" -- see validate_source()/cmd_approve()'s own
+# --confirm-non-human-source gate, which this value triggers exactly like
+# any other non-human source).
+#
+# target_project ENFORCEMENT: there is deliberately NO --target-project (or
+# any other) flag on this subcommand that could name a different project
+# than the one the hit was scanned from. `_target_project_for_discovery_hit()`
+# is the ONLY place target_project is derived, and it derives it from
+# nothing but the hit record's own `project_id` field (the project
+# discover_capability_candidates.py itself resolved and stamped onto the hit
+# at scan time -- see that file's `annotate_hits_for_root()`). A discovery
+# hit found in project A therefore cannot become a candidate targeting
+# project B: the attack surface a caller would need to express that does
+# not exist on this command's CLI at all (see
+# test_draft_from_discovery_hit_rejects_target_project_override in the test
+# suite, which confirms this the attack-shaped way: passing --target-project
+# on this subcommand is an argparse usage error, not a silently-accepted
+# override).
+# ---------------------------------------------------------------------------
+
+
+def load_discovery_hits(path: Path) -> dict[str, Any]:
+    """Full, read-only load of discovery-hits.json. Mirrors load_catalog()'s
+    own error mapping (missing/unreadable/unparseable -> PromoteFatal,
+    exit 4) -- this file is, like catalog.json, an input this tool depends
+    on but never writes."""
+    try:
+        raw = _read_bounded(path, MAX_DISCOVERY_HITS_BYTES, follow_symlinks=True)
+    except FileNotFoundError as exc:
+        raise PromoteFatal("discovery_hits_missing", str(path)) from exc
+    except OSError as exc:
+        raise PromoteFatal("discovery_hits_unreadable", str(exc)) from exc
+    try:
+        doc = _load_json_object(raw, label="discovery_hits")
+    except PromoteUsageError as exc:
+        raise PromoteFatal("discovery_hits_unparseable", exc.message) from exc
+    if not isinstance(doc.get("hits"), list):
+        raise PromoteFatal("discovery_hits_malformed", "no 'hits' array at top level")
+    return doc
+
+
+def find_discovery_hit(doc: dict[str, Any], hit_id: str) -> dict[str, Any] | None:
+    for entry in doc["hits"]:
+        if isinstance(entry, dict) and entry.get("hit_id") == hit_id:
+            return entry
+    return None
+
+
+def _target_project_for_discovery_hit(hit: dict[str, Any]) -> str:
+    """The ONE AND ONLY source of `target_project` for a discovery-hit-
+    derived draft: the hit's own `project_id`, exactly as
+    discover_capability_candidates.py itself resolved and stamped onto the
+    record at scan time. No caller-supplied value can reach this -- see the
+    section comment above."""
+    project_id = hit.get("project_id")
+    if not _is_plain_str(project_id) or not project_id:
+        raise PromoteValidationError("discovery_hit_missing_project_id", "hit record has no usable 'project_id' field")
+    return project_id
+
+
+def _draft_payload_from_discovery_hit(hit: dict[str, Any]) -> dict[str, Any]:
+    """Maps one discovery-hits.json record onto a `draft`-shaped candidate
+    input payload (the same shape a hand-authored --from-json file uses).
+    Takes ONLY the hit record -- see `_target_project_for_discovery_hit()`'s
+    own docstring for why target_project has no other input path."""
+    target_project = _target_project_for_discovery_hit(hit)
+    hit_id = hit.get("hit_id")
+    signal_type = hit.get("signal_type")
+    path_value = hit.get("path")
+    if not _is_plain_str(path_value) or not path_value:
+        raise PromoteValidationError("discovery_hit_missing_path", "hit record has no usable 'path' field")
+
+    # source.mechanism is forced here, never taken from the hit record --
+    # this is what makes cmd_approve's `--confirm-non-human-source` gate
+    # apply to every discovery-derived candidate unconditionally. The rest
+    # of `source` is free-form provenance for audit trail only (validate_
+    # source() only constrains `mechanism`).
+    source = {
+        "mechanism": DISCOVERY_SOURCE_MECHANISM,
+        "discovery_hit_id": hit_id,
+        "root_real_path": hit.get("root_real_path"),
+        "root_source": hit.get("root_source"),
+        "content_sha256": hit.get("content_sha256"),
+    }
+
+    id_material = hit_id if _is_plain_str(hit_id) and hit_id else _sha256_hex(
+        f"{target_project}|{signal_type}|{path_value}".encode("utf-8")
+    )
+    synthetic_id = f"discovered-{id_material}"[:ID_MAX_LEN]
+    summary = f"Auto-discovered {signal_type} candidate (discovery hit {hit_id})."[:SUMMARY_MAX_LEN]
+
+    if _is_plain_str(signal_type) and signal_type in _DISCOVERY_SIGNAL_TYPE_TO_CAPABILITY_KIND:
+        if hit.get("kind") == "dir" and path_value in (".", "(root)"):
+            # A capability:skill hit found AT the scanned root itself has no
+            # relative path a reusable-capabilities.json entry could
+            # reference (its own `path` grammar forbids "." / empty -- see
+            # _validate_path()) -- refuse explicitly rather than stage a
+            # candidate approve would later reject for an unrelated-looking
+            # reason.
+            raise PromoteValidationError(
+                "discovery_hit_root_path_not_supported",
+                "a capability:skill hit at the scan root itself has no relative path a candidate can reference",
+            )
+        return {
+            "target_project": target_project,
+            "proposed_target": "reusable-capabilities.json",
+            "id": synthetic_id,
+            "kind": _DISCOVERY_SIGNAL_TYPE_TO_CAPABILITY_KIND[signal_type],
+            "name": path_value[:NAME_MAX_LEN],
+            "path": path_value,
+            "summary": summary,
+            "source": source,
+        }
+    if _is_plain_str(signal_type) and signal_type.startswith(_DISCOVERY_KNOWLEDGE_SIGNAL_PREFIX):
+        return {
+            "target_project": target_project,
+            "proposed_target": "orca-context-wiki.json",
+            "id": synthetic_id,
+            "title": path_value[:NAME_MAX_LEN],
+            "path": path_value,
+            "summary": summary,
+            "source": source,
+        }
+    raise PromoteValidationError(
+        "discovery_hit_signal_type_unsupported", f"signal_type {signal_type!r} has no known candidate mapping"
+    )
+
+
+def cmd_draft_from_discovery_hit(args: argparse.Namespace) -> dict[str, Any]:
+    hit_id = (args.hit_id or "").strip()
+    if not hit_id:
+        raise PromoteUsageError("empty_hit_id")
+    if not args.catalog.strip():
+        raise PromoteUsageError("empty_catalog_path")
+
+    hits_path = Path(args.hits_path).expanduser() if args.hits_path else _DISCOVERY_STAGING_DEFAULT_HITS_PATH
+
+    # Unsuppressible visibility notice, same mechanism (and same underlying
+    # reason) as discover_capability_candidates.py's own --all-projects
+    # warning and review_capability_candidates.py's own mark-to-production
+    # notice: M8-2's independent authorization gate (design 3.3.3) has not
+    # been granted, so a candidate drafted from the REAL production
+    # discovery-hits.json is no more "production-authoritative" than one
+    # drafted from the staging default -- a human already triaged this one
+    # hit via `mark`, but the underlying scan's false-positive rate is
+    # unchanged. Compared by realpath (not literal Path equality) for the
+    # same reason those two call sites do: an aliased spelling must not
+    # silently dodge the notice.
+    if os.path.realpath(str(hits_path)) == os.path.realpath(str(_DISCOVERY_PRODUCTION_DEFAULT_HITS_PATH)):
+        print(
+            "NOTICE: reading manifests/capability-discovery/discovery-hits.json, M8-2's real production "
+            "discovery output. M8-2's own independent authorization gate (design 3.3.3) has not been "
+            "granted -- a candidate drafted from this hit is not more trustworthy for that reason alone; "
+            "it is still gated by cmd_approve's --confirm-non-human-source requirement like any other "
+            "non-human-sourced candidate.",
+            file=sys.stderr,
+        )
+
+    doc = load_discovery_hits(hits_path)  # read-only: this command never mutates discovery-hits.json
+    hit = find_discovery_hit(doc, hit_id)
+    if hit is None:
+        raise PromoteValidationError("discovery_hit_not_found", hit_id)
+
+    state = hit.get("state")
+    if state != _DISCOVERY_HIT_TRIAGE_STATE_REQUIRED:
+        raise PromoteValidationError(
+            "discovery_hit_not_triaged_for_promotion",
+            f"hit {hit_id!r} has state {state!r}; only a hit already marked "
+            f"{_DISCOVERY_HIT_TRIAGE_STATE_REQUIRED!r} (via review_capability_candidates.py mark) can be drafted",
+        )
+
+    payload = _draft_payload_from_discovery_hit(hit)
+    result = _draft_from_payload(payload, args.catalog)
+    result["discovery_hit_id"] = hit_id
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3188,6 +3431,21 @@ def build_parser() -> argparse.ArgumentParser:
     draft.add_argument("--catalog", type=str, required=True)
     draft.add_argument("--json", action="store_true")
 
+    draft_from_hit = subparsers.add_parser(
+        "draft-from-discovery-hit",
+        help="Bridge a triaged_for_promotion discovery-hits.json hit into a normal pending_approval candidate "
+             "(Gate C -> Gate B). Read-only on discovery-hits.json itself -- refuses any hit not already marked "
+             "triaged_for_promotion via review_capability_candidates.py mark. target_project is always the hit's "
+             "own project_id; there is no flag to point it at a different project.",
+    )
+    draft_from_hit.add_argument("--hit-id", type=str, required=True, dest="hit_id")
+    draft_from_hit.add_argument(
+        "--hits-path", type=str, default=None, dest="hits_path",
+        help="Path to discovery-hits.json (default: M8-2's staging-default output location).",
+    )
+    draft_from_hit.add_argument("--catalog", type=str, required=True)
+    draft_from_hit.add_argument("--json", action="store_true")
+
     amend = subparsers.add_parser("amend", help="Draft an amend_depends_on candidate (still requires approve).")
     amend.add_argument("--target-project", type=str, required=True, dest="target_project")
     amend.add_argument("--target", type=str, required=True, help='"<kind>:<name>" of the already-published entry to amend')
@@ -3269,6 +3527,7 @@ def _emit_error(args: argparse.Namespace, code: int, reason: str, message: Any =
 
 _COMMANDS = {
     "draft": cmd_draft,
+    "draft-from-discovery-hit": cmd_draft_from_discovery_hit,
     "amend": cmd_amend,
     "approve": cmd_approve,
     "reject": cmd_reject,
