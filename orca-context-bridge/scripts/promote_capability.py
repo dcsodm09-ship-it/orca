@@ -445,6 +445,39 @@ def identity_unchanged(path: Path, identity: tuple[int, int, int, int]) -> bool:
     return current == identity
 
 
+def _read_bytes_via_dir_fd(dir_fd: int, filename: str, max_bytes: int) -> bytes:
+    """Read-side counterpart of read_with_identity(), anchored to an
+    already-open directory fd instead of a plain path (O_NOFOLLOW on the
+    filename too). Resolves inside the EXACT directory inode dir_fd was
+    opened against, immune to anything that has since happened to that
+    directory's own name (or any ancestor of it) -- the same guarantee
+    atomic_write_in_dir()'s dir_fd path already gives the write side.
+    Used by _approve_reusable_capabilities()'s post-write self-check so it
+    validates the SAME bytes the write actually landed: a plain
+    wiki_path.read_bytes() there could otherwise be fooled by a directory
+    swap performed between the write completing and that read (2026-08-26
+    3-model cross-audit finding -- see
+    test_post_write_self_check_reads_via_dir_fd_not_plain_path)."""
+    fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PromoteFatal("target_not_a_regular_file", filename)
+        if st.st_size > max_bytes:
+            raise PromoteFatal("target_too_large", f"{st.st_size} bytes > {max_bytes}")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 1 << 20))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
+
+
 # ---------------------------------------------------------------------------
 # write_only_within -- confines every write THIS tool does to its own
 # staging root (PROMOTION_ROOT). The one write that legitimately leaves that
@@ -2306,16 +2339,49 @@ def _approve_reusable_capabilities(
     wiki_dir_fd_for_write = _open_wiki_dir_fd_for_guard(real_path)
     try:
         atomic_write_in_dir(wiki_path, new_bytes, dir_fd=wiki_dir_fd_for_write)
+
+        # Post-write integrity check: confirm the canonical "wiki" NAME
+        # still resolves to the SAME directory wiki_dir_fd_for_write was
+        # opened against (compare fstat(dir_fd) against a fresh stat() of
+        # the name -- stat() follows symlinks, so this catches a symlink
+        # swap AND a substituted real directory, not just one of the two).
+        # The write itself is already immune to a name swap (dir_fd
+        # anchoring) -- but if "wiki" was swapped in the gap between
+        # opening that fd and this point, the just-written bytes, though
+        # correctly landed in the originally-validated directory, are no
+        # longer reachable at the path any caller or future reader would
+        # actually look at. Fail loudly here rather than letting the
+        # fd-anchored self-check below validate the now-orphaned write and
+        # report success while the canonical path has been hijacked out
+        # from under us (2026-08-26 3-model cross-audit finding -- see
+        # test_post_write_self_check_reads_via_dir_fd_not_plain_path).
+        try:
+            wiki_name_stat = os.stat(real_path / "wiki")
+        except OSError as exc:
+            raise PromoteFatal("concurrent_modification_detected", str(exc)) from exc
+        dir_fd_stat = os.fstat(wiki_dir_fd_for_write)
+        if (wiki_name_stat.st_dev, wiki_name_stat.st_ino) != (dir_fd_stat.st_dev, dir_fd_stat.st_ino):
+            raise PromoteFatal("concurrent_modification_detected", str(wiki_path))
+
+        # Self-check: re-read what is ACTUALLY on disk now (not the
+        # in-memory new_doc) and run this file's own copy of
+        # validate_document() against it. Read through the SAME dir_fd the
+        # write above just used -- NOT wiki_path.read_bytes() (a plain
+        # path re-read), which would re-walk "wiki" and the filename from
+        # scratch and so could be handed a completely different, merely
+        # coincidentally-valid document if a directory (or filename)
+        # symlink swap landed in the gap between the write finishing and
+        # this read, while the actually-written bytes sit orphaned under
+        # the pre-swap name -- a false "approved successfully" against a
+        # decoy (2026-08-26 3-model cross-audit finding, confirmed real by
+        # test_post_write_self_check_reads_via_dir_fd_not_plain_path).
+        written_raw = _read_bytes_via_dir_fd(wiki_dir_fd_for_write, wiki_path.name, MAX_WIKI_BYTES)
     finally:
         try:
             os.close(wiki_dir_fd_for_write)
         except OSError:
             pass
 
-    # Self-check: re-read what is ACTUALLY on disk now (not the in-memory
-    # new_doc) and run this file's own copy of validate_document() against
-    # it. On failure, roll back to the original bytes and fail closed.
-    written_raw = wiki_path.read_bytes()
     written_doc = json.loads(written_raw.decode("utf-8"))
     run = validate_document(written_doc, project_root=real_path, check_paths=True, now=datetime.now(timezone.utc))
     if run.errors:
@@ -2324,10 +2390,18 @@ def _approve_reusable_capabilities(
         # use -- not reusing a stale check -- is this file's own established
         # rule throughout): a symlink swap in the gap between the write above
         # and this rollback must not be able to redirect the rollback either.
+        # rolled_back must reflect what ACTUALLY happened, not what was
+        # merely attempted -- the guard below can legitimately skip the
+        # rollback write (failing closed rather than writing rollback bytes
+        # through an attacker-controlled symlink), and the reported field
+        # must say so rather than unconditionally claiming success (the
+        # second half of the same 2026-08-26 cross-audit finding).
+        rolled_back = False
         if not _has_symlink_component((real_path / "wiki" / wiki_path.name).absolute(), real_path.absolute()):
             rollback_dir_fd = _open_wiki_dir_fd_for_guard(real_path)
             try:
                 atomic_write_in_dir(wiki_path, old_raw, dir_fd=rollback_dir_fd)
+                rolled_back = True
             finally:
                 try:
                     os.close(rollback_dir_fd)
@@ -2335,7 +2409,7 @@ def _approve_reusable_capabilities(
                     pass
         raise PromoteValidationError(
             "post_write_self_check_failed",
-            {"errors": [e.as_dict() for e in run.errors], "rolled_back": True},
+            {"errors": [e.as_dict() for e in run.errors], "rolled_back": rolled_back},
         )
 
     return {

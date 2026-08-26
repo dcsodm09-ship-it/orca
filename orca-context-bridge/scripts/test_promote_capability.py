@@ -798,6 +798,140 @@ class ApproveReusableCapabilitiesTests(PromoteCapabilityTestCase):
         self.assertEqual(substituted_doc["capabilities"][0]["id"], "my-cap")
         self.assertTrue(str(wiki_dir.resolve()).startswith(str(proj.resolve())), "substituted dir still inside project")
 
+    def test_post_write_self_check_reads_via_dir_fd_not_plain_path(self) -> None:
+        """2026-08-26, 3-model max-effort cross-audit DISPUTE over this same
+        function: Codex rated this P1 (a wiki/ swap between the dir-fd-
+        anchored write completing and the post-write self-check's re-read
+        can make the self-check validate a decoy instead of what was
+        actually written, producing a false "approved successfully"
+        report while the real inode holds the real bytes, now orphaned
+        under the pre-swap name); Grok agreed on the mechanism but called
+        it P2 and folded it into the rollback-reporting issue below;
+        Gemini asserted this function's dir-fd fix already closes every
+        TOCTOU gap here with no residual issue. Adjudicated by reproducing
+        it directly: the write's OWN dir_fd anchoring does hold (confirmed
+        below -- the real write lands correctly in the pre-swap directory,
+        which is exactly why that data survives at moved_aside), but the
+        self-check that ran right after it, pre-fix, used
+        wiki_path.read_bytes() -- a fresh plain-path walk of "wiki" that
+        the swap below redirects to an attacker-controlled decoy -- so
+        Codex/Grok's mechanism was real, not Gemini's "no issue". Pre-fix
+        this produced exit 0 (false success) with the decoy silently
+        substituted for validation. Fixed by (a) reading the self-check's
+        bytes through the SAME dir_fd the write used (immune to the name
+        swap), and (b) an explicit post-write check that "wiki" still
+        resolves to the fd's own directory, so a hijack mid-operation is
+        refused outright rather than validated-via-fd and silently
+        accepted as success."""
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+
+        wiki_dir = proj / "wiki"
+        decoy_dir = self.tmp / "decoy-after-write"
+        decoy_dir.mkdir()
+        # Must independently pass validate_document() (schema_version +
+        # project + capabilities, all required top-level keys) so a
+        # pre-fix self-check that reads THIS instead of the real write
+        # finds no errors at all and reports a bare false success --
+        # not merely a different, but still-detected, validation failure.
+        decoy_doc = {"schema_version": 1, "project": "proj-a", "capabilities": []}
+        (decoy_dir / "reusable-capabilities.json").write_text(json.dumps(decoy_doc, indent=2) + "\n", encoding="utf-8")
+        moved_aside = proj / "wiki-real-after-write"
+
+        real_atomic_write = pc.atomic_write_in_dir
+        state = {"swapped": False}
+
+        def swap_right_after_write(final_path, payload, *, dir_fd=None):
+            real_atomic_write(final_path, payload, dir_fd=dir_fd)
+            if not state["swapped"] and final_path.name == "reusable-capabilities.json" and dir_fd is not None:
+                state["swapped"] = True
+                os.rename(str(wiki_dir), str(moved_aside))
+                wiki_dir.symlink_to(decoy_dir, target_is_directory=True)
+
+        pc.atomic_write_in_dir = swap_right_after_write
+        try:
+            code, result, _err = run_cli_json(
+                ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+            )
+        finally:
+            pc.atomic_write_in_dir = real_atomic_write
+
+        # The real dir_fd-anchored write DID land correctly in the
+        # pre-swap directory (now orphaned at moved_aside) -- proving the
+        # write side's own anchoring holds regardless of this bug.
+        real_written_doc = json.loads((moved_aside / "reusable-capabilities.json").read_bytes().decode("utf-8"))
+        self.assertEqual(len(real_written_doc["capabilities"]), 1, "the real dir_fd-anchored write must have landed correctly")
+
+        # Post-fix: the hijack is detected and refused -- NOT a false
+        # success against the decoy (the pre-fix behavior).
+        self.assertEqual(code, 4, result)
+        self.assertEqual(result["reason"], "concurrent_modification_detected")
+        # The decoy must never be mutated (nothing should ever write
+        # through the hijacked name).
+        self.assertEqual(
+            json.loads(decoy_dir.joinpath("reusable-capabilities.json").read_bytes().decode("utf-8")),
+            decoy_doc,
+        )
+
+    def test_rollback_skipped_by_symlink_guard_still_reports_rolled_back_false(self) -> None:
+        """Second half of the same 2026-08-26 cross-audit dispute: on the
+        rollback branch (self-check finds real validation errors), if
+        wiki/ has meanwhile become a symlink, _has_symlink_component()
+        correctly skips the rollback write (failing closed rather than
+        writing rollback bytes through an attacker-controlled symlink) --
+        but pre-fix, the exception raised right after unconditionally set
+        "rolled_back": True regardless of whether that guard actually let
+        the rollback run. Reproduced here (not mocked-to-assume-the-
+        answer): the self-check must first see the REAL, invalid written
+        content to fail validation naturally -- same no-mocking-the-answer
+        technique as test_approve_rolls_back_when_referenced_path_missing
+        -- and only THEN, in the narrow gap before the rollback branch's
+        own _has_symlink_component() re-check, does wiki/ get swapped;
+        hooked via validate_document(), the exact seam between those two
+        points."""
+        proj = self.make_project("proj-a", add_script_file=None)
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a", path="scripts/does_not_exist.py")
+
+        wiki_dir = proj / "wiki"
+        before_bytes = (wiki_dir / "reusable-capabilities.json").read_bytes()
+        moved_aside = proj / "wiki-real-rollback-test"
+        decoy_dir = self.tmp / "decoy-for-rollback-test"
+        decoy_dir.mkdir()
+        (decoy_dir / "reusable-capabilities.json").write_bytes(b'{"capabilities": []}\n')
+
+        real_validate_document = pc.validate_document
+        state = {"swapped": False}
+
+        def swap_after_self_check_read(doc, **kwargs):
+            run = real_validate_document(doc, **kwargs)
+            if not state["swapped"] and run.errors:
+                state["swapped"] = True
+                os.rename(str(wiki_dir), str(moved_aside))
+                wiki_dir.symlink_to(decoy_dir, target_is_directory=True)
+            return run
+
+        pc.validate_document = swap_after_self_check_read
+        try:
+            code, result, _err = run_cli_json(
+                ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+            )
+        finally:
+            pc.validate_document = real_validate_document
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual(result["reason"], "post_write_self_check_failed")
+        # BUG (pre-fix): rolled_back was unconditionally True even though
+        # the symlink guard skipped the rollback write entirely.
+        self.assertFalse(result["message"]["rolled_back"], "must not claim a rollback happened when the guard skipped it")
+        # Prove no rollback write actually happened: the moved-aside real
+        # file (holding the invalid written content) was never restored to
+        # old_raw, and the swapped-in symlink's target was never touched
+        # either.
+        self.assertNotEqual((moved_aside / "reusable-capabilities.json").read_bytes(), before_bytes)
+        self.assertEqual((decoy_dir / "reusable-capabilities.json").read_bytes(), b'{"capabilities": []}\n')
+
 
 # ---------------------------------------------------------------------------
 # CLI: approve -- orca-context-wiki.json branch
