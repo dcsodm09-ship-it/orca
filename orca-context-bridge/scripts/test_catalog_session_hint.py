@@ -77,8 +77,16 @@ PROTECTED_SHA256 = {
         "50721e76835ed9e162577fa66757f129aa195a33e5d37e96436ab84a8dceccbe",
     "/Users/www1adwawd/.agents/skills/orca-context-bridge/scripts/startup_context.py":
         "2095d1de3f00c323f647cb2614325b8bef0cb2f65dbc24fef529d6c1957581c3",
+    # 2026-08-26: re-pinned after this exact repo-tracked copy was corrected
+    # from a stale 2026-08-15 snapshot to match the real, live, currently-
+    # deployed content (see the incident this same date: install_shared.py
+    # --update's full-tree-replace semantics had silently deleted this file,
+    # startup_context.py's own live copy, and detect_orca_automation_prompt.py
+    # from ~/.agents/skills/ entirely, because none of the three were ever
+    # actually present in this repo's tracked+untracked scripts/ source --
+    # this pinned hash now equals the live copy's own pin above, on purpose).
     "/Volumes/Extreme SSD/Orca/workspaces/orca/完善orca/orca-context-bridge/scripts/startup_context.py":
-        "cc6148d8c0b3a880c0558b01b132753948a49b54c7554f44377475afc134896d",
+        "2095d1de3f00c323f647cb2614325b8bef0cb2f65dbc24fef529d6c1957581c3",
     "/Users/www1adwawd/.claude/settings.json":
         "3e557009ccb7f160e8b4b4604eb6d9596b50da7a0268e58f91340df1f2f765bb",
 }
