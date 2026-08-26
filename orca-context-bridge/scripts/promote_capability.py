@@ -2281,8 +2281,36 @@ def _approve_reusable_capabilities(
     if not identity_unchanged(wiki_path, identity):
         raise PromoteFatal("concurrent_modification_detected", str(wiki_path))
 
+    # 2026-08-26 fix: this write used to call atomic_write_in_dir() with NO
+    # dir_fd, unlike _approve_orca_context_wiki()'s round-5/round-6 hardening
+    # of the SAME class of write (a sibling approval path -- this one for
+    # reusable-capabilities.json, that one for orca-context-wiki.json -- both
+    # write into the same target project's wiki/ directory, but only one of
+    # the two ever got the TOCTOU hardening). A 3-model max-effort cross-audit
+    # (2026-08-26) found this real, still-live gap: without a dir_fd, a
+    # symlink swap of real_path/wiki (or of wiki_path's own name) between the
+    # identity_unchanged() check above and the write below could still
+    # redirect the write outside the project. Mirror the wiki-approval path's
+    # own re-check + dir-fd-open sequence exactly (same order: symlink-
+    # component check, then open the dir with O_NOFOLLOW, then write through
+    # that fd) -- _open_wiki_dir_fd_for_guard() is reused here despite its
+    # "for_guard" name (it is, and always was, a thin "open real_path/wiki
+    # with O_NOFOLLOW" helper with no guard-specific logic in it -- see its
+    # own docstring) rather than duplicating an identical second copy.
+    if _has_symlink_component((real_path / "wiki" / wiki_path.name).absolute(), real_path.absolute()):
+        raise PromoteFatal("wiki_path_symlink_introduced", str(wiki_path))
+    if not identity_unchanged(wiki_path, identity):
+        raise PromoteFatal("concurrent_modification_detected", str(wiki_path))
+
     new_bytes = (json.dumps(new_doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-    atomic_write_in_dir(wiki_path, new_bytes)
+    wiki_dir_fd_for_write = _open_wiki_dir_fd_for_guard(real_path)
+    try:
+        atomic_write_in_dir(wiki_path, new_bytes, dir_fd=wiki_dir_fd_for_write)
+    finally:
+        try:
+            os.close(wiki_dir_fd_for_write)
+        except OSError:
+            pass
 
     # Self-check: re-read what is ACTUALLY on disk now (not the in-memory
     # new_doc) and run this file's own copy of validate_document() against
@@ -2291,7 +2319,20 @@ def _approve_reusable_capabilities(
     written_doc = json.loads(written_raw.decode("utf-8"))
     run = validate_document(written_doc, project_root=real_path, check_paths=True, now=datetime.now(timezone.utc))
     if run.errors:
-        atomic_write_in_dir(wiki_path, old_raw)
+        # Same dir-fd discipline as the write above, re-derived fresh (the
+        # earlier fd is already closed, and re-checking immediately before
+        # use -- not reusing a stale check -- is this file's own established
+        # rule throughout): a symlink swap in the gap between the write above
+        # and this rollback must not be able to redirect the rollback either.
+        if not _has_symlink_component((real_path / "wiki" / wiki_path.name).absolute(), real_path.absolute()):
+            rollback_dir_fd = _open_wiki_dir_fd_for_guard(real_path)
+            try:
+                atomic_write_in_dir(wiki_path, old_raw, dir_fd=rollback_dir_fd)
+            finally:
+                try:
+                    os.close(rollback_dir_fd)
+                except OSError:
+                    pass
         raise PromoteValidationError(
             "post_write_self_check_failed",
             {"errors": [e.as_dict() for e in run.errors], "rolled_back": True},

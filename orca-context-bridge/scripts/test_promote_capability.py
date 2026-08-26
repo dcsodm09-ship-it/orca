@@ -701,6 +701,103 @@ class ApproveReusableCapabilitiesTests(PromoteCapabilityTestCase):
         self.assertEqual(code, 4)
         self.assertEqual(result["reason"], "target_project_unknown_in_catalog")
 
+    def test_wiki_dir_symlink_swap_before_dir_fd_open_fails_closed(self) -> None:
+        """2026-08-26, 3-model max-effort cross-audit finding: this
+        function's write used to call atomic_write_in_dir(wiki_path,
+        new_bytes) with NO dir_fd -- unlike ApproveOrcaContextWikiTests'
+        sibling approval path, which got the round-5/round-6 TOCTOU
+        hardening for the exact same class of write. Unlike that sibling
+        path, this one has no subprocess spawn between the dir-fd open and
+        the write (the write happens synchronously, in-process, right
+        after) -- so there is no equivalent "spawn latency" residual
+        window to target. The earliest an attacker could plausibly race is
+        immediately before _open_wiki_dir_fd_for_guard()'s own os.open()
+        call; swap real_path/wiki for a symlink to an outside decoy right
+        there (by hooking that real function's entry, before it calls the
+        real os.open()) and confirm O_NOFOLLOW refuses it outright rather
+        than following it -- the decoy must never be touched, and approve
+        must report a clean, named failure, not a false success."""
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+
+        wiki_dir = proj / "wiki"
+        before_bytes = (wiki_dir / "reusable-capabilities.json").read_bytes()
+        outside_dir = self.tmp / "outside-decoy-reusable-caps"
+        outside_dir.mkdir()
+        outside_copy = outside_dir / "reusable-capabilities.json"
+        outside_copy.write_bytes(before_bytes)
+        moved_aside = proj / "wiki-real-reusable-caps"
+
+        real_open = pc._open_wiki_dir_fd_for_guard
+        state = {"done": False}
+
+        def swap_then_open(real_path):
+            if not state["done"]:
+                state["done"] = True
+                os.rename(str(wiki_dir), str(moved_aside))
+                wiki_dir.symlink_to(outside_dir, target_is_directory=True)
+            return real_open(real_path)
+
+        pc._open_wiki_dir_fd_for_guard = swap_then_open
+        try:
+            code, result, _err = run_cli_json(
+                ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+            )
+        finally:
+            pc._open_wiki_dir_fd_for_guard = real_open
+
+        self.assertEqual(outside_copy.read_bytes(), before_bytes, "the outside decoy copy must never be mutated")
+        self.assertEqual(code, 4, result)
+        self.assertEqual(result["reason"], "wiki_dir_unopenable_for_guard")
+        # Nothing was written anywhere -- the original (now moved-aside)
+        # file is untouched too.
+        real_doc = json.loads((moved_aside / "reusable-capabilities.json").read_bytes().decode("utf-8"))
+        self.assertEqual(real_doc["capabilities"], [])
+
+    def test_wiki_dir_real_directory_swap_bounded_not_escape(self) -> None:
+        """Companion to the symlink-swap test above: a brand-new REAL
+        (non-symlink) directory swapped in for wiki/ cannot be caught by
+        O_NOFOLLOW (it isn't a symlink) -- the open succeeds against the
+        substitute, and the write lands there. That is bounded, not an
+        escape, since the substitute was created as real_path/"wiki" by
+        construction -- same accepted shape as the wiki-approval path's
+        own documented residual for this exact scenario."""
+        proj = self.make_project("proj-a")
+        self.write_catalog({"proj-a": proj})
+        candidate_id = self._draft_and_get_id("proj-a")
+
+        wiki_dir = proj / "wiki"
+        before_bytes = (wiki_dir / "reusable-capabilities.json").read_bytes()
+        moved_aside = proj / "wiki-original-moved-reusable-caps"
+
+        real_open = pc._open_wiki_dir_fd_for_guard
+        state = {"done": False}
+
+        def swap_then_open(real_path):
+            if not state["done"]:
+                state["done"] = True
+                os.rename(str(wiki_dir), str(moved_aside))
+                wiki_dir.mkdir()
+                (wiki_dir / "reusable-capabilities.json").write_bytes(before_bytes)
+            return real_open(real_path)
+
+        pc._open_wiki_dir_fd_for_guard = swap_then_open
+        try:
+            code, result, _err = run_cli_json(
+                ["approve", "--candidate-id", candidate_id, "--catalog", str(self.catalog_path), "--approved-by", "t", "--rationale", "r"]
+            )
+        finally:
+            pc._open_wiki_dir_fd_for_guard = real_open
+
+        self.assertEqual(code, 0, result)
+        original_doc = json.loads((moved_aside / "reusable-capabilities.json").read_bytes().decode("utf-8"))
+        substituted_doc = json.loads((wiki_dir / "reusable-capabilities.json").read_bytes().decode("utf-8"))
+        self.assertEqual(original_doc["capabilities"], [], "original moved-aside copy must stay unchanged")
+        self.assertEqual(len(substituted_doc["capabilities"]), 1)
+        self.assertEqual(substituted_doc["capabilities"][0]["id"], "my-cap")
+        self.assertTrue(str(wiki_dir.resolve()).startswith(str(proj.resolve())), "substituted dir still inside project")
+
 
 # ---------------------------------------------------------------------------
 # CLI: approve -- orca-context-wiki.json branch
