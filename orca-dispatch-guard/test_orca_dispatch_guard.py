@@ -412,6 +412,60 @@ class MatchingHelperTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# `_find_capability_revoked_hit`: structured-field matching, not substring
+# (same P2 bug class as `_find_matching_worker_done` above, fixed the same
+# way -- see that function's own docstring for the general rationale).
+# ---------------------------------------------------------------------------
+
+
+class CapabilityRevokedMatchingHelperTests(unittest.TestCase):
+    def test_does_not_false_positive_on_watched_id_that_is_a_prefix_of_another(self) -> None:
+        # Mirrors MatchingHelperTests' own prefix regression above: watching
+        # "dispatch-1" must not match a message whose real id is
+        # "dispatch-12" just because "dispatch-1" is a substring of it.
+        message = {
+            "id": "msg-p",
+            "type": "worker_done",
+            "error": "dispatch_capability_invalid",
+            "payload": json.dumps({"dispatchId": "dispatch-12"}),
+        }
+        parsed = json.loads(ok_envelope({"messages": [message]}))
+        self.assertIsNone(
+            dg._find_capability_revoked_hit(parsed, {"dispatch-1"}),
+            "a watched id that is a strict prefix of the message's real id must never match",
+        )
+        # Sanity: the exact id still matches correctly.
+        self.assertEqual(dg._find_capability_revoked_hit(parsed, {"dispatch-12"}), "dispatch-12")
+
+    def test_matches_dispatch_id_nested_in_json_encoded_payload_string(self) -> None:
+        message = {
+            "id": "msg-1",
+            "type": "worker_done",
+            "error": "capability is revoked",
+            "payload": json.dumps({"dispatchId": "d-1"}),
+        }
+        parsed = json.loads(ok_envelope({"messages": [message]}))
+        self.assertEqual(dg._find_capability_revoked_hit(parsed, {"d-1"}), "d-1")
+
+    def test_no_match_when_watched_id_absent_entirely(self) -> None:
+        message = {
+            "id": "msg-1",
+            "type": "worker_done",
+            "error": "dispatch_capability_invalid",
+            "payload": json.dumps({"dispatchId": "d-1"}),
+        }
+        parsed = json.loads(ok_envelope({"messages": [message]}))
+        self.assertIsNone(dg._find_capability_revoked_hit(parsed, {"d-completely-different"}))
+
+    def test_no_match_when_signature_absent_even_if_id_present(self) -> None:
+        # A message that merely names the watched id, with no
+        # capability-revoked signature, must not be treated as a hit.
+        message = {"id": "msg-1", "type": "worker_done", "payload": json.dumps({"dispatchId": "d-1"})}
+        parsed = json.loads(ok_envelope({"messages": [message]}))
+        self.assertIsNone(dg._find_capability_revoked_hit(parsed, {"d-1"}))
+
+
+# ---------------------------------------------------------------------------
 # TerminalLock: real fcntl.flock semantics, no mocking.
 # ---------------------------------------------------------------------------
 

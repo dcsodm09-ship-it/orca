@@ -886,14 +886,33 @@ def _find_capability_revoked_hit(parsed: dict[str, Any] | None, watched_ids: set
     """Scan every message (not just worker_done) for the capability-revoked
     signature referencing one of our watched dispatch ids -- if this real,
     previously-documented downstream symptom shows up for a dispatch we are
-    watching, report it explicitly instead of just timing out silently."""
+    watching, report it explicitly instead of just timing out silently.
+
+    The signature itself (`is_capability_revoked_failure`) is still a text
+    search -- there is no confirmed field name for "this message reports a
+    revoked capability" to key off instead. But WHICH dispatch id it names is
+    resolved via the same structured-field extraction as the worker_done
+    sibling below (`_extract_dispatch_id_from_worker_done`), not a substring
+    scan of the serialized message: this symptom is documented as the
+    rejection of the dispatch's own real, eventual `worker_done`, so the
+    message carries that same confirmed id shape (`dispatchId`/`dispatch_id`
+    directly, or nested under `payload`/`dispatch`). A raw
+    `did in msg_text` search (the previous approach) false-positives
+    whenever a watched id is a PREFIX of another id present anywhere in the
+    same message (e.g. watching "dispatch-123" while the message mentions
+    "dispatch-1234" in an unrelated field) -- the exact bug already fixed for
+    `_find_matching_worker_done` above. Non-dict messages have no structured
+    field to extract from and are skipped rather than text-scanned, per this
+    project's fail-closed convention (no guessing an id match)."""
     for msg in _message_list(parsed):
-        msg_text = json.dumps(msg, ensure_ascii=False) if isinstance(msg, dict) else str(msg)
+        if not isinstance(msg, dict):
+            continue
+        msg_text = json.dumps(msg, ensure_ascii=False)
         if not is_capability_revoked_failure(msg_text, ""):
             continue
-        for did in watched_ids:
-            if did and did in msg_text:
-                return did
+        found_id = _extract_dispatch_id_from_worker_done(msg)
+        if found_id and found_id in watched_ids:
+            return found_id
     return None
 
 
