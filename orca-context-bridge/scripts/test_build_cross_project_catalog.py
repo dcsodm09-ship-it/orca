@@ -2544,24 +2544,37 @@ class AtomicWriteCleanupTests(unittest.TestCase):
         errno 17 on a pre-planted symlink). So this test pins the FLAG, not
         a behaviour difference -- it exists so the documented property stops
         being unpinned, and the symlink assertion below records which flag
-        is actually doing the work."""
+        is actually doing the work.
+
+        Updated for the parent-directory-TOCTOU fix: the dir fd is now
+        opened FIRST (order flipped from the original tmp-file-then-dir
+        sequence) and the tmp file is created RELATIVE to it via dir_fd=,
+        so the spy must accept that keyword and the two opens are asserted
+        in their new order."""
         final_path = self.out / "catalog.json"
-        seen: list[int] = []
+        seen: list[tuple[int, dict]] = []
         real_open = os.open
 
-        def spy(path, flags, *args):
-            seen.append(flags)
-            return real_open(path, flags, *args)
+        def spy(path, flags, *args, **kwargs):
+            seen.append((flags, kwargs))
+            return real_open(path, flags, *args, **kwargs)
 
         with mock.patch.object(bcpc.os, "open", spy):
             bcpc.atomic_write_within(self.out, final_path, b'{"ok": true}')
-        # Two opens: the tmp file, then the O_RDONLY directory handle used
-        # for the best-effort directory fsync. Only the first is the write.
+        # Two opens: the parent-dir fd FIRST (hardening against a
+        # parent-directory TOCTOU), then the tmp file created relative to
+        # that dir_fd. The best-effort durability fsync at the end reuses
+        # this SAME dir_fd rather than opening the directory a second time.
         self.assertEqual(len(seen), 2)
-        self.assertTrue(seen[0] & os.O_NOFOLLOW)
-        self.assertTrue(seen[0] & os.O_EXCL)
-        self.assertTrue(seen[0] & os.O_CREAT)
-        self.assertTrue(seen[0] & os.O_WRONLY)
+        dir_flags, _dir_kwargs = seen[0]
+        tmp_flags, tmp_kwargs = seen[1]
+        self.assertTrue(dir_flags & os.O_NOFOLLOW)
+        self.assertTrue(dir_flags & os.O_DIRECTORY)
+        self.assertTrue(tmp_flags & os.O_NOFOLLOW)
+        self.assertTrue(tmp_flags & os.O_EXCL)
+        self.assertTrue(tmp_flags & os.O_CREAT)
+        self.assertTrue(tmp_flags & os.O_WRONLY)
+        self.assertIn("dir_fd", tmp_kwargs)
 
         # And the behaviour O_EXCL alone already guarantees: a symlink
         # pre-planted at the tmp path is refused, never followed.
@@ -2574,6 +2587,55 @@ class AtomicWriteCleanupTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             os.open(str(planted), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         self.assertEqual(victim.read_text(encoding="utf-8"), "original")
+
+
+class AtomicWriteWithinParentDirTocTouTests(unittest.TestCase):
+    """Parent-directory TOCTOU hardening: atomic_write_within() used to
+    check catalog_dir's containment only ONCE, in the CALLER, then do its
+    own tmp-file create and rename by PATH STRING
+    (os.open(str(tmp_path), ..., O_NOFOLLOW) / os.replace(str(tmp_path),
+    str(final_path))). O_NOFOLLOW there only refuses a symlinked tmp-file
+    BASENAME -- it does nothing about the directory actually holding the
+    file being swapped for a symlink to an outside decoy in the gap
+    between the caller's earlier check and this call. Repro follows this
+    repo's own established dir-fd-swap methodology (see
+    promote_capability.py's
+    test_wiki_dir_symlink_swap_before_dir_fd_open_fails_closed): hook
+    _open_atomic_write_dir_fd()'s call site -- the first thing
+    atomic_write_within() does -- to perform the swap at the exact moment
+    the real function is about to open the directory, then confirm the
+    open refuses outright (O_NOFOLLOW on its own now-symlinked name)
+    instead of silently writing through it into the decoy."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="bcpc-atomic-write-dirfd-"))
+        self.real_dir = self.tmp / "real-out"
+        self.real_dir.mkdir(mode=0o700)
+        self.moved_aside = self.tmp / "real-out-moved-aside"
+        self.outside_decoy = self.tmp / "outside-decoy"
+        self.outside_decoy.mkdir()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_catalog_dir_symlink_swap_before_dir_fd_open_fails_closed(self) -> None:
+        final_path = self.real_dir / "catalog.json"
+        real_opener = bcpc._open_atomic_write_dir_fd
+
+        def swap_then_open(write_dir):
+            os.rename(str(self.real_dir), str(self.moved_aside))
+            self.real_dir.symlink_to(self.outside_decoy, target_is_directory=True)
+            return real_opener(write_dir)
+
+        with mock.patch.object(bcpc, "_open_atomic_write_dir_fd", side_effect=swap_then_open):
+            with self.assertRaises(OSError):
+                bcpc.atomic_write_within(self.real_dir, final_path, b'{"x": 1}')
+
+        # The exact exploit this closes: the outside decoy must never
+        # receive the write.
+        self.assertEqual(list(self.outside_decoy.iterdir()), [])
+        self.assertEqual(list(self.moved_aside.iterdir()), [])
+        self.assertFalse(final_path.exists())
 
 
 class ShortWriteRegressionTests(unittest.TestCase):

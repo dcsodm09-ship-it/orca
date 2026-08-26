@@ -984,5 +984,54 @@ class AtomicWriteWithinShortWriteRegressionTests(unittest.TestCase):
         self.assertEqual(leftovers, [], f"leftover tmp files: {leftovers}")
 
 
+class AtomicWriteWithinBaseDirTocTouTests(unittest.TestCase):
+    """Parent-directory TOCTOU hardening: atomic_write_within() used to
+    check base_dir's containment only ONCE, in the CALLER, then do its own
+    tmp-file create and rename by PATH STRING
+    (os.open(str(tmp_path), ..., O_NOFOLLOW) / os.replace(str(tmp_path),
+    str(final_path))). O_NOFOLLOW there only refuses a symlinked tmp-file
+    BASENAME -- it does nothing about the directory actually holding the
+    file being swapped for a symlink to an outside decoy in the gap
+    between the caller's earlier check and this call. Repro follows this
+    repo's own established dir-fd-swap methodology (see
+    promote_capability.py's
+    test_wiki_dir_symlink_swap_before_dir_fd_open_fails_closed): hook
+    _open_atomic_write_dir_fd()'s call site -- the first thing
+    atomic_write_within() does -- to perform the swap at the exact moment
+    the real function is about to open the directory, then confirm the
+    open refuses outright (O_NOFOLLOW on its own now-symlinked name)
+    instead of silently writing through it into the decoy."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="rcc-atomic-write-dirfd-"))
+        self.real_dir = self.tmp / "real-base"
+        self.real_dir.mkdir(mode=0o700)
+        self.moved_aside = self.tmp / "real-base-moved-aside"
+        self.outside_decoy = self.tmp / "outside-decoy"
+        self.outside_decoy.mkdir()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_base_dir_symlink_swap_before_dir_fd_open_fails_closed(self) -> None:
+        final_path = self.real_dir / "discovery-hits.json"
+        real_opener = rcc._open_atomic_write_dir_fd
+
+        def swap_then_open(write_dir):
+            os.rename(str(self.real_dir), str(self.moved_aside))
+            self.real_dir.symlink_to(self.outside_decoy, target_is_directory=True)
+            return real_opener(write_dir)
+
+        with mock.patch.object(rcc, "_open_atomic_write_dir_fd", side_effect=swap_then_open):
+            with self.assertRaises(OSError):
+                rcc.atomic_write_within(self.real_dir, final_path, b'{"x": 1}')
+
+        # The exact exploit this closes: the outside decoy must never
+        # receive the write.
+        self.assertEqual(list(self.outside_decoy.iterdir()), [])
+        self.assertEqual(list(self.moved_aside.iterdir()), [])
+        self.assertFalse(final_path.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

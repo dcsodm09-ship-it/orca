@@ -680,30 +680,50 @@ def _write_all_bytes(fd: int, payload: bytes) -> None:
         view = view[n:]
 
 
+def _open_atomic_write_dir_fd(write_dir: Path) -> int:
+    """Seam for tests: open write_dir as a dir fd, O_NOFOLLOW-refusing a
+    symlinked name. Split out from atomic_write_within() so a test can
+    monkeypatch this exact call site to swap the directory's name for a
+    symlink right before it opens -- same technique as
+    promote_capability.py's own _open_wiki_dir_fd_for_guard()."""
+    return os.open(str(write_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+
 def atomic_write_within(output_dir: Path, final_path: Path, payload: bytes) -> None:
     tmp_path = final_path.parent / f".{final_path.name}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
-    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    # Opened on final_path.parent, not the output_dir parameter: for every
+    # call site in this codebase today the two name the same directory,
+    # EXCEPT promote_capability.py's candidate/content-md writers, where
+    # that first parameter is an ancestor 1-2 levels above final_path.parent
+    # -- opening it there would create/replace the tmp file in the wrong
+    # directory. Opened FIRST, before any create/replace, so a symlink
+    # swapped in for this directory's own name in the gap between the
+    # caller's earlier containment check and these calls cannot redirect
+    # the write: dir_fd pins the real directory's inode, and every
+    # relative (dir_fd=) call below still resolves inside it even if the
+    # name is swapped out from under it afterward.
+    dir_fd = _open_atomic_write_dir_fd(final_path.parent)
     try:
+        fd = os.open(tmp_path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
         try:
-            _write_all_bytes(fd, payload)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(str(tmp_path), str(final_path))
-    except BaseException:
-        try:
-            os.unlink(str(tmp_path))
-        except OSError:
-            pass
-        raise
-    try:
-        dir_fd = os.open(str(output_dir), os.O_RDONLY)
+            try:
+                _write_all_bytes(fd, payload)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp_path.name, final_path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except BaseException:
+            try:
+                os.unlink(tmp_path.name, dir_fd=dir_fd)
+            except OSError:
+                pass
+            raise
         try:
             os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:
-        pass
+        except OSError:
+            pass
+    finally:
+        os.close(dir_fd)
 
 
 def acquire_lock(output_dir: Path) -> Path:
