@@ -1336,6 +1336,170 @@ def _validate_compat_check_document(doc: Any, project_root: Path) -> tuple[list[
 
 
 # ---------------------------------------------------------------------------
+# Unattended-execution authorization -- 2026-08-26 cross-audit finding.
+#
+# --authorize-project (above) was designed for a HUMAN, invoking this tool
+# by hand, to name which projects' own declared check_command they take
+# responsibility for running right now. catalog_session_hint.py's
+# SessionStart auto-trigger satisfies that same parameter programmatically
+# -- it always names the CURRENT project (asking Gate D to run that
+# project's own self-declared checks against whatever dependency just went
+# stale) -- with no human ever in the loop for that specific decision. A
+# 3-model max-effort audit (Codex sol/xhigh, Grok/xhigh, Gemini) converged
+# on this being the real gap behind the "--authorize-production-write only
+# controls OUTPUT location, not EXECUTION" finding: that flag was never
+# meant to gate execution at all, and conflating the two was the mistake.
+#
+# The fix is a SEPARATE, per-project, human-only opt-in: a human runs
+# `authorize-auto-run` once, by hand, after actually reading (or at least
+# being shown) the project's current wiki/compat-check.json, pinning its
+# exact sha256. The auto-trigger (implemented in catalog_session_hint.py,
+# which duplicates the read+hash+compare half of this rather than importing
+# this file, per this codebase's own REUSE convention -- see that file's
+# module docstring) then refuses to run unless the CURRENT on-disk content
+# still hashes to that exact pinned value. Any edit to compat-check.json --
+# malicious or benign -- silently revokes this authorization until a human
+# re-runs authorize-auto-run, by construction: there is no "authorize
+# forever" option and no way to authorize content that has not been read.
+AUTO_RUN_AUTHORIZATION_RELATIVE_PATH = Path(".orca") / "context" / "compat-auto-run-authorization.json"
+AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION = 1
+MAX_AUTO_RUN_AUTHORIZATION_BYTES = 4096
+
+
+def _read_auto_run_authorization(project_root: Path) -> tuple[Any, str | None]:
+    """Fresh, bounded, symlink-refusing read of this project's own
+    AUTO_RUN_AUTHORIZATION_RELATIVE_PATH. Returns (doc, None) on success or
+    (None, reason) for any failure, including "does not exist" -- that is
+    the ordinary, expected state for the ~155 projects that have never
+    opted in, not an error worth distinguishing from any other unreadable
+    state here (both mean "not authorized")."""
+    path = project_root / AUTO_RUN_AUTHORIZATION_RELATIVE_PATH
+    if _has_symlink_component(path, project_root):
+        return None, "auto_run_authorization_symlink_component"
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None, "auto_run_authorization_missing"
+    except OSError as exc:
+        return None, f"auto_run_authorization_unreadable:{exc}"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_AUTO_RUN_AUTHORIZATION_BYTES:
+            return None, "auto_run_authorization_not_a_small_regular_file"
+        raw = os.read(fd, MAX_AUTO_RUN_AUTHORIZATION_BYTES + 1)
+    except OSError as exc:
+        return None, f"auto_run_authorization_unreadable:{exc}"
+    finally:
+        os.close(fd)
+    if len(raw) > MAX_AUTO_RUN_AUTHORIZATION_BYTES:
+        return None, "auto_run_authorization_too_large"
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None, "auto_run_authorization_not_valid_json"
+    return doc, None
+
+
+def is_auto_run_authorized(project_root: Path) -> tuple[bool, str]:
+    """The single question the auto-trigger must ask before it is allowed
+    to spawn `run` unattended: has a human explicitly authorized THIS
+    project's CURRENT wiki/compat-check.json content, by its exact hash?
+    Both reads are fresh (no caching) so an edit made a second ago is
+    already enough to revoke a stale authorization -- this is the whole
+    point, not a race to close."""
+    _check_doc, check_reason, current_sha256 = _read_compat_check(project_root)
+    if check_reason is not None:
+        return False, check_reason
+    if current_sha256 is None:
+        return False, "compat_check_unhashable"
+    auth_doc, auth_reason = _read_auto_run_authorization(project_root)
+    if auth_reason is not None:
+        return False, auth_reason
+    if not isinstance(auth_doc, dict):
+        return False, "auto_run_authorization_not_an_object"
+    if auth_doc.get("schema_version") != AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION:
+        return False, "auto_run_authorization_unsupported_schema_version"
+    authorized_sha256 = auth_doc.get("authorized_compat_check_sha256")
+    if not _is_str(authorized_sha256) or authorized_sha256 != current_sha256:
+        return False, "auto_run_authorization_hash_mismatch"
+    return True, "authorized"
+
+
+def cmd_authorize_auto_run(args: argparse.Namespace) -> int:
+    """Human-invoked only -- never called from catalog_session_hint.py or
+    any other unattended path. Reads the project's CURRENT wiki/compat-
+    check.json, prints its declared checks so the human actually sees what
+    they are about to authorize, and pins its exact sha256 into
+    AUTO_RUN_AUTHORIZATION_RELATIVE_PATH. Re-running after an edit re-
+    authorizes the NEW content; it does not "extend" trust in the old one."""
+    project_root = Path(args.project_root).expanduser().resolve(strict=False)
+    if not project_root.is_dir():
+        return _emit_error(args, 4, "project_root_missing", str(project_root))
+
+    doc, reason, sha256_hex = _read_compat_check(project_root)
+    if reason is not None:
+        return _emit_error(args, 4, reason, "wiki/compat-check.json")
+    validated, violation_reason = _validate_compat_check_document(doc, project_root)
+    if violation_reason is not None:
+        return _emit_error(args, 4, "compat_check_invalid", violation_reason)
+
+    if not getattr(args, "quiet", False) and not getattr(args, "json", False):
+        print(f"About to authorize unattended auto-run of {len(validated)} check(s) declared in")
+        print(f"  {project_root / 'wiki' / 'compat-check.json'}  (sha256 {sha256_hex})")
+        for entry in validated:
+            print(f"  - [{entry['id']}] depends_on_ref={entry['depends_on_ref']!r} command={entry['check_command']!r}")
+
+    auth_dir = project_root / AUTO_RUN_AUTHORIZATION_RELATIVE_PATH.parent
+    if _has_symlink_component(auth_dir, project_root):
+        return _emit_error(args, 4, "auto_run_authorization_dir_symlink_component", str(auth_dir))
+    try:
+        auth_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        return _emit_error(args, 4, "auto_run_authorization_dir_uncreatable", str(exc))
+
+    now = datetime.now(timezone.utc)
+    payload = {
+        "schema_version": AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION,
+        "authorized_compat_check_sha256": sha256_hex,
+        "authorized_at": now.isoformat(),
+        "authorized_by": args.authorized_by,
+    }
+    body = (json.dumps(payload, ensure_ascii=False, indent=1) + "\n").encode("utf-8")
+    final_path = project_root / AUTO_RUN_AUTHORIZATION_RELATIVE_PATH
+    try:
+        atomic_write_within(auth_dir, final_path, body)
+    except OSError as exc:
+        return _emit_error(args, 4, "auto_run_authorization_write_failed", str(exc))
+
+    if getattr(args, "json", False):
+        print(_sanitize_line_separators(json.dumps({"ok": True, **payload}, ensure_ascii=False)))
+    elif not getattr(args, "quiet", False):
+        print(f"Authorized. Any future edit to compat-check.json revokes this until re-run.")
+    return 0
+
+
+def cmd_revoke_auto_run(args: argparse.Namespace) -> int:
+    """Idempotent: succeeds whether or not an authorization currently
+    exists. Human-invoked, same as authorize-auto-run."""
+    project_root = Path(args.project_root).expanduser().resolve(strict=False)
+    final_path = project_root / AUTO_RUN_AUTHORIZATION_RELATIVE_PATH
+    if _has_symlink_component(final_path, project_root):
+        return _emit_error(args, 4, "auto_run_authorization_symlink_component", str(final_path))
+    try:
+        final_path.unlink()
+        revoked = True
+    except FileNotFoundError:
+        revoked = False
+    except OSError as exc:
+        return _emit_error(args, 4, "auto_run_authorization_unlink_failed", str(exc))
+    if getattr(args, "json", False):
+        print(_sanitize_line_separators(json.dumps({"ok": True, "revoked": revoked}, ensure_ascii=False)))
+    elif not getattr(args, "quiet", False):
+        print("Revoked." if revoked else "Nothing to revoke (was not authorized).")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Process execution -- shell=False always, argv always a list, process-group
 # isolation + process-group kill on timeout (task spec's "DANGEROUS-PROCESS-
 # TREE requirement": subprocess.run's default timeout kills only the direct
@@ -2244,6 +2408,28 @@ def build_parser() -> argparse.ArgumentParser:
             "--compat-runs-root that resolves to that same production path."
         ),
     )
+
+    authorize_auto_run = subparsers.add_parser(
+        "authorize-auto-run",
+        help=(
+            "Human-only: pin this project's CURRENT wiki/compat-check.json (by exact sha256) as "
+            "authorized for catalog_session_hint.py's unattended SessionStart auto-trigger. Any "
+            "later edit to that file revokes this until re-run."
+        ),
+    )
+    authorize_auto_run.add_argument("--project-root", type=str, required=True, dest="project_root")
+    authorize_auto_run.add_argument("--authorized-by", type=str, required=True, dest="authorized_by")
+    authorize_auto_run.add_argument("--json", action="store_true")
+    authorize_auto_run.add_argument("--quiet", action="store_true")
+
+    revoke_auto_run = subparsers.add_parser(
+        "revoke-auto-run",
+        help="Human-only: remove a project's auto-run authorization, if any.",
+    )
+    revoke_auto_run.add_argument("--project-root", type=str, required=True, dest="project_root")
+    revoke_auto_run.add_argument("--json", action="store_true")
+    revoke_auto_run.add_argument("--quiet", action="store_true")
+
     return parser
 
 
@@ -2402,6 +2588,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_affected(args)
         if args.command == "run":
             return cmd_run(args)
+        if args.command == "authorize-auto-run":
+            return cmd_authorize_auto_run(args)
+        if args.command == "revoke-auto-run":
+            return cmd_revoke_auto_run(args)
         return 2
     except CheckFatal as exc:
         return _emit_error(args, 4, exc.reason, exc.message)

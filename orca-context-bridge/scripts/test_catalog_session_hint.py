@@ -1637,9 +1637,45 @@ class GateDAutoTriggerTests(unittest.TestCase):
             time.sleep(0.02)
         return False
 
+    def _authorize_auto_run(self) -> None:
+        """2026-08-26 cross-audit fix: the trigger now additionally requires
+        a human-granted, per-project, hash-pinned authorization (see
+        is_compat_auto_run_authorized() in catalog_session_hint.py and
+        authorize-auto-run in check_cross_project_compatibility.py) before
+        it will spawn anything -- writes exactly what that human-invoked
+        subcommand would write, against a real wiki/compat-check.json in
+        self.project_root, so tests that exist to exercise the SPAWN path
+        itself still do."""
+        wiki_dir = self.project_root / "wiki"
+        wiki_dir.mkdir(parents=True, exist_ok=True)
+        check_doc = {
+            "schema_version": 1,
+            "checks": [
+                {
+                    "id": "chk", "depends_on_ref": "proj/beta#dep-b",
+                    "check_command": [sys.executable, "-c", "pass"], "cwd": ".",
+                    "timeout_seconds": 30, "reviewed_by": "alice", "reviewed_at": "2026-08-23T00:00:00Z",
+                }
+            ],
+        }
+        check_bytes = json.dumps(check_doc, ensure_ascii=False).encode("utf-8")
+        (wiki_dir / "compat-check.json").write_bytes(check_bytes)
+        auth_dir = self.project_root / ".orca" / "context"
+        auth_dir.mkdir(parents=True, exist_ok=True)
+        (auth_dir / "compat-auto-run-authorization.json").write_text(
+            json.dumps({
+                "schema_version": 1,
+                "authorized_compat_check_sha256": hashlib.sha256(check_bytes).hexdigest(),
+                "authorized_at": "2026-08-23T00:00:00Z",
+                "authorized_by": "test",
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
     def test_stale_dependency_triggers_a_background_gate_d_check(self) -> None:
         self._install_gate_d_stub()
         write_catalog(self.catalog, self._stale_dep_catalog())
+        self._authorize_auto_run()
         proc = self._run()
         self.assertEqual(proc.returncode, 0)
         self.assertTrue(self._wait_for_marker(10.0), "a stale dependency must trigger a Gate D check")
@@ -1672,6 +1708,7 @@ class GateDAutoTriggerTests(unittest.TestCase):
 
     def test_missing_gate_d_script_degrades_gracefully(self) -> None:
         write_catalog(self.catalog, self._stale_dep_catalog())  # no stub installed
+        self._authorize_auto_run()  # so this genuinely exercises the missing-script path, not the auth gate
         proc = self._run()
         self.assertEqual(proc.returncode, 0)
         text = context_of(proc.stdout.decode("utf-8"))
@@ -1685,10 +1722,49 @@ class GateDAutoTriggerTests(unittest.TestCase):
         chmod-based negative control)."""
         self._install_gate_d_stub()
         write_catalog(self.catalog, self._stale_dep_catalog())
+        self._authorize_auto_run()  # so this genuinely exercises the unwritable-dir path, not the auth gate
         self.triggers_dir.write_text("not a directory", encoding="utf-8")
         proc = self._run()
         self.assertEqual(proc.returncode, 0)
         self.assertFalse(self._wait_for_marker(1.0))
+
+    def test_unauthorized_project_never_spawns_even_when_stale(self) -> None:
+        """THE core 2026-08-26 cross-audit fix, proven end-to-end: no
+        wiki/compat-check.json and no authorization marker at all (today's
+        real state for every one of the ~155 fleet projects) must never
+        spawn Gate D, no matter how stale the dependency is -- unlike
+        before this fix, where staleness alone was sufficient."""
+        self._install_gate_d_stub()
+        write_catalog(self.catalog, self._stale_dep_catalog())  # no self._authorize_auto_run() call
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0)
+        self.assertFalse(self._wait_for_marker(1.0), "an unauthorized project must never trigger Gate D")
+        text = context_of(proc.stdout.decode("utf-8"))
+        self.assertIn(csh.SENTINEL_DEP, text, "line 2 must still render")
+
+    def test_editing_compat_check_after_authorization_revokes_it(self) -> None:
+        """The whole point of hash-pinning rather than a boolean flag: an
+        edit to compat-check.json AFTER authorization -- attacker-planted
+        or entirely benign, this mechanism cannot tell the difference and
+        is not supposed to try -- silently re-locks the trigger until a
+        human re-authorizes the new content."""
+        self._install_gate_d_stub()
+        write_catalog(self.catalog, self._stale_dep_catalog())
+        self._authorize_auto_run()
+        (self.project_root / "wiki" / "compat-check.json").write_text(
+            json.dumps({
+                "schema_version": 1,
+                "checks": [{
+                    "id": "chk", "depends_on_ref": "proj/beta#dep-b",
+                    "check_command": [sys.executable, "-c", "print('different now')"], "cwd": ".",
+                    "timeout_seconds": 30, "reviewed_by": "alice", "reviewed_at": "2026-08-23T00:00:00Z",
+                }],
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0)
+        self.assertFalse(self._wait_for_marker(1.0), "an edit since authorization must revoke it")
 
     def test_result_surfacing_labels_staging_and_hides_injected_check_output(self) -> None:
         """THE load-bearing injection-defense test, parallel to
@@ -1765,6 +1841,7 @@ class GateDAutoTriggerTests(unittest.TestCase):
     def test_the_only_write_anywhere_is_the_one_debounce_marker(self) -> None:
         self._install_gate_d_stub()
         write_catalog(self.catalog, self._stale_dep_catalog())
+        self._authorize_auto_run()  # set up BEFORE the snapshot: this is pre-existing state, not a new write
         before = _snapshot(self.tmp)
         proc = self._run()
         self.assertEqual(proc.returncode, 0)
@@ -1813,13 +1890,20 @@ class HandleCompatHitsUnitTests(unittest.TestCase):
         popen.assert_not_called()
 
     def test_distinct_targets_are_capped_at_the_configured_maximum(self) -> None:
+        """is_compat_auto_run_authorized() is mocked True here: this test's
+        own subject is the MAX_COMPAT_TARGETS_PER_HOOK cap, not the
+        2026-08-26 authorization gate (covered separately, in
+        GateDAutoTriggerTests and TestIsCompatAutoRunAuthorized)."""
         hits = [
             (f"proj/alpha#cap-{i}", f"proj/beta#dep-{i}", NOW, NOW - timedelta(days=1))
             for i in range(csh.MAX_COMPAT_TARGETS_PER_HOOK + 5)
         ]
         with mock.patch("catalog_session_hint.subprocess.Popen") as popen, \
-             mock.patch("catalog_session_hint.Path.is_file", return_value=True):
-            csh.handle_compat_hits(hits, "proj/alpha", self._args(), time.monotonic(), Path("/fake/catalog.json"))
+             mock.patch("catalog_session_hint.Path.is_file", return_value=True), \
+             mock.patch("catalog_session_hint.is_compat_auto_run_authorized", return_value=True):
+            csh.handle_compat_hits(
+                hits, "proj/alpha", self._args(), time.monotonic(), Path("/fake/catalog.json"), {}
+            )
         self.assertEqual(popen.call_count, csh.MAX_COMPAT_TARGETS_PER_HOOK)
 
     def test_a_slow_scan_degrades_via_the_deadline_rather_than_hanging(self) -> None:
@@ -1827,6 +1911,120 @@ class HandleCompatHitsUnitTests(unittest.TestCase):
         with mock.patch("catalog_session_hint._check_deadline", side_effect=csh._HookDeadline("x")):
             with self.assertRaises(csh._HookDeadline):
                 csh.handle_compat_hits(hits, "proj/alpha", self._args(), time.monotonic(), Path("/fake/catalog.json"))
+
+
+class IsCompatAutoRunAuthorizedTests(unittest.TestCase):
+    """is_compat_auto_run_authorized() and its helpers, direct and
+    isolated from the full hook subprocess -- the 2026-08-26 cross-audit
+    fix's actual enforcement point (see the long comment above
+    spawn_compat_check() in catalog_session_hint.py)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="csh-authz-"))
+        self.project_root = self.tmp / "proj"
+        (self.project_root / "wiki").mkdir(parents=True)
+        self.check_path = self.project_root / "wiki" / "compat-check.json"
+        self.auth_dir = self.project_root / ".orca" / "context"
+        self.auth_path = self.auth_dir / "compat-auto-run-authorization.json"
+
+    def tearDown(self) -> None:
+        _make_writable(self.tmp)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _catalog(self) -> dict:
+        return make_catalog(projects=[
+            _project(project_id="proj/alpha", real_path=str(self.project_root), path=str(self.project_root)),
+        ])
+
+    def _write_check(self, payload: bytes = b'{"schema_version": 1, "checks": []}') -> bytes:
+        self.check_path.write_bytes(payload)
+        return payload
+
+    def _authorize(self, check_bytes: bytes) -> None:
+        self.auth_dir.mkdir(parents=True, exist_ok=True)
+        self.auth_path.write_text(
+            json.dumps({
+                "schema_version": 1,
+                "authorized_compat_check_sha256": hashlib.sha256(check_bytes).hexdigest(),
+                "authorized_at": "2026-08-23T00:00:00Z",
+                "authorized_by": "test",
+            }),
+            encoding="utf-8",
+        )
+
+    def test_no_compat_check_at_all_is_unauthorized(self) -> None:
+        self.assertFalse(csh.is_compat_auto_run_authorized(self._catalog(), "proj/alpha"))
+
+    def test_compat_check_present_but_no_marker_is_unauthorized(self) -> None:
+        self._write_check()
+        self.assertFalse(csh.is_compat_auto_run_authorized(self._catalog(), "proj/alpha"))
+
+    def test_matching_hash_is_authorized(self) -> None:
+        check_bytes = self._write_check()
+        self._authorize(check_bytes)
+        self.assertTrue(csh.is_compat_auto_run_authorized(self._catalog(), "proj/alpha"))
+
+    def test_edited_compat_check_after_authorization_is_unauthorized(self) -> None:
+        check_bytes = self._write_check()
+        self._authorize(check_bytes)
+        self._write_check(b'{"schema_version": 1, "checks": [{"different": true}]}')
+        self.assertFalse(csh.is_compat_auto_run_authorized(self._catalog(), "proj/alpha"))
+
+    def test_wrong_schema_version_is_unauthorized(self) -> None:
+        check_bytes = self._write_check()
+        self.auth_dir.mkdir(parents=True, exist_ok=True)
+        self.auth_path.write_text(
+            json.dumps({
+                "schema_version": 999,
+                "authorized_compat_check_sha256": hashlib.sha256(check_bytes).hexdigest(),
+            }),
+            encoding="utf-8",
+        )
+        self.assertFalse(csh.is_compat_auto_run_authorized(self._catalog(), "proj/alpha"))
+
+    def test_unresolvable_project_id_is_unauthorized(self) -> None:
+        check_bytes = self._write_check()
+        self._authorize(check_bytes)
+        self.assertFalse(csh.is_compat_auto_run_authorized(self._catalog(), "proj/does-not-exist"))
+
+    def test_symlinked_wiki_dir_is_unauthorized(self) -> None:
+        """O_NOFOLLOW must refuse a symlinked wiki/ the same way the
+        authoritative check_cross_project_compatibility.py's own
+        _read_compat_check() does -- a false True here would be the
+        pre-check waving through exactly the substitution attack the real
+        `run` execution path is hardened against."""
+        check_bytes = self._write_check()
+        self._authorize(check_bytes)
+        outside = self.tmp / "outside-wiki"
+        outside.mkdir()
+        (outside / "compat-check.json").write_bytes(check_bytes)
+        shutil.rmtree(self.project_root / "wiki")
+        (self.project_root / "wiki").symlink_to(outside, target_is_directory=True)
+        self.assertFalse(csh.is_compat_auto_run_authorized(self._catalog(), "proj/alpha"))
+
+    def test_symlinked_authorization_dir_is_unauthorized(self) -> None:
+        check_bytes = self._write_check()
+        self._authorize(check_bytes)
+        outside = self.tmp / "outside-orca"
+        outside.mkdir()
+        shutil.copy2(str(self.auth_path), str(outside / "compat-auto-run-authorization.json"))
+        shutil.rmtree(self.project_root / ".orca")
+        (self.project_root / ".orca").symlink_to(outside.parent, target_is_directory=True)
+        self.assertFalse(csh.is_compat_auto_run_authorized(self._catalog(), "proj/alpha"))
+
+    def test_constants_agree_with_check_cross_project_compatibility(self) -> None:
+        """Anti-drift safeguard for the duplicated-not-imported logic (see
+        REUSE in the module docstring for the established precedent this
+        follows, with query_catalog.py). Imported HERE, in the test
+        process only -- never at runtime by catalog_session_hint.py
+        itself (test_the_dependency_surface_is_stdlib_only enforces
+        that)."""
+        import check_cross_project_compatibility as ccc
+        self.assertEqual(
+            csh._AUTO_RUN_AUTHORIZATION_RELATIVE_PARTS,
+            ccc.AUTO_RUN_AUTHORIZATION_RELATIVE_PATH.parts,
+        )
+        self.assertEqual(csh._AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION, ccc.AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION)
 
 
 class RenderCompatResultLineTests(unittest.TestCase):

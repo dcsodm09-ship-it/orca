@@ -1175,6 +1175,139 @@ def claim_compat_trigger_slot(triggers_dir: Path, project_id: str, target_global
         return False
 
 
+# ---------------------------------------------------------------------------
+# Auto-run authorization pre-check -- 2026-08-26 cross-audit finding.
+#
+# --authorize-production-write (spawn_compat_check()'s argv, above) only
+# ever gated where Gate D's `run` WRITES its result, never whether it
+# EXECUTES the third-party-declared check_command in the first place --
+# that execution happens unconditionally inside run_compatibility_checks()
+# once --authorize-project is satisfied, and spawn_compat_check() always
+# satisfies it (with THIS project's own project_id) on this project's own
+# behalf, with no human in the loop for that specific decision. A 3-model
+# max-effort audit (Codex sol/xhigh, Grok/xhigh, Gemini) converged on this
+# being the real gap. check_cross_project_compatibility.py's own
+# `authorize-auto-run` subcommand (human-invoked only, never called from
+# here) is the fix: a human runs it once, after being shown the project's
+# current wiki/compat-check.json, pinning its exact sha256 into
+# AUTO_RUN_AUTHORIZATION_RELATIVE_PARTS. The functions below are this
+# hook's own read-only PRE-CHECK of that same pinned-hash gate, so the
+# trigger below never even attempts to spawn `run` for a project that has
+# not opted in -- see REUSE in the module docstring for why this is
+# duplicated rather than imported, and test_catalog_session_hint.py's
+# TestAutoRunAuthorizationAgreesWithSource for the anti-drift safeguard.
+# Any edit to compat-check.json after authorization changes its hash and
+# silently, correctly re-locks the trigger until a human re-authorizes.
+_AUTO_RUN_AUTHORIZATION_RELATIVE_PARTS = (".orca", "context", "compat-auto-run-authorization.json")
+_AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION = 1
+_MAX_AUTO_RUN_AUTHORIZATION_BYTES = 4096
+_MAX_COMPAT_CHECK_BYTES_FOR_AUTH_PRECHECK = 2 * 1024 * 1024
+
+
+def _path_has_symlink_component(path: Path, root: Path) -> bool:
+    """Duplicated from check_cross_project_compatibility.py's
+    _has_symlink_component()."""
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return True
+    candidate = root
+    for part in relative.parts:
+        candidate = candidate / part
+        if candidate.is_symlink():
+            return True
+    return False
+
+
+def _read_small_guarded_file(path: Path, root: Path, max_bytes: int) -> "bytes | None":
+    """Bounded, symlink-refusing read collapsed to bytes-or-None, duplicated
+    (in spirit) from check_cross_project_compatibility.py's
+    _read_compat_check()/_read_auto_run_authorization(): this pre-check
+    only ever needs to hash or parse, never to distinguish WHY a read
+    failed the way the authoritative tool does for its own error
+    reporting."""
+    if _path_has_symlink_component(path, root):
+        return None
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except _HookDeadline:
+        raise
+    except BaseException:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+            return None
+        raw = os.read(fd, max_bytes + 1)
+    except _HookDeadline:
+        raise
+    except BaseException:
+        return None
+    finally:
+        os.close(fd)
+    if len(raw) > max_bytes:
+        return None
+    return raw
+
+
+def _project_root_for_id(catalog: dict, project_id: str) -> "Path | None":
+    """Best-effort project_id -> real_path lookup for the pre-check only.
+    Deliberately simpler than check_cross_project_compatibility.py's own
+    build_project_root_index(): a wrong or missing answer here only makes
+    this pre-check conservatively refuse (fails closed, same as any other
+    unreadable state) -- Gate D's own `run`, if it is ever actually
+    spawned, resolves project roots fresh and authoritatively on its own."""
+    rows = catalog.get("projects")
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not isinstance(row, dict) or row.get("project_id") != project_id:
+            continue
+        real_path = row.get("real_path")
+        if not isinstance(real_path, str) or not real_path:
+            continue
+        candidate = Path(real_path)
+        if not candidate.is_absolute():
+            continue
+        return candidate
+    return None
+
+
+def is_compat_auto_run_authorized(catalog: dict, project_id: str) -> bool:
+    """True only if a human has run check_cross_project_compatibility.py's
+    `authorize-auto-run` for this exact project, against the exact bytes
+    wiki/compat-check.json currently holds. Fails closed on every
+    ambiguity -- unresolvable root, missing/unreadable/oversized/symlinked
+    file on either side, malformed JSON, wrong schema version, or a hash
+    that no longer matches -- never raises."""
+    project_root = _project_root_for_id(catalog, project_id)
+    if project_root is None or not project_root.is_dir():
+        return False
+
+    check_path = project_root / "wiki" / "compat-check.json"
+    check_bytes = _read_small_guarded_file(
+        check_path, project_root, _MAX_COMPAT_CHECK_BYTES_FOR_AUTH_PRECHECK
+    )
+    if check_bytes is None:
+        return False
+    current_sha256 = hashlib.sha256(check_bytes).hexdigest()
+
+    auth_path = project_root.joinpath(*_AUTO_RUN_AUTHORIZATION_RELATIVE_PARTS)
+    auth_bytes = _read_small_guarded_file(auth_path, project_root, _MAX_AUTO_RUN_AUTHORIZATION_BYTES)
+    if auth_bytes is None:
+        return False
+    try:
+        auth_doc = json.loads(auth_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(auth_doc, dict):
+        return False
+    if auth_doc.get("schema_version") != _AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION:
+        return False
+    authorized_sha256 = auth_doc.get("authorized_compat_check_sha256")
+    return isinstance(authorized_sha256, str) and authorized_sha256 == current_sha256
+
+
 def spawn_compat_check(
     gate_d_script: Path,
     catalog_path: Path,
@@ -1372,6 +1505,7 @@ def handle_compat_hits(
     args: argparse.Namespace,
     started: float,
     catalog_path: Path,
+    catalog: "dict | None" = None,
 ) -> list:
     """Orchestrator, called once per hook invocation with the SAME `hits`
     already computed for line 2. For up to MAX_COMPAT_TARGETS_PER_HOOK
@@ -1382,15 +1516,27 @@ def handle_compat_hits(
          an EARLIER invocation's result is still surfaced even when THIS
          invocation's debounce suppresses a new spawn.
       2. only if nothing was found: when spawning is allowed (see below) AND
-         project_id is real AND the Gate D script is found on disk,
-         claim_compat_trigger_slot() then spawn_compat_check().
+         project_id is real AND this project has a live, human-granted
+         is_compat_auto_run_authorized() AND the Gate D script is found on
+         disk, claim_compat_trigger_slot() then spawn_compat_check().
 
     spawn_allowed = not args.no_spawn and not args.no_compat_spawn --
     --no-spawn already means "never start a background process from this
     hook, however stale anything is"; extending that existing meaning to
     Gate D is safer than inventing a second flag nobody remembers, while
     --no-compat-spawn gives independent control to disable ONLY Gate D
-    while still allowing catalog rebuilds.
+    while still allowing catalog rebuilds. Both are coarse, global kill
+    switches; is_compat_auto_run_authorized() is the real, per-project,
+    human-granted gate added 2026-08-26 (see that function's own docstring)
+    -- kept ADDITIONAL to, not instead of, the two flags above.
+
+    `catalog` is optional and defaults to None (not computed here) purely
+    so every EXISTING caller/test that only cares about the debounce/
+    result-surfacing behavior keeps working unchanged; a None catalog
+    makes is_compat_auto_run_authorized() unreachable and the authorization
+    check below correctly, silently treats that the same as "not
+    authorized" -- fail closed, not fail open, on a caller that forgot to
+    pass it.
 
     Every per-target step is individually `except _HookDeadline: raise` /
     `except BaseException: continue` -- one target's failure never blocks
@@ -1417,6 +1563,15 @@ def handle_compat_hits(
         if len(targets) >= MAX_COMPAT_TARGETS_PER_HOOK:
             break
 
+    # Computed at most once per hook invocation (not per-target): the
+    # authorization decision does not depend on target_global_id, only on
+    # this project's own (catalog, project_id). Lazily skipped entirely
+    # when spawning could never happen anyway (spawn_allowed is False,
+    # project_id is None, or no catalog was supplied), so the extra
+    # filesystem reads never happen on the vast majority of hook
+    # invocations where nothing is even stale.
+    auto_run_authorized = "unknown"
+
     results: list = []
     for target_global_id in targets:
         try:
@@ -1427,6 +1582,17 @@ def handle_compat_hits(
                 results.append((target_global_id, doc, path))
                 continue
             if not spawn_allowed or not project_id:
+                continue
+            if auto_run_authorized == "unknown":
+                try:
+                    auto_run_authorized = bool(
+                        catalog is not None and is_compat_auto_run_authorized(catalog, project_id)
+                    )
+                except _HookDeadline:
+                    raise
+                except BaseException:
+                    auto_run_authorized = False
+            if not auto_run_authorized:
                 continue
             gate_d_script = Path(__file__).resolve().parent / GATE_D_SCRIPT_NAME
             if not gate_d_script.is_file():
@@ -1659,7 +1825,7 @@ def build_hook_text(args: argparse.Namespace, started: float, now: "datetime | N
     compat_results: list = []
     try:
         _check_deadline(started)
-        compat_results = handle_compat_hits(hits, project_id, args, started, catalog_path)
+        compat_results = handle_compat_hits(hits, project_id, args, started, catalog_path, catalog)
     except BaseException:
         compat_results = []
 

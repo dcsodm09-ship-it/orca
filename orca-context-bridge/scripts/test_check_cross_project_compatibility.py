@@ -2565,5 +2565,114 @@ class CliRunProductionAuthorizationTest(unittest.TestCase):
         self.assertNotIn("NOTICE", err)
 
 
+class AutoRunAuthorizationTests(unittest.TestCase):
+    """authorize-auto-run / revoke-auto-run / is_auto_run_authorized --
+    2026-08-26 cross-audit fix: catalog_session_hint.py's SessionStart
+    auto-trigger used to satisfy --authorize-project on this project's own
+    behalf with no human ever in the loop for that specific decision.
+    These are the human-only commands that close it (see the module
+    comment above them in check_cross_project_compatibility.py)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="ccc-authz-"))
+        self.project_root = make_project_dir(self.tmp, "p")
+        write_compat_check(self.project_root, [make_check_entry()])
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _marker_path(self) -> Path:
+        return self.project_root / ccc.AUTO_RUN_AUTHORIZATION_RELATIVE_PATH
+
+    def test_authorize_writes_a_marker_pinning_the_current_hash(self) -> None:
+        code, out, err = _run_main(
+            ["authorize-auto-run", "--project-root", str(self.project_root), "--authorized-by", "alice", "--json"]
+        )
+        self.assertEqual(code, 0, out + err)
+        payload = json.loads(out)
+        self.assertTrue(payload["ok"])
+        marker = json.loads(self._marker_path().read_text(encoding="utf-8"))
+        self.assertEqual(marker["schema_version"], ccc.AUTO_RUN_AUTHORIZATION_SCHEMA_VERSION)
+        self.assertEqual(marker["authorized_by"], "alice")
+        _doc, _reason, current_sha256 = ccc._read_compat_check(self.project_root)
+        self.assertEqual(marker["authorized_compat_check_sha256"], current_sha256)
+        self.assertTrue(ccc.is_auto_run_authorized(self.project_root)[0])
+
+    def test_authorize_refuses_an_invalid_compat_check_document(self) -> None:
+        (self.project_root / "wiki" / "compat-check.json").write_text("not json", encoding="utf-8")
+        code, out, err = _run_main(
+            ["authorize-auto-run", "--project-root", str(self.project_root), "--authorized-by", "alice", "--quiet"]
+        )
+        self.assertEqual(code, 4)
+        self.assertFalse(self._marker_path().exists())
+
+    def test_authorize_refuses_a_missing_project_root(self) -> None:
+        code, out, err = _run_main(
+            ["authorize-auto-run", "--project-root", str(self.tmp / "nope"), "--authorized-by", "alice", "--quiet"]
+        )
+        self.assertEqual(code, 4)
+
+    def test_editing_compat_check_after_authorization_revokes_it(self) -> None:
+        _run_main(
+            ["authorize-auto-run", "--project-root", str(self.project_root), "--authorized-by", "alice", "--quiet"]
+        )
+        self.assertTrue(ccc.is_auto_run_authorized(self.project_root)[0])
+        write_compat_check(self.project_root, [make_check_entry(check_command=["/bin/echo", "different"])])
+        authorized, reason = ccc.is_auto_run_authorized(self.project_root)
+        self.assertFalse(authorized)
+        self.assertEqual(reason, "auto_run_authorization_hash_mismatch")
+
+    def test_re_authorizing_after_an_edit_pins_the_new_hash(self) -> None:
+        _run_main(
+            ["authorize-auto-run", "--project-root", str(self.project_root), "--authorized-by", "alice", "--quiet"]
+        )
+        write_compat_check(self.project_root, [make_check_entry(check_command=["/bin/echo", "different"])])
+        code, out, err = _run_main(
+            ["authorize-auto-run", "--project-root", str(self.project_root), "--authorized-by", "bob", "--quiet"]
+        )
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(ccc.is_auto_run_authorized(self.project_root)[0])
+
+    def test_revoke_removes_an_existing_authorization(self) -> None:
+        _run_main(
+            ["authorize-auto-run", "--project-root", str(self.project_root), "--authorized-by", "alice", "--quiet"]
+        )
+        code, out, err = _run_main(["revoke-auto-run", "--project-root", str(self.project_root), "--json"])
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(json.loads(out)["revoked"])
+        self.assertFalse(self._marker_path().exists())
+        self.assertFalse(ccc.is_auto_run_authorized(self.project_root)[0])
+
+    def test_revoke_is_idempotent_when_nothing_was_authorized(self) -> None:
+        code, out, err = _run_main(["revoke-auto-run", "--project-root", str(self.project_root), "--json"])
+        self.assertEqual(code, 0, out + err)
+        self.assertFalse(json.loads(out)["revoked"])
+
+    def test_never_authorized_is_unauthorized(self) -> None:
+        authorized, reason = ccc.is_auto_run_authorized(self.project_root)
+        self.assertFalse(authorized)
+        self.assertEqual(reason, "auto_run_authorization_missing")
+
+    def test_missing_compat_check_is_unauthorized(self) -> None:
+        (self.project_root / "wiki" / "compat-check.json").unlink()
+        authorized, reason = ccc.is_auto_run_authorized(self.project_root)
+        self.assertFalse(authorized)
+        self.assertEqual(reason, "compat_check_missing")
+
+    def test_symlinked_authorization_dir_component_refused(self) -> None:
+        """Same O_NOFOLLOW discipline as _read_compat_check() on the read
+        side of wiki/, applied here to .orca/context/."""
+        _run_main(
+            ["authorize-auto-run", "--project-root", str(self.project_root), "--authorized-by", "alice", "--quiet"]
+        )
+        outside = self.tmp / "outside-orca-context"
+        outside.mkdir()
+        shutil.move(str(self.project_root / ".orca" / "context"), str(outside / "context"))
+        (self.project_root / ".orca" / "context").symlink_to(outside / "context", target_is_directory=True)
+        authorized, reason = ccc.is_auto_run_authorized(self.project_root)
+        self.assertFalse(authorized)
+        self.assertEqual(reason, "auto_run_authorization_symlink_component")
+
+
 if __name__ == "__main__":
     unittest.main()
