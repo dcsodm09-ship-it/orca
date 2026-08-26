@@ -54,6 +54,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -234,6 +235,9 @@ def hook_args(**overrides) -> argparse.Namespace:
         "catalog": None,
         "stale_after_hours": float(csh.DEFAULT_STALE_AFTER_HOURS),
         "no_spawn": True,
+        "no_compat_spawn": True,
+        "compat_runs_root": None,
+        "compat_triggers_dir": None,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -901,6 +905,75 @@ class InjectionTests(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"],
                          "a" + chr(0x2028) + "b")
 
+    def test_lone_surrogate_is_scrubbed_not_left_to_break_utf8_encoding(self) -> None:
+        """Dedicated-review P1, 2026-08-26: a bare \\uD800-style escape in a
+        catalog's JSON text is a legal json.loads() result (an in-memory str
+        containing an unpaired UTF-16 surrogate) even though it can never be
+        UTF-8 *encoded* -- and this module's own rendering pipeline
+        (_truncate_bytes, fit_budget) encodes to UTF-8. Previously
+        unstripped by _flatten_for_terminal, a poisoned id could raise
+        UnicodeEncodeError deep inside rendering. Unit-level: the scrub
+        itself must neutralize it, exactly like Cc."""
+        poisoned = "evil" + "\ud800" + "tail"
+        scrubbed = csh._flatten_for_terminal(poisoned)
+        self.assertNotIn("\ud800", scrubbed)
+        # Must not merely avoid crashing -- must actually be UTF-8 encodable
+        # afterward, since that's the operation that used to raise.
+        scrubbed.encode("utf-8")
+
+    def test_lone_surrogate_in_a_dependency_id_does_not_take_down_line_1(self) -> None:
+        """End-to-end repro of the dedicated review's exact finding: a
+        poisoned id reaching `hits` (line 2's data) must degrade to "no
+        line 2", never to losing the already-correct line 1 summary --
+        this is the guarantee build_hook_text()'s own comment names
+        explicitly, and the guarantee this specific bug broke.
+
+        json.dumps(..., ensure_ascii=False) on an in-memory str containing a
+        real surrogate cannot itself be UTF-8 encoded to write the fixture
+        file (confirmed empirically: it raises the very UnicodeEncodeError
+        this test exists to prove doesn't escape the hook) -- so this test
+        writes the catalog with a LITERAL `\\uD800` JSON escape sequence in
+        the file text instead (plain ASCII on disk, exactly how a real
+        buggy upstream writer using json.dumps()'s own ensure_ascii=True
+        default would actually produce this). json.loads() decodes that
+        escape into a real in-memory surrogate character regardless of
+        pairing, which is the actual, only realistic way this bug is
+        reachable -- matching the dedicated review's own repro method."""
+        catalog_text = (
+            '{"generated_at": "2026-08-20T00:00:00Z", "verified_at": "2026-08-20T00:00:00Z", '
+            '"capabilities": [{"global_id": "proj/alpha#cap:\\uD800", "project_id": "proj/alpha", '
+            '"last_verified_at": "2026-08-20T00:00:00Z", "depends_on": ["proj/beta#t"]}, '
+            '{"global_id": "proj/beta#t", "project_id": "proj/beta", '
+            '"last_verified_at": "2026-08-21T00:00:00Z", "depends_on": []}], '
+            '"wiki_pages": [], "projects": [{"project_id": "proj/alpha", "real_path": "/fixtures/proj/alpha"}, '
+            '{"project_id": "proj/beta", "real_path": "/fixtures/proj/beta"}]}'
+        )
+        catalog_path = self.tmp / "catalog.json"
+        catalog_path.write_text(catalog_text, encoding="utf-8")
+        # Sanity: confirm this really does produce an in-memory surrogate,
+        # so a future stdlib/behavior change can't silently defang this test.
+        doc = json.loads(catalog_text)
+        gid = doc["capabilities"][0]["global_id"]
+        self.assertTrue(any(0xD800 <= ord(c) <= 0xDFFF for c in gid), "fixture no longer produces a real surrogate")
+
+        args = hook_args(catalog=str(catalog_path))
+        text = csh.build_hook_text(args, time.monotonic(), now=NOW)
+        self.assertTrue(text.startswith(csh.SENTINEL_SUMMARY), f"line 1 missing: {text!r}")
+        text.encode("utf-8")  # must not raise -- the whole point of the fix
+
+    def test_lone_surrogate_in_compat_result_global_id_does_not_crash_line_3(self) -> None:
+        """render_compat_result_line() shares _safe_field()'s single
+        interpolation boundary with line 2 -- same fix, same coverage,
+        verified at this function's own unit level per the dedicated
+        review's explicit request ("since render_compat_result_line shares
+        the same gap")."""
+        text = csh.render_compat_result_line(
+            [("proj/alpha#cap:\ud800", {"outcome": "ok", "checks": []}, "/tmp/fake-run/proj.json")],
+            shown=1,
+        )
+        self.assertNotIn("\ud800", text)
+        text.encode("utf-8")  # must not raise
+
     def test_a_hostile_project_id_cannot_reach_the_output(self) -> None:
         """project_id is only ever compared, never interpolated -- so this
         asserts the absence of a rendering path, not a scrub of one."""
@@ -957,6 +1030,45 @@ class BudgetTests(unittest.TestCase):
     def test_a_real_sized_context_is_far_under_budget(self) -> None:
         text = csh.fit_budget("ORCA_CATALOG_V1 " + "s" * 200, self._hits(3))
         self.assertLess(len(text.encode("utf-8")), 1024)
+
+    # -- line 3 (compat results) -------------------------------------------
+
+    def _compat_results(self, n: int) -> list:
+        return [
+            (f"proj/beta#target{i:04d}", {"outcome": "ok", "checks": []}, Path(f"/x/r{i}.json"))
+            for i in range(n)
+        ]
+
+    def test_two_arg_call_sites_are_completely_unaffected(self) -> None:
+        """Every existing 2-arg fit_budget(summary, hits) call site must
+        take the identical code path as before compat_results existed."""
+        text = csh.fit_budget("ORCA_CATALOG_V1 short", self._hits(2))
+        self.assertIn(csh.SENTINEL_DEP, text)
+        self.assertNotIn(csh.SENTINEL_COMPAT_RESULT, text)
+
+    def test_three_lines_fit_the_budget(self) -> None:
+        text = csh.fit_budget("ORCA_CATALOG_V1 short", self._hits(1), self._compat_results(1))
+        self.assertLessEqual(len(text.encode("utf-8")), csh.MAX_CONTEXT_BYTES)
+        self.assertIn(csh.SENTINEL_DEP, text)
+        self.assertIn(csh.SENTINEL_COMPAT_RESULT, text)
+
+    def test_line_three_drops_before_line_two_when_both_compete_for_budget(self) -> None:
+        """Line 3 is the most speculative/newest addition and is dropped in
+        full BEFORE line 2's own tail pairs are ever touched."""
+        with mock.patch("catalog_session_hint.render_dependency_line", return_value="DEP"), \
+             mock.patch("catalog_session_hint.render_compat_result_line", return_value="COMPAT"):
+            summary = "S" * (csh.MAX_CONTEXT_BYTES - len("\nDEP"))
+            text = csh.fit_budget(summary, [("a", "b", NOW, NOW)], [("t", {}, Path("/x"))])
+        self.assertTrue(text.startswith(summary))
+        self.assertIn("DEP", text)
+        self.assertNotIn("COMPAT", text)
+
+    def test_line_three_is_dropped_entirely_before_line_two_is_touched(self) -> None:
+        summary = "ORCA_CATALOG_V1 " + "s" * 4000
+        text = csh.fit_budget(summary, self._hits(3), self._compat_results(2))
+        self.assertNotIn(csh.SENTINEL_DEP, text)
+        self.assertNotIn(csh.SENTINEL_COMPAT_RESULT, text)
+        self.assertEqual(text, summary)
 
 
 # ---------------------------------------------------------------------------
@@ -1337,6 +1449,398 @@ class StalenessAndSpawnTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Gate D auto-trigger + result surfacing (line 3)
+# ---------------------------------------------------------------------------
+
+
+class CompatTriggerArgvTests(unittest.TestCase):
+    """spawn_compat_check() in isolation: argv shape and the one property
+    that matters most -- --authorize-production-write is never present."""
+
+    def test_argv_shape_and_never_authorizes_production_write(self) -> None:
+        with mock.patch("catalog_session_hint.subprocess.Popen") as popen:
+            ok = csh.spawn_compat_check(
+                Path("/fake/dir/check_cross_project_compatibility.py"),
+                Path("/fake/catalog.json"),
+                csh.COMPAT_RUNS_ROOT,
+                "proj/alpha",
+                "proj/beta#dep-b",
+            )
+        self.assertTrue(ok)
+        popen.assert_called_once()
+        argv, kwargs = popen.call_args[0][0], popen.call_args[1]
+        self.assertEqual(
+            argv,
+            [
+                sys.executable, "-I", "/fake/dir/check_cross_project_compatibility.py", "run",
+                "--global-id", "proj/beta#dep-b",
+                "--authorize-project", "proj/alpha",
+                "--catalog", "/fake/catalog.json",
+                "--compat-runs-root", str(csh.COMPAT_RUNS_ROOT),
+            ],
+        )
+        self.assertNotIn("--authorize-production-write", argv)
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
+        self.assertTrue(kwargs["start_new_session"])
+        self.assertEqual(kwargs["cwd"], "/fake/dir")
+
+    def test_a_spawn_failure_returns_false_without_raising(self) -> None:
+        with mock.patch("catalog_session_hint.subprocess.Popen", side_effect=OSError("EAGAIN")):
+            ok = csh.spawn_compat_check(
+                Path("/fake/check_cross_project_compatibility.py"), Path("/fake/catalog.json"),
+                csh.COMPAT_RUNS_ROOT, "proj/alpha", "proj/beta#dep-b",
+            )
+        self.assertFalse(ok)
+
+
+class CompatDebounceTests(unittest.TestCase):
+    """claim_compat_trigger_slot() in isolation -- the correctness
+    guarantee behind the auto-trigger's debounce, exercised directly rather
+    than through a real subprocess race."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="csh-debounce-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_exactly_one_winner_under_real_concurrency(self) -> None:
+        """The O_CREAT|O_EXCL path gives an EXACT, non-probabilistic
+        guarantee, stronger than lock_appears_free()'s own "roughly one"."""
+        triggers_dir = self.tmp / "triggers"
+        results: list = []
+        results_lock = threading.Lock()
+
+        def attempt() -> None:
+            claimed = csh.claim_compat_trigger_slot(triggers_dir, "proj/alpha", "proj/beta#dep-b")
+            with results_lock:
+                results.append(claimed)
+
+        threads = [threading.Thread(target=attempt) for _ in range(24)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1, f"expected exactly one winner, got {sum(results)} of {len(results)}")
+
+    def test_a_second_claim_for_the_same_pair_is_debounced(self) -> None:
+        triggers_dir = self.tmp / "triggers"
+        self.assertTrue(csh.claim_compat_trigger_slot(triggers_dir, "proj/alpha", "proj/beta#dep-b"))
+        self.assertFalse(csh.claim_compat_trigger_slot(triggers_dir, "proj/alpha", "proj/beta#dep-b"))
+
+    def test_a_different_target_is_claimed_independently(self) -> None:
+        triggers_dir = self.tmp / "triggers"
+        self.assertTrue(csh.claim_compat_trigger_slot(triggers_dir, "proj/alpha", "proj/beta#dep-b"))
+        self.assertTrue(csh.claim_compat_trigger_slot(triggers_dir, "proj/alpha", "proj/beta#dep-c"))
+
+    def test_a_different_project_for_the_same_target_is_claimed_independently(self) -> None:
+        triggers_dir = self.tmp / "triggers"
+        self.assertTrue(csh.claim_compat_trigger_slot(triggers_dir, "proj/alpha", "proj/beta#dep-b"))
+        self.assertTrue(csh.claim_compat_trigger_slot(triggers_dir, "proj/gamma", "proj/beta#dep-b"))
+
+    def test_a_stale_marker_is_reclaimed(self) -> None:
+        triggers_dir = self.tmp / "triggers"
+        self.assertTrue(csh.claim_compat_trigger_slot(triggers_dir, "proj/alpha", "proj/beta#dep-b"))
+        marker = triggers_dir / csh._compat_trigger_key("proj/alpha", "proj/beta#dep-b")
+        old = time.time() - (csh.COMPAT_TRIGGER_STALE_SECONDS + 100)
+        os.utime(str(marker), (old, old))
+        self.assertTrue(csh.claim_compat_trigger_slot(triggers_dir, "proj/alpha", "proj/beta#dep-b"))
+
+    def test_an_uncreatable_triggers_dir_is_treated_as_busy(self) -> None:
+        blocker = self.tmp / "not-a-directory"
+        blocker.write_text("x", encoding="utf-8")
+        triggers_dir = blocker / "triggers"  # parent is a file, mkdir must fail
+        self.assertFalse(csh.claim_compat_trigger_slot(triggers_dir, "proj/alpha", "proj/beta#dep-b"))
+
+    def test_key_hashing_avoids_separator_ambiguity(self) -> None:
+        self.assertEqual(
+            csh._compat_trigger_key("proj/alpha", "x"), csh._compat_trigger_key("proj/alpha", "x")
+        )
+        self.assertNotEqual(csh._compat_trigger_key("a/b", "c"), csh._compat_trigger_key("a", "b/c"))
+
+
+class GateDAutoTriggerTests(unittest.TestCase):
+    """End-to-end: a real subprocess run of a COPY of the hook, beside a
+    STUB check_cross_project_compatibility.py that records its own argv,
+    mirroring StalenessAndSpawnTests' isolation pattern (spawn_compat_check
+    resolves its target the same way spawn_rebuild does: a sibling of
+    __file__)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="csh-gated-")).resolve()
+        self.script = self.tmp / "catalog_session_hint.py"
+        shutil.copy2(str(SCRIPT_PATH), str(self.script))
+        self.marker = self.tmp / "gate-d-ran.txt"
+        self.catalog = self.tmp / "catalog.json"
+        self.project_root = self.tmp / "project"
+        self.project_root.mkdir()
+        self.compat_runs_root = self.tmp / "compat-runs"
+        self.triggers_dir = self.tmp / "compat-triggers"
+
+    def tearDown(self) -> None:
+        _make_writable(self.tmp)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _install_gate_d_stub(self) -> None:
+        (self.tmp / "check_cross_project_compatibility.py").write_text(
+            textwrap.dedent(f"""
+            import sys, pathlib
+            pathlib.Path({str(self.marker)!r}).write_text(" ".join(sys.argv[1:]), encoding="utf-8")
+            """).strip() + "\n",
+            encoding="utf-8",
+        )
+
+    def _stale_dep_catalog(self) -> dict:
+        """proj/alpha#cap-a (verified 2020) depends on proj/beta#dep-b
+        (verified 2026): a line-2 hit, and the exact pair the trigger must
+        target."""
+        return make_catalog(
+            capabilities=[
+                _capability(
+                    project_id="proj/alpha", id="cap-a", global_id="proj/alpha#cap-a",
+                    last_verified_at="2020-01-01T00:00:00Z",
+                    depends_on=[_dep("proj/beta#dep-b")],
+                ),
+                _capability(
+                    project_id="proj/beta", id="dep-b", global_id="proj/beta#dep-b",
+                    last_verified_at="2026-01-01T00:00:00Z", depends_on=[],
+                ),
+            ],
+            projects=[
+                _project(project_id="proj/alpha", real_path=str(self.project_root), path=str(self.project_root)),
+                _project(project_id="proj/beta", real_path="/fixtures/proj/beta", path="/fixtures/proj/beta"),
+            ],
+            # Fresh, so the (unrelated) aggregator rebuild never enters the
+            # picture in these tests -- only Gate D's own trigger is tested.
+            verified_at=csh._format_utc_timestamp(datetime.now(timezone.utc)),
+        )
+
+    def _run(self, extra: list = None, timeout: float = 30.0) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [
+                sys.executable, str(self.script), "hook",
+                "--catalog", str(self.catalog),
+                "--knowledge-root", str(self.project_root),
+                "--compat-runs-root", str(self.compat_runs_root),
+                "--compat-triggers-dir", str(self.triggers_dir),
+            ] + (extra or []),
+            input=b"", stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+        )
+
+    def _wait_for_marker(self, seconds: float) -> bool:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self.marker.exists():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_stale_dependency_triggers_a_background_gate_d_check(self) -> None:
+        self._install_gate_d_stub()
+        write_catalog(self.catalog, self._stale_dep_catalog())
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0)
+        self.assertTrue(self._wait_for_marker(10.0), "a stale dependency must trigger a Gate D check")
+        tokens = shlex.split(self.marker.read_text(encoding="utf-8"))
+        self.assertEqual(tokens[0], "run")
+        self.assertEqual(tokens[tokens.index("--global-id") + 1], "proj/beta#dep-b")
+        self.assertEqual(tokens[tokens.index("--authorize-project") + 1], "proj/alpha")
+        self.assertEqual(tokens[tokens.index("--compat-runs-root") + 1], str(self.compat_runs_root))
+        self.assertEqual(tokens[tokens.index("--catalog") + 1], str(self.catalog))
+        self.assertNotIn("--authorize-production-write", tokens)
+        self.assertTrue(self.triggers_dir.is_dir())
+        self.assertEqual(len(list(self.triggers_dir.iterdir())), 1, "exactly one debounce marker")
+
+    def test_no_compat_spawn_flag_suppresses_the_trigger(self) -> None:
+        self._install_gate_d_stub()
+        write_catalog(self.catalog, self._stale_dep_catalog())
+        proc = self._run(["--no-compat-spawn"])
+        self.assertEqual(proc.returncode, 0)
+        self.assertFalse(self._wait_for_marker(1.0))
+        self.assertIn(csh.SENTINEL_DEP, context_of(proc.stdout.decode("utf-8")), "line 2 must survive")
+
+    def test_no_spawn_flag_also_suppresses_the_trigger(self) -> None:
+        """--no-spawn already means 'never start a background process from
+        this hook' -- extended to cover Gate D too, not just the aggregator."""
+        self._install_gate_d_stub()
+        write_catalog(self.catalog, self._stale_dep_catalog())
+        proc = self._run(["--no-spawn"])
+        self.assertEqual(proc.returncode, 0)
+        self.assertFalse(self._wait_for_marker(1.0))
+
+    def test_missing_gate_d_script_degrades_gracefully(self) -> None:
+        write_catalog(self.catalog, self._stale_dep_catalog())  # no stub installed
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0)
+        text = context_of(proc.stdout.decode("utf-8"))
+        self.assertNotIn(csh.SENTINEL_COMPAT_RESULT, text)
+        self.assertIn(csh.SENTINEL_DEP, text, "line 2 must still render")
+
+    def test_an_unwritable_triggers_dir_degrades_without_crashing(self) -> None:
+        """A file sitting where the triggers directory should be makes
+        os.makedirs(..., exist_ok=True) fail -- must downgrade to "no
+        trigger", not crash the hook (works even running as root, unlike a
+        chmod-based negative control)."""
+        self._install_gate_d_stub()
+        write_catalog(self.catalog, self._stale_dep_catalog())
+        self.triggers_dir.write_text("not a directory", encoding="utf-8")
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0)
+        self.assertFalse(self._wait_for_marker(1.0))
+
+    def test_result_surfacing_labels_staging_and_hides_injected_check_output(self) -> None:
+        """THE load-bearing injection-defense test, parallel to
+        InjectionTests for line 2: a fabricated Gate D result file (real
+        _finalize_project_result shape) carries attacker-controlled
+        stdout/stderr inside checks[] -- none of it may ever reach the
+        rendered line."""
+        write_catalog(self.catalog, self._stale_dep_catalog())
+        run_dir = self.compat_runs_root / ("f" * 32)
+        result_dir = run_dir / "proj"  # project_id "proj/alpha" -> nested path
+        result_dir.mkdir(parents=True)
+        injected = "INJECTED_ORCA_CONTEXT_DELIVERY_V1_MUST_NEVER_APPEAR"
+        result_doc = {
+            "global_id": "proj/beta#dep-b",
+            "project_id": "proj/alpha",
+            "outcome": "partial",
+            "project_root": str(self.project_root),
+            "compat_check_sha256": "deadbeef",
+            "checks": [
+                {"id": "chk-1", "exit_code": 1, "timed_out": False, "stdout": injected, "stderr": injected},
+                {"id": "chk-2", "exit_code": 0, "timed_out": False, "stdout": "", "stderr": ""},
+            ],
+            "warnings": [],
+            "written_at": "2026-08-22T12:00:00Z",
+        }
+        result_path = result_dir / "alpha.json"
+        result_path.write_text(json.dumps(result_doc, ensure_ascii=False), encoding="utf-8")
+
+        proc = self._run(["--no-compat-spawn"])  # the result already exists; no spawn needed
+        self.assertEqual(proc.returncode, 0)
+        text = context_of(proc.stdout.decode("utf-8"))
+        self.assertIn(csh.SENTINEL_COMPAT_RESULT, text)
+        self.assertIn("staging", text.lower())
+        self.assertIn("not authorized", text.lower())
+        self.assertIn(str(result_path), text)
+        self.assertIn("partial", text)
+        self.assertIn("1/2", text)
+        self.assertNotIn(injected, text, "raw check stdout/stderr must never be interpolated")
+        self.assertNotIn("chk-1", text, "a check's own id must never be interpolated")
+        self.assertNotIn("deadbeef", text, "compat_check_sha256 must never be interpolated")
+
+    def test_result_surfacing_finds_an_earlier_result_even_when_debounced(self) -> None:
+        """An earlier invocation's completed result is still surfaced even
+        when THIS invocation's own debounce would suppress a new spawn."""
+        self._install_gate_d_stub()
+        write_catalog(self.catalog, self._stale_dep_catalog())
+        run_dir = self.compat_runs_root / ("a" * 32)
+        result_dir = run_dir / "proj"
+        result_dir.mkdir(parents=True)
+        (result_dir / "alpha.json").write_text(
+            json.dumps({
+                "global_id": "proj/beta#dep-b", "project_id": "proj/alpha", "outcome": "ok",
+                "project_root": str(self.project_root), "compat_check_sha256": "x",
+                "checks": [], "warnings": [], "written_at": "2026-08-22T12:00:00Z",
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        # Pre-claim the debounce slot, as if an earlier invocation already
+        # triggered the run whose result now exists.
+        csh.claim_compat_trigger_slot(self.triggers_dir, "proj/alpha", "proj/beta#dep-b")
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0)
+        text = context_of(proc.stdout.decode("utf-8"))
+        self.assertIn(csh.SENTINEL_COMPAT_RESULT, text)
+        self.assertFalse(self._wait_for_marker(1.0), "a fresh debounce marker must suppress a second spawn")
+
+    def test_the_only_write_anywhere_is_the_one_debounce_marker(self) -> None:
+        self._install_gate_d_stub()
+        write_catalog(self.catalog, self._stale_dep_catalog())
+        before = _snapshot(self.tmp)
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0)
+        self._wait_for_marker(10.0)
+        after = _snapshot(self.tmp)
+        new_marker_files = [
+            path for path in (set(after) - set(before))
+            if str(self.triggers_dir) in path and Path(path).is_file()
+        ]
+        self.assertEqual(len(new_marker_files), 1, f"expected exactly one debounce marker, got {new_marker_files}")
+
+
+class HandleCompatHitsUnitTests(unittest.TestCase):
+    """handle_compat_hits() directly, for the branches a full subprocess
+    round-trip would make slow or awkward to hit."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="csh-handle-compat-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _args(self, **overrides) -> argparse.Namespace:
+        return hook_args(
+            no_spawn=False, no_compat_spawn=False,
+            compat_runs_root=str(self.tmp / "runs"), compat_triggers_dir=str(self.tmp / "triggers"),
+            **overrides,
+        )
+
+    def test_no_hits_means_no_work_at_all(self) -> None:
+        with mock.patch("catalog_session_hint.subprocess.Popen") as popen:
+            out = csh.handle_compat_hits([], "proj/alpha", self._args(), time.monotonic(), Path("/fake/catalog.json"))
+        self.assertEqual(out, [])
+        popen.assert_not_called()
+
+    def test_an_unresolvable_project_id_never_spawns(self) -> None:
+        """A dangling/unresolved dependency never reaches freshness_hits()
+        as a hit in the first place (branches E/B in the truth table), but
+        an unresolved PROJECT identity (project_id is None -- an unknown
+        session cwd) must independently prevent a spawn here too, since
+        --authorize-project has nothing valid to authorize."""
+        hits = [("proj/alpha#cap-a", "proj/beta#dep-b", NOW, NOW - timedelta(days=1))]
+        with mock.patch("catalog_session_hint.subprocess.Popen") as popen:
+            out = csh.handle_compat_hits(hits, None, self._args(), time.monotonic(), Path("/fake/catalog.json"))
+        self.assertEqual(out, [])
+        popen.assert_not_called()
+
+    def test_distinct_targets_are_capped_at_the_configured_maximum(self) -> None:
+        hits = [
+            (f"proj/alpha#cap-{i}", f"proj/beta#dep-{i}", NOW, NOW - timedelta(days=1))
+            for i in range(csh.MAX_COMPAT_TARGETS_PER_HOOK + 5)
+        ]
+        with mock.patch("catalog_session_hint.subprocess.Popen") as popen, \
+             mock.patch("catalog_session_hint.Path.is_file", return_value=True):
+            csh.handle_compat_hits(hits, "proj/alpha", self._args(), time.monotonic(), Path("/fake/catalog.json"))
+        self.assertEqual(popen.call_count, csh.MAX_COMPAT_TARGETS_PER_HOOK)
+
+    def test_a_slow_scan_degrades_via_the_deadline_rather_than_hanging(self) -> None:
+        hits = [("proj/alpha#cap-a", "proj/beta#dep-b", NOW, NOW - timedelta(days=1))]
+        with mock.patch("catalog_session_hint._check_deadline", side_effect=csh._HookDeadline("x")):
+            with self.assertRaises(csh._HookDeadline):
+                csh.handle_compat_hits(hits, "proj/alpha", self._args(), time.monotonic(), Path("/fake/catalog.json"))
+
+
+class RenderCompatResultLineTests(unittest.TestCase):
+    def test_empty_results_render_nothing(self) -> None:
+        self.assertEqual(csh.render_compat_result_line([], 1), "")
+        self.assertEqual(csh.render_compat_result_line([("t", {}, Path("/x"))], 0), "")
+
+    def test_unknown_outcome_is_normalized(self) -> None:
+        line = csh.render_compat_result_line(
+            [("proj/beta#dep-b", {"outcome": "something-new", "checks": []}, Path("/x/r.json"))], 1
+        )
+        self.assertIn(csh.SENTINEL_COMPAT_RESULT, line)
+        self.assertIn("unknown", line)
+
+    def test_more_tail_is_appended(self) -> None:
+        results = [(f"proj/beta#dep-{i}", {"outcome": "ok", "checks": []}, Path("/x")) for i in range(4)]
+        line = csh.render_compat_result_line(results, 2)
+        self.assertIn("+2 more", line)
+
+
+# ---------------------------------------------------------------------------
 # Timing
 # ---------------------------------------------------------------------------
 
@@ -1527,7 +2031,7 @@ class IndependenceTests(unittest.TestCase):
                     imported.add(node.module.split(".")[0])
         self.assertEqual(
             imported,
-            {"__future__", "argparse", "json", "math", "os", "shlex", "signal", "stat",
+            {"__future__", "argparse", "hashlib", "json", "math", "os", "shlex", "signal", "stat",
              "subprocess", "sys", "time", "unicodedata", "datetime", "pathlib", "typing"},
             "catalog_session_hint.py's dependency surface changed",
         )
@@ -1669,10 +2173,30 @@ class NoWritePathTests(unittest.TestCase):
                              f"this interpreter reports caches at {cache_path}, "
                              "yet a sibling __pycache__ appeared")
 
+    # The ONE named, bounded exception to "no write API anywhere in the
+    # source" -- see the module docstring's "NO WRITE PATH AT ALL, WITH ONE
+    # NAMED, BOUNDED EXCEPTION" section. Every other function must remain
+    # completely free of these constructs; this one function is now
+    # REQUIRED to use exactly the debounce-marker write primitives it
+    # documents, no more.
+    _WRITE_EXEMPT_FUNCTION = "claim_compat_trigger_slot"
+
+    def _write_exempt_node_ids(self, tree: ast.AST) -> set:
+        ids = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == self._WRITE_EXEMPT_FUNCTION:
+                for inner in ast.walk(node):
+                    ids.add(id(inner))
+        return ids
+
     def test_no_write_api_appears_anywhere_in_the_source(self) -> None:
         """The structural half of the no-write claim: no write-capable call
-        or flag exists in the AST, so there is nothing to guard."""
+        or flag exists in the AST OUTSIDE claim_compat_trigger_slot(), so
+        there is nothing to guard everywhere else. A second assertion below
+        proves the exception is real (not an accidentally-too-broad
+        exemption hiding a write that was never added)."""
         tree = ast.parse(SCRIPT_PATH.read_text(encoding="utf-8"))
+        exempt_ids = self._write_exempt_node_ids(tree)
 
         def dotted(node):
             parts = []
@@ -1685,23 +2209,37 @@ class NoWritePathTests(unittest.TestCase):
             return ".".join(reversed(parts))
 
         banned_attrs = {
-            "write_text", "write_bytes", "makedirs", "mkdir", "touch", "rmdir",
+            "write_text", "write_bytes", "touch", "rmdir",
             "symlink_to", "hardlink_to", "fdopen",
-            "O_WRONLY", "O_RDWR", "O_CREAT", "O_APPEND", "O_TRUNC",
         }
         banned_dotted = {
-            "os.replace", "os.write", "os.unlink", "os.remove", "os.rename",
+            "os.replace", "os.write", "os.remove", "os.rename",
             "os.truncate", "os.mkfifo", "os.mknod", "os.link", "os.symlink",
             "os.chmod", "os.utime",
         }
+        found_in_exempt = set()
         for node in ast.walk(tree):
+            in_exempt = id(node) in exempt_ids
             if isinstance(node, ast.Attribute):
+                if node.attr in {"O_WRONLY", "O_RDWR", "O_CREAT", "O_APPEND", "O_TRUNC",
+                                  "makedirs", "mkdir", "unlink"}:
+                    if in_exempt:
+                        found_in_exempt.add(node.attr)
+                        continue
+                    self.fail(f"write API .{node.attr} appears outside {self._WRITE_EXEMPT_FUNCTION}()")
                 self.assertNotIn(node.attr, banned_attrs, f"write API .{node.attr} appears in the hook")
                 name = dotted(node)
                 if name is not None:
                     self.assertNotIn(name, banned_dotted, f"write API {name} appears in the hook")
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "open":
                 self.fail("the hook calls builtins.open(); it must read through os.open only")
+        # The exception must actually be exercised, not an unused escape
+        # hatch: the marker file is created with O_CREAT|O_EXCL|O_WRONLY and
+        # reclaimed via os.unlink, exactly as the module docstring promises.
+        self.assertEqual(
+            found_in_exempt, {"O_CREAT", "O_WRONLY", "makedirs", "unlink"},
+            f"{self._WRITE_EXEMPT_FUNCTION}() no longer matches its own documented write surface",
+        )
 
     def test_no_write_flag_is_ever_requested_at_runtime(self) -> None:
         """The behavioural half: an interceptor over os.open/builtins.open
@@ -1907,6 +2445,33 @@ class AntiDriftTests(unittest.TestCase):
                         self.qc.load_catalog(path)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_compat_runs_root_agrees_with_gate_d(self) -> None:
+        """The two files' staging-path constants can never silently
+        diverge -- same pattern as LOCK_NAME/LOCK_STALE_SECONDS above."""
+        try:
+            import check_cross_project_compatibility as gate_d
+        except Exception as exc:  # pragma: no cover
+            self.skipTest(f"check_cross_project_compatibility.py not importable: {exc}")
+        self.assertEqual(csh.COMPAT_RUNS_ROOT, gate_d.COMPAT_RUNS_ROOT)
+
+    def test_the_gate_d_run_subcommand_still_accepts_the_argv_this_hook_spawns(self) -> None:
+        """Same rationale as the aggregator's own argv-acceptance test: the
+        spawn is fire-and-forget with output discarded, so a renamed flag on
+        either side would fail SILENTLY forever."""
+        try:
+            import check_cross_project_compatibility as gate_d
+        except Exception as exc:  # pragma: no cover
+            self.skipTest(f"check_cross_project_compatibility.py not importable: {exc}")
+        parser = gate_d.build_parser()
+        args = parser.parse_args([
+            "run", "--global-id", "proj/beta#dep-b", "--authorize-project", "proj/alpha",
+            "--catalog", "/fake/catalog.json", "--compat-runs-root", "/fake/runs",
+        ])
+        self.assertEqual(args.command, "run")
+        self.assertEqual(args.global_id, "proj/beta#dep-b")
+        self.assertEqual(args.authorize_project, ["proj/alpha"])
+        self.assertFalse(getattr(args, "authorize_production_write", False))
 
     def test_aggregator_lock_constants_agree(self) -> None:
         try:

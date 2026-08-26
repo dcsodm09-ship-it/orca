@@ -5,7 +5,7 @@ cross-project catalog plan).
 `build_cross_project_catalog.py build` writes one consolidated file and
 `query_catalog.py search` asks it questions -- but only if somebody
 remembers the catalog exists. This script is the reminder: a SessionStart
-hook that prints at most two lines into a new session's context.
+hook that prints at most three lines into a new session's context.
 
     line 1  what the catalog currently holds, how fresh it is, and the exact
             command to search it
@@ -13,12 +13,21 @@ hook that prints at most two lines into a new session's context.
             depends on something re-verified more recently than the
             capability itself, i.e. the dependency moved and this project
             has not re-checked it
+    line 3  (only when a line-2 condition exists) either the honest,
+            explicitly-labeled result of a STAGING (not authorized) Gate D
+            compatibility check for that exact stale dependency, or nothing
+            yet -- in which case this invocation may, once per (project,
+            dependency) debounce window, auto-trigger that check in a fully
+            detached background process for a LATER invocation to surface
 
 Run with:
     python3 catalog_session_hint.py hook [--knowledge-root PATH]
                                          [--catalog PATH]
                                          [--stale-after-hours H]
                                          [--no-spawn]
+                                         [--no-compat-spawn]
+                                         [--compat-runs-root PATH]
+                                         [--compat-triggers-dir PATH]
     python3 catalog_session_hint.py print-registration [--knowledge-root PATH]
                                                        [--script-path PATH]
                                                        [--python PATH]
@@ -40,8 +49,14 @@ cannot influence the answer to the first one:
     The deployed verified-context hook holds an exclusive `flock` on
     `<project>/.orca/context/.startup-context.lock` for up to 28 s of its
     40 s slot; adding a second reader there would be adding contention to a
-    security path for a convenience feature. This script reads exactly one
-    file (`catalog.json`) and `lstat`s exactly one more (`.catalog.lock`).
+    security path for a convenience feature. This script reads `catalog.json`;
+    `lstat`s `.catalog.lock`; opens (read+write, `O_CREAT|O_EXCL`) its own
+    debounce marker under a dedicated `manifests/compat-check-triggers/`
+    directory it owns exclusively (see BACKGROUND GATE D AUTO-TRIGGER); and
+    read-only-opens up to `MAX_COMPAT_RUN_DIRS_SCANNED` per-project result
+    files under Gate D's own staging directory,
+    `manifests/compat-runs-pending-authorization/`. None of that is under
+    any project's `.orca/`.
   * It is registered as a SEPARATE element of `hooks.SessionStart`, never
     merged into the verified-context hook's `hooks[]` array: separate
     process, separate timeout, separate blast radius. If this script
@@ -51,14 +66,26 @@ cannot influence the answer to the first one:
     a session's startup context is unambiguously attributable to the hook
     that produced it.
 
-NO WRITE PATH AT ALL
---------------------
-Structurally, not by guard: no `open(..., "w")`, no `os.O_WRONLY`, no output
-file, no cache, no lockfile of its own, and no settings-file writer. The
-same claim `query_catalog.py` makes, for the same reason -- and here it also
-makes boundary compliance structural rather than promised: `print-registration`
-PRINTS a settings.json snippet and there is no code path in this file capable
-of writing one. Two caveats stated precisely rather than promised away:
+NO WRITE PATH AT ALL, WITH ONE NAMED, BOUNDED EXCEPTION
+--------------------------------------------------------
+No `open(..., "w")`, no `os.O_WRONLY`, no output file, no cache, and no
+settings-file writer -- with exactly ONE precisely-scoped exception, confined
+to a single function, `claim_compat_trigger_slot()`: a tiny (zero-byte)
+debounce marker, `os.open(path, O_CREAT | O_EXCL | O_WRONLY, 0o600)`, under
+its own dedicated directory (`COMPAT_TRIGGERS_DIR`, `manifests/compat-check-
+triggers/` by default) that no other file in this repo reads or writes. The
+marker's path is a sha256 hex digest of `(project_id, target_global_id)` --
+never a literal id, so it can never itself be a traversal string, an
+oversized filename, or a forged path -- and its content is never read; only
+its EXISTENCE and its mtime are ever consulted (`os.lstat`). This is the
+entire write surface this script has: no other function in this file ever
+requests a write flag, and the same negative-control test that proves the
+read-only-tree claim for the REST of this script (`NoWritePathTests`) proves
+this exception is scoped exactly to that one function and nowhere else. The
+same claim `query_catalog.py` makes about `print-registration` still holds
+verbatim: it PRINTS a settings.json snippet and there is no code path in
+this file capable of writing one. Two more caveats stated precisely rather
+than promised away:
 
   1. Importing this module (its test suite does) can write a bytecode cache.
      Running it as a script -- the only thing a hook does -- never writes
@@ -79,8 +106,10 @@ of writing one. Two caveats stated precisely rather than promised away:
      tree leaves that tree byte-identical.
   2. Whatever the caller redirects stdout into is written by the shell.
 
-The one process this script can start is a fully detached rebuild of the
-catalog (see BACKGROUND REBUILD); that child writes, this parent does not.
+The two processes this script can start are a fully detached rebuild of the
+catalog (see BACKGROUND REBUILD) and a fully detached Gate D compatibility
+check (see BACKGROUND GATE D AUTO-TRIGGER); those children write, this
+parent -- apart from the one debounce marker above -- does not.
 
 SILENCE IS THE ONLY FAILURE MODE
 --------------------------------
@@ -118,6 +147,45 @@ Stated honestly: the alarm bounds everything EXCEPT uninterruptible D-state
 I/O, and `catalog.json` lives on an external SSD, so that case is real and
 nothing in userspace can bound it. The `O_NONBLOCK` open removes the one
 blocking case that IS addressable (a FIFO planted at the catalog path).
+
+BACKGROUND GATE D AUTO-TRIGGER
+-------------------------------
+When line 2's own condition fires (this project declares a capability whose
+resolved dependency was re-verified more recently than the capability
+itself), this script -- in its own failure domain, isolated from line 1 and
+line 2 -- ALSO looks for, and if absent tries to start, a
+`check_cross_project_compatibility.py run` (Gate D) check scoped EXACTLY to
+that one stale `(project_id, target_global_id)` pair. Three properties make
+this safe to run unattended from every session start on every project:
+
+  * NEVER `--authorize-production-write`. That flag is not a variable
+    anywhere in `spawn_compat_check()`'s argv, not conditionally appended,
+    and no other code path in this file can add it -- verified by a test
+    that inspects the literal argv list, not just the exit code. Without
+    it, Gate D's own `run` subcommand writes to its staging default,
+    `manifests/compat-runs-pending-authorization/`, never to real
+    production. This is the single property that keeps an automatic
+    trigger's results advisory rather than a silent production write.
+  * Debounced, not stampeded. `REGISTRATION_MATCHER` fires this hook on
+    every `compact`/`fork` within one long session, and a single Gate D
+    check can legitimately run for tens of seconds to a few minutes.
+    `claim_compat_trigger_slot()` mirrors `lock_appears_free()`'s pattern
+    but is a genuine, non-probabilistic `O_CREAT|O_EXCL` exclusive claim
+    (see NO WRITE PATH AT ALL) rather than an advisory read, because unlike
+    the aggregator rebuild there is no downstream O_EXCL lock inside Gate D
+    itself to fall back on for correctness -- this debounce IS the
+    correctness guarantee here, not just an optimisation.
+  * Same detachment contract as `spawn_rebuild()`. `spawn_compat_check()`
+    uses the identical `Popen` keywords (`stdin`/`stdout`/`stderr=DEVNULL`,
+    `start_new_session=True`, `cwd=<script dir>`) for the identical,
+    already-verified reasons -- not re-derived here.
+
+Result surfacing is a SEPARATE, later concern: a subsequent hook invocation
+(for the same project, some time after a triggered run has had a chance to
+finish) scans Gate D's own staging directory read-only for a completed
+result matching the exact pair and, if found, renders line 3 with an
+explicit "STAGING, NOT authorized" label -- never claiming the result is
+authoritative, because it explicitly is not.
 
 BACKGROUND REBUILD
 ------------------
@@ -158,6 +226,7 @@ EXIT CODES
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -200,6 +269,44 @@ MAX_CATALOG_BYTES = 16 * 1024 * 1024
 DEFAULT_STALE_AFTER_HOURS = 6
 AGGREGATOR_NAME = "build_cross_project_catalog.py"
 QUERY_SCRIPT_NAME = "query_catalog.py"
+
+GATE_D_SCRIPT_NAME = "check_cross_project_compatibility.py"
+
+# Gate D's own staging default, copied (not imported) -- same REUSE
+# rationale as LOCK_NAME/LOCK_STALE_SECONDS. Pinned by a test equality
+# assertion against the real module (AntiDriftTests convention).
+COMPAT_RUNS_ROOT = Path("/Volumes/Extreme SSD/Orca/manifests/compat-runs-pending-authorization")
+
+# This hook's OWN debounce markers. A location this file did not previously
+# write to at all, distinct from DEFAULT_CATALOG_DIR (the aggregator's
+# output) and COMPAT_RUNS_ROOT (Gate D's own staging output) -- never
+# conflated with either.
+COMPAT_TRIGGERS_DIR = Path("/Volumes/Extreme SSD/Orca/manifests/compat-check-triggers")
+
+# Debounce window for the auto-triggered Gate D check. NOT LOCK_STALE_SECONDS
+# (300s) -- that constant is calibrated to the aggregator's own runtime.
+# Gate D's DEFAULT_TIMEOUT_CEILING_SECONDS bounds each declared check_command
+# at 300s, and REGISTRATION_MATCHER ("startup|resume|clear|compact|fork")
+# fires this hook on every compaction/fork WITHIN a single long session --
+# a window shorter than a plausible in-flight run's own worst case would
+# spawn a SECOND check on the very next compaction while the first is still
+# running. 1800s is a comfortable multiple of the 300s ceiling while still
+# letting a same-day re-check follow a real fix.
+COMPAT_TRIGGER_STALE_SECONDS = 1800.0
+
+MAX_COMPAT_TARGETS_PER_HOOK = 3   # bound worst-case Popen calls/scans per invocation
+MAX_COMPAT_RESULTS_SHOWN = 2      # line 3's own MAX_PAIRS_SHOWN analogue
+MAX_COMPAT_RUN_DIRS_SCANNED = 100 # bound the result-surfacing scan's cost
+MAX_COMPAT_RESULT_BYTES = 65536   # a per-project result file is small; no need for MAX_CATALOG_BYTES' 16MB
+
+# Deliberately distinct, same rationale as SENTINEL_DEP.
+SENTINEL_COMPAT_RESULT = "ORCA_COMPAT_RESULT_V1"
+
+# The only outcomes _finalize_project_result() in check_cross_project_
+# compatibility.py can ever write. Anything else (a hand-edited file, a
+# future schema change this copy hasn't caught up with) renders as
+# "unknown" rather than being echoed verbatim.
+_KNOWN_COMPAT_OUTCOMES = frozenset({"ok", "skipped", "partial", "unrecorded"})
 
 # The deployed location a user-level SessionStart hook must point at. Used
 # only to PRINT a registration snippet; nothing here ever writes it.
@@ -396,7 +503,17 @@ def _flatten_for_terminal(text: str) -> str:
     """
     scrubbed = []
     for ch in text:
-        if ch in _LINE_SEPARATORS or ch in _BIDI_CONTROLS or unicodedata.category(ch) == "Cc":
+        # Cs (surrogate) fix, dedicated-review P1, 2026-08-26: a bare
+        # \uD800-style escape survives json.loads() as a legal Python str
+        # containing an unpaired UTF-16 surrogate. str.encode("utf-8")
+        # later in this module's own rendering pipeline (_truncate_bytes,
+        # fit_budget) raises UnicodeEncodeError on such a character --
+        # previously unstripped here, so a poisoned id could blow up the
+        # render/emit boundary this function exists to be the single
+        # sanitization point for. Stripped exactly like Cc: replaced with a
+        # space, never dropped outright, so length/field-boundary
+        # reasoning elsewhere in this file stays unaffected.
+        if ch in _LINE_SEPARATORS or ch in _BIDI_CONTROLS or unicodedata.category(ch) in ("Cc", "Cs"):
             scrubbed.append(" ")
         else:
             scrubbed.append(ch)
@@ -504,9 +621,17 @@ def _reject_non_finite_constant(name: str) -> float:
     raise ValueError(f"non-finite JSON constant {name!r} is not producible by the aggregator")
 
 
-def read_catalog_bytes(path: Path) -> bytes:
-    """Read the catalog with the descriptor-level guards that matter to a
-    read-only consumer, and no others.
+def read_catalog_bytes(path: Path, max_bytes: int = MAX_CATALOG_BYTES) -> bytes:
+    """Read the catalog (or, with an explicit `max_bytes`, a Gate D staging
+    result file -- see find_latest_compat_result) with the descriptor-level
+    guards that matter to a read-only consumer, and no others.
+
+    `max_bytes` defaults to MAX_CATALOG_BYTES so `load_catalog()`'s existing
+    call site is untouched and takes the identical code path as before this
+    parameter existed. This is the ONE guarded-open implementation in the
+    file (see REUSE's own "helpers copied not imported" convention, which is
+    about cross-file reuse -- duplicating this exact guard a second time
+    WITHIN this file would be the anti-pattern it elsewhere avoids).
 
     O_NONBLOCK: a FIFO planted at this path would otherwise block inside
     os.open() itself, in the kernel, before any S_ISREG check downstream
@@ -535,10 +660,10 @@ def read_catalog_bytes(path: Path) -> bytes:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise _CatalogUnavailable()
-        if st.st_size > MAX_CATALOG_BYTES:
+        if st.st_size > max_bytes:
             raise _CatalogUnavailable()
         chunks: list = []
-        remaining = MAX_CATALOG_BYTES + 1
+        remaining = max_bytes + 1
         while remaining > 0:
             chunk = os.read(fd, min(remaining, 1 << 20))
             if not chunk:
@@ -553,7 +678,7 @@ def read_catalog_bytes(path: Path) -> bytes:
     raw = b"".join(chunks)
     # A file that GREW past the cap between fstat and the read loop lands
     # here rather than being silently truncated into a "corrupt" parse.
-    if len(raw) > MAX_CATALOG_BYTES:
+    if len(raw) > max_bytes:
         raise _CatalogUnavailable()
     return raw
 
@@ -960,6 +1085,349 @@ def spawn_rebuild() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Gate D auto-trigger + result surfacing (line 3). See BACKGROUND GATE D
+# AUTO-TRIGGER in the module docstring for the design rationale; nothing
+# here re-derives it.
+# ---------------------------------------------------------------------------
+
+
+def _compat_trigger_key(project_id: str, target_global_id: str) -> str:
+    """sha256 hex of "{project_id}\\x00{target_global_id}" -- a filesystem-
+    safe debounce-marker filename. Hashed, not concatenated, so neither
+    string's length/separators/reserved characters ever reaches a path (the
+    same discipline check_cross_project_compatibility.py's own ENAMETOOLONG
+    fix-round finding forced onto ITS project_id-derived filenames). NUL-
+    separated before hashing so ("a/b", "c") and ("a", "b/c") can't collide.
+    `errors="surrogatepass"` because these strings are lifted from a JSON
+    document and json.loads can legally produce an unpaired surrogate from a
+    bare `\\uD800`-style escape -- this must hash successfully rather than
+    raise on that input, the same "every uncertainty is silence, never a
+    crash" discipline as everywhere else in this file.
+    """
+    payload = f"{project_id}\x00{target_global_id}".encode("utf-8", "surrogatepass")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def claim_compat_trigger_slot(triggers_dir: Path, project_id: str, target_global_id: str) -> bool:
+    """Returns True iff the caller should proceed to spawn a Gate D check
+    for this exact (project_id, target_global_id) pair right now.
+
+    os.open(path, O_CREAT|O_EXCL|O_WRONLY, 0o600):
+      - success -> no marker existed -> True, and the marker now exists with
+        a fresh mtime. This case is FULLY exclusive at the OS level: under
+        real concurrency, exactly one of N simultaneous callers for the SAME
+        key gets True.
+      - FileExistsError -> lstat the existing marker's mtime. Fresh (age <=
+        COMPAT_TRIGGER_STALE_SECONDS) -> False (someone already triggered
+        recently). Stale -> best-effort unlink + one retry O_CREAT|O_EXCL
+        create; if that also loses a race, False. This is the ONE place a
+        race is accepted, exactly the same "allowed to race" contract
+        lock_appears_free() already documents -- and it only matters at the
+        edge of the debounce window, never the common case.
+      - any other OSError (triggers_dir uncreatable, an unstattable marker)
+        -> False, same conservative "cannot tell -> assume busy" default as
+        lock_appears_free().
+    """
+    try:
+        os.makedirs(str(triggers_dir), exist_ok=True)
+    except _HookDeadline:
+        raise
+    except BaseException:
+        return False
+
+    marker = triggers_dir / _compat_trigger_key(project_id, target_global_id)
+
+    def _create() -> bool:
+        fd = os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        return True
+
+    try:
+        return _create()
+    except FileExistsError:
+        pass
+    except _HookDeadline:
+        raise
+    except BaseException:
+        return False
+
+    try:
+        age = time.time() - os.lstat(str(marker)).st_mtime
+    except _HookDeadline:
+        raise
+    except BaseException:
+        return False
+    if age <= COMPAT_TRIGGER_STALE_SECONDS:
+        return False
+
+    try:
+        os.unlink(str(marker))
+    except _HookDeadline:
+        raise
+    except BaseException:
+        pass  # best-effort reclaim; the retried create below still decides correctly
+
+    try:
+        return _create()
+    except _HookDeadline:
+        raise
+    except BaseException:
+        return False
+
+
+def spawn_compat_check(
+    gate_d_script: Path,
+    catalog_path: Path,
+    compat_runs_root: Path,
+    project_id: str,
+    target_global_id: str,
+) -> bool:
+    """Same Popen contract as spawn_rebuild() -- see that docstring for the
+    -I / start_new_session / stdin=DEVNULL / cwd rationale, not re-derived
+    here. The ONLY difference is argv.
+
+    --catalog is pinned to the SAME catalog THIS hook just read (not Gate
+    D's own default), so the auto-triggered check reasons about the exact
+    document that produced the freshness hit -- and so a test (or a real
+    invocation) that redirects --catalog on catalog_session_hint.py's own
+    invocation gets an isolated Gate D run too, never the real catalog.
+
+    --authorize-production-write is NEVER in this argv: it is not a
+    variable, not conditionally appended, and no other code path in this
+    file can add it. This is the single safety property that keeps this
+    trigger's results advisory rather than a silent production write, and
+    it is verified by a test that inspects the exact argv list, not just
+    that "something" was spawned.
+    """
+    try:
+        subprocess.Popen(  # noqa: S603 - fixed argv, no shell, no user input
+            [
+                sys.executable, "-I", str(gate_d_script), "run",
+                "--global-id", target_global_id,
+                "--authorize-project", project_id,
+                "--catalog", str(catalog_path),
+                "--compat-runs-root", str(compat_runs_root),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=str(gate_d_script.parent),
+        )
+        return True
+    except _HookDeadline:
+        raise
+    except BaseException:
+        return False
+
+
+def _safe_join_within(base: Path, name: str) -> "Path | None":
+    """Join `name` onto `base` and verify the result really stays within
+    `base`, without ever raising. `name` here is built from THIS project's
+    own (already catalog-resolved) project_id, not third-party content --
+    but project_id may legitimately contain '/' (a shallow
+    "<topic>/<task>" layout, same as check_cross_project_compatibility.py's
+    own project_id shape rule allows), so containment is verified the same
+    way that file's write_only_within() verifies its own output path,
+    rather than trusted blindly."""
+    try:
+        resolved_base = base.resolve(strict=False)
+        candidate = (base / name).resolve(strict=False)
+    except _HookDeadline:
+        raise
+    except BaseException:
+        return None
+    try:
+        candidate.relative_to(resolved_base)
+    except ValueError:
+        return None
+    return candidate
+
+
+def find_latest_compat_result(
+    compat_runs_root: Path,
+    project_id: str,
+    target_global_id: str,
+    started: float,
+) -> "tuple[dict, Path] | None":
+    """Best-effort, READ-ONLY scan for the newest completed staging result
+    matching (project_id, target_global_id). Bounded three ways:
+
+      - at most MAX_COMPAT_RUN_DIRS_SCANNED run-id directories, most-
+        recently-modified first (os.scandir + sort by st_mtime desc,
+        follow_symlinks=False on both the dir-type check and the stat) --
+        a run this hook itself just triggered is always near the front;
+      - each <run_dir>/<project_id>.json candidate is opened through
+        read_catalog_bytes(path, MAX_COMPAT_RESULT_BYTES) -- the same
+        O_NONBLOCK/S_ISREG guard as the catalog itself, not a bare open();
+      - a _check_deadline(started) call between run-id directories, so a
+        slow scan degrades to "found nothing yet" rather than blowing the
+        hook's own budget (same accepted "uninterruptible D-state I/O"
+        caveat the module's TIMING section already states).
+
+    A read/parse failure on ONE run-id directory (including a half-written
+    atomic_write_within temp file, or a project_id whose "/"-containing
+    shape would escape run_dir) is skipped, not fatal to the scan. Returns
+    the parsed dict plus the path it came from, or None.
+    """
+    try:
+        entries = list(os.scandir(str(compat_runs_root)))
+    except _HookDeadline:
+        raise
+    except BaseException:
+        return None
+
+    dated: list = []
+    for entry in entries:
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            mtime = entry.stat(follow_symlinks=False).st_mtime
+        except _HookDeadline:
+            raise
+        except BaseException:
+            continue
+        dated.append((mtime, entry.path))
+    dated.sort(key=lambda item: item[0], reverse=True)
+
+    for _mtime, run_dir_path in dated[:MAX_COMPAT_RUN_DIRS_SCANNED]:
+        _check_deadline(started)
+        result_path = _safe_join_within(Path(run_dir_path), f"{project_id}.json")
+        if result_path is None:
+            continue
+        try:
+            raw = read_catalog_bytes(result_path, MAX_COMPAT_RESULT_BYTES)
+            doc = json.loads(raw.decode("utf-8"))
+        except _HookDeadline:
+            raise
+        except BaseException:
+            continue
+        if not isinstance(doc, dict):
+            continue
+        if doc.get("project_id") != project_id or doc.get("global_id") != target_global_id:
+            continue
+        return doc, result_path
+    return None
+
+
+def render_compat_result_line(results: list, shown: int) -> str:
+    """Line 3. NEVER interpolates a check's stdout/stderr/check_command/id --
+    only `outcome` (validated against the known outcome set, else
+    "unknown"), a failed/total check count derived from `exit_code`/
+    `timed_out`, and the locally-constructed file path (safe: built from OUR
+    OWN resolved project_id and compat_runs_root, not from project-declared
+    content). `target_global_id` still goes through _safe_field() -- same
+    untrusted-hand-authored-text category as line 2's ids. Mirrors
+    render_dependency_line()'s "+K more" tail and explicit untrusted-data
+    disclaimer, plus an explicit "STAGING, NOT authorized" label so this can
+    never be misread as authoritative.
+    """
+    if not results or shown <= 0:
+        return ""
+    rendered = []
+    for target_global_id, result, path in results[:shown]:
+        outcome = result.get("outcome")
+        if not isinstance(outcome, str) or outcome not in _KNOWN_COMPAT_OUTCOMES:
+            outcome = "unknown"
+        checks = result.get("checks")
+        if isinstance(checks, list):
+            total = len(checks)
+            failed = sum(
+                1 for check in checks
+                if not isinstance(check, dict) or check.get("exit_code") != 0 or check.get("timed_out")
+            )
+        else:
+            total = 0
+            failed = 0
+        rendered.append(
+            f"{_safe_field(target_global_id)}: {outcome} ({failed}/{total} checks failed), see {path}"
+        )
+    remaining = len(results) - len(rendered)
+    if remaining > 0:
+        rendered.append(f"+{remaining} more")
+    return (
+        f"{SENTINEL_COMPAT_RESULT} background Gate D compatibility check result(s), "
+        f"STAGING (not authorized, not authoritative): {'; '.join(rendered)}"
+    )
+
+
+def handle_compat_hits(
+    hits: list,
+    project_id: "str | None",
+    args: argparse.Namespace,
+    started: float,
+    catalog_path: Path,
+) -> list:
+    """Orchestrator, called once per hook invocation with the SAME `hits`
+    already computed for line 2. For up to MAX_COMPAT_TARGETS_PER_HOOK
+    DISTINCT target_global_ids (hits is already deterministically sorted, so
+    "first N distinct targets" is itself deterministic):
+
+      1. find_latest_compat_result() -- regardless of the spawn decision, so
+         an EARLIER invocation's result is still surfaced even when THIS
+         invocation's debounce suppresses a new spawn.
+      2. only if nothing was found: when spawning is allowed (see below) AND
+         project_id is real AND the Gate D script is found on disk,
+         claim_compat_trigger_slot() then spawn_compat_check().
+
+    spawn_allowed = not args.no_spawn and not args.no_compat_spawn --
+    --no-spawn already means "never start a background process from this
+    hook, however stale anything is"; extending that existing meaning to
+    Gate D is safer than inventing a second flag nobody remembers, while
+    --no-compat-spawn gives independent control to disable ONLY Gate D
+    while still allowing catalog rebuilds.
+
+    Every per-target step is individually `except _HookDeadline: raise` /
+    `except BaseException: continue` -- one target's failure never blocks
+    another's, matching this file's per-phase failure-isolation style.
+    Returns [(target_global_id, result_dict, result_path), ...] in hits'
+    own order, for render_compat_result_line.
+    """
+    if not hits:
+        return []
+
+    compat_runs_root = (
+        Path(args.compat_runs_root).expanduser() if args.compat_runs_root else COMPAT_RUNS_ROOT
+    )
+    triggers_dir = (
+        Path(args.compat_triggers_dir).expanduser() if args.compat_triggers_dir else COMPAT_TRIGGERS_DIR
+    )
+    spawn_allowed = not args.no_spawn and not args.no_compat_spawn
+
+    targets: list = []
+    for hit in hits:
+        target = hit[1]
+        if target not in targets:
+            targets.append(target)
+        if len(targets) >= MAX_COMPAT_TARGETS_PER_HOOK:
+            break
+
+    results: list = []
+    for target_global_id in targets:
+        try:
+            _check_deadline(started)
+            found = find_latest_compat_result(compat_runs_root, project_id, target_global_id, started)
+            if found is not None:
+                doc, path = found
+                results.append((target_global_id, doc, path))
+                continue
+            if not spawn_allowed or not project_id:
+                continue
+            gate_d_script = Path(__file__).resolve().parent / GATE_D_SCRIPT_NAME
+            if not gate_d_script.is_file():
+                continue
+            if claim_compat_trigger_slot(triggers_dir, project_id, target_global_id):
+                spawn_compat_check(
+                    gate_d_script, catalog_path, compat_runs_root, project_id, target_global_id
+                )
+        except _HookDeadline:
+            raise
+        except BaseException:
+            continue
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
@@ -1061,13 +1529,32 @@ def render_dependency_line(hits: list, shown: int) -> str:
     )
 
 
-def fit_budget(summary_line: str, hits: list) -> str:
+def fit_budget(summary_line: str, hits: list, compat_results: list = ()) -> str:
     """Assemble the final context within MAX_CONTEXT_BYTES, deterministically.
 
-    Line 2's tail pairs are dropped first (each is one more example of the
-    same message), then line 2 entirely, and only then is line 1 truncated
-    -- line 1 is the part that is useful even alone.
+    Line 3's tail entries are dropped first, then line 3 entirely (it is
+    the most speculative/newest addition), THEN line 2's tail pairs (each
+    is one more example of the same message), then line 2 entirely, and
+    only then is line 1 truncated -- line 1 is the part that is useful even
+    alone.
+
+    `compat_results: list = ()` as the default means every existing 2-arg
+    call site (`fit_budget(summary, hits)`) is untouched and takes the
+    identical code path as before this parameter existed.
     """
+    dependency_line_full = render_dependency_line(hits, min(MAX_PAIRS_SHOWN, len(hits)))
+    for compat_shown in range(min(MAX_COMPAT_RESULTS_SHOWN, len(compat_results)), 0, -1):
+        compat_line = render_compat_result_line(compat_results, compat_shown)
+        parts = [summary_line]
+        if dependency_line_full:
+            parts.append(dependency_line_full)
+        if compat_line:
+            parts.append(compat_line)
+        candidate = "\n".join(parts)
+        if len(candidate.encode("utf-8")) <= MAX_CONTEXT_BYTES:
+            return candidate
+    # Line 3 fully dropped (or never existed) -- byte-identical to the
+    # pre-existing line1/line2 logic below.
     for shown in range(min(MAX_PAIRS_SHOWN, len(hits)), 0, -1):
         dependency_line = render_dependency_line(hits, shown)
         candidate = f"{summary_line}\n{dependency_line}" if dependency_line else summary_line
@@ -1147,11 +1634,41 @@ def build_hook_text(args: argparse.Namespace, started: float, now: "datetime | N
 
         _check_deadline(started)
         hits = freshness_hits(catalog, project_id)
-
-        _check_deadline(started)
-        return fit_budget(summary_line, hits)
     except BaseException:
-        return fit_budget(summary_line, [])
+        return fit_budget(summary_line, [], [])
+
+    # Gate D auto-trigger + result surfacing (line 3): its own failure
+    # domain, isolated from the already-correct `hits` above -- a problem
+    # here degrades to "no line 3", never to losing line 2 or crashing the
+    # hook. See BACKGROUND GATE D AUTO-TRIGGER in the module docstring.
+    compat_results: list = []
+    try:
+        _check_deadline(started)
+        compat_results = handle_compat_hits(hits, project_id, args, started, catalog_path)
+    except BaseException:
+        compat_results = []
+
+    try:
+        return fit_budget(summary_line, hits, compat_results)
+    except BaseException:
+        # Defense-in-depth, dedicated-review P1, 2026-08-26: the primary
+        # fix is _flatten_for_terminal() now stripping Cs (surrogate)
+        # characters at the single interpolation boundary, so `hits`
+        # should never actually be able to raise here again for that
+        # specific cause. But this fallback's OWN job -- per the comment on
+        # the entry to this function -- is "must not throw away the
+        # already-correct summary_line", for ANY failure, not just the one
+        # failure mode we happen to have diagnosed today. The prior version
+        # of this fallback still passed the (potentially still-poisoned)
+        # `hits` through, so a different future encode-hazard in `hits`
+        # would raise again here, escape uncaught, and cost line 1 too --
+        # exactly the regression a dedicated review caught. Drop `hits`
+        # here as well, matching the pre-this-feature fallback's own
+        # stronger guarantee (`fit_budget(summary_line, [])`).
+        try:
+            return fit_budget(summary_line, [], [])
+        except BaseException:
+            return summary_line
 
 
 def emit_hook_context(text: str) -> None:
@@ -1306,6 +1823,24 @@ def build_parser(silent: bool = False) -> argparse.ArgumentParser:
         "--no-spawn",
         action="store_true",
         help="Never start a background rebuild, however stale the catalog is.",
+    )
+    hook.add_argument(
+        "--no-compat-spawn",
+        dest="no_compat_spawn",
+        action="store_true",
+        help="Never auto-trigger a Gate D compatibility check, even when --no-spawn allows the catalog rebuild.",
+    )
+    hook.add_argument(
+        "--compat-runs-root",
+        dest="compat_runs_root",
+        default=None,
+        help=f"Gate D staging output root for the auto-trigger. Default: {COMPAT_RUNS_ROOT}.",
+    )
+    hook.add_argument(
+        "--compat-triggers-dir",
+        dest="compat_triggers_dir",
+        default=None,
+        help=f"Debounce-marker directory. Default: {COMPAT_TRIGGERS_DIR}.",
     )
 
     registration = sub.add_parser(
