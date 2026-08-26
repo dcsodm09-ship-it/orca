@@ -1314,13 +1314,28 @@ def render_compat_result_line(results: list, shown: int) -> str:
     """Line 3. NEVER interpolates a check's stdout/stderr/check_command/id --
     only `outcome` (validated against the known outcome set, else
     "unknown"), a failed/total check count derived from `exit_code`/
-    `timed_out`, and the locally-constructed file path (safe: built from OUR
-    OWN resolved project_id and compat_runs_root, not from project-declared
-    content). `target_global_id` still goes through _safe_field() -- same
-    untrusted-hand-authored-text category as line 2's ids. Mirrors
-    render_dependency_line()'s "+K more" tail and explicit untrusted-data
-    disclaimer, plus an explicit "STAGING, NOT authorized" label so this can
-    never be misread as authoritative.
+    `timed_out`, and the discovered result-file path. `target_global_id`
+    and `path` both go through _safe_field() -- same untrusted-hand-
+    authored-text category as line 2's ids. Fix, 2026-08-26 cross-audit
+    finding (independently confirmed by 3 models, all flagging this same
+    line): `path` is NOT purely "our own" the way this docstring used to
+    claim -- find_latest_compat_result() builds it from compat_runs_root
+    (ours) joined with a RUN-ID DIRECTORY NAME discovered via os.scandir(),
+    which is never format-validated (see that function's own docstring:
+    "a project_id whose '/'-containing shape would escape run_dir is
+    skipped, not fatal" -- that guards against *escaping* the scan, not
+    against a *hostile-but-contained* directory name reaching this render
+    step). A local process able to write into the staging compat-runs
+    root (a real possibility: it inherits normal filesystem permissions,
+    not a locked-down system directory) could create a directory whose
+    name contains newlines/control characters and have that string reach
+    this line 3's rendered text, which lands directly in the model's own
+    SessionStart context. Routing `path` through the same _safe_field()
+    scrub used for `target_global_id` closes this at the same single
+    interpolation boundary the rest of this module already relies on.
+    Mirrors render_dependency_line()'s "+K more" tail and explicit
+    untrusted-data disclaimer, plus an explicit "STAGING, NOT authorized"
+    label so this can never be misread as authoritative.
     """
     if not results or shown <= 0:
         return ""
@@ -1340,7 +1355,7 @@ def render_compat_result_line(results: list, shown: int) -> str:
             total = 0
             failed = 0
         rendered.append(
-            f"{_safe_field(target_global_id)}: {outcome} ({failed}/{total} checks failed), see {path}"
+            f"{_safe_field(target_global_id)}: {outcome} ({failed}/{total} checks failed), see {_safe_field(str(path))}"
         )
     remaining = len(results) - len(rendered)
     if remaining > 0:
