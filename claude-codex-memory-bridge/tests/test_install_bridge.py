@@ -1183,11 +1183,23 @@ class InstallEndToEndTests(unittest.TestCase):
             verify_result,
             {
                 "ok": True,
+                # Round-4 (2026-08-28): `hook_functional` answers "is the redaction hook actually
+                # running on every managed config?" on its own, separately from `ok` (which also
+                # folds in account coverage), and `summary` says it in one readable line. `broken`
+                # and `drift` are the two lists that used to be one raise -- see verify()'s own
+                # comment for why conflating them caused a week of unredacted production.
+                "hook_functional": True,
+                "summary": (
+                    "HEALTHY: the redaction hook is correctly wired and functional on every "
+                    "managed config."
+                ),
                 "release_id": receipt["release_id"],
                 "script_sha256": receipt["script_sha256"],
                 "policy_sha256": receipt["policy_sha256"],
                 "volume_uuid": receipt["volume_uuid"],
                 "configs": sorted(os.fspath(p) for p in (self.main_config, self.account_config)),
+                "broken": [],
+                "drift": [],
                 "unreachable": [],
                 # Always present as of the fail-closed account-coverage fix (2026-08-27); empty
                 # here because this fixture's home directory has no Orca account registry at all
@@ -1229,17 +1241,217 @@ class InstallEndToEndTests(unittest.TestCase):
         with self.assertRaises(installer.InstallError):
             installer.verify()
 
-    def test_verify_detects_hook_config_drift(self) -> None:
+    def test_verify_reports_a_foreign_edit_without_calling_the_hook_broken(self) -> None:
+        # Round-4 (2026-08-28) contract change, deliberate, replacing this test's previous
+        # `assertRaises(InstallError)` body. Something outside this installer adding its OWN handler
+        # used to abort verify() with `hook config drift: <path>` -- the same message, the same exit
+        # code and the same abort as `~/.codex/hooks.json` being DELETED, which is how the
+        # 2026-08-21 incident stayed unnoticed for a week (see verify()'s own comment).
+        #
+        # It is not hypothetical drift either: Orca does exactly this on this machine today, adding
+        # six of its own hook events to the shared `.codex/hooks.json`. So the requirement is not
+        # "stop noticing" -- the edit must still be reported, by path and by classification -- but
+        # "stop calling it broken", because the redaction hook is untouched and still firing.
         installer.install()
-        # Something outside this installer edits the config after install.
         payload = json.loads(self.main_config.read_bytes())
         payload["hooks"]["UserPromptSubmit"].append({"hooks": [{"type": "command", "command": "/bin/echo hi"}]})
         drifted = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode()
         self.main_config.chmod(0o600)
         self.main_config.write_bytes(drifted)
         self.main_config.chmod(0o600)
-        with self.assertRaises(installer.InstallError):
-            installer.verify()
+
+        result = installer.verify()
+        self.assertTrue(result["hook_functional"])
+        self.assertEqual(result["broken"], [])
+        self.assertTrue(result["ok"])
+        drift = [record for record in result["drift"] if record["config"] == os.fspath(self.main_config)]
+        self.assertEqual(len(drift), 1, f"the foreign edit was not reported at all: {result['drift']}")
+        self.assertEqual(drift[0]["classification"], "foreign_change")
+        self.assertTrue(drift[0]["hook_functional"])
+        self.assertIn("does NOT affect it", result["summary"])
+
+    def test_verify_calls_a_reformatted_config_cosmetic_not_broken(self) -> None:
+        # The other half of the same distinction, and the one that made verify() permanently red:
+        # a writer that rewrites the file with different formatting but an identical object graph.
+        installer.install()
+        payload = json.loads(self.main_config.read_bytes())
+        reserialized = json.dumps(payload, sort_keys=False, indent=4).encode()
+        self.assertNotEqual(reserialized, self.main_config.read_bytes())
+        self.main_config.chmod(0o600)
+        self.main_config.write_bytes(reserialized)
+        self.main_config.chmod(0o600)
+
+        result = installer.verify()
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["hook_functional"])
+        self.assertEqual(result["broken"], [])
+        drift = [record for record in result["drift"] if record["config"] == os.fspath(self.main_config)]
+        self.assertEqual(len(drift), 1)
+        self.assertEqual(drift[0]["classification"], "reserialized")
+
+    def test_verify_is_broken_when_the_owned_handler_is_removed(self) -> None:
+        # The state the 2026-08-21 incident actually left behind, in its survivable form: the file
+        # is present and valid, but our entry is gone. This MUST be `ok: false`, and it must say so
+        # in words a human can act on -- distinguishably from either drift case above.
+        installer.install()
+        payload = json.loads(self.main_config.read_bytes())
+        payload["hooks"]["UserPromptSubmit"] = [
+            handler for handler in payload["hooks"]["UserPromptSubmit"] if not installer.owned_handler(handler)
+        ]
+        self.main_config.chmod(0o600)
+        self.main_config.write_bytes((json.dumps(payload, sort_keys=True, indent=2) + "\n").encode())
+        self.main_config.chmod(0o600)
+
+        result = installer.verify()
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["hook_functional"])
+        self.assertEqual(len(result["broken"]), 1)
+        self.assertEqual(result["broken"][0]["config"], os.fspath(self.main_config))
+        self.assertEqual(result["broken"][0]["problems"][0]["kind"], "hook_missing")
+        self.assertIn("NOT being redacted", result["summary"])
+
+    def test_verify_is_broken_when_the_handler_points_at_another_release(self) -> None:
+        # "The hook is running, but not this release" -- a stale handler left behind pointing at an
+        # older release directory. Byte-comparison caught this only incidentally; it is now checked
+        # on its own terms, against the handler's own self-declared arguments.
+        installer.install()
+        payload = json.loads(self.main_config.read_bytes())
+        for handler in payload["hooks"]["UserPromptSubmit"]:
+            if not installer.owned_handler(handler):
+                continue
+            for hook in handler["hooks"]:
+                hook["command"] = hook["command"].replace(
+                    "--expected-script-sha256 ", "--expected-script-sha256 " + "0" * 64 + " ignored-"
+                )
+        self.main_config.chmod(0o600)
+        self.main_config.write_bytes((json.dumps(payload, sort_keys=True, indent=2) + "\n").encode())
+        self.main_config.chmod(0o600)
+
+        result = installer.verify()
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["hook_functional"])
+        self.assertEqual(result["broken"][0]["problems"][0]["kind"], "hook_points_elsewhere")
+
+    def test_verify_checks_every_config_instead_of_aborting_on_the_first(self) -> None:
+        # The abort was its own defect: one drifted account hid the state of every account after it,
+        # so an operator could not tell whether the rest were fine or simply never looked at. Both
+        # fixture configs are broken here; both must be named.
+        installer.install()
+        for config in (self.main_config, self.account_config):
+            payload = json.loads(config.read_bytes())
+            payload["hooks"]["UserPromptSubmit"] = [
+                handler
+                for handler in payload["hooks"]["UserPromptSubmit"]
+                if not installer.owned_handler(handler)
+            ]
+            config.chmod(0o600)
+            config.write_bytes((json.dumps(payload, sort_keys=True, indent=2) + "\n").encode())
+            config.chmod(0o600)
+
+        result = installer.verify()
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            sorted(record["config"] for record in result["broken"]),
+            sorted(os.fspath(p) for p in (self.main_config, self.account_config)),
+        )
+
+    # ------------------------------------------------------------------------------ doctor
+    def test_doctor_is_healthy_after_a_plain_install(self) -> None:
+        installer.install()
+        result = installer.doctor()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["findings"], [])
+        self.assertIn("HEALTHY", result["summary"])
+
+    def test_doctor_names_a_deleted_hooks_json_as_the_2026_08_21_incident_shape(self) -> None:
+        # The exact production failure this whole blocker is about: a Codex app upgrade removed
+        # `~/.codex/hooks.json` and the machine ran an unredacted hook for about a week. verify()
+        # cannot be the check for this on its own -- it treats an absent managed path as a tolerated
+        # "unreachable" (a deleted account), by deliberate design since round 3. doctor() is the
+        # check that says it out loud.
+        installer.install()
+        self.main_config.unlink()
+        result = installer.doctor()
+        self.assertFalse(result["ok"])
+        kinds = {finding["kind"] for finding in result["findings"]}
+        self.assertIn("config_missing", kinds)
+        finding = next(f for f in result["findings"] if f["kind"] == "config_missing")
+        self.assertEqual(finding["target"], os.fspath(self.main_config))
+        self.assertIn("2026-08-21", finding["detail"])
+        self.assertIn("ATTENTION", result["summary"])
+
+    def test_doctor_names_a_config_that_lost_its_redaction_entry(self) -> None:
+        installer.install()
+        payload = json.loads(self.main_config.read_bytes())
+        payload["hooks"]["UserPromptSubmit"] = [
+            handler for handler in payload["hooks"]["UserPromptSubmit"] if not installer.owned_handler(handler)
+        ]
+        self.main_config.chmod(0o600)
+        self.main_config.write_bytes((json.dumps(payload, sort_keys=True, indent=2) + "\n").encode())
+        self.main_config.chmod(0o600)
+        result = installer.doctor()
+        self.assertFalse(result["ok"])
+        self.assertIn("hook_missing", {finding["kind"] for finding in result["findings"]})
+
+    def test_doctor_reports_a_missing_receipt_instead_of_raising(self) -> None:
+        # doctor() must answer even in the states verify() refuses to start in -- "there is no
+        # receipt" is a finding, not an exception, or an unattended runner just sees a crash.
+        result = installer.doctor()
+        self.assertFalse(result["ok"])
+        self.assertIn("receipt_unavailable", {finding["kind"] for finding in result["findings"]})
+
+    def test_doctor_still_answers_the_only_question_that_matters_without_a_receipt(self) -> None:
+        # With the receipt gone, doctor() can no longer say WHICH release should be wired -- but it
+        # can still say whether a redaction handler exists at all, which is the difference between
+        # "unredacted" and "redacted by something older".
+        installer.install()
+        (installer.RUNTIME_BASE / "latest-receipt.json").unlink()
+        healthy = installer.doctor()
+        self.assertIn("receipt_unavailable", {finding["kind"] for finding in healthy["findings"]})
+        self.assertNotIn("hook_missing", {finding["kind"] for finding in healthy["findings"]})
+
+        payload = json.loads(self.main_config.read_bytes())
+        payload["hooks"]["UserPromptSubmit"] = [
+            handler for handler in payload["hooks"]["UserPromptSubmit"] if not installer.owned_handler(handler)
+        ]
+        self.main_config.chmod(0o600)
+        self.main_config.write_bytes((json.dumps(payload, sort_keys=True, indent=2) + "\n").encode())
+        self.main_config.chmod(0o600)
+        stripped = installer.doctor()
+        self.assertIn("hook_missing", {finding["kind"] for finding in stripped["findings"]})
+
+    def test_doctor_reports_a_tampered_script_the_live_handler_points_at(self) -> None:
+        receipt = installer.install()
+        installed_script = Path(receipt["release_dir"]) / "claude_memory_hook.py"
+        installed_script.chmod(0o600)
+        installed_script.write_bytes(b"# tampered\n")
+        installed_script.chmod(0o600)
+        result = installer.doctor()
+        self.assertFalse(result["ok"])
+        self.assertIn("script_digest_mismatch", {finding["kind"] for finding in result["findings"]})
+
+    def test_doctor_flags_the_launchd_tcc_hazard_only_for_an_apple_platform_interpreter(self) -> None:
+        # The Ego reaper on this machine was silently dead for ~2 weeks because of this, and every
+        # path this tool manages is on /Volumes by design -- so a health check that could die the
+        # same way must say so about itself. The condition is narrower than "external volume",
+        # though: the measured denial (ego-reaper-launchd/README.md, real throwaway launchd job,
+        # 2026-08-28) is specific to Apple platform binaries -- /opt/homebrew/bin/python3 reads the
+        # same paths fine, which is why the dispatch reaper's own plist uses it.
+        installer.install()
+        external = os.fspath(installer.RUNTIME_BASE).startswith("/Volumes/")
+        for executable, expected in (
+            ("/usr/bin/python3", external),
+            # `/usr/bin/python3` is a stub that re-execs into Xcode, so `sys.executable` reads as
+            # the Xcode path and a naive `/usr/bin/` check reports the denied case as safe.
+            ("/Applications/Xcode.app/Contents/Developer/usr/bin/python3", external),
+            ("/opt/homebrew/bin/python3", False),
+        ):
+            with mock.patch.object(installer.sys, "executable", executable):
+                result = installer.doctor()
+            with self.subTest(executable=executable):
+                self.assertEqual(result["launchd_tcc_risk"], expected)
+                self.assertEqual(result["interpreter"], executable)
+        self.assertIn("launchd", result["launchd_tcc_note"])
 
     def test_uninstall_restores_original_configs_exactly(self) -> None:
         before_main = self.main_config.read_bytes()

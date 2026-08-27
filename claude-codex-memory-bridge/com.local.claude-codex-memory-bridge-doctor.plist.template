@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.local.claude-codex-memory-bridge-doctor</string>
+
+	<!-- TEMPLATE. Not installed by install_bridge.py, and installing it is a change to
+	     the user's own machine configuration, so it is theirs to make. See README.md,
+	     "Periodic health check", for what it does and does not buy you.
+
+	     Runs `install_bridge.py doctor`: read-only, never writes, never touches a
+	     hooks.json. It exists for ONE failure class, the one that actually happened —
+	     on 2026-08-21 a Codex app upgrade deleted ~/.codex/hooks.json and this machine
+	     ran the original, unbounded, pre-round-1 vulnerable redact() in production for
+	     about a week with nobody noticing.
+
+	     INTERPRETER: /opt/homebrew/bin/python3, and this is load-bearing, not a
+	     preference. Every path this tool manages is on /Volumes/Extreme SSD by design
+	     (resolve_ssd_path enforces it), and macOS TCC denies Apple platform binaries
+	     access to removable volumes inside a launchd session. Measured on this machine
+	     under a real throwaway launchd job (ego-reaper-launchd/README.md, 2026-08-28):
+
+	         /bin/cat                    reading a source on /Volumes/...   DENIED (Errno 1)
+	         /usr/bin/python3            running a source on /Volumes/...   DENIED (exit 2)
+	         /opt/homebrew/bin/python3   running a source on /Volumes/...   OK
+
+	     `/usr/bin/python3` is additionally a stub that re-execs into Xcode, so it is
+	     denied AND fragile. Swapping this line to it turns this job into a health check
+	     that is itself silently dead — the exact bug it is here to catch. `doctor`
+	     reports `launchd_tcc_risk: true` when it notices it is running that way.
+
+	     StandardOutPath/StandardErrorPath are on INTERNAL storage for the same reason:
+	     a log the job cannot write is a job you cannot diagnose. Create the directory
+	     first — launchd does not, and a missing parent makes the job fail to spawn:
+	         mkdir -p ~/.local/state/claude-codex-memory-bridge
+
+	     doctor exits non-zero on any finding, so LastExitStatus in `launchctl list
+	     com.local.claude-codex-memory-bridge-doctor` is a usable signal on its own. It
+	     does NOT notify anybody: nothing here reads that status for you. Wire it to
+	     whatever this machine already uses for alerts, or check it by hand — an
+	     unwatched red light is what the original incident was.
+
+	     Install:
+	         cp com.local.claude-codex-memory-bridge-doctor.plist.template \
+	            ~/Library/LaunchAgents/com.local.claude-codex-memory-bridge-doctor.plist
+	         # then replace __REPO__ below with this checkout's absolute path
+	         launchctl bootstrap gui/$(id -u) \
+	            ~/Library/LaunchAgents/com.local.claude-codex-memory-bridge-doctor.plist
+	     Remove:
+	         launchctl bootout gui/$(id -u)/com.local.claude-codex-memory-bridge-doctor
+	-->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/python3</string>
+		<string>__REPO__/install_bridge.py</string>
+		<string>doctor</string>
+	</array>
+
+	<!-- Hourly. The incident it catches is an app upgrade deleting a hooks.json, which
+	     is rare and not urgent to the minute; the reaper next door runs every 60s
+	     because it is reclaiming live resources, which this is not. -->
+	<key>StartInterval</key>
+	<integer>3600</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Umask</key>
+	<integer>63</integer>
+
+	<key>StandardOutPath</key>
+	<string>__HOME__/.local/state/claude-codex-memory-bridge/doctor.stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/.local/state/claude-codex-memory-bridge/doctor.stderr.log</string>
+</dict>
+</plist>

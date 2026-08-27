@@ -130,11 +130,66 @@ untrusted historical reference, and emits at most 7,000 UTF-8 bytes.
 Run from this directory with the system Python:
 
 ```sh
-/usr/bin/python3 -m unittest discover -s tests -v
+/usr/bin/python3 -m unittest discover -s tests -t tests -p 'test_*.py'
 /usr/bin/python3 install_bridge.py plan
 /usr/bin/python3 install_bridge.py install
 /usr/bin/python3 install_bridge.py verify
+/usr/bin/python3 install_bridge.py doctor
 ```
+
+### `verify` vs `doctor`
+
+They answer different questions, and conflating them is what caused this
+project's worst production incident (see below).
+
+`verify` asks **"is what I installed still correctly installed?"** It needs a
+valid receipt and refuses to start without one. Since round 4 it checks the hook
+*semantically* — is there exactly one handler owned by this bridge under
+`UserPromptSubmit`, does it point at this release's script and policy, and does
+that script file's own content hash match — rather than byte-comparing each
+`hooks.json` against the receipt. Byte differences are still reported, in a
+separate `drift` list, and each one is classified:
+
+| classification | meaning | fails `ok` |
+|---|---|---|
+| `reserialized` | same JSON, different formatting; another writer rewrote the file | no |
+| `foreign_change` | another tool changed its own handlers; ours is untouched | no |
+| *(a `broken` entry)* | our handler is missing, duplicated, or points elsewhere | **yes** |
+
+`hook_functional` and a plain-English `summary` are top-level, so a caller does
+not have to interpret anything to learn whether prompts are being redacted.
+
+`doctor` asks **"is the redaction hook running right now?"** It never raises —
+a missing receipt is a *finding*, not an exception — and it enumerates configs
+live rather than from the receipt, so it still answers on a machine whose
+receipt is gone. It exists for one failure class: `hooks.json` disappearing, or
+losing its redaction entry. Both exit non-zero on failure.
+
+Why the byte comparison had to go: on 2026-08-21 a Codex app upgrade deleted
+`~/.codex/hooks.json`, and this machine ran the original, unbounded,
+pre-round-1 vulnerable `redact()` in production for about a week. `verify` was
+not silent during that week — it was *failing*. It just failed with the same
+word (`drift`), the same exit code, and the same abort-on-first-config as a
+harmless reformat, so the signal carried no information and stopped being read.
+Orca reserializes these files in normal operation, so that state was permanent.
+
+### Periodic health check
+
+`com.local.claude-codex-memory-bridge-doctor.plist.template` is a launchd agent
+that runs `doctor` hourly. It is a **template**: nothing installs it, because
+installing it changes the machine's configuration. Read its header comment
+before using it — in particular, it must run under `/opt/homebrew/bin/python3`.
+Everything this tool manages lives on `/Volumes/Extreme SSD`, and macOS TCC
+denies Apple platform binaries access to removable volumes inside a launchd
+session (measured on this machine: `/bin/cat` and `/usr/bin/python3` are denied,
+`/opt/homebrew/bin/python3` is not — see `ego-reaper-launchd/README.md`).
+Pointing it at `/usr/bin/python3` produces a health check that is itself
+silently dead. `doctor` reports `launchd_tcc_risk: true` when it detects it is
+running that way.
+
+It sets an exit status; it does not notify anyone. An unwatched red light is
+what the original incident was, so wire `LastExitStatus` into whatever this
+machine already uses for alerts, or check it deliberately.
 
 `plan` is read-only. `install` first writes private, content-addressed runtime
 files and private backups, then records a durable pending transaction before it

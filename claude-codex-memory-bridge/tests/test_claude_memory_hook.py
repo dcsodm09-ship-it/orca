@@ -9441,16 +9441,13 @@ class RedactFlatQuantifierTests(unittest.TestCase):
         # x3.9 per doubling, textbook quadratic, past the hook's own 5s budget at ~17,000
         # characters. Bounded input, so no ceiling could ever have caught it. Now x1.9.
         #
-        # Scoped to the two patterns this round rewrote ON PURPOSE: `redact()` as a whole is still
-        # quadratic on this one shape, in four OTHER patterns that share
-        # `_ASCII_SECRET_KEYWORD_CORE` (`_SECRET_LABEL_KEYWORD_RE`,
-        # `_CJK_SECRET_VALUE_PERMISSIVE_TABLE_RE`, `_CJK_TABLE_CELL_VALUE_OR_PLACEHOLDER_RE`,
-        # `_INLINE_ASCII_SECRET_RE` -- all x4.1/doubling, identical before and after this round,
-        # so pre-existing and untouched here). That is a separate defect of the same class and is
-        # deliberately out of this round's scope; see `test_homoglyph_quadratic_residue_is_not_in
-        # _the_two_patterns_this_round_rewrote` below, which pins exactly that split so the next
-        # round can pick it up without re-deriving it.
+        # Round-4 update (2026-08-28): this was scoped to the two patterns round 3 rewrote because
+        # `redact()` as a whole was still quadratic on this shape, in the four siblings round 3
+        # listed. Those four are fixed now (see `RedactSiblingFlatQuantifierTests`), so the scoping
+        # is no longer needed -- the whole pipeline is asserted linear on this shape below, in
+        # addition to the two-pattern assertion this test has always made.
         self._assert_linear(self._two_patterns, lambda n: self.KELVIN * n, '"\\u212a" * n')
+        self._assert_linear(hook.redact, lambda n: self.KELVIN * n, 'redact("\\u212a" * n)')
 
     def test_homoglyph_separated_label_run_is_linear_to_256k(self) -> None:
         self._assert_linear(
@@ -9469,15 +9466,24 @@ class RedactFlatQuantifierTests(unittest.TestCase):
     def test_homoglyph_quadratic_residue_is_not_in_the_two_patterns_this_round_rewrote(
         self,
     ) -> None:
-        # Pins the boundary of this round's scope with a measurement rather than a claim. The two
-        # patterns rewritten here are linear on a pure homoglyph run; the four that still are not
-        # are listed by name so the follow-up round has the list. If a future change makes one of
-        # the two below quadratic again, this fails; if someone fixes the other four, the second
-        # loop starts failing and should simply be deleted along with this comment.
+        # Round-3 pinned the boundary of its own scope with a measurement rather than a claim. Round
+        # 4 (2026-08-28) fixed the four siblings it named, so the list below is now every pattern in
+        # the homoglyph blast radius rather than only round 3's half of it -- kept in one place so a
+        # regression in ANY of them fails here with the offending name.
         run = self.KELVIN * 8_000
         for name, call in (
             ("_URL_USERINFO_RE", lambda t: hook._URL_USERINFO_RE.sub("X", t)),
             ("_ASSIGNMENT_RE", lambda t: hook._ASSIGNMENT_RE.sub("X", t)),
+            ("_SECRET_LABEL_KEYWORD_RE", lambda t: hook._SECRET_LABEL_KEYWORD_RE.sub("X", t)),
+            ("_INLINE_ASCII_SECRET_RE", lambda t: hook._INLINE_ASCII_SECRET_RE.sub("X", t)),
+            (
+                "_CJK_SECRET_VALUE_PERMISSIVE_TABLE_RE",
+                lambda t: hook._CJK_SECRET_VALUE_PERMISSIVE_TABLE_RE.sub("X", t),
+            ),
+            (
+                "_CJK_TABLE_CELL_VALUE_OR_PLACEHOLDER_RE",
+                lambda t: hook._CJK_TABLE_CELL_VALUE_OR_PLACEHOLDER_RE.sub("X", t),
+            ),
         ):
             with self.subTest(fixed=name):
                 self.assertLess(self._timed(call, run), 0.25, f"{name} regressed to quadratic")
@@ -9585,6 +9591,238 @@ class RedactFlatQuantifierTests(unittest.TestCase):
                         _re.compile(unsupported)
 
 
+class RedactSiblingFlatQuantifierTests(unittest.TestCase):
+    """Round-4 pins for the four siblings round 3 measured, named, and deliberately deferred.
+
+    Round 3 fixed `_ASSIGNMENT_RE`/`_URL_USERINFO_RE` and left a written scope note listing four
+    patterns sharing `_ASCII_SECRET_KEYWORD_CORE` that were still quadratic on the same homoglyph
+    run. A `gpt-5.6-sol` review then returned NO-GO on exactly that residue. Measured here before
+    the fix, `/usr/bin/python3` 3.9.6:
+
+        _SECRET_LABEL_KEYWORD_RE.sub      108 / 562 / 3171 / 12828 ms  at 2k/4k/8k/16k  ("İıſK" run)
+        _INLINE_ASCII_SECRET_RE.sub        81 / 903 / 3382 / 12596 ms  at 2k/4k/8k/16k  ("İıſK" run)
+
+    The two CJK table patterns turned out NOT to be quadratic on a homoglyph run -- the review's
+    reproduction was right about the symptom and the sizes but not about the mechanism, and the
+    difference matters because the fix is different. They are LINEAR with a ~250us/character
+    constant, from `_cjk_value_pattern`'s 256-deep three-branch guard scan re-run at every start
+    position, and the shape that triggers it is an ordinary value-body run with no alphanumeric in
+    it at all:
+
+        _CJK_SECRET_VALUE_PERMISSIVE_TABLE_RE.sub   1007 / 2842 / 4950 / 7779 ms  at 4k/8k/16k/32k
+        _CJK_TABLE_CELL_VALUE_OR_PLACEHOLDER_RE.sub  340 /  906 / 2132 /  4432 ms  at 4k/8k/16k/32k
+
+    Both are pinned below, by their own worst shape rather than by a shape borrowed from a sibling.
+    """
+
+    KELVIN = "K"
+    HOMOGLYPHS = ("İ", "ı", "ſ", "K")
+
+    @staticmethod
+    def _timed(call, text: str) -> float:
+        start = time.perf_counter()
+        call(text)
+        return time.perf_counter() - start
+
+    def _assert_linear(self, call, make, name: str, *, ceiling: float = 3.0) -> None:
+        # Same 32x sweep and same 150x allowance as `RedactFlatQuantifierTests._assert_linear`;
+        # see that method's own comment for why the allowance is that wide.
+        small = self._timed(call, make(8_000))
+        large = self._timed(call, make(256_000))
+        self.assertLess(
+            large,
+            max(small * 150, 0.05),
+            f"{name} scaled worse than linearly: {small:.4f}s @8k -> {large:.4f}s @256k",
+        )
+        self.assertLess(large, ceiling, f"{name} took {large:.4f}s on 256,000 chars")
+
+    # ------------------------------------------------------- 1. quadratic detection, per pattern
+    def test_ascii_label_patterns_are_linear_on_a_homoglyph_run(self) -> None:
+        for name, pattern in (
+            ("_SECRET_LABEL_KEYWORD_RE", hook._SECRET_LABEL_KEYWORD_RE),
+            ("_INLINE_ASCII_SECRET_RE", hook._INLINE_ASCII_SECRET_RE),
+        ):
+            with self.subTest(pattern=name):
+                self._assert_linear(
+                    lambda text, _p=pattern: _p.sub("X", text),
+                    lambda n: "".join(self.HOMOGLYPHS) * (n // 4),
+                    f'{name} on a homoglyph run',
+                )
+
+    def test_cjk_table_patterns_are_linear_on_a_guardless_value_run(self) -> None:
+        # "**" is the worst shape for these two specifically: every character is an ordinary
+        # value-body character (so the guard scan runs to its full depth) and none is alphanumeric
+        # (so it then fails), at every start position.
+        #
+        # The ceiling is 8s rather than the 3s `RedactFlatQuantifierTests` uses, because these two
+        # keep a genuinely larger per-character constant than the assignment patterns do and this
+        # sweep runs them on a single 256,000-character line, far past anything the pipeline sees in
+        # practice. Both numbers are measured, `/usr/bin/python3` 3.9.6, on the "**" run:
+        #     before this round   0.32s @8k -> 10.39s / 10.23s @256k
+        #     after               0.10s @8k ->  3.40s /  3.40s @256k
+        # The RATIO assertion is the actual defect detector (x32 input, x34 time = linear); the
+        # ceiling is only the backstop for "flat ratio but slow outright", and 8s still fails a 2.4x
+        # constant regression. The budget that actually matters is asserted end-to-end, at realistic
+        # sizes, by `test_the_reviewed_repro_sizes_are_now_far_inside_the_hook_budget`.
+        for name, pattern in (
+            ("_CJK_SECRET_VALUE_PERMISSIVE_TABLE_RE", hook._CJK_SECRET_VALUE_PERMISSIVE_TABLE_RE),
+            ("_CJK_TABLE_CELL_VALUE_OR_PLACEHOLDER_RE", hook._CJK_TABLE_CELL_VALUE_OR_PLACEHOLDER_RE),
+        ):
+            for shape, unit in (("asterisks", "**"), ("quotes", "'"), ("homoglyphs", "K")):
+                with self.subTest(pattern=name, shape=shape):
+                    self._assert_linear(
+                        lambda text, _p=pattern: _p.sub("X", text),
+                        lambda n, _u=unit: _u * (n // len(_u)),
+                        f"{name} on a {shape} run",
+                        ceiling=8.0,
+                    )
+
+    def test_the_reviewed_repro_sizes_are_now_far_inside_the_hook_budget(self) -> None:
+        # The review's own numbers: past the hook's outer 5-second cap at 16-20KB. Both shapes are
+        # asserted end-to-end through `redact()`, at 24KB, with a wide margin -- 6088ms/5572ms
+        # before the fix, ~30ms/~380ms after.
+        homoglyph = "".join(self.HOMOGLYPHS) * 6_000
+        table = "| name | password |\n| --- | --- |\n| bob | %s |\n" % ("**" * 12_000)
+        for label, text in (("homoglyph run", homoglyph), ("guardless table cell", table)):
+            with self.subTest(shape=label):
+                elapsed = self._timed(hook.redact, text)
+                self.assertLess(elapsed, 2.0, f"{label} took {elapsed:.3f}s on {len(text)} chars")
+
+    def test_the_whitespace_redos_round_6_closed_stays_closed(self) -> None:
+        # The round-4 guard-scan rewrite reopened this once, in review: flattening the body's
+        # multi-character tokens to their constituent characters made horizontal whitespace
+        # crossable from every position of a long run, and `test_inline_cjk_secret_connector_is_not
+        # _cubic` went from passing to a multi-second failure (whole-suite wall time 77s -> 159s).
+        # `_CJK_VALUE_GUARD_SCAN_NEVER_CROSSABLE` is what keeps it closed; this asserts the property
+        # directly against the guard scan rather than only through that older test's own pattern.
+        for name, pattern in (
+            ("_CJK_SECRET_VALUE_PERMISSIVE_TABLE_RE", hook._CJK_SECRET_VALUE_PERMISSIVE_TABLE_RE),
+            ("_INLINE_CJK_SECRET_RE", hook._INLINE_CJK_SECRET_RE),
+        ):
+            with self.subTest(pattern=name):
+                elapsed = self._timed(
+                    lambda text, _p=pattern: _p.search(text), "密码" + " " * 12_000 + "x"
+                )
+                self.assertLess(elapsed, 1.0, f"{name} took {elapsed:.3f}s on a whitespace run")
+
+    # --------------------------------------------------- 2. boundary / leak, no cap at any length
+    def test_compound_key_labels_are_still_recognized_without_the_redundant_alternative(self) -> None:
+        # `[A-Za-z0-9]+[_-]key` was removed from `_ASCII_SECRET_KEYWORD_CORE` as redundant: bare
+        # `key` is reachable at the same terminal position because `[_-]` satisfies the vocabulary's
+        # own `(?<![A-Za-z0-9])` boundary. "Redundant" is a claim about rendered output, so it is
+        # asserted on rendered output, through every shape these four patterns actually see.
+        secret = "Qw7#zP2mLv8Ke"
+        for label in (
+            "soga_key", "ACCESS_KEY", "AWS_SECRET_ACCESS_KEY", "my_key", "x9_key", "9_key",
+            "a-key", "session_key", "host_key_v2", "api_key", "private_key", "PRIVATE-KEY",
+        ):
+            for text in (
+                f"{label}: {secret}",
+                f"{label} is {secret}",
+                f"| {label} | {secret} |",
+                # Header-row form: the label names the SECOND column, so only that column's data
+                # cell is the secret -- the first column deliberately carries unrelated content, or
+                # this asserts the column scan over-redacts rather than that it fires at all.
+                f"| id | {label} |\n| --- | --- |\n| row-one | {secret} |",
+            ):
+                with self.subTest(label=label, text=text):
+                    redacted = hook.redact(text)
+                    self.assertNotIn(secret, redacted)
+                    self.assertIn("[REDACTED", redacted)
+
+    def test_homoglyph_prefixed_label_is_still_recognized_so_the_boundary_taint_stays_reverted(
+        self,
+    ) -> None:
+        # Aligning `_ASCII_SECRET_KEYWORD_STANDALONE_BASE`'s lookbehind with its `(?i:...)` keyword
+        # -- round 3's stated invariant, applied literally -- was implemented, measured and then
+        # reverted here: unlike `_ASSIGNMENT_RE`, this vocabulary anchors directly on the keyword
+        # with no run to relocate into, so rejecting the mid-run start position rejects the LABEL.
+        # A differential sweep put 1,877 outputs in the leak direction, all of this shape. That is a
+        # redaction-EVASION vector (one homoglyph in front of an ordinary label turns redaction
+        # off), so the disagreement stays. See that constant's own comment for the full reasoning.
+        secret = "Ab7xK9mQ2"
+        for homoglyph in self.HOMOGLYPHS:
+            for label in ("password", "secret", "token"):
+                text = f"| {homoglyph}{label} | {secret} |"
+                with self.subTest(text=text):
+                    redacted = hook.redact(text)
+                    self.assertNotIn(secret, redacted)
+                    self.assertIn("[REDACTED", redacted)
+
+    def test_guard_scan_still_reaches_a_value_behind_fullwidth_punctuation(self) -> None:
+        # `_CJK_VALUE_CHARS_COMMON` and `_CJK_VALUE_NON_ASCII_TOKEN` overlap: "：＝" and the
+        # fullwidth connector punctuation are ordinary value characters AND sit inside the
+        # Halfwidth-and-Fullwidth block the token excludes. The first flat scan class blocked the
+        # block wholesale and so NARROWED the gate -- 13 of 59,480 differential-sweep inputs stopped
+        # redacting, all of this shape. Pinned with the sweep's own smallest repro plus the general
+        # form for every carve-out character.
+        self.assertNotEqual(
+            hook.redact('Y密码 cb"ſ[：@ı1b**-ı0'),
+            'Y密码 cb"ſ[：@ı1b**-ı0',
+        )
+        for char in "：＝－／＿．＠；｜＋＊～":
+            with self.subTest(carve_out=char):
+                text = "密码 ab" + char + "cd7xKqZ"
+                self.assertIn("[REDACTED", hook.redact(text), f"carve-out {char!r} was blocked")
+
+    def test_guard_scan_class_is_disjoint_from_its_guard(self) -> None:
+        # Disjointness is the whole reason the flat scan cannot backtrack. Asserted structurally,
+        # over every ASCII character plus the carve-outs, for every (body, guard) pair the module
+        # actually builds -- so a future guard that stops being a subset of the body repertoire
+        # fails here rather than silently reintroducing an ambiguous scan.
+        pairs = (
+            (hook._CJK_VALUE_BODY_TABLE_PERMISSIVE, "[A-Za-z0-9]"),
+            (hook._CJK_VALUE_BODY_INLINE_PERMISSIVE, "[A-Za-z0-9]"),
+            (hook._CJK_VALUE_BODY_INLINE_PERMISSIVE, "[0-9-]"),
+            (hook._CJK_VALUE_BODY_INLINE, "[0-9-]"),
+        )
+        probes = [chr(code) for code in range(0x80)]
+        probes += list("：＝－／＿＠İıſK密")
+        for body, guard in pairs:
+            scan = re.compile(hook._cjk_value_guard_scan_class(body, guard))
+            guard_re = re.compile(guard)
+            for char in probes:
+                if guard_re.fullmatch(char):
+                    with self.subTest(guard=guard, char=char):
+                        self.assertIsNone(scan.match(char), "scan class overlaps its guard")
+
+    def test_guard_scan_window_has_no_leak_boundary_at_realistic_lengths(self) -> None:
+        # The window's unit changed from body tokens to characters, so its edge moved. Swept well
+        # past both the old (256 tokens) and new (512 characters) numbers, in the shape that
+        # actually exercises it: a run of non-guard value characters before the value's first
+        # alphanumeric.
+        for pad in (1, 8, 64, 255, 256, 257, 511, 512, 513, 1_000):
+            with self.subTest(pad=pad):
+                text = "密码：" + "." * pad + "Qw7zP2mLv8Ke"
+                redacted = hook.redact(text)
+                # Past the window the gate declines, exactly as the capped version always has --
+                # what must never happen is a match that captures a PREFIX and renders the tail.
+                if "[REDACTED" in redacted:
+                    self.assertNotIn("Qw7zP2mLv8Ke", redacted, f"partial capture at pad={pad}")
+
+    # ------------------------------------------------------------- 3. differential no-op sweep
+    def test_round4_changed_no_redaction_output_on_the_real_input_shapes(self) -> None:
+        # The rewrite is meant to be a pure performance change. This is the assertion of that,
+        # sampled from the same corpus the full 59,480-input differential sweep against the pre-fix
+        # module used (that sweep reported 0 differences; this keeps a representative slice of it
+        # in the suite so a later round cannot quietly change behaviour here).
+        labels = ["password", "secret", "token", "api_key", "db_password_prod", "ACCESS_KEY",
+                  "passphrase", "backup code", "密码", "密钥", "助记词"]
+        values = ["Ab7xK9mQ2", "sk-abcdefghij1234567890", "159 3321 8874 6650",
+                  "Qx9\\|Lm2N7", "[Zq7-203.0.113.77-Pk]", "v2.Bearer xoxbslackbotusertoken",
+                  "R7mQ betaLOCK", "----", "密码zh", "'Qw7#zP2mLv8Ke'", "**Zx8Qm2**"]
+        for label in labels:
+            for value in values:
+                for text in (
+                    f"{label}: {value}",
+                    f"| {label} | {value} |",
+                    f"| id | {label} |\n| --- | --- |\n| {value} | {value} |",
+                ):
+                    with self.subTest(text=text):
+                        # Idempotence is the invariant every round here has had to hold, and it is
+                        # the one most sensitive to a gate that changed which candidates it admits.
+                        once = hook.redact(text)
+                        self.assertEqual(hook.redact(once), once)
 
 
 if __name__ == "__main__":

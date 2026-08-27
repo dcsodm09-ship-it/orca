@@ -2918,6 +2918,177 @@ def read_receipt() -> dict[str, Any]:
     return receipt
 
 
+# Round-4 (2026-08-28), BLOCKER 2. verify()'s per-config test used to be a byte-exact digest
+# comparison against the receipt, and any mismatch raised `hook config drift: <path>` -- aborting
+# the whole run, so no later account was checked either.
+#
+# That single line is the mechanism behind this project's own worst production incident. On
+# 2026-08-21 a Codex app upgrade deleted `~/.codex/hooks.json` outright; the machine then ran the
+# original, completely unbounded, pre-round-1 vulnerable `redact()` in production for about a week
+# with nobody noticing. verify() was not silent during that week -- it was FAILING. It just failed
+# the same way it fails for a harmless reformat, with the same word ("drift") and the same exit
+# code, so the signal carried no information and stopped being read.
+#
+# It is not a hypothetical. Reproduced live on this machine while writing this fix: Orca had added
+# six of its own hook events (PreToolUse/PostToolUse/Stop/SubagentStart/SubagentStop/
+# PermissionRequest, all pointing at ~/.orca/agent-hooks/codex-hook.sh) to
+# `/Volumes/Extreme SSD/Orca/local-homes/.codex/hooks.json`, and
+#     $ ./install_bridge.py verify
+#     {"ok": false, "error": "hook config drift: .../local-homes/.codex/hooks.json"}   rc=1
+# while the redaction handler was present, correct and firing on all three managed configs
+# (owned handler count 1/1/1, correct script path, correct digest).
+#
+# So the question this function asks changes from "are these bytes the bytes I wrote?" to "is the
+# redaction hook actually wired correctly?", and byte drift becomes a separately reported, and
+# separately CLASSIFIED, observation rather than a verdict. The classification is what makes the
+# signal readable again:
+#
+#   reserialized   -- the parsed JSON is equal to what install() wrote; only formatting differs.
+#                     Somebody else's writer rewrote the file. Cosmetic, by construction.
+#   foreign_change -- the JSON differs, but every check below still passes: another tool added or
+#                     changed ITS OWN handlers and left ours intact. Reported loudly, not fatal --
+#                     making it fatal is what would put this machine back into permanent red, which
+#                     is the failure this whole rewrite exists to undo.
+#   (problems)     -- our handler is missing, duplicated, points somewhere else, or the script it
+#                     points at does not hash to the expected release. THIS is "genuinely broken,
+#                     hook not firing", and only this sets ok:false.
+#
+# `reserialized` is decided against the receipt's own `after_backup` (a copy of the exact bytes
+# install() wrote, which every receipt this tool has ever written already records) rather than a new
+# receipt field, so the distinction works for receipts that predate this change -- including the one
+# live on this machine right now.
+_HOOK_HEALTH_MISSING = "hook_missing"
+_HOOK_HEALTH_DUPLICATE = "hook_duplicated"
+_HOOK_HEALTH_MISPOINTED = "hook_points_elsewhere"
+_HOOK_HEALTH_TAMPERED = "script_digest_mismatch"
+_HOOK_HEALTH_UNPARSEABLE = "config_unparseable"
+
+
+def _live_handler_arguments(command: str) -> dict[str, str]:
+    """Pull the self-declared `--policy`/`--expected-*-sha256` pairs (and argv[1]) out of a command.
+
+    Same shape make_release() always bakes in, and the same parse verify()'s write-trigger liveness
+    check has used since round 52 -- shared here rather than copied so the base handler and the
+    write-trigger handler cannot drift apart in how they read the identical command line.
+    """
+    try:
+        tokens = shlex.split(command, comments=True)
+    except ValueError as exc:
+        raise InstallError("cannot parse a live hook command") from exc
+    parsed: dict[str, str] = {}
+    if len(tokens) > 1:
+        parsed["script"] = tokens[1]
+    for index, token in enumerate(tokens):
+        if index + 1 >= len(tokens):
+            continue
+        if token in ("--policy", "--expected-policy-sha256", "--expected-script-sha256"):
+            # `-`s normalized to `_` so the keys are the identifier-shaped names the callers use;
+            # a bare `lstrip("-")` leaves "expected-script-sha256", which silently reads back as
+            # None at every call site and reports a correctly-wired hook as mispointed.
+            parsed[token[2:].replace("-", "_")] = tokens[index + 1]
+    return parsed
+
+
+def _config_hook_health(
+    raw: bytes,
+    *,
+    expected_script: str,
+    expected_policy: str,
+    expected_script_sha256: str,
+    expected_policy_sha256: str,
+) -> dict[str, Any]:
+    """Is the redaction hook correctly wired in THIS config's bytes? Semantics only, never bytes."""
+    problems: list[dict[str, str]] = []
+    try:
+        payload = strict_json(raw)
+    except InstallError as exc:
+        return {
+            "hook_present": False,
+            "problems": [{"kind": _HOOK_HEALTH_UNPARSEABLE, "detail": str(exc)}],
+            "payload": None,
+        }
+    handlers = payload.get("hooks", {}).get(DEFAULT_HOOK_EVENT, []) if isinstance(payload, dict) else []
+    if not isinstance(handlers, list):
+        handlers = []
+    matches = [handler for handler in handlers if owned_handler(handler)]
+    if not matches:
+        # The 2026-08-21 incident's exact shape when the file survives but loses its entry, and the
+        # one this whole rewrite must never again report with the same words as a reformat.
+        problems.append(
+            {
+                "kind": _HOOK_HEALTH_MISSING,
+                "detail": (
+                    f"no handler owned by {BRIDGE_ID} under {DEFAULT_HOOK_EVENT}: the redaction "
+                    "hook is NOT running for this account. Re-run `install`."
+                ),
+            }
+        )
+        return {"hook_present": False, "problems": problems, "payload": payload}
+    if len(matches) > 1:
+        problems.append(
+            {
+                "kind": _HOOK_HEALTH_DUPLICATE,
+                "detail": f"{len(matches)} handlers owned by {BRIDGE_ID}; exactly one is expected",
+            }
+        )
+    command = _owned_handler_command(matches[0])
+    if command is None:
+        problems.append({"kind": _HOOK_HEALTH_MISSING, "detail": "owned handler carries no command"})
+        return {"hook_present": False, "problems": problems, "payload": payload}
+    arguments = _live_handler_arguments(command)
+    expected_arguments = {
+        "script": expected_script,
+        "policy": expected_policy,
+        "expected_script_sha256": expected_script_sha256,
+        "expected_policy_sha256": expected_policy_sha256,
+    }
+    for name, expected_value in expected_arguments.items():
+        actual = arguments.get(name)
+        if actual != expected_value:
+            problems.append(
+                {
+                    "kind": _HOOK_HEALTH_MISPOINTED,
+                    "detail": (
+                        f"live handler's {name} is {actual!r}, expected {expected_value!r} -- the "
+                        "hook is running, but not this release"
+                    ),
+                }
+            )
+    return {"hook_present": True, "problems": problems, "payload": payload, "command": command}
+
+
+def _classify_config_drift(raw: bytes, row: dict[str, Any], payload: Any) -> dict[str, Any] | None:
+    """None when the bytes still match the receipt; otherwise a classified drift record."""
+    if sha256_bytes(raw) == row.get("after_sha256"):
+        return None
+    classification = "unclassified"
+    detail = (
+        "this config's bytes differ from what install() wrote, and the receipt's after-backup could "
+        "not be read, so a reformat cannot be told apart from a foreign edit here"
+    )
+    after_backup = row.get("after_backup")
+    if isinstance(after_backup, str):
+        try:
+            backup_path = resolve_ssd_path(Path(after_backup), must_exist=False)
+            if not _path_is_absent(backup_path):
+                installed = strict_json(validate_owned_file(backup_path, private=True))
+                if installed == payload:
+                    classification = "reserialized"
+                    detail = (
+                        "byte-for-byte different but semantically identical to what install() "
+                        "wrote: another writer reformatted this file. Cosmetic."
+                    )
+                else:
+                    classification = "foreign_change"
+                    detail = (
+                        "another tool changed this config's own content; the redaction hook itself "
+                        "is unaffected (see hook_functional)"
+                    )
+        except InstallError:
+            pass
+    return {"classification": classification, "detail": detail}
+
+
 def verify() -> dict[str, Any]:
     receipt = read_receipt()
     if volume_uuid() != receipt.get("volume_uuid"):
@@ -2931,6 +3102,12 @@ def verify() -> dict[str, Any]:
         raise InstallError("installed policy digest mismatch")
     checked: list[str] = []
     unreachable: list[str] = []
+    # Round-4: `broken` carries the semantic verdicts that actually mean "the redaction hook is not
+    # running"; `drift` carries the byte-level observations, each classified and each tagged with
+    # whether the hook is still functional despite it. Keeping them in two lists is the whole point
+    # of this change -- one list is what conflated a reformat with a deletion.
+    broken: list[dict[str, Any]] = []
+    drift: list[dict[str, Any]] = []
     # Fail-closed account coverage (P1, 2026-08-27). Everything below this line only ever looked at
     # receipt["configs"] -- the set install() discovered -- so verify() shared install()'s
     # enumeration blind spot instead of being an independent check of it: a real, live Codex account
@@ -2987,13 +3164,28 @@ def verify() -> dict[str, Any]:
             unreachable.append(os.fspath(path))
             continue
         raw = validate_owned_file(path, private=True)
-        if sha256_bytes(raw) != row.get("after_sha256"):
-            raise InstallError(f"hook config drift: {path}")
-        payload = strict_json(raw)
-        handlers = payload.get("hooks", {}).get(DEFAULT_HOOK_EVENT, []) if isinstance(payload, dict) else []
-        matches = [handler for handler in handlers if owned_handler(handler)]
-        if len(matches) != 1:
-            raise InstallError(f"owned hook count mismatch: {path}")
+        # Round-4 (see the block comment above `_config_hook_health`): SEMANTIC first, bytes second,
+        # and neither raises -- every config is checked and reported, so one drifted account can no
+        # longer hide the state of the others the way the old `raise` did.
+        health = _config_hook_health(
+            raw,
+            expected_script=os.fspath(release_dir / "claude_memory_hook.py"),
+            expected_policy=os.fspath(release_dir / "policy.json"),
+            expected_script_sha256=receipt["script_sha256"],
+            expected_policy_sha256=receipt["policy_sha256"],
+        )
+        if health["problems"]:
+            broken.append({"config": os.fspath(path), "problems": health["problems"]})
+        drift_record = _classify_config_drift(raw, row, health["payload"])
+        if drift_record is not None:
+            drift.append(
+                {
+                    "config": os.fspath(path),
+                    "hook_functional": not health["problems"],
+                    **drift_record,
+                }
+            )
+        payload = health["payload"]
         # `SessionEnd` here is a PRE-EXISTING key this tool may not own or have ever written --
         # install() never inspects/normalizes it on a plain (non-write-trigger) install, only the
         # event actually being registered (DEFAULT_HOOK_EVENT, above) gets that treatment -- so a
@@ -3175,20 +3367,281 @@ def verify() -> dict[str, Any]:
                 }
             )
 
+    # Round-4: `hook_functional` is the answer to the only question that mattered during the
+    # 2026-08-21 incident -- "is the redaction hook actually running on every account I manage?" --
+    # and it is reported separately from `ok` so a caller can act on it without parsing anything
+    # else. `ok` keeps its established meaning (nothing wrong AND nothing unverifiable), so a
+    # scripted caller that only checks `ok`/rc is no more permissive than before.
+    # `unreachable` is deliberately NOT part of either verdict. A receipt row whose path is gone is
+    # a deleted or re-provisioned account -- this file has treated that as "skip and report, not a
+    # failure" since round 3 (see the `_path_is_absent()` branch above and R3-P1-A), and two tests
+    # pin exactly that (`test_permanently_retired_account_does_not_lock_out_other_accounts`,
+    # `test_install_carries_forward_a_temporarily_undiscovered_config_without_losing_baseline`).
+    # An account that no longer exists submits no prompts; the check that catches a LIVE account
+    # going unprotected is the registry enumeration below, which reports it as `unmanaged`.
+    hook_functional = not broken
+    cosmetic = [record for record in drift if record["hook_functional"]]
+    if broken:
+        summary = (
+            "BROKEN: the redaction hook is not correctly wired on "
+            + ", ".join(record["config"] for record in broken)
+            + ". Prompts submitted from these accounts are NOT being redacted. Re-run `install`."
+        )
+    elif unmanaged:
+        summary = (
+            "INCOMPLETE: the redaction hook is correctly wired on every config this tool manages, "
+            "but " + str(len(unmanaged)) + " live Orca account(s) are outside its management and "
+            "were not verified."
+        )
+    elif cosmetic:
+        summary = (
+            "HEALTHY: the redaction hook is correctly wired and functional on every managed config. "
+            + str(len(cosmetic))
+            + " config(s) have byte-level drift that does NOT affect it ("
+            + ", ".join(sorted({record["classification"] for record in cosmetic}))
+            + "); this is not a failure and needs no action."
+        )
+    else:
+        summary = "HEALTHY: the redaction hook is correctly wired and functional on every managed config."
     result = {
         # NOT unconditionally True (P1, 2026-08-27): a verify() that cannot see an account is not
         # allowed to report success over it. See the `unmanaged` computation above.
-        "ok": not unmanaged,
+        "ok": hook_functional and not unmanaged,
+        "hook_functional": hook_functional,
+        "summary": summary,
         "release_id": receipt["release_id"],
         "script_sha256": receipt["script_sha256"],
         "policy_sha256": receipt["policy_sha256"],
         "volume_uuid": receipt["volume_uuid"],
         "configs": checked,
+        "broken": broken,
+        "drift": drift,
         "unreachable": unreachable,
         "unmanaged": unmanaged,
     }
     if write_trigger_script_sha256 is not None:
         result["write_trigger_script_sha256"] = write_trigger_script_sha256
+    return result
+
+
+# Round-4 (2026-08-28), BLOCKER 2's liveness half. verify() answers "is what I installed still
+# correctly installed?" and needs a valid receipt to answer anything at all -- `read_receipt()`
+# raises before the first check whenever the receipt is missing, pending, or unparseable. That is
+# the right contract for verify() and precisely the wrong one for detecting the 2026-08-21 incident,
+# where the interesting states are the ones with nothing to read.
+#
+# doctor() therefore never raises. Every failure is a FINDING, including "there is no receipt", and
+# the finding is loud rather than an exception a caller has to catch and interpret. It is also cheap
+# and read-only, so it is safe to run on a timer.
+#
+# What is actually available on this machine to run it on a timer (investigated, not assumed):
+#   * launchd user agents, and this repo already carries the pattern --
+#     `orca-terminal-dispatch/com.local.orca-terminal-dispatch-reaper.plist.template` plus a
+#     `doctor` subcommand, installed at ~/Library/LaunchAgents and loaded.
+#   * That plist also carries the warning that matters here, learned the hard way on this exact
+#     machine: "The Ego reaper this mirrors was silently dead for ~2 weeks because its script lived
+#     under ~/.agents, which resolves onto /Volumes/Extreme SSD, and macOS TCC denies a launchd job
+#     'Files on Removable Volumes' (Errno 1, Operation not permitted, 21,380 times)."
+#     EVERY path this tool touches -- install_bridge.py itself, RUNTIME_BASE, the receipt, and every
+#     managed hooks.json -- is on that volume BY DESIGN (resolve_ssd_path() enforces it). So a
+#     launchd agent running this doctor is exactly the configuration that already failed silently
+#     once here, and shipping one without saying so would be installing a health check that cannot
+#     report its own death: the same class of bug as the one being fixed.
+#   * The mechanism that demonstrably DOES reach the SSD is a hook running inside the user's own
+#     session -- `~/.claude/settings.json`'s SessionStart hooks already run
+#     `/usr/bin/python3 .../startup_context.py --knowledge-root '/Volumes/Extreme SSD/...'`
+#     successfully today.
+# `launchd_tcc_risk` below reports which of those a caller is in, so whichever runner is chosen, a
+# silently-dead checker is itself a finding rather than silence. Nothing here installs a runner:
+# that is a change to the user's own machine configuration and is theirs to make.
+def doctor() -> dict[str, Any]:
+    findings: list[dict[str, str]] = []
+    checked: list[str] = []
+
+    def finding(kind: str, target: str, detail: str) -> None:
+        findings.append({"kind": kind, "target": target, "detail": detail})
+
+    receipt: dict[str, Any] | None = None
+    try:
+        receipt = read_receipt()
+    except InstallError as exc:
+        # "not installed", "pending journal", "unreadable receipt" are all real, actionable states
+        # and none of them may be reported as silence.
+        finding("receipt_unavailable", os.fspath(RUNTIME_BASE / "latest-receipt.json"), str(exc))
+
+    expected_script = expected_policy = None
+    if receipt is not None:
+        release_dir = Path(receipt["release_dir"])
+        expected_script = os.fspath(release_dir / "claude_memory_hook.py")
+        expected_policy = os.fspath(release_dir / "policy.json")
+
+    targets: list[str] = []
+    if receipt is not None:
+        targets.extend(
+            row["path"] for row in receipt["configs"] if isinstance(row, dict) and isinstance(row.get("path"), str)
+        )
+    # Enumerated LIVE and independently of the receipt, in both halves: an account that appeared
+    # after the last install is examined rather than being invisible the way it is to a purely
+    # receipt-driven scan, and -- the case that matters most -- a machine whose receipt is gone or
+    # unparseable still gets every discoverable config checked for the one question that does not
+    # need a receipt to answer: is there a redaction handler here AT ALL? Without this, doctor()
+    # degraded to "no receipt" and checked nothing in exactly the state most likely to be the
+    # incident (caught by `test_doctor_still_answers_the_only_question_that_matters_without_a_
+    # receipt`, which failed against the first version of this function).
+    #
+    # `_enumerate_accounts()` rather than `discover_hook_configs()` on purpose: the latter enforces
+    # an "at least 2 configs" policy that belongs to INSTALLING, and a health check must keep
+    # working when only one config is left -- the same reasoning uninstall()'s safety scan uses.
+    try:
+        discovered, registry_accounts = _enumerate_accounts()
+    except InstallError as exc:
+        discovered, registry_accounts = [], {}
+        finding("registry_unreadable", os.fspath(orca_accounts_root()), str(exc))
+    for config in discovered:
+        if os.fspath(config) not in targets:
+            targets.append(os.fspath(config))
+    for account_id, located in sorted(registry_accounts.items()):
+        if located is None:
+            finding(
+                "account_unmanageable",
+                account_id,
+                "this live Orca account's hooks.json does not resolve onto the Extreme SSD, so its "
+                "redaction hook cannot be checked from here",
+            )
+            continue
+        if os.fspath(located) not in targets:
+            targets.append(os.fspath(located))
+
+    for target in targets:
+        checked.append(target)
+        try:
+            path = resolve_ssd_path(Path(target), must_exist=False)
+        except InstallError as exc:
+            finding("config_unreachable", target, str(exc))
+            continue
+        if _path_is_absent(path):
+            # THE incident. A Codex app upgrade deleted ~/.codex/hooks.json on 2026-08-21 and the
+            # machine ran an unredacted hook for about a week.
+            finding(
+                "config_missing",
+                target,
+                "hooks.json does not exist. If this account is live, NOTHING is redacting its "
+                "prompts -- this is the exact state a Codex app upgrade left this machine in on "
+                "2026-08-21. Re-run `install`.",
+            )
+            continue
+        try:
+            raw = validate_owned_file(path, private=True)
+        except InstallError as exc:
+            finding("config_unreadable", target, str(exc))
+            continue
+        if expected_script is None or expected_policy is None or receipt is None:
+            # Without a receipt there is no expected release to compare against, but the single most
+            # important question -- is there a redaction handler here AT ALL? -- still has an answer.
+            try:
+                payload = strict_json(raw)
+            except InstallError as exc:
+                finding("config_unparseable", target, str(exc))
+                continue
+            handlers = payload.get("hooks", {}).get(DEFAULT_HOOK_EVENT, []) if isinstance(payload, dict) else []
+            handlers = handlers if isinstance(handlers, list) else []
+            if not [handler for handler in handlers if owned_handler(handler)]:
+                finding(
+                    "hook_missing",
+                    target,
+                    f"no handler owned by {BRIDGE_ID}: this account's prompts are NOT being redacted",
+                )
+            continue
+        health = _config_hook_health(
+            raw,
+            expected_script=expected_script,
+            expected_policy=expected_policy,
+            expected_script_sha256=receipt["script_sha256"],
+            expected_policy_sha256=receipt["policy_sha256"],
+        )
+        for problem in health["problems"]:
+            finding(problem["kind"], target, problem["detail"])
+        if health["hook_present"] and not health["problems"]:
+            # The handler self-declares the script it runs; confirm that file is really there and
+            # really is the release, rather than trusting the command line's own assertion about it.
+            try:
+                script_raw = validate_owned_file(resolve_ssd_path(Path(expected_script)), private=True)
+            except InstallError as exc:
+                finding("script_unreadable", expected_script, str(exc))
+                continue
+            if sha256_bytes(script_raw) != receipt["script_sha256"]:
+                finding(
+                    _HOOK_HEALTH_TAMPERED,
+                    expected_script,
+                    "the script this account's hook runs does not hash to the installed release",
+                )
+
+    # Self-check for the way a periodic runner of THIS command would die silently. The hazard is
+    # real and measured on this machine (`ego-reaper-launchd/README.md`, throwaway launchd job,
+    # 2026-08-28) but it is narrower than "launchd cannot read /Volumes", which is what the first
+    # version of this check asserted and is wrong:
+    #
+    #     /bin/cat                     reading a source on /Volumes/...   DENIED (Errno 1)
+    #     /usr/bin/python3             running a source on /Volumes/...   DENIED (exit 2)
+    #     /opt/homebrew/bin/python3    running a source on /Volumes/...   OK
+    #
+    # The denial applies to APPLE PLATFORM BINARIES in a launchd session, not to launchd generally,
+    # so the configuration that fails silently is specifically "run from launchd, under
+    # /usr/bin/python3 (or any /bin,/usr/bin tool), against paths on the external volume" -- and
+    # every path this tool manages is on that volume by design (resolve_ssd_path() enforces it).
+    # `com.local.orca-terminal-dispatch-reaper` already runs on this machine under
+    # /opt/homebrew/bin/python3 for exactly this reason.
+    #
+    # This is reported rather than acted on: it is only a hazard for a launchd caller, an
+    # interactive run inherits its terminal's removable-volume grant and is unaffected (which is
+    # what made the Ego reaper's breakage look like it was working), and choosing/installing a
+    # runner is a change to the user's own machine configuration.
+    runtime_external = os.fspath(RUNTIME_BASE).startswith("/Volumes/")
+    # Both forms are tested, and the Xcode/CommandLineTools prefixes are in the list, because
+    # `/usr/bin/python3` is a STUB that re-execs `$(xcode-select -p)/usr/bin/python3` -- so
+    # `sys.executable` under it reads `/Applications/Xcode.app/.../usr/bin/python3` and a check for
+    # `/usr/bin/` alone silently returns "safe" for the single most likely interpreter a plist
+    # author would reach for. (Observed while writing this: the first version of this check reported
+    # launchd_tcc_risk=false when run under /usr/bin/python3, which is precisely the denied case.)
+    _APPLE_PLATFORM_PREFIXES = (
+        "/usr/bin/",
+        "/bin/",
+        "/System/",
+        "/Applications/Xcode.app/",
+        "/Library/Developer/CommandLineTools/",
+    )
+    interpreter_forms = {sys.executable or "", os.path.realpath(sys.executable) if sys.executable else ""}
+    apple_platform_interpreter = any(
+        form.startswith(_APPLE_PLATFORM_PREFIXES) for form in interpreter_forms if form
+    )
+    result: dict[str, Any] = {
+        "ok": not findings,
+        "checked": checked,
+        "findings": findings,
+        "runtime_base": os.fspath(RUNTIME_BASE),
+        "interpreter": sys.executable,
+        "launchd_tcc_risk": runtime_external and apple_platform_interpreter,
+        "launchd_tcc_note": (
+            "this run's interpreter is an Apple platform binary and the paths it checks are on an "
+            "external volume. That exact combination is denied under launchd (measured on this "
+            "machine) and would fail before producing any output -- it is how the Ego reaper stayed "
+            "silently dead for two weeks. An interactive run like this one is unaffected. To run "
+            "this on a timer, use /opt/homebrew/bin/python3, as "
+            "com.local.orca-terminal-dispatch-reaper already does."
+            if runtime_external and apple_platform_interpreter
+            else "this interpreter/path combination is safe to run from launchd."
+        ),
+    }
+    if findings:
+        result["summary"] = (
+            "ATTENTION: " + str(len(findings)) + " problem(s) found. "
+            + "; ".join(f"[{item['kind']}] {item['target']}" for item in findings)
+        )
+    else:
+        result["summary"] = (
+            "HEALTHY: a redaction handler owned by this bridge is present, correctly pointed and "
+            "backed by the expected script on all " + str(len(checked)) + " config(s) checked."
+        )
     return result
 
 
@@ -3501,7 +3954,8 @@ def _acquire_exclusive_lock() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "action", choices=("plan", "install", "verify", "uninstall", "recover", "install-write-trigger")
+        "action",
+        choices=("plan", "install", "verify", "doctor", "uninstall", "recover", "install-write-trigger"),
     )
     # Only meaningful for install-write-trigger; unused (and untouched-by-any-other-action) otherwise.
     parser.add_argument("--write-trigger-policy", default=None)
@@ -3524,6 +3978,8 @@ def main() -> int:
             result = install()
         elif args.action == "verify":
             result = verify()
+        elif args.action == "doctor":
+            result = doctor()
         elif args.action == "uninstall":
             result = uninstall()
         elif args.action == "recover":
@@ -3547,7 +4003,11 @@ def main() -> int:
     # scripted caller through the exit status too, not only through JSON a caller may not parse.
     # Every other action keeps returning 0 on a structured result exactly as before (`plan` has
     # always reported `ok: false` for a pending transaction at rc 0).
-    if args.action == "verify" and not result.get("ok"):
+    # `doctor` joins `verify` here for the same reason (round 4, 2026-08-28): it exists to be run
+    # unattended, so its verdict has to reach a scripted caller through the exit status and not only
+    # through JSON. A health check whose failure is invisible to `||` is the shape of the bug it is
+    # meant to catch.
+    if args.action in ("verify", "doctor") and not result.get("ok"):
         return 1
     return 0
 

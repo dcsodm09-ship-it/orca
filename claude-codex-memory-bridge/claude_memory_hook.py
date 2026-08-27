@@ -2342,11 +2342,21 @@ _CJK_SECRET_KEYWORD_SUFFIX = _LABEL_QUALIFIER_SUFFIX
 # this block only ever recognized CJK keywords, and `_ASSIGNMENT_RE` only ever recognizes an
 # explicit "="/":" separator, not a table cell or an "is"-joined sentence. The keyword alternation
 # below is reused verbatim from `_ASSIGNMENT_RE`'s own core (not re-invented), so the two
-# vocabularies cannot drift apart. Its boundary lookarounds use plain, explicitly two-case
-# `[A-Za-z0-9]` classes rather than a global `(?i)` flag -- so, unlike `_ASSIGNMENT_RE`/
-# `_BEARER_RE`/`_EMAIL_RE` above, there is no IGNORECASE-taint surface here to guard against in the
-# first place: only the scoped `(?i:...)` group around the keyword alternatives themselves needs
-# case-folding, and a scoped flag group never leaks out to affect a lookaround outside it.
+# vocabularies cannot drift apart.
+#
+# Round-4 (2026-08-28) correction of this comment. It used to read: "Its boundary lookarounds use
+# plain, explicitly two-case `[A-Za-z0-9]` classes rather than a global `(?i)` flag -- so, unlike
+# `_ASSIGNMENT_RE`/`_BEARER_RE`/`_EMAIL_RE` above, there is no IGNORECASE-taint surface here to
+# guard against in the first place: only the scoped `(?i:...)` group around the keyword
+# alternatives themselves needs case-folding, and a scoped flag group never leaks out to affect a
+# lookaround outside it." Every clause of that is literally true and the conclusion is still wrong,
+# which is exactly why the defect survived four rounds of review: the hazard round 3 named is not
+# "the flag leaks OUT of its scope", it is "the boundary class and the run class it guards
+# DISAGREE about case". A scoped `(?i:...)` that correctly does not leak out produces that
+# disagreement just as effectively as a global flag that does -- the run folds, the lookbehind does
+# not, so U+0130/U+0131/U+017F/U+212A are run characters the lookbehind declines to reject and each
+# one opens a fresh start position in the middle of a single run. See
+# `_ASCII_SECRET_KEYWORD_STANDALONE_BASE` below for the fix and the measurement.
 # Round-4 finding (item 9): kept textually identical to `_ASSIGNMENT_RE`'s own keyword
 # alternation (see that pattern's comment) -- "signature" and bare "key" added there too, same
 # round, same reason.
@@ -2389,9 +2399,41 @@ _CJK_SECRET_KEYWORD_SUFFIX = _LABEL_QUALIFIER_SUFFIX
 # re-invented" invariant, see the comment above `_ASSIGNMENT_RE`'s own keyword_run) -- e.g.
 # `redact('| PIN | 186 5527 4419 8806 |')` and `redact('backup code is 159 3308 7742 6015')` now
 # redact fully instead of only through the colon-assignment shape.
+# Round-4 (2026-08-28) ReDoS fix, same defect class and same structural remedy round 3 applied to
+# `_ASSIGNMENT_RE`/`_URL_USERINFO_RE` and deliberately scoped out of that round -- see
+# `RedactFlatQuantifierTests`'s own scope note, which named this constant and left the list for
+# this round to pick up.
+#
+# `[A-Za-z0-9]+[_-]key` was the last unbounded inner scan reachable from this vocabulary. At every
+# start position the ASCII-scoped lookbehind failed to reject (i.e. every homoglyph in a
+# `(?i)`-tainted run), that `+` walked forward to the end of the run looking for a `[_-]key` that
+# is not there, so the cost was O(run) per position -- textbook O(n^2). Measured on
+# `/usr/bin/python3` 3.9.6 against a pure `"İıſK"` run, BEFORE this fix:
+# `_SECRET_LABEL_KEYWORD_RE.sub` 108/562/3171/12828 ms at 2k/4k/8k/16k, and
+# `_INLINE_ASCII_SECRET_RE.sub` 81/903/3382/12596 ms at the same sizes -- x4 per doubling, and past
+# the hook's own 5-second budget at ~10-12k characters. AFTER: 0.2/0.5/0.9/1.9 ms, x2 per doubling.
+#
+# It is removed rather than bounded, for the same reason round 3 removed the bounds it inherited:
+# a ceiling here would only move the failure, and this alternative is REDUNDANT anyway. Anything
+# `[A-Za-z0-9]+[_-]key` matches ends on the same `key`, and bare `key` (already an alternative
+# above) is reachable at that same terminal position because the character immediately before it is
+# `_` or `-`, which is exactly what this vocabulary's own `(?<![A-Za-z0-9])` boundary admits. So
+# `soga_key`, `ACCESS_KEY`, `AWS_SECRET_ACCESS_KEY` and friends are still recognized; only the
+# match's own START offset moves rightward onto the bare keyword, and every consumer either uses
+# this as a boolean `search()` gate (`_cell_is_genuine_secret_label`) or echoes the matched keyword
+# back verbatim with the preceding text left outside the match (`_INLINE_ASCII_SECRET_RE` ->
+# `_redact_inline_ascii_secret`), so the rendered output is unchanged either way. Verified by
+# differential sweep, not by argument alone -- see
+# `RedactSiblingFlatQuantifierTests.test_compound_key_labels_are_still_recognized_without_the_
+# redundant_alternative` and the round-4 report's corpus diff.
+#
+# This also restores the "reused verbatim from `_ASSIGNMENT_RE`'s own core, so the two vocabularies
+# cannot drift apart" invariant this constant's comment above asserts: round 3 dropped exactly this
+# alternative from `_ASSIGNMENT_RE`'s gate for exactly this reason (see that pattern's own comment,
+# "`[A-Za-z0-9]+[_-]key` ... is deliberately NOT here"), leaving the two out of sync until now.
 _ASCII_SECRET_KEYWORD_CORE = (
     r"(?:password|passwd|pwd|secret|token|signature|key|api[_-]?key|private[_-]?key|"
-    + _SECRET_KEYWORD_CODE_WORDS + r"|[A-Za-z0-9]+[_-]key)"
+    + _SECRET_KEYWORD_CODE_WORDS + r")"
 )
 # Round-10 fix (see `_CJK_SECRET_KEYWORD_STANDALONE`'s own comment above for the full history):
 # same fix as the CJK sibling, mirrored here so the two vocabularies stay in sync. `_BASE` (the
@@ -2399,6 +2441,46 @@ _ASCII_SECRET_KEYWORD_CORE = (
 # `_INLINE_ASCII_SECRET_RE` below can reuse it directly -- that pattern needs to *tolerate* a
 # compound suffix without ever echoing it back (see that pattern's own comment for why), which is
 # a different requirement than this STANDALONE form's "is this cell a genuine label" boolean gate.
+# Round-4 (2026-08-28): the lookbehind below STAYS case-sensitive, deliberately, and this is a
+# considered exception to round 3's "boundary class == run class, IGNORECASE scope included"
+# invariant rather than an oversight. Writing it down because the invariant is otherwise exactly
+# right and the next round will be tempted to "finish the job" here.
+#
+# The disagreement is real: the keyword alternatives fold under `(?i:...)` and the lookbehind does
+# not, so U+0130/U+0131/U+017F/U+212A are run characters it declines to reject. Directly observed,
+# `/usr/bin/python3` 3.9.6:
+#     re.compile(r"(?<![A-Za-z0-9])(?i:secret)").search("xſſsecret")      -> matches at 3
+#     re.compile(r"(?i:(?<![A-Za-z0-9]))(?i:secret)").search("xſſsecret") -> None
+# Aligning the two was implemented, measured, and then REVERTED after a differential sweep against
+# the pre-fix module (59,480 inputs over the real table/inline shapes these patterns are used on,
+# plus 8,000 fuzzed mixed-script strings) found it turns redaction OFF for every homoglyph-prefixed
+# label -- 1,877 differing outputs, every single one in the leak direction, e.g.
+#     redact('| İpassword | Ab7xK9mQ2 |')
+#         aligned  -> '| İpassword | Ab7xK9mQ2 |'      (the secret in the clear)
+#         as-is    -> '| İpassword | [REDACTED] |'
+# That is not a cosmetic over-rejection, it is a REDACTION-EVASION VECTOR: prefixing a single
+# invisible-ish homoglyph to an ordinary label would reliably stop this file from recognizing the
+# label at all, and the value beside it would render in full.
+#
+# The asymmetry with `_ASSIGNMENT_RE`, which took the alignment safely, is structural rather than a
+# difference of opinion. `_ASSIGNMENT_RE`'s round-3 form guards a RUN it consumes whole
+# (`(?<![A-Za-z0-9_\-])(?=[A-Za-z0-9_-]*<keyword>)(?P<keyword_run>[A-Za-z0-9_-]+)`), so a rejected
+# mid-run start position is not a lost match -- the zero-width gate still finds the keyword INSIDE
+# the run and the match simply relocates to the run's own start. This vocabulary has no such run:
+# it anchors directly on the keyword, so rejecting the mid-run start position rejects the LABEL,
+# with nothing to relocate to. Aligning the classes here would therefore need round 3's whole
+# template (gate + flat run capture), which would also change the `keyword`/`suffix` span
+# `_INLINE_ASCII_SECRET_RE` echoes back through `_redact_inline_ascii_secret` and
+# `_fold_suffix_digit_continuation` -- a much larger blast radius than this round's ReDoS scope.
+#
+# Nothing is owed to performance by leaving it: the extra start positions a homoglyph opens are
+# only quadratic when something UNBOUNDED runs at each of them, which is precisely what removing
+# `[A-Za-z0-9]+[_-]key` above eliminated. Each surviving start position now costs one failed
+# literal alternation, i.e. a constant. Measured after the removal alone, with this lookbehind left
+# case-sensitive: 0.5/0.9/1.8/3.8 ms at 2k/4k/8k/16k -- x2 per doubling, linear, no cap. Aligning
+# the classes on top of that bought a further 2x constant and nothing else, which is not a trade
+# worth a live evasion vector. See `RedactSiblingFlatQuantifierTests.test_homoglyph_prefixed_label_
+# is_still_recognized_so_the_boundary_taint_stays_reverted`, which pins the repro above.
 _ASCII_SECRET_KEYWORD_STANDALONE_BASE = (
     r"(?<![A-Za-z0-9])(?i:" + _ASCII_SECRET_KEYWORD_CORE + r")"
 )
@@ -2909,6 +2991,227 @@ _CJK_VALUE_MAX_LEN = 65536
 # near its start from paying O(remaining) per position.
 _CJK_VALUE_GUARD_LOOKAHEAD_MAX = 256
 
+# Round-4 (2026-08-28). The cap above did make this scan O(n) -- that part of its comment is
+# accurate -- but it left the per-position constant enormous, and "linear with a 250us/character
+# constant" fails the hook's 5-second budget just as surely as a quadratic does, only at a slightly
+# larger input. Measured on `/usr/bin/python3` 3.9.6 against `"**" * n` (every character of which is
+# an ordinary value-body character, so the capped scan runs to its full depth at every one of the n
+# start positions and then fails):
+#     _CJK_SECRET_VALUE_PERMISSIVE_TABLE_RE.sub   1007 / 2842 / 4950 / 7779 ms  at 4k/8k/16k/32k
+#     _CJK_TABLE_CELL_VALUE_OR_PLACEHOLDER_RE.sub  340 /  906 / 2132 / 4432 ms  at 4k/8k/16k/32k
+# and reachable end-to-end through the real `redact()` with an ordinary two-column markdown table
+# whose value cell holds that run: 527 / 1314 / 2291 / 5572 ms at 4k/8k/16k/24k -- i.e. past the
+# 5-second budget at ~24KB, which is an unremarkable size for a pasted table.
+#
+# The cost is the same ambiguity round 3 removed everywhere else, in its other shape. `(?:body)`
+# here is a THREE-BRANCH alternation, two of whose branches carry their own inner quantifier
+# (`_CJK_VALUE_BEARER_BRIDGE`'s `[^\S\n]+`, `_CJK_VALUE_BODY_TABLE`'s `\|` two-character token), so
+# each of the 256 backtrack steps re-dispatches the whole alternation rather than testing one
+# character. Flattening it to ONE character class with ONE quantifier -- the same remedy, the same
+# reason -- drops the constant ~7x (measured below), and the class is DERIVED from `body` itself
+# rather than re-typed, so it cannot drift out of sync the way two hand-maintained copies would.
+#
+# Why a flat class is sound here, and one-way safe. `guard` is a subset of the body repertoire, so
+# `(?:body){0,N}guard` is just an existence test: "a guard character is reachable within the first
+# N body tokens". `_cjk_value_guard_scan_class()` below builds the complement class -- every
+# character `body` can consume that is NOT a guard character -- so the two classes are DISJOINT.
+# That is what makes the scan deterministic: `[N]{0,MAX}` consumes the maximal non-guard run and
+# `guard` is then tested once, with no (how-many-tokens x which-branch) grid to walk. And because
+# the scan class is a SUPERSET of what body can consume there (it flattens the multi-character
+# tokens to their constituent characters and drops body's own `(?!\[REDACTED...\])` refusal), the
+# gate can only ever admit MORE candidates than before, never fewer -- the direction that cannot
+# turn a redaction into a leak. The actual capture (`body{4,max_len}`) is untouched, so any extra
+# candidate this admits still has to satisfy the real value grammar before anything is replaced.
+#
+# The bound's UNIT changes with it, from body tokens to characters. `_CJK_VALUE_GUARD_LOOKAHEAD_MAX`
+# is deliberately not reused for the character window: at 256 characters this would be the one
+# NARROWING in the change (256 tokens of `\|` is 512 characters), and narrowing a secret-detection
+# gate is exactly the direction round 3's "every finite N leaks at N+1" lesson warns about. Doubling
+# it makes the character window dominate the old token window for every single- and two-character
+# token, which is every body token except `_CJK_VALUE_BEARER_BRIDGE`; that one can only exceed it
+# with 250+ consecutive spaces between "Bearer" and the value's first alphanumeric character, a
+# shape `_BEARER_RE` in Phase B independently anchors on anyway.
+_CJK_VALUE_GUARD_SCAN_MAX = 2 * _CJK_VALUE_GUARD_LOOKAHEAD_MAX
+
+# Each entry is a (probe text, offset) pair that exercises ONE multi-character body token in a
+# context where its own lookarounds can succeed, so the characters that token consumes are
+# discovered by running `body` itself rather than re-listed here by hand (this file's standing
+# "derived once, never re-invented" rule -- a hand-copied list is exactly how the boundary/run class
+# pairs drifted apart in the first place). A probe that `body` declines contributes nothing, so an
+# entry for a token some particular `body` does not carry is harmless.
+_CJK_VALUE_GUARD_SCAN_PROBES: tuple[tuple[str, int], ...] = (
+    ("a 9", 1),        # `_CJK_VALUE_SPACE_DIGIT_CONTINUATION`, space form
+    ("a\t9", 1),       # ... and its tab form
+    ("\\|", 0),        # `_CJK_VALUE_BODY_TABLE`'s escaped-pipe token
+    ("Bearer  x", 0),  # `_CJK_VALUE_BEARER_BRIDGE` plus its trailing whitespace run
+)
+
+# Horizontal whitespace is then subtracted back out of whatever those probes discovered. It is the
+# one character class where flattening a token to its characters is NOT one-way safe, because it is
+# the only body token whose own precondition depends on what precedes it, and dropping that
+# precondition is what makes a long whitespace run crossable from every position in it.
+#
+# Caught by this repo's own `test_inline_cjk_secret_connector_is_not_cubic`, which pins exactly this
+# shape ("密码" + 12,000 spaces + "x") because round 6 already had a ReDoS here: with whitespace left
+# in the scan class that test went from passing to a multi-second failure, and the whole suite's
+# wall time doubled (77s -> 159s). Keeping it out costs nothing real:
+#   * `_CJK_VALUE_SPACE_DIGIT_CONTINUATION` only crosses a space that is IMMEDIATELY PRECEDED by
+#     `[A-Za-z0-9]`. Whenever `guard` is the PERMISSIVE `[A-Za-z0-9]` -- which is both of the table
+#     patterns this round is fixing -- that preceding character IS a guard character, so the scan
+#     had already succeeded on it and never needed to reach the space at all. Provably redundant,
+#     not a judgement call.
+#   * For the STRICT `[0-9-]` guard the preceding character may be a letter, so a value whose first
+#     digit sits behind a space ("密码：abc 7xyz") is the one shape that could narrow. Verified by
+#     differential sweep against the pre-fix module rather than assumed -- see the round-4 report.
+_CJK_VALUE_GUARD_SCAN_NEVER_CROSSABLE = " \t\x0b\x0c\r"
+
+_CJK_VALUE_GUARD_SCAN_CACHE: dict[tuple[str, str], str] = {}
+
+
+def _class_escape_codepoints(codepoints: "list[int]") -> str:
+    """Render a sorted codepoint list as character-class text, collapsing contiguous runs."""
+    parts: list[str] = []
+    index = 0
+    while index < len(codepoints):
+        start = index
+        while index + 1 < len(codepoints) and codepoints[index + 1] == codepoints[index] + 1:
+            index += 1
+        first, last = codepoints[start], codepoints[index]
+        if last - first >= 2:
+            parts.append(rf"\x{first:02x}-\x{last:02x}")
+        else:
+            parts.extend(rf"\x{code:02x}" for code in range(first, last + 1))
+        index += 1
+    return "".join(parts)
+
+
+def _class_escape_ranges(ranges: "list[tuple[int, int]]") -> str:
+    """Render (lo, hi) codepoint ranges as character-class text."""
+    parts: list[str] = []
+    for low, high in ranges:
+        if low == high:
+            parts.append(rf"\u{low:04x}")
+        elif high == low + 1:
+            parts.append(rf"\u{low:04x}\u{high:04x}")
+        else:
+            parts.append(rf"\u{low:04x}-\u{high:04x}")
+    return "".join(parts)
+
+
+def _parse_class_ranges(text: str) -> "list[tuple[int, int]]":
+    """Parse a character-class BODY of bare literals and `lo-hi` runs into codepoint ranges.
+
+    Only ever applied to `_CJK_VALUE_EXCLUDED_UNICODE_RANGES`, which is a literal in this file
+    containing no escapes, no negation and no literal '-' member, and the result is verified
+    against the real compiled class before use (see `_subtract_codepoints`'s caller).
+    """
+    ranges: list[tuple[int, int]] = []
+    index = 0
+    while index < len(text):
+        if index + 2 < len(text) and text[index + 1] == "-":
+            low, high = ord(text[index]), ord(text[index + 2])
+            index += 3
+        else:
+            low = high = ord(text[index])
+            index += 1
+        if high < low:
+            raise ValueError("inverted range while parsing an excluded-character class")
+        ranges.append((low, high))
+    return ranges
+
+
+def _subtract_codepoints(
+    ranges: "list[tuple[int, int]]", removed: "set[int]"
+) -> "list[tuple[int, int]]":
+    """Remove individual codepoints from a range list, splitting any range that contains one."""
+    result: list[tuple[int, int]] = []
+    for low, high in ranges:
+        cut = sorted(code for code in removed if low <= code <= high)
+        cursor = low
+        for code in cut:
+            if cursor <= code - 1:
+                result.append((cursor, code - 1))
+            cursor = code + 1
+        if cursor <= high:
+            result.append((cursor, high))
+    return result
+
+
+def _cjk_value_guard_scan_class(body: str, guard: str) -> str:
+    """The flat, guard-disjoint scan class for `body` (see `_CJK_VALUE_GUARD_SCAN_MAX` above).
+
+    Returns a NEGATED class listing what the scan may NOT cross: every ASCII character `body`
+    cannot consume, plus every character `guard` can (so the two are disjoint and the scan is
+    deterministic), plus `_CJK_VALUE_EXCLUDED_UNICODE_RANGES` (the non-ASCII ranges
+    `_CJK_VALUE_NON_ASCII_TOKEN` itself excludes). Everything else -- all remaining non-ASCII --
+    stays crossable, matching that token exactly.
+
+    ... with one carve-out, because `_CJK_VALUE_CHARS_COMMON` and `_CJK_VALUE_NON_ASCII_TOKEN`
+    OVERLAP: `_CJK_VALUE_FULLWIDTH_SEP_CHARS` ("：＝") and `_CJK_CONNECTOR_FULLWIDTH_PUNCT_CHARS`
+    ("－／＿．＠；｜＋＊～＂＇＄％＃！？") are ordinary value characters listed explicitly in COMMON, and
+    they also sit inside the Halfwidth-and-Fullwidth block the token excludes. Blocking the ranges
+    wholesale therefore blocks characters the body can genuinely consume -- a NARROWING, the one
+    direction this rewrite must never take. Found by the round-4 differential sweep's fuzz corpus,
+    not by inspection: 13 of 59,480 inputs regressed, every one a CJK-labelled value whose first
+    guard character sat behind a fullwidth "：" (e.g. `redact('Y密码 cb"ſ[：@ı1b**-ı0')` stopped
+    redacting). The carve-out is computed by asking `body` itself, so it stays correct if either
+    constant changes.
+    """
+    key = (body, guard)
+    cached = _CJK_VALUE_GUARD_SCAN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    body_re = re.compile(body)
+    guard_re = re.compile(guard)
+    crossable = {chr(code) for code in range(0x80) if body_re.match(chr(code))}
+    for probe, offset in _CJK_VALUE_GUARD_SCAN_PROBES:
+        match = body_re.match(probe, offset)
+        if match is not None and match.end() > offset:
+            crossable.update(probe[offset:match.end()])
+    crossable.difference_update(_CJK_VALUE_GUARD_SCAN_NEVER_CROSSABLE)
+    # Disjointness with `guard` is what removes the backtracking; it is enforced here rather than
+    # assumed, so a future `guard` that stops being a subset of the body repertoire cannot silently
+    # reintroduce an ambiguous scan.
+    blocked = sorted(
+        code for code in range(0x80) if chr(code) not in crossable or guard_re.fullmatch(chr(code))
+    )
+    negated = "[^" + _class_escape_codepoints(blocked) + _CJK_VALUE_EXCLUDED_UNICODE_RANGES + "]"
+    negated_re = re.compile(negated)
+    carved = {
+        ord(char)
+        for char in set(_CJK_VALUE_HOMOGLYPH_CHARS + _CJK_VALUE_FULLWIDTH_SEP_CHARS
+                        + _CJK_CONNECTOR_FULLWIDTH_PUNCT_CHARS)
+        if body_re.match(char) and not negated_re.match(char) and not guard_re.fullmatch(char)
+    }
+    rendered = negated
+    if carved:
+        # The carve-out has to land INSIDE the negated class, not beside it as `(?:[^X]|[Y])`.
+        # Both forms are correct, but only a single class compiles to the engine's tight
+        # repeat-one-character-set loop; the two-branch version compiles to a generic branch loop
+        # and measured 2.7x slower end-to-end on the adversarial table (2.63s vs ~1.0s of
+        # `_sub_atomic_value` time at 64KB, where this scan is 96% of `redact()`'s total).
+        excluded = _subtract_codepoints(_parse_class_ranges(_CJK_VALUE_EXCLUDED_UNICODE_RANGES), carved)
+        candidate = "[^" + _class_escape_codepoints(blocked) + _class_escape_ranges(excluded) + "]"
+        # The parse above is the one step here that reads a hand-written literal as structured data,
+        # so it is verified rather than trusted: the rebuilt class must agree with the reference
+        # two-branch form on every ASCII codepoint, every carve-out, every parsed range boundary and
+        # its neighbours, and a stride sample across the BMP. On disagreement, keep the slower form
+        # -- a performance regression is recoverable, a silently wrong value class is not.
+        reference = re.compile("(?:" + negated + "|[" + re.escape("".join(map(chr, sorted(carved)))) + "])")
+        probes = set(range(0x80)) | carved
+        for low, high in _parse_class_ranges(_CJK_VALUE_EXCLUDED_UNICODE_RANGES):
+            probes.update({low - 1, low, low + 1, high - 1, high, high + 1})
+        probes.update(range(0x80, 0x10000, 97))
+        candidate_re = re.compile(candidate)
+        agrees = all(
+            bool(candidate_re.match(chr(code))) == bool(reference.match(chr(code)))
+            for code in probes
+            if 0 <= code <= 0x10FFFF
+        )
+        rendered = candidate if agrees else reference.pattern
+    _CJK_VALUE_GUARD_SCAN_CACHE[key] = rendered
+    return rendered
+
 
 def _cjk_value_pattern(body: str, *, guard: str, max_len: int = _CJK_VALUE_MAX_LEN) -> str:
     return (
@@ -2931,7 +3234,10 @@ def _cjk_value_pattern(body: str, *, guard: str, max_len: int = _CJK_VALUE_MAX_L
         # "＝" remain ordinary, unrestricted CONTINUATION characters (the actual fix needed), just
         # never the very first character consumed.
         rf"(?![{re.escape(_CJK_VALUE_FULLWIDTH_SEP_CHARS)}])"
-        rf"(?=(?:{body}){{0,{_CJK_VALUE_GUARD_LOOKAHEAD_MAX}}}{guard})"
+        # One flat class, one quantifier, disjoint from `guard` -- see `_CJK_VALUE_GUARD_SCAN_MAX`
+        # and `_cjk_value_guard_scan_class()` above for the measurement, the soundness argument and
+        # why the window's unit changed from body tokens to characters.
+        rf"(?={_cjk_value_guard_scan_class(body, guard)}{{0,{_CJK_VALUE_GUARD_SCAN_MAX}}}{guard})"
         rf"{body}{{4,{max_len}}}{_CJK_VALUE_WRAP}?"
     )
 
