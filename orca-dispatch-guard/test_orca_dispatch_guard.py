@@ -8,8 +8,11 @@ live against the actual `orca` binary in this worktree on 2026-08-26 -- see
 the commands and raw output recorded in this round's review notes, and the
 CONFIRMED REAL ENVELOPE SHAPE note in orca_dispatch_guard.py's own
 docstring); the full `start` happy path; the false-positive recovery flow
-end to end (tui-idle wait -> terminal read -> task-create -> worker-start
---retry-of); idempotent journal bookkeeping across a second recovery attempt
+end to end (task-list spec lookup -> tui-idle wait -> terminal read ->
+task-create -> worker-start --retry-of), including that the harvest prompt
+actually carries the original task's own spec text and still degrades to a
+bare task id when that lookup fails or the task is absent; idempotent
+journal bookkeeping across a second recovery attempt
 on the SAME original dispatch id (remount_count 1 -> 2, captured tail never
 overwritten); the remount cap (4th attempt refuses and marks "gave_up"); a
 persistently-failing task-create still counting toward that cap instead of
@@ -110,6 +113,8 @@ def _key_for(args: list[str]) -> str:
         return "worker-start-retry" if "--retry-of" in a else "worker-start"
     if a[:2] == ["orchestration", "task-create"]:
         return "task-create"
+    if a[:2] == ["orchestration", "task-list"]:
+        return "task-list"
     if a[:2] == ["terminal", "wait"]:
         return "terminal-wait"
     if a[:2] == ["terminal", "read"]:
@@ -406,6 +411,41 @@ class RealEnvelopeExtractionTests(unittest.TestCase):
         self.assertEqual(dg.extract_task_id({"task": {"id": "t-3"}}), "t-3")
         self.assertIsNone(dg.extract_task_id({}))
 
+    # -- extract_task_spec_text ------------------------------------------------
+
+    def test_extract_task_spec_text_real_nested_shape(self) -> None:
+        # Matches live `orchestration task-list --json` output: result.tasks[]
+        # entries carrying `id` and `spec`.
+        parsed = json.loads(
+            ok_envelope(
+                {
+                    "runId": "run_b5f289593797",
+                    "tasks": [
+                        {"id": "task_aaaa", "spec": "first task spec", "status": "completed"},
+                        {"id": "task_bbbb", "spec": "second task spec", "status": "ready"},
+                    ],
+                }
+            )
+        )
+        self.assertEqual(dg.extract_task_spec_text(parsed, "task_bbbb"), "second task spec")
+
+    def test_extract_task_spec_text_matches_ids_exactly_not_by_prefix(self) -> None:
+        parsed = json.loads(ok_envelope({"tasks": [{"id": "task_12", "spec": "the longer id's spec"}]}))
+        self.assertIsNone(dg.extract_task_spec_text(parsed, "task_1"))
+
+    def test_extract_task_spec_text_none_when_absent_or_unusable(self) -> None:
+        parsed = json.loads(ok_envelope({"tasks": [{"id": "task_a", "spec": "s"}]}))
+        self.assertIsNone(dg.extract_task_spec_text(parsed, "task_missing"))
+        self.assertIsNone(dg.extract_task_spec_text(json.loads(ok_envelope({"tasks": [{"id": "t", "spec": ""}]})), "t"))
+        self.assertIsNone(dg.extract_task_spec_text(json.loads(ok_envelope({"tasks": [{"id": "t"}]})), "t"))
+        self.assertIsNone(dg.extract_task_spec_text(json.loads(err_envelope("run_required", "No Run is bound.")), "t"))
+        self.assertIsNone(dg.extract_task_spec_text(None, "t"))
+        self.assertIsNone(dg.extract_task_spec_text(parsed, ""))
+
+    def test_extract_task_spec_text_legacy_unwrapped_shape_still_supported(self) -> None:
+        self.assertEqual(dg.extract_task_spec_text({"tasks": [{"id": "t-1", "spec": "flat"}]}, "t-1"), "flat")
+        self.assertIsNone(dg.extract_task_spec_text({"tasks": "not a list"}, "t-1"))
+
     # -- extract_stage_diagnostics ------------------------------------------------
 
     def test_extract_stage_diagnostics_from_real_result_container(self) -> None:
@@ -694,9 +734,28 @@ def _stalled_worker_start_body(dispatch_id: str) -> str:
     )
 
 
+ORIGINAL_SPEC_TEXT = "Audit the widget pipeline and report every duplicate write you find."
+
+
+def _task_list_body(*, task_id: str = "orig-t", spec: str = ORIGINAL_SPEC_TEXT) -> str:
+    # Confirmed live shape (2026-08-27, real `orca orchestration task-list
+    # --json`): result.tasks[], each entry with `id`/`spec`/`task_title`.
+    return ok_envelope(
+        {
+            "runId": "run-x",
+            "legacyReadOnly": False,
+            "tasks": [
+                {"id": "some-other-task", "spec": "an unrelated task that must not be picked up", "status": "ready"},
+                {"id": task_id, "spec": spec, "task_title": "orig", "status": "ready"},
+            ],
+        }
+    )
+
+
 class RecoveryFlowTests(DispatchGuardTestCase):
     def _queue_full_recovery(self, *, dispatch_id: str, tail: str, new_task_id: str, new_dispatch_id: str) -> None:
         self.router.queue("worker-start", cp([], 1, stdout=_stalled_worker_start_body(dispatch_id)))
+        self.router.queue("task-list", cp([], 0, stdout=_task_list_body()))
         self.router.queue("terminal-wait", cp([], 0, stdout=ok_envelope({})))
         self.router.queue("terminal-read", cp([], 0, stdout=tail))
         self.router.queue("task-create", cp([], 0, stdout=ok_envelope({"task": {"id": new_task_id}})))
@@ -770,6 +829,7 @@ class RecoveryFlowTests(DispatchGuardTestCase):
         # worker-start-retry again, the router would raise on the
         # unqueued call, failing this test.
         self.router.queue("worker-start", cp([], 1, stdout=_stalled_worker_start_body("orig-d-1")))
+        self.router.queue("task-list", cp([], 0, stdout=_task_list_body()))
         self.router.queue("terminal-wait", cp([], 0, stdout=ok_envelope({})))
         self.router.queue("terminal-read", cp([], 0, stdout="tail on 4th attempt"))
 
@@ -784,6 +844,7 @@ class RecoveryFlowTests(DispatchGuardTestCase):
 
     def test_tui_idle_timeout_does_not_remount_and_leaves_no_journal(self) -> None:
         self.router.queue("worker-start", cp([], 1, stdout=_stalled_worker_start_body("orig-d-busy")))
+        self.router.queue("task-list", cp([], 0, stdout=_task_list_body()))
         # Non-zero return = "did not report idle in time" per this module's
         # conservative reading of `orca terminal wait`'s own exit code.
         self.router.queue("terminal-wait", cp([], 1, stdout=err_envelope("timeout", "tui-idle wait timed out")))
@@ -814,6 +875,7 @@ class RecoveryFlowTests(DispatchGuardTestCase):
             }
         )
         self.router.queue("worker-start", cp([], 1, stdout=_stalled_worker_start_body("orig-d-tc")))
+        self.router.queue("task-list", cp([], 0, stdout=_task_list_body()))
         self.router.queue("terminal-wait", cp([], 0, stdout=ok_envelope({})))
         self.router.queue("terminal-read", cp([], 0, stdout="tail"))
         self.router.queue("task-create", cp([], 1, stdout="", stderr="task-create exploded"))
@@ -827,6 +889,7 @@ class RecoveryFlowTests(DispatchGuardTestCase):
         # A subsequent attempt must now refuse outright (cap reached) and
         # never call task-create again.
         self.router.queue("worker-start", cp([], 1, stdout=_stalled_worker_start_body("orig-d-tc")))
+        self.router.queue("task-list", cp([], 0, stdout=_task_list_body()))
         self.router.queue("terminal-wait", cp([], 0, stdout=ok_envelope({})))
         self.router.queue("terminal-read", cp([], 0, stdout="tail"))
         code2, out2, _err2 = self.run_cli(["start", "--task", "orig-t", "--terminal", "term-tc"])
@@ -839,6 +902,7 @@ class RecoveryFlowTests(DispatchGuardTestCase):
         # dispatch id must be reported as a failure, not masqueraded as
         # EXIT_OK (which would silently lose the ability to `wait` on it).
         self.router.queue("worker-start", cp([], 1, stdout=_stalled_worker_start_body("orig-d-unresolvable")))
+        self.router.queue("task-list", cp([], 0, stdout=_task_list_body()))
         self.router.queue("terminal-wait", cp([], 0, stdout=ok_envelope({})))
         self.router.queue("terminal-read", cp([], 0, stdout="tail"))
         self.router.queue("task-create", cp([], 0, stdout=ok_envelope({"task": {"id": "harvest-t-x"}})))
@@ -852,6 +916,68 @@ class RecoveryFlowTests(DispatchGuardTestCase):
         journal = self.read_journal_for("orig-d-unresolvable")
         self.assertEqual(journal["remount_count"], 1)
         self.assertEqual(journal["remount_dispatch_ids"], [], "no dispatch id was resolvable, so none should be recorded")
+
+    def _harvest_spec_submitted(self) -> str:
+        create_call = next(c for c in self.router.calls if c[1:3] == ["orchestration", "task-create"])
+        return create_call[create_call.index("--spec") + 1]
+
+    def test_recovery_prompt_carries_the_original_task_spec_text(self) -> None:
+        # Previously `_do_start()` hardcoded original_spec_text=None, so the
+        # harvest worker was handed a bare task id and no description of what
+        # it had originally been asked to do -- `_build_harvest_spec()`'s
+        # non-None branch had zero production callers and zero coverage.
+        self._queue_full_recovery(
+            dispatch_id="orig-d-spec", tail="tail", new_task_id="harvest-t-s", new_dispatch_id="remount-d-s"
+        )
+        code, _out, _err = self.run_cli(["start", "--task", "orig-t", "--terminal", "term-spec"])
+        self.assertEqual(code, dg.EXIT_OK)
+
+        submitted = self._harvest_spec_submitted()
+        self.assertIn(ORIGINAL_SPEC_TEXT, submitted, "the real spec text must reach the harvest worker verbatim")
+        self.assertIn("Original task id", submitted)
+        self.assertNotIn("an unrelated task that must not be picked up", submitted, "only the requested task's spec")
+
+    def test_recovery_passes_the_run_id_through_to_the_spec_lookup(self) -> None:
+        self._queue_full_recovery(
+            dispatch_id="orig-d-run", tail="tail", new_task_id="harvest-t-r", new_dispatch_id="remount-d-r"
+        )
+        code, _out, _err = self.run_cli(
+            ["start", "--task", "orig-t", "--terminal", "term-run", "--run", "run-abc"]
+        )
+        self.assertEqual(code, dg.EXIT_OK)
+        list_call = next(c for c in self.router.calls if c[1:3] == ["orchestration", "task-list"])
+        self.assertEqual(list_call[list_call.index("--run") + 1], "run-abc")
+        self.assertNotIn("--brief", list_call, "--brief would truncate the spec at 160 chars")
+
+    def test_recovery_still_proceeds_when_the_spec_lookup_fails(self) -> None:
+        # Best-effort only: a failed task-list must degrade to the previous
+        # bare-task-id prompt, never abort the recovery (aborting would lose
+        # the real worker result this whole module exists to rescue).
+        self.router.queue("worker-start", cp([], 1, stdout=_stalled_worker_start_body("orig-d-nospec")))
+        self.router.queue("task-list", cp([], 1, stdout="", stderr="task-list exploded"))
+        self.router.queue("terminal-wait", cp([], 0, stdout=ok_envelope({})))
+        self.router.queue("terminal-read", cp([], 0, stdout="tail"))
+        self.router.queue("task-create", cp([], 0, stdout=ok_envelope({"task": {"id": "harvest-t-n"}})))
+        self.router.queue("worker-start-retry", cp([], 0, stdout=ok_envelope({"dispatchId": "remount-d-n"})))
+
+        code, _out, _err = self.run_cli(["start", "--task", "orig-t", "--terminal", "term-nospec"])
+        self.assertEqual(code, dg.EXIT_OK)
+
+        submitted = self._harvest_spec_submitted()
+        self.assertIn("Original task id", submitted)
+        self.assertNotIn("Original task spec text", submitted)
+
+    def test_recovery_degrades_when_the_task_is_absent_from_the_listing(self) -> None:
+        self.router.queue("worker-start", cp([], 1, stdout=_stalled_worker_start_body("orig-d-absent")))
+        self.router.queue("task-list", cp([], 0, stdout=_task_list_body(task_id="a-different-task")))
+        self.router.queue("terminal-wait", cp([], 0, stdout=ok_envelope({})))
+        self.router.queue("terminal-read", cp([], 0, stdout="tail"))
+        self.router.queue("task-create", cp([], 0, stdout=ok_envelope({"task": {"id": "harvest-t-a"}})))
+        self.router.queue("worker-start-retry", cp([], 0, stdout=ok_envelope({"dispatchId": "remount-d-a"})))
+
+        code, _out, _err = self.run_cli(["start", "--task", "orig-t", "--terminal", "term-absent"])
+        self.assertEqual(code, dg.EXIT_OK)
+        self.assertNotIn("Original task spec text", self._harvest_spec_submitted())
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +1017,11 @@ class ConcurrencyTests(DispatchGuardTestCase):
         # well-defined instead of a genuine race.
         for _ in range(2):
             self.router.queue("worker-start", cp([], 1, stdout=_stalled_worker_start_body("shared-orig-d")))
+        self.router.queue(
+            "task-list",
+            cp([], 0, stdout=_task_list_body(task_id="orig-task")),
+            cp([], 0, stdout=_task_list_body(task_id="orig-task")),
+        )
         self.router.queue("terminal-wait", cp([], 0, stdout=ok_envelope({})), cp([], 0, stdout=ok_envelope({})))
         self.router.queue("terminal-read", cp([], 0, stdout="tail-A"), cp([], 0, stdout="tail-B"))
         self.router.queue(

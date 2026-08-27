@@ -467,6 +467,38 @@ def extract_task_id(parsed: dict[str, Any] | None) -> str | None:
     return None
 
 
+def extract_task_spec_text(parsed: dict[str, Any] | None, task_id: str) -> str | None:
+    """One task's own `spec` text, pulled out of a parsed `orchestration
+    task-list --json` body. Confirmed live shape (2026-08-27, real `orca`
+    binary): `result.tasks[]`, each entry carrying `id`, `spec`, `task_title`
+    and friends -- the same `result.tasks[].id` shape already noted in the
+    module docstring's CONFIRMED REAL ENVELOPE SHAPE section. Ids are
+    compared by exact equality, never substring (see
+    `_extract_dispatch_id_from_worker_done` for that bug class).
+
+    Returns None whenever the task is absent or carries no non-empty string
+    spec -- callers treat None as "no spec context available" and degrade,
+    never as an error."""
+    if not isinstance(parsed, dict) or not task_id:
+        return None
+    tasks: Any = None
+    if _is_wrapped_envelope(parsed):
+        result = parsed.get("result")
+        tasks = result.get("tasks") if isinstance(result, dict) else None
+    else:
+        tasks = parsed.get("tasks")
+    if not isinstance(tasks, list):
+        return None
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        if task.get("id") != task_id:
+            continue
+        spec = task.get("spec")
+        return spec if isinstance(spec, str) and spec else None
+    return None
+
+
 def extract_delivery_id(parsed: dict[str, Any] | None) -> str | None:
     """Extraction of the BATCH delivery id from a parsed `orchestration
     check` JSON body, for use with `orchestration check --ack`. On the
@@ -687,6 +719,19 @@ def _task_create(*, spec: str, run_id: str | None, title: str | None) -> subproc
     return _run_orca(args)
 
 
+def _task_list(*, run_id: str | None) -> subprocess.CompletedProcess:
+    # No per-task `task-show` subcommand exists on this CLI (checked against
+    # `orca orchestration --help`); `dispatch-show --task` returns only the
+    # dispatch, not the spec. `task-list` is the one confirmed way to read a
+    # task's own spec text back. `--brief` is deliberately NOT passed: it
+    # caps each spec at 160 characters, and the whole point of reading it is
+    # to hand the recovery worker the full original wording.
+    args = ["orchestration", "task-list", "--json"]
+    if run_id:
+        args += ["--run", run_id]
+    return _run_orca(args)
+
+
 def _terminal_wait_tui_idle(terminal: str, *, timeout_ms: int) -> subprocess.CompletedProcess:
     return _run_orca(
         ["terminal", "wait", "--terminal", terminal, "--for", "tui-idle", "--timeout-ms", str(timeout_ms), "--json"],
@@ -881,6 +926,26 @@ def _recover_from_stalled_false_positive(
     return exit_code
 
 
+def _fetch_task_spec_text(*, task_id: str, run_id: str | None) -> str | None:
+    """Best-effort read of the original task's own spec text, so the recovery
+    harvest prompt can tell the worker WHAT it was originally asked to do
+    instead of just naming an opaque task id (`_build_harvest_spec()` already
+    degrades gracefully to the bare id when this returns None).
+
+    Strictly best-effort and never raises: a failed/odd `task-list` call is
+    reported as None, because losing the spec text only makes the harvest
+    prompt less informative, whereas letting this abort the recovery would
+    lose a real, already-completed worker result -- the exact outcome this
+    whole module exists to prevent."""
+    try:
+        proc = _task_list(run_id=run_id)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return extract_task_spec_text(_parse_json_loose(proc.stdout), task_id)
+
+
 def _do_start(*, terminal: str, task_id: str, run_id: str | None) -> int:
     proc = _worker_start(task_id=task_id, terminal=terminal, run_id=run_id, retry_of=None)
     if proc.returncode == 0:
@@ -919,7 +984,7 @@ def _do_start(*, terminal: str, task_id: str, run_id: str | None) -> int:
         original_task_id=task_id,
         original_dispatch_id=original_dispatch_id,
         run_id=run_id,
-        original_spec_text=None,
+        original_spec_text=_fetch_task_spec_text(task_id=task_id, run_id=run_id),
         stage_diagnostics=diagnostics,
     )
 
