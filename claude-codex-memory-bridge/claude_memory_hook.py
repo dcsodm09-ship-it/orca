@@ -962,6 +962,13 @@ _PEM_RE = re.compile(
 # observable through `redact()` today. Fixed with the same `(?<!(?-i:[A-Za-z0-9_]))` idiom as
 # `_BEARER_RE` anyway, for consistency: the "accidentally immune" property is a coincidence of this
 # pattern's shape, not something a future edit to it (or a copy of it) can rely on.
+# (Round 3, below, replaced that scoped lookbehind with an IGNORECASE-tainted one that is the exact
+# complement of the scheme run class -- see the "Bounds removed" note for why the two must match.
+# The homoglyph vectors stay covered by the *same* absorption this comment describes, now made
+# deliberate rather than accidental: a homoglyph glued onto the scheme is a scheme-run character
+# under `(?i)`, so it is swallowed into the run and the match simply starts at the run's first
+# character. Pinned by `test_url_userinfo_and_email_confirmed_immune_to_ignorecase_homoglyph_taint`
+# and `test_email_redaction_catches_homoglyph_directly_followed_by_a_word_character`.)
 #
 # ReDoS bound (2026-08-28): all three quantifiers here were previously unbounded (`*`, `+`, `+`)
 # over character classes that exclude the literal each one must eventually reach (`://`, `:`, `@`).
@@ -981,16 +988,63 @@ _PEM_RE = re.compile(
 # scheme in total) is likewise under the real ceiling: `microsoft.windows.camera.multipicker` is a
 # registered IANA scheme at 36 characters, so `<that>://user:pass@host` stopped being redacted too.
 #
-# The bounds below are chosen from measurement, not intuition. What fixes the ReDoS is that the
-# quantifier is *finite* -- a finite bound caps backtracking per start position at a constant, so
-# total cost stays O(len x bound) instead of O(len^2) -- and the size of the constant barely
-# registers here, because on the adversarial `"a-" * n` input the cost is dominated by the
-# scheme-tail retry ladder and the userinfo halves are never even reached. Measured through full
-# `redact()` on 32,000 adversarial characters: (31, 255) 0.037s, (63, 4096) 0.040s -- inside noise.
-# So the halves are set to 4,096 (a fully percent-encoded 1,365-byte password, or an embedded JWT)
-# and the scheme tail to 63, both far past anything real, for no measurable cost.
+# Bounds removed (2026-08-28, round 3): rounds 1 and 2 both tried to pick a *number*, and an
+# independent review found the same leak past each one -- `redact("a" * 65 + "://user:" + "%41" * 86
+# + "@example.test")` walked one character past the widened `{0,63}` scheme tail, and `"%41" * 1366`
+# walked one group past the widened 4,096-character userinfo cap. Both leaked the credential in
+# plaintext. That is not a bad choice of number, it is the shape: "match up to N repetitions, and if
+# the real value has N+1 match only a prefix (or nothing) and let the tail render as plaintext" has
+# a leak just past *every* finite N. Widening only moves where it sits.
+#
+# What actually costs quadratic time is not the absence of a bound, it is AMBIGUITY plus the number
+# of start positions. Two separate defects were fixed here, and the numbers went away with them:
+#
+#   1. The lookbehind class and the run class disagreed. `(?<!(?-i:[A-Za-z0-9_]))` is ASCII-scoped
+#      while the scheme run `[a-z0-9+.-]` is IGNORECASE-tainted, so every character that the run
+#      accepts but the lookbehind rejects -- `A`-`Z`, and U+0130/U+0131/U+017F/U+212A, which fold to
+#      ASCII letters -- opens a *fresh start position in the middle of a single run*. O(n) start
+#      positions x an O(n) scan each is the quadratic. The two classes are now the same class, so
+#      a maximal run of scheme characters offers exactly one start position: its first.
+#   2. `[a-z]` pinned the first character, so a run whose first character is not a letter forced the
+#      match to restart further along; combined with (1) that multiplied the start positions. The
+#      "a scheme contains a letter" requirement is now a zero-width gate (lookaheads do not
+#      re-enter on backtracking in `re`, verified on 3.9.6), and the run itself is one flat class.
+#
+# With one start position per run and only flat single-character-class quantifiers, every piece is
+# linear and nothing needs a ceiling: the userinfo halves are plain `+`. Each half's class excludes
+# the literal it must reach (`:`, `@`), so at most one length can ever satisfy the tail -- there is
+# no (user_len x pass_len) grid to explore -- and both halves stop at the next `/`, so many `://`
+# occurrences share the input length rather than each re-scanning it.
+#
+# Measured through full `redact()`, this file, 32x input (8,000 -> 256,000 chars):
+#
+#     shape                     8,000     32,000    128,000    256,000     ratio
+#     "a-" * n                 0.0009s    0.0036s    0.0138s    0.0285s     32.0x
+#     "a." * n                 0.0009s    0.0036s    0.0147s    0.0305s     32.6x
+#     "http://" + "a" * n      0.0006s    0.0024s    0.0103s    0.0224s     35.8x
+#     "http://u:" + "a:" * n   0.0013s    0.0050s    0.0205s    0.0407s     31.7x
+#     "a://" * n               0.0014s    0.0055s    0.0224s    0.0456s     33.4x
+#     (U+212A + ".") * n       0.0014s    0.0051s    0.0197s    0.0408s     29.8x
+#
+# 32x the input for ~32x the time on every shape -- linear, with no cap anywhere in the pattern.
+# The last row is defect (1): against the bounded round-2 pattern the same homoglyph shape is
+# quadratic (see `_ASSIGNMENT_RE` below, which had it far worse and where it was measured).
+#
+# Semantics are a superset of round 2's, verified by a 500,000-case planted-secret differential
+# (see `RedactFlatQuantifierTests`): zero inputs where this pattern leaks a credential the bounded
+# one redacted, and 65,617 where the bounded one leaked and this one does not. The two deliberate
+# widenings: a scheme may now start with a digit/`+`/`.`/`-` as long as it contains a letter
+# somewhere (previously the match just restarted at the first letter, so the same URL was redacted
+# anyway -- this only removes the restart), and a scheme directly preceded by `_` now matches (`_`
+# is not a scheme character, so it is a run boundary, not part of the run).
 _URL_USERINFO_RE = re.compile(
-    r"(?i)(?<!(?-i:[A-Za-z0-9_]))([a-z][a-z0-9+.-]{0,63}://)[^\s/@:]{1,4096}:[^\s/@]{1,4096}@"
+    # Boundary class == run class, byte for byte, IGNORECASE scope included. Do not "tighten" one
+    # without the other: any character one accepts and the other rejects is a start position inside
+    # a run, and that is the quadratic blowup this round removed.
+    r"(?i)(?<![a-z0-9+.\-])"
+    r"(?=[a-z0-9+.-]*[a-z])"  # zero-width, atomic: the scheme contains at least one letter
+    r"([a-z0-9+.-]*://)"
+    r"[^\s/@:]+:[^\s/@]+@"
 )
 # `_BEARER_RE`'s CJK-adjacency fix above (`(?<![A-Za-z0-9_])` in place of `\b`) has its own,
 # narrower bug: this pattern also carries `(?i)`, and IGNORECASE applies to *every* character
@@ -1197,11 +1251,79 @@ _REDACTED_PLACEHOLDER_PATTERN = r"\[REDACTED[A-Z_]*\]"
 # So: suffix 64 (7x the 9-segment case that leaked, and past any label a human would write), prefix
 # left at 8 because widening it is provably pure cost. Scaling stays linear in input length at these
 # bounds -- x2.1 per doubling, measured to 32,000 chars -- which is the property that matters.
+#
+# ---------------------------------------------------------------------------------------------
+# Bounds removed (2026-08-28, round 3). The round-2 bound leaked in exactly the same way the
+# round-1 bound did, one segment further out: `redact("api_key" + "_x" * 65 + ": secret-suffix-65")`
+# emitted `secret-suffix-65` in plaintext, because 65 suffix segments overflow `{0,64}`, the whole
+# pattern then fails to match, and the value is echoed verbatim. Picking a third, larger number
+# would have the identical defect at N+1. The bound is gone instead, and the two things it was
+# standing in for are fixed directly:
+#
+#   AMBIGUITY. `(?:[A-Za-z][A-Za-z0-9]*[_-]){0,8}` and `(?:[_-][A-Za-z0-9]+){0,64}` are repeated
+#   *groups that each contain their own quantifier*. The engine cannot know how many segments to
+#   spend, so it walks the entire (prefix_count, suffix_count) grid at every start position before
+#   admitting failure -- that grid, not the run length, is what the bounds were capping. Both are
+#   replaced by ONE flat quantifier over ONE character class, `[A-Za-z0-9_-]+`. A flat class repeat
+#   has nothing to partition, so it is linear at any length and needs no ceiling: `keyword_run` now
+#   captures the whole identifier run however long it is.
+#
+#   START POSITIONS. The lookbehind `(?<!(?-i:[A-Za-z0-9]))` is ASCII-scoped while the run classes
+#   were IGNORECASE-tainted, and that mismatch is a ReDoS of its own that survived both earlier
+#   rounds: U+0130/U+0131/U+017F/U+212A fold to ASCII letters, so they are run characters that the
+#   lookbehind does *not* reject, and each one opens a fresh start position in the middle of a
+#   single run. Measured against this pattern at HEAD, `redact("K" * n)`: 2,000 chars 0.071s,
+#   4,000 0.283s, 8,000 1.140s, 16,000 4.475s -- 4x per doubling, textbook quadratic, and past the
+#   hook's 5-second budget at ~17,000 characters. The boundary lookbehind is now `[A-Za-z0-9_-]`
+#   under the same `(?i)` as the run, i.e. literally the same class, so one maximal run offers
+#   exactly one start position and the same input is 0.0012s at 8,000 and 0.038s at 256,000.
+#
+# The keyword's own component boundaries did not move -- they just moved *into the gate*, where
+# they belong. `(?<!(?-i:[A-Za-z0-9]))` before the keyword and `(?!(?-i:[A-Za-z0-9]))` after it are
+# what still refuse `monkey`/`turkey`/`pwda`/`keynote`/`secrets`/`api_keys`; the ASCII scoping is
+# what still catches `"Kpassword=..."`, the vector the whole `(?-i:)` idiom exists for. The
+# gate is a lookahead, and lookaheads in `re` are atomic -- verified on the deployed interpreter,
+# `re.match(r'(?=(a*))\1ab', 'aaab')` is None -- so a failed tail cannot make it re-partition.
+#
+# `[A-Za-z0-9]+[_-]key` is dropped from the gate's alternation only (`_ASCII_SECRET_KEYWORD_CORE`
+# below still carries it verbatim, and is a different context: standalone, no flat prefix). Inside
+# this gate it is exactly redundant -- the flat `[A-Za-z0-9_-]*` prefix plus the boundary lookbehind
+# already reach every `key` that branch could, since its `key` is always preceded by `[_-]` -- and
+# its inner `+` would re-scan at O(n) offsets, which is what made `"K" * n` quadratic again in
+# an intermediate cut of this fix. `soga_key=`, the case that branch was added for, is pinned by
+# `test_redacts_generic_service_prefixed_key_assignment` and still redacts.
+#
+# Measured through full `redact()`, this file, 32x input (8,000 -> 256,000 chars):
+#
+#     shape                      8,000     32,000    128,000    256,000     ratio    HEAD @32,000
+#     "key_" * n                0.0009s    0.0036s    0.0141s    0.0292s     31.1x        1.995s
+#     "key_" * n + ": ab"       0.0009s    0.0035s    0.0140s    0.0285s     31.5x            --
+#     "a_" * n + ":"            0.0011s    0.0043s    0.0170s    0.0340s     32.0x        0.024s
+#     "a-" * n                  0.0009s    0.0036s    0.0138s    0.0285s     32.0x        0.035s
+#     "privatekey_" * n         0.0009s    0.0036s    0.0137s    0.0277s     30.3x            --
+#     "_" * n                   0.0012s    0.0045s    0.0188s    0.0375s     32.6x            --
+#     (U+212A + "password_") * n 0.0009s   0.0035s    0.0141s    0.0280s     31.8x        0.148s
+#     U+212A * n                0.0011s    0.0044s    0.0183s    0.0361s     32.4x       17.895s
+#
+# 32x the input for ~32x the time on all 38 adversarial shapes tried, worst 0.046s at 256,000
+# characters, with no cap anywhere in the pattern. Semantics are a superset of round 2's, verified
+# by a 300,000-case planted-secret differential (see `RedactFlatQuantifierTests`): zero inputs where
+# this pattern leaks a secret the bounded one redacted, and 157,939 where the bounded one leaked and
+# this one does not. Deliberate widenings, all in the "redact more" direction: a label may now
+# contain `__`/`--` or end in `_`/`-` (`api_key__x:` used to fail outright), and a label may end in
+# one of the four homoglyphs.
 _ASSIGNMENT_RE = re.compile(
-    r"(?i)(?<!(?-i:[A-Za-z0-9]))"
-    r"(?P<keyword_run>(?:[A-Za-z][A-Za-z0-9]*[_-]){0,8}"
-    r"(?:password|passwd|pwd|secret|token|signature|key|api[_-]?key|private[_-]?key|[A-Za-z0-9]+[_-]key)"
-    r"(?:[_-][A-Za-z0-9]+){0,64})"
+    # Boundary class == run class, byte for byte, IGNORECASE scope included. Do not "tighten" one
+    # without the other: any character one accepts and the other rejects is a start position inside
+    # a run, and that is the quadratic blowup this round removed.
+    r"(?i)(?<![A-Za-z0-9_\-])"
+    # Zero-width, atomic gate: somewhere in this run there is a secret keyword sitting on component
+    # boundaries. Both `(?-i:...)` lookarounds are ASCII-scoped on purpose -- see the note above.
+    r"(?=[A-Za-z0-9_-]*(?<!(?-i:[A-Za-z0-9]))"
+    r"(?:password|passwd|pwd|secret|token|signature|key|api[_-]?key|private[_-]?key)"
+    r"(?!(?-i:[A-Za-z0-9])))"
+    # One flat class, one quantifier, no ceiling: the whole label run, however long.
+    r"(?P<keyword_run>[A-Za-z0-9_-]+)"
     r'(?P<preq>"?)'
     r"(?P<sep>\s*[:：=＝]\s*)"
     r'(?P<preval>"?)'

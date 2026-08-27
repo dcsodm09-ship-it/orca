@@ -2192,16 +2192,24 @@ class RedactQuantifierBoundTests(unittest.TestCase):
             f"{name} stalled on 32,000 chars of adversarial input: {large:.4f}s",
         )
 
-    def test_url_userinfo_quantifiers_are_bounded(self) -> None:
-        # Widened 2026-08-28 round 2 (31 -> 63, 255 -> 4096): the first values cut real
-        # credentials in half. Still explicitly bounded -- that is what fixes the ReDoS.
+    def test_url_userinfo_quantifiers_are_flat_and_uncapped(self) -> None:
+        # Round 3 (2026-08-28) removed these bounds rather than widening them a third time. Both
+        # earlier rounds picked a number and an independent review found the leak just past it;
+        # any finite N has one. What restores linear time is that every quantifier here is now a
+        # single FLAT class with nothing nested inside it to re-partition, and that the boundary
+        # lookbehind is the exact complement of the run class so one run has one start position.
         pattern = hook._URL_USERINFO_RE.pattern
-        self.assertIn("[a-z0-9+.-]{0,63}", pattern)
-        self.assertIn(r"[^\s/@:]{1,4096}", pattern)
-        self.assertIn(r"[^\s/@]{1,4096}", pattern)
-        self.assertNotIn("[a-z0-9+.-]*", pattern)
-        self.assertNotIn(r"[^\s/@:]+", pattern)
-        self.assertNotIn(r"[^\s/@]+", pattern)
+        self.assertIn("[a-z0-9+.-]*://", pattern)
+        self.assertIn(r"[^\s/@:]+:", pattern)
+        self.assertIn(r"[^\s/@]+@", pattern)
+        # No numeric ceiling anywhere: a repetition count is what leaked twice.
+        self.assertNotRegex(pattern, r"\{\d+,\d+\}")
+        # THE invariant. The lookbehind class and the scheme run class must stay byte-identical:
+        # a character one accepts and the other rejects is a fresh start position in the middle of
+        # a run, which is quadratic. This is what made `(U+212A + ".") * n` blow up in an earlier
+        # cut of this fix.
+        self.assertIn(r"(?<![a-z0-9+.\-])", pattern)
+        self.assertIn("[a-z0-9+.-]*", pattern)
 
     def test_email_quantifiers_are_bounded(self) -> None:
         pattern = hook._EMAIL_RE.pattern
@@ -2211,16 +2219,30 @@ class RedactQuantifierBoundTests(unittest.TestCase):
         self.assertIn("[A-Z]{2,24}", pattern)
         self.assertNotIn("[A-Z0-9._%+-]+", pattern)
 
-    def test_assignment_keyword_run_segments_are_bounded(self) -> None:
-        # Asymmetric on purpose (see `_ASSIGNMENT_RE`'s comment). Overflowing the SUFFIX bound
-        # loses the value entirely, so it was widened 8 -> 64 in round 2; overflowing the PREFIX
-        # bound only moves the match's start, so 8 stays. Cost is ~the product of the two, so
-        # widening the prefix would buy no leak coverage at double the adversarial price.
+    def test_assignment_keyword_run_is_one_flat_uncapped_class(self) -> None:
+        # Round 3 (2026-08-28). The prefix/suffix repeats were repeated GROUPS each holding their
+        # own quantifier, so the engine walked the whole (prefix_count, suffix_count) grid at every
+        # start position -- that grid is what the bounds were capping, and capping it is what leaked
+        # (round 1 at 8 segments, round 2 at 64). One flat class over one quantifier has nothing to
+        # partition, so it is linear at any length and needs no ceiling at all.
         pattern = hook._ASSIGNMENT_RE.pattern
-        self.assertIn("(?:[A-Za-z][A-Za-z0-9]*[_-]){0,8}", pattern)
-        self.assertIn("(?:[_-][A-Za-z0-9]+){0,64}", pattern)
-        self.assertNotIn("(?:[A-Za-z][A-Za-z0-9]*[_-])*", pattern)
-        self.assertNotIn("(?:[_-][A-Za-z0-9]+)*", pattern)
+        self.assertIn("(?P<keyword_run>[A-Za-z0-9_-]+)", pattern)
+        # Neither ambiguous nested-quantifier group may come back, bounded or not.
+        self.assertNotIn("[A-Za-z][A-Za-z0-9]*[_-]", pattern)
+        self.assertNotIn("[_-][A-Za-z0-9]+", pattern)
+        # And no numeric ceiling anywhere: a repetition count is what leaked twice.
+        self.assertNotRegex(pattern, r"\{\d+,\d+\}")
+        # THE invariant. The boundary lookbehind must stay the exact complement of the run class,
+        # IGNORECASE scope included. When it was the ASCII-scoped `(?<!(?-i:[A-Za-z0-9]))` against
+        # an IGNORECASE-tainted run, U+0130/U+0131/U+017F/U+212A opened a start position inside
+        # every run and `redact("K" * n)` was quadratic -- 4.5s at 16,000 characters, past the
+        # hook's own 5s budget at ~17,000. Pinned as a regression by the timing test below.
+        self.assertIn(r"(?i)(?<![A-Za-z0-9_\-])", pattern)
+        # The keyword's component boundaries moved INTO the gate, and stay ASCII-scoped there --
+        # that scoping is what still catches "Kpassword=..." (see the homoglyph test above)
+        # while still refusing "monkey"/"turkey"/"pwda".
+        self.assertIn(r"(?<!(?-i:[A-Za-z0-9]))", pattern)
+        self.assertIn(r"(?!(?-i:[A-Za-z0-9]))", pattern)
 
     def test_url_userinfo_pattern_scales_near_linearly(self) -> None:
         self._assert_near_linear(
@@ -2281,14 +2303,17 @@ class RedactQuantifierBoundTests(unittest.TestCase):
                 self.assertNotEqual(redacted, text, f"{name} stopped being redacted")
                 self.assertIn("[REDACTED", redacted)
 
-    def test_known_accepted_narrowing_is_limited_to_absurd_suffix_runs(self) -> None:
-        # The `{0,64}` suffix bound still narrows *somewhere* -- any finite bound does. The pin is
-        # on where: 64 '[_-]'-separated suffix segments is a 250+ character label made of nothing
-        # but qualifiers after the keyword, roughly 7x the longest the review's repro used and far
-        # past anything a human writes. The first cut of this bound was 8, which a plainly
-        # realistic label reached; see RedactRegexBoundWideningTests for that regression.
-        at_bound = "key" + "_zz" * 64 + ": value123"
-        self.assertIn("[REDACTED", hook.redact(at_bound))
+    def test_there_is_no_accepted_narrowing_left_at_any_length(self) -> None:
+        # This test used to be `test_known_accepted_narrowing_is_limited_to_absurd_suffix_runs`,
+        # and it documented where the `{0,64}` bound still cut a real label off. Round 3 removed
+        # the bound, so there is no longer a "where" -- the correct assertion is that the label
+        # length no longer has a ceiling at all. Checkpoints run far past every bound this pattern
+        # has ever carried (8, then 64), so a fourth attempt at "just raise the number" fails here.
+        for segments in (7, 8, 9, 63, 64, 65, 100, 1_000, 10_000):
+            with self.subTest(segments=segments):
+                text = "key" + "_zz" * segments + ": value123"
+                self.assertIn("[REDACTED]", hook.redact(text))
+                self.assertNotIn("value123", hook.redact(text))
         # And the ordinary shapes this pattern actually exists for are unaffected.
         for text in ("api_key: abc123", "db_password = s3cr3t", "AWS_SECRET_ACCESS_KEY=wJalrXU"):
             with self.subTest(text=text):
@@ -2406,6 +2431,286 @@ class RedactRegexBoundWideningTests(unittest.TestCase):
         hook.redact(text)
         elapsed = time.perf_counter() - t0
         self.assertLess(elapsed, 1.0, f'redact("a-" * 16000) took {elapsed:.4f}s')
+
+
+class RedactFlatQuantifierTests(unittest.TestCase):
+    """Round-3 pins: the bounds are gone, and they must not come back at ANY width.
+
+    Rounds 1 (fc39b99705) and 2 (bb2142e41c) both fixed a real ReDoS by capping a quantifier, and
+    an independent review then found the same plaintext leak sitting just past each cap:
+
+        redact("api_key" + "_x" * 65 + ": secret-suffix-65")   -> leaked, past round 2's {0,64}
+        redact("a" * 65 + "://user:" + "%41" * 86 + "@...")    -> leaked, past round 2's {0,63}
+        redact("https://u:" + "%41" * 1366 + "@...")           -> leaked, past round 2's {1,4096}
+
+    That is not two unlucky numbers, it is the shape: "match up to N repetitions, and if the real
+    value has N+1 match only a prefix (or nothing) and let the tail render as plaintext" leaks just
+    past every finite N. Round 3 removed the caps instead, by killing the two things they were
+    standing in for -- the repeated-group-with-an-inner-quantifier ambiguity, and a boundary
+    lookbehind whose character class disagreed with the run class it guarded.
+
+    The length checkpoints below deliberately run orders of magnitude past every bound that has
+    ever existed in these patterns (8, 31, 63, 64, 255, 4096), so a fourth round that "just raises
+    the number again" fails immediately rather than shipping and being caught by the next review.
+    """
+
+    # The four IGNORECASE-tainted homoglyphs. Each folds to an ASCII letter under `(?i)`, so each
+    # is a run character that an ASCII-scoped lookbehind does not reject -- the mismatch that made
+    # both earlier rounds quadratic on these shapes without either round noticing.
+    KELVIN = "\u212a"
+
+    @staticmethod
+    def _timed(call, text: str) -> float:
+        start = time.perf_counter()
+        call(text)
+        return time.perf_counter() - start
+
+    # ------------------------------------------------------------------ the three round-3 repros
+    def test_round3_repro_label_one_segment_past_the_round2_bound(self) -> None:
+        text = "api_key" + "_x" * 65 + ": secret-suffix-65"
+        redacted = hook.redact(text)
+        self.assertNotIn("secret-suffix-65", redacted)
+        self.assertIn("[REDACTED]", redacted)
+
+    def test_round3_repro_scheme_one_char_past_the_round2_bound(self) -> None:
+        text = "a" * 65 + "://user:" + "%41" * 86 + "@example.test"
+        redacted = hook.redact(text)
+        self.assertNotIn("%41", redacted)
+        self.assertIn("[REDACTED]@example.test", redacted)
+
+    def test_round3_repro_userinfo_one_group_past_the_round2_bound(self) -> None:
+        text = "https://u:" + "%41" * 1366 + "@example.test"  # 4,098 chars, past {1,4096}
+        self.assertEqual(hook.redact(text), "https://[REDACTED]@example.test")
+
+    # ------------------------------------------------------------------ no boundary at ANY length
+    def test_label_suffix_has_no_leak_boundary_at_any_length(self) -> None:
+        # 8 and 64 are rounds 1 and 2's bounds. Everything past 65 is new ground; 20,000 segments
+        # is a 40,000-character label, ~300x round 2's ceiling.
+        for segments in (1, 8, 9, 64, 65, 66, 100, 500, 1_000, 5_000, 20_000):
+            with self.subTest(segments=segments):
+                text = "api_key" + "_x" * segments + ": secret-suffix-value"
+                redacted = hook.redact(text)
+                self.assertNotIn("secret-suffix-value", redacted)
+                self.assertIn("[REDACTED]", redacted)
+
+    def test_label_prefix_has_no_leak_boundary_at_any_length(self) -> None:
+        for segments in (1, 8, 9, 64, 65, 200, 1_000, 10_000):
+            with self.subTest(segments=segments):
+                text = "_".join(["aa"] * segments) + "_key: secret-prefix-value"
+                redacted = hook.redact(text)
+                self.assertNotIn("secret-prefix-value", redacted)
+                self.assertIn("[REDACTED]", redacted)
+
+    def test_url_scheme_has_no_leak_boundary_at_any_length(self) -> None:
+        # 31 and 63 are rounds 1 and 2's scheme-tail bounds.
+        for length in (1, 31, 32, 36, 63, 64, 65, 200, 5_000, 50_000):
+            with self.subTest(scheme_length=length):
+                text = "s" * length + "://user:supersecretpw@example.test"
+                redacted = hook.redact(text)
+                self.assertNotIn("supersecretpw", redacted)
+                self.assertIn("[REDACTED]@example.test", redacted)
+
+    def test_url_userinfo_halves_have_no_leak_boundary_at_any_length(self) -> None:
+        # 255 and 4096 are rounds 1 and 2's userinfo bounds. 40,000 is ~10x round 2's ceiling.
+        for length in (1, 255, 256, 4_096, 4_097, 10_000, 40_000):
+            with self.subTest(half_length=length):
+                text = "https://" + "u" * length + ":" + "p" * length + "@example.test"
+                redacted = hook.redact(text)
+                self.assertEqual(redacted, "https://[REDACTED]@example.test")
+
+    def test_percent_encoded_password_has_no_leak_boundary_at_any_length(self) -> None:
+        # The review's own vector, swept: 1,365 groups is exactly round 2's {1,4096}; 20,000 groups
+        # is a 60,000-character password.
+        for groups in (1, 85, 86, 1_365, 1_366, 1_367, 5_000, 20_000):
+            with self.subTest(groups=groups):
+                text = "https://u:" + "%41" * groups + "@example.test"
+                redacted = hook.redact(text)
+                self.assertNotIn("%41", redacted)
+                self.assertEqual(redacted, "https://[REDACTED]@example.test")
+
+    # ------------------------------------------------------------------ linearity, no cap needed
+    @staticmethod
+    def _two_patterns(text: str) -> str:
+        """Just the two patterns this round rewrote, in pipeline order."""
+        text = hook._URL_USERINFO_RE.sub(r"\1[REDACTED]@", text)
+        return hook._ASSIGNMENT_RE.sub(hook._redact_assignment, text)
+
+    def _assert_linear(self, call, make, name: str, *, ceiling: float = 3.0) -> None:
+        # 32x the input (8,000 -> 256,000). Linear is ~32x, quadratic is ~1024x. The 150x
+        # allowance still fails a genuine quadratic by nearly an order of magnitude while
+        # absorbing scheduling noise on a loaded machine; the absolute ceiling catches a
+        # regression that keeps a flat ratio while being slow outright.
+        small = self._timed(call, make(8_000))
+        large = self._timed(call, make(256_000))
+        self.assertLess(
+            large,
+            max(small * 150, 0.05),
+            f"{name} scaled worse than linearly: {small:.4f}s @8k -> {large:.4f}s @256k",
+        )
+        self.assertLess(large, ceiling, f"{name} took {large:.4f}s on 256,000 chars")
+
+    def test_worst_shape_key_run_is_linear_to_256k(self) -> None:
+        # Round 2's own worst shape. Unbounded (parent of fc39b99705) it was 71.6s at 4,000 chars;
+        # bounded at 64/4096 it was 2.5s at 32,000. Flat and uncapped it is ~0.04s at 256,000
+        # through the two patterns, ~0.18s through the whole pipeline.
+        self._assert_linear(hook.redact, lambda n: "key_" * (n // 4), '"key_" * n')
+
+    def test_worst_shape_key_run_with_dangling_separator_is_linear_to_256k(self) -> None:
+        # Nastier than the bare run: the separator makes the gate succeed, so the whole tail is
+        # explored, and the too-short value then forces the failure path.
+        self._assert_linear(
+            hook.redact, lambda n: "key_" * (n // 4) + ": ab", '"key_" * n + ": ab"'
+        )
+
+    def test_homoglyph_run_is_linear_to_256k_through_both_rewritten_patterns(self) -> None:
+        # The vector both earlier rounds missed, and the reason the boundary/run class invariant
+        # is now spelled out at both patterns. Measured on the round-2 definitions,
+        # `_ASSIGNMENT_RE.sub` against "\u212a" * n: 0.075s / 0.292s / 1.145s at 2k/4k/8k --
+        # x3.9 per doubling, textbook quadratic, past the hook's own 5s budget at ~17,000
+        # characters. Bounded input, so no ceiling could ever have caught it. Now x1.9.
+        #
+        # Scoped to the two patterns this round rewrote ON PURPOSE: `redact()` as a whole is still
+        # quadratic on this one shape, in four OTHER patterns that share
+        # `_ASCII_SECRET_KEYWORD_CORE` (`_SECRET_LABEL_KEYWORD_RE`,
+        # `_CJK_SECRET_VALUE_PERMISSIVE_TABLE_RE`, `_CJK_TABLE_CELL_VALUE_OR_PLACEHOLDER_RE`,
+        # `_INLINE_ASCII_SECRET_RE` -- all x4.1/doubling, identical before and after this round,
+        # so pre-existing and untouched here). That is a separate defect of the same class and is
+        # deliberately out of this round's scope; see `test_homoglyph_quadratic_residue_is_not_in
+        # _the_two_patterns_this_round_rewrote` below, which pins exactly that split so the next
+        # round can pick it up without re-deriving it.
+        self._assert_linear(self._two_patterns, lambda n: self.KELVIN * n, '"\\u212a" * n')
+
+    def test_homoglyph_separated_label_run_is_linear_to_256k(self) -> None:
+        self._assert_linear(
+            hook.redact,
+            lambda n: (self.KELVIN + "password_") * (n // 10),
+            '("\\u212a" + "password_") * n',
+        )
+
+    def test_homoglyph_separated_scheme_run_is_linear_to_256k(self) -> None:
+        self._assert_linear(
+            hook.redact,
+            lambda n: (self.KELVIN + ".") * (n // 2) + "://u:p",
+            '("\\u212a" + ".") * n + "://u:p"',
+        )
+
+    def test_homoglyph_quadratic_residue_is_not_in_the_two_patterns_this_round_rewrote(
+        self,
+    ) -> None:
+        # Pins the boundary of this round's scope with a measurement rather than a claim. The two
+        # patterns rewritten here are linear on a pure homoglyph run; the four that still are not
+        # are listed by name so the follow-up round has the list. If a future change makes one of
+        # the two below quadratic again, this fails; if someone fixes the other four, the second
+        # loop starts failing and should simply be deleted along with this comment.
+        run = self.KELVIN * 8_000
+        for name, call in (
+            ("_URL_USERINFO_RE", lambda t: hook._URL_USERINFO_RE.sub("X", t)),
+            ("_ASSIGNMENT_RE", lambda t: hook._ASSIGNMENT_RE.sub("X", t)),
+        ):
+            with self.subTest(fixed=name):
+                self.assertLess(self._timed(call, run), 0.25, f"{name} regressed to quadratic")
+
+    def test_dash_and_underscore_runs_are_linear_to_256k(self) -> None:
+        for name, make in (
+            ('"a-" * n', lambda n: "a-" * (n // 2)),
+            ('"a_" * n + ":"', lambda n: "a_" * (n // 2) + ":"),
+            ('"_" * n', lambda n: "_" * n),
+            ('"a://" * n', lambda n: "a://" * (n // 4)),
+            ('"http://u:" + "a:" * n', lambda n: "http://u:" + "a:" * (n // 2)),
+        ):
+            with self.subTest(shape=name):
+                self._assert_linear(hook.redact, make, name)
+
+    def test_long_secret_is_redacted_and_cheap_at_the_same_time(self) -> None:
+        # The two properties this round had to hold simultaneously, on one input: a 60,000-char
+        # label with a real value behind it must redact completely AND not cost quadratic time.
+        text = "api_key" + "_x" * 30_000 + ": secret-suffix-value"
+        elapsed = self._timed(hook.redact, text)
+        self.assertNotIn("secret-suffix-value", hook.redact(text))
+        self.assertLess(elapsed, 3.0, f"60,000-char label took {elapsed:.4f}s")
+
+    # ------------------------------------------------------------------ no semantic regression
+    def test_flat_run_did_not_start_over_redacting_ordinary_words(self) -> None:
+        # The flat run captures the WHOLE label, so the keyword's own component boundaries had to
+        # move into the gate rather than disappear. Without the trailing `(?!(?-i:[A-Za-z0-9]))`
+        # every word merely starting with a keyword ("keynote", "secrets", "pwda") would redact.
+        for text in (
+            "turkey=5",
+            "monkey=xyz123",
+            "keynote: my-presentation",
+            "secrets: three-of-them",
+            "tokens: twelve-total",
+            "pwda: some-value-x",
+            "api_keys: documented",
+            "xxpassword: value123",
+            "9key: value123",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(hook.redact(text), text)
+
+    def test_flat_run_kept_every_shape_the_bounded_pattern_redacted(self) -> None:
+        # Spot-check across both patterns, including the shapes each earlier round added.
+        cases = {
+            "https://user:pass@example.com/path": "[REDACTED]@example.com",
+            "git+ssh://user:tok@github.com/o/r": "[REDACTED]@github.com",
+            "microsoft.windows.camera.multipicker://user:pass@example.com": "[REDACTED]@",
+            "password: hunter2secret": "[REDACTED]",
+            "api_key: abc123": "[REDACTED]",
+            "db_password = s3cr3t": "[REDACTED]",
+            "AWS_SECRET_ACCESS_KEY=wJalrXU": "[REDACTED]",
+            "soga_key=abcd1234efgh5678ijkl9012mnop3456": "[REDACTED]",
+            '{"password": "hunter2xyz"}': "[REDACTED]",
+            "_key: value123": "[REDACTED]",
+            "-password: value123": "[REDACTED]",
+            "\u212apassword=hunter2value": "[REDACTED]",
+            "\u212ahttps://user:supersecretpw@host": "[REDACTED]",
+            "\u017fpassword=hunter2value": "[REDACTED]",
+            "\u0130password=hunter2value": "[REDACTED]",
+            "\u0131password=hunter2value": "[REDACTED]",
+            "\u8bbf\u95eehttps://user:supersecretpw@host\u4eca\u5929": "[REDACTED]",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertIn(expected, hook.redact(text))
+
+    def test_flat_run_now_also_redacts_shapes_the_bounded_pattern_dropped(self) -> None:
+        # Deliberate widenings, all in the "redact more" direction. Each of these leaked at HEAD:
+        # the bounded suffix could not span a doubled separator, a trailing separator, or a
+        # homoglyph, so the label stopped being a label and the value was emitted verbatim.
+        for text in (
+            "api_key__x: secret-value-1",
+            "api_key_: secret-value-2",
+            "api_key-: secret-value-3",
+            "password\u212a: secret-value-4",
+            "password-x\u212a: secret-value-5",
+            "_https://user:supersecretpw@host",
+        ):
+            with self.subTest(text=text):
+                redacted = hook.redact(text)
+                self.assertIn("[REDACTED]", redacted)
+                self.assertNotIn("secret-value", redacted)
+                self.assertNotIn("supersecretpw", redacted)
+
+    def test_lookaheads_are_atomic_on_the_deployed_interpreter(self) -> None:
+        # The gate is a lookahead, and the linearity argument depends on `re` not re-entering it
+        # with a different partition when the tail fails. Verified rather than assumed, because
+        # the obvious way to write "do not backtrack into this" -- an atomic group `(?>...)` or a
+        # possessive quantifier -- does not exist on the interpreter that actually runs the hook.
+        # `install_bridge.py` writes `/usr/bin/python3 <script>` into hooks.json, which is the
+        # macOS system Python (3.9.6 on this machine); atomic groups and possessive quantifiers
+        # need 3.11+. So the fix could not use them, and the property is pinned directly instead.
+        import re as _re
+        import sys as _sys
+
+        # Atomicity itself: if the lookahead were re-entered with a shorter `a*`, `\1ab` would
+        # match "aaab". It is not, so this is None -- on every version.
+        self.assertIsNone(_re.match(r"(?=(a*))\1ab", "aaab"))
+        self.assertIsNone(_re.match(r"(?=(a+))\1ab", "aaab"))
+        if _sys.version_info < (3, 11):
+            for unsupported in (r"(?>a+)b", r"a++b", r"a{1,3}+b"):
+                with self.subTest(syntax=unsupported):
+                    with self.assertRaises(_re.error):
+                        _re.compile(unsupported)
 
 
 if __name__ == "__main__":
