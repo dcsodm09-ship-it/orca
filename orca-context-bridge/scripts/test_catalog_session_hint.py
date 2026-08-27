@@ -87,9 +87,62 @@ PROTECTED_SHA256 = {
     # this pinned hash now equals the live copy's own pin above, on purpose).
     "/Volumes/Extreme SSD/Orca/workspaces/orca/完善orca/orca-context-bridge/scripts/startup_context.py":
         "2095d1de3f00c323f647cb2614325b8bef0cb2f65dbc24fef529d6c1957581c3",
-    "/Users/www1adwawd/.claude/settings.json":
-        "3e557009ccb7f160e8b4b4604eb6d9596b50da7a0268e58f91340df1f2f765bb",
 }
+
+# settings.json is NOT whole-file pinned like the three files above: it is a
+# shared, actively-edited config file that other, unrelated features (e.g.
+# local-canvas-editor) legitimately add their own hook entries to. Pinning
+# its full bytes made this test go red on 2026-08-27 for a completely
+# unrelated PostToolUse addition, which is worse than useless as a tripwire
+# -- once the whole-file hash is "known red" for a benign reason, a real
+# tamper of the thing this test actually cares about produces no new signal.
+#
+# What boundary #1 actually needs to guarantee for settings.json is narrower:
+# that the hooks.SessionStart entry which invokes catalog_session_hint.py
+# (matched by "catalog_session_hint.py" + "--no-compat-spawn" both appearing
+# in its command string) is present, unique, and byte-for-byte the entry
+# pinned below. So this is scoped to a hash of just that one hook-entry
+# object (its command/timeout/statusMessage/type, canonical-JSON-encoded),
+# not the surrounding file. See _extract_session_hint_hook_entry() and
+# test_the_four_protected_files_are_unchanged() /
+# test_settings_json_session_hint_hook_entry_is_pinned() below for how this
+# is computed and checked.
+SETTINGS_JSON_PATH = "/Users/www1adwawd/.claude/settings.json"
+PROTECTED_SESSION_HINT_HOOK_SHA256 = (
+    "b74b3238f19e36c238b2053a1dd1882080b9724f15e59c9f11320286d37614b8"
+)
+
+
+def _canonical_hook_entry_json(entry: dict) -> str:
+    """The exact, order-independent serialization the scoped hash is over."""
+    return json.dumps(entry, sort_keys=True, ensure_ascii=True)
+
+
+def _extract_session_hint_hook_entry(settings_path: str) -> dict:
+    """Find the one hooks.SessionStart entry that invokes
+    catalog_session_hint.py with --no-compat-spawn inside settings.json,
+    and return that single hook-entry dict (not the whole file, not the
+    whole matcher group it lives in).
+
+    Raises AssertionError if the file is missing that section, or if the
+    entry isn't present exactly once -- an ambiguous match would make the
+    scoped hash meaningless.
+    """
+    data = json.loads(Path(settings_path).read_text(encoding="utf-8"))
+    session_start_groups = data.get("hooks", {}).get("SessionStart", [])
+    matches = []
+    for group in session_start_groups:
+        for hook_entry in group.get("hooks", []):
+            command = hook_entry.get("command", "")
+            if "catalog_session_hint.py" in command and "--no-compat-spawn" in command:
+                matches.append(hook_entry)
+    if len(matches) != 1:
+        raise AssertionError(
+            "expected exactly one hooks.SessionStart entry invoking "
+            f"catalog_session_hint.py with --no-compat-spawn in {settings_path}, "
+            f"found {len(matches)}"
+        )
+    return matches[0]
 
 REAL_CATALOG = Path("/Volumes/Extreme SSD/Orca/manifests/cross-project-catalog/catalog.json")
 
@@ -2473,6 +2526,99 @@ class IndependenceTests(unittest.TestCase):
                     self.skipTest(f"{path} not present on this host")
                 digest = hashlib.sha256(target.read_bytes()).hexdigest()
                 self.assertEqual(digest, expected, f"PROTECTED FILE MODIFIED: {path}")
+
+        # The fourth protected file, settings.json, is checked separately
+        # below (scoped to just its catalog_session_hint.py hook entry) --
+        # see test_settings_json_session_hint_hook_entry_is_pinned.
+
+    def test_settings_json_session_hint_hook_entry_is_pinned(self) -> None:
+        """Boundary #1 for settings.json, scoped: only the hooks.SessionStart
+        entry that invokes catalog_session_hint.py --no-compat-spawn must be
+        byte-for-byte pinned, not the whole shared config file (see the
+        comment above PROTECTED_SESSION_HINT_HOOK_SHA256 for why)."""
+        if not Path(SETTINGS_JSON_PATH).is_file():
+            self.skipTest(f"{SETTINGS_JSON_PATH} not present on this host")
+        entry = _extract_session_hint_hook_entry(SETTINGS_JSON_PATH)
+        digest = hashlib.sha256(
+            _canonical_hook_entry_json(entry).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(
+            digest,
+            PROTECTED_SESSION_HINT_HOOK_SHA256,
+            "PROTECTED SETTINGS.JSON HOOK ENTRY MODIFIED: "
+            "hooks.SessionStart catalog_session_hint.py --no-compat-spawn entry",
+        )
+
+    def test_settings_json_hook_entry_tamper_is_detected(self) -> None:
+        """Negative control: mutating ONLY the pinned hook entry's command
+        string must flip the scoped check to failing."""
+        if not Path(SETTINGS_JSON_PATH).is_file():
+            self.skipTest(f"{SETTINGS_JSON_PATH} not present on this host")
+        real = json.loads(Path(SETTINGS_JSON_PATH).read_text(encoding="utf-8"))
+        entry = _extract_session_hint_hook_entry(SETTINGS_JSON_PATH)
+        tampered = dict(real)
+        tampered_session_start = []
+        for group in tampered["hooks"]["SessionStart"]:
+            new_group = dict(group)
+            new_hooks = []
+            for hook_entry in group.get("hooks", []):
+                if hook_entry is entry or hook_entry == entry:
+                    hook_entry = dict(hook_entry)
+                    hook_entry["command"] = hook_entry["command"] + " --tampered"
+                new_hooks.append(hook_entry)
+            new_group["hooks"] = new_hooks
+            tampered_session_start.append(new_group)
+        tampered["hooks"] = dict(tampered["hooks"])
+        tampered["hooks"]["SessionStart"] = tampered_session_start
+
+        tampered_path = self.tmp / "settings.json"
+        tampered_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+        tampered_entry = _extract_session_hint_hook_entry(str(tampered_path))
+        digest = hashlib.sha256(
+            _canonical_hook_entry_json(tampered_entry).encode("utf-8")
+        ).hexdigest()
+        self.assertNotEqual(
+            digest,
+            PROTECTED_SESSION_HINT_HOOK_SHA256,
+            "tampering the pinned hook entry's command should change its hash",
+        )
+
+    def test_settings_json_unrelated_hook_addition_does_not_trip_the_check(self) -> None:
+        """Negative control for the false-positive this fix removes: adding
+        an unrelated hook elsewhere in settings.json (simulating what
+        local-canvas-editor's own PostToolUse entry actually did on
+        2026-08-27) must NOT change the scoped hash."""
+        if not Path(SETTINGS_JSON_PATH).is_file():
+            self.skipTest(f"{SETTINGS_JSON_PATH} not present on this host")
+        real = json.loads(Path(SETTINGS_JSON_PATH).read_text(encoding="utf-8"))
+        mutated = dict(real)
+        mutated["hooks"] = dict(mutated["hooks"])
+        mutated["hooks"]["PostToolUse"] = list(mutated["hooks"].get("PostToolUse", [])) + [
+            {
+                "matcher": "SomeUnrelatedTool",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "/bin/true # simulated unrelated feature hook",
+                    }
+                ],
+            }
+        ]
+
+        mutated_path = self.tmp / "settings.json"
+        mutated_path.write_text(json.dumps(mutated), encoding="utf-8")
+
+        entry = _extract_session_hint_hook_entry(str(mutated_path))
+        digest = hashlib.sha256(
+            _canonical_hook_entry_json(entry).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(
+            digest,
+            PROTECTED_SESSION_HINT_HOOK_SHA256,
+            "an unrelated hook addition elsewhere in settings.json must not "
+            "trip the scoped session-hint hook-entry check",
+        )
 
     def test_the_dependency_surface_is_stdlib_only(self) -> None:
         """Boundary #2: no import of the trust anchor, the deployed hook,
