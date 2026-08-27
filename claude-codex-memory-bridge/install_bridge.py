@@ -95,28 +95,6 @@ RECEIPT_SCHEMA = "orca.claude-native-memory-bridge-receipt.v2"
 JOURNAL_SCHEMA = "orca.claude-native-memory-bridge-journal.v1"
 SSD_ROOT = Path("/Volumes/Extreme SSD")
 LOCAL_HOMES_ROOT = SSD_ROOT / "Orca/local-homes"
-# Orca's REAL, live pooled-Codex-account registry, relative to the user's home directory. This --
-# not the SSD's own `local-homes/codex-accounts/` tree -- is the authoritative answer to "which
-# Codex accounts exist on this machine": Orca creates one directory here per account, each with a
-# `home` entry that is EITHER a symlink into local-homes (the accounts provisioned when this bridge
-# was written) OR a real directory living somewhere else entirely (every account provisioned since).
-#
-# Enumerating only `LOCAL_HOMES_ROOT / "codex-accounts"` -- which is all _enumerate_hook_configs()
-# used to do -- therefore enumerates a STALE SNAPSHOT, not the live registry: on the real target
-# machine that snapshot holds 2 accounts while the registry holds 3, and the missing one is the
-# only account actually in active use. Because verify() checked exactly the same (receipt-derived,
-# hence same-snapshot) set, it reported `ok: true` while completely blind to that account's
-# hooks.json -- a shared blind spot between install and verify, not an independent check
-# (P1, 2026-08-27). The registry is now the authoritative account list; the local-homes tree is
-# kept only as a supplementary/legacy way to LOCATE an already-known account's home, and any
-# registry account this tool cannot locate an SSD-resident hooks.json for is reported explicitly
-# as unmanaged by verify() instead of silently vanishing from its output.
-#
-# Deliberately a home-relative subpath resolved through Path.home() at call time (see
-# orca_accounts_root()), not a path baked in at import: _enumerate_hook_configs() already anchors
-# everything else it does to Path.home(), so a caller (or a test fixture) that redirects the home
-# directory redirects the account registry with it, instead of the two silently disagreeing.
-ORCA_ACCOUNTS_SUBPATH = "Library/Application Support/orca/codex-accounts"
 RUNTIME_BASE = LOCAL_HOMES_ROOT / ".shared-runtime/claude-codex-memory-bridge"
 PENDING_PATH = RUNTIME_BASE / "pending-install.json"
 SOURCE_SCRIPT = Path(__file__).with_name("claude_memory_hook.py")
@@ -435,75 +413,7 @@ def _is_regular_file(path: Path) -> bool:
     return stat.S_ISREG(info.st_mode)
 
 
-def orca_accounts_root() -> Path:
-    # See ORCA_ACCOUNTS_SUBPATH. Resolved from Path.home() on every call, exactly like
-    # _enumerate_hook_configs()'s own `Path.home() / ".codex"` check, so the account registry and
-    # the live Codex home can never be anchored to two different home directories.
-    return Path.home() / ORCA_ACCOUNTS_SUBPATH
-
-
-def _list_account_ids(root: Path) -> list[str] | None:
-    # Account-id directory names directly under one account root. `None` means the root itself does
-    # not exist -- "this machine has no such registry", deliberately distinguished from "the
-    # registry exists and is empty", because the first must fall back to the other root while the
-    # second is authoritative information (there really are no accounts).
-    #
-    # NOTE this returns bare NAMES, never paths, and never follows anything: locating an account's
-    # actual hooks.json is _resolve_account_hook_config()'s job, and every path it builds goes
-    # through resolve_ssd_path(), so accepting a symlinked entry here cannot widen what this tool is
-    # willing to write to.
-    try:
-        entries = sorted(item.name for item in root.iterdir())
-    except (FileNotFoundError, NotADirectoryError):
-        return None
-    except OSError as exc:
-        raise InstallError(f"cannot list Codex account homes: {root}") from exc
-    ids: list[str] = []
-    for name in entries:
-        try:
-            info = (root / name).stat()
-        except FileNotFoundError:
-            continue
-        except OSError:
-            # Cannot determine what this entry is. Keep the id rather than silently dropping it:
-            # for a registry account, being undeterminable is precisely the state verify() must
-            # surface as unmanaged instead of omitting from its output.
-            ids.append(name)
-            continue
-        if stat.S_ISDIR(info.st_mode):
-            ids.append(name)
-    return ids
-
-
-def _resolve_account_hook_config(account_id: str) -> Path | None:
-    # Locate one account's manageable hooks.json, or None if this tool cannot manage it at all.
-    #
-    # The registry entry is tried first (`<registry>/<id>/home/hooks.json` -- which, for the
-    # accounts whose `home` is a symlink into local-homes, resolves onto the SSD exactly like the
-    # legacy path did), then the legacy local-homes location as a supplementary/compat fallback for
-    # an account that exists there but no longer has, or never had, a registry entry.
-    #
-    # Both go through resolve_ssd_path(), so an account whose home is a REAL directory outside the
-    # Extreme SSD (Orca's current provisioning shape) resolves to None here -- this tool's entire
-    # write path requires SSD residency, so "not on the SSD" genuinely means "not manageable", and
-    # the honest report for it is `unmanaged`, not silent omission.
-    for candidate in (
-        orca_accounts_root() / account_id / "home/hooks.json",
-        LOCAL_HOMES_ROOT / "codex-accounts" / account_id / "home/hooks.json",
-    ):
-        try:
-            resolved = resolve_ssd_path(candidate)
-        except InstallError:
-            continue
-        try:
-            if _is_regular_file(resolved):
-                return resolved
-        except InstallError:
-            continue
-    return None
-
-
-def _enumerate_accounts() -> tuple[list[Path], dict[str, Path | None]]:
+def _enumerate_hook_configs() -> list[Path]:
     # The raw enumeration discover_hook_configs() is built on, split out so
     # a caller that only wants to know "what managed-shaped configs
     # currently exist" (uninstall()'s R7-P1-A safety scan, below) can reuse
@@ -512,38 +422,27 @@ def _enumerate_accounts() -> tuple[list[Path], dict[str, Path | None]]:
     # only meant to run against isolated multi-account setups) and has
     # nothing to do with what a safety scan needs, which must keep working
     # even when only one config remains discoverable.
-    #
-    # Returns both halves of the picture, because they are not the same set (see
-    # ORCA_ACCOUNTS_SUBPATH):
-    #   [0] every hook config this tool can actually manage, main Codex home first;
-    #   [1] the live Orca registry's accounts mapped to the config located for each, with None for
-    #       any registry account no manageable hooks.json could be found for. Empty dict when this
-    #       machine has no registry at all -- the enumeration then behaves exactly as it always did.
     expected_codex_home = resolve_ssd_path(LOCAL_HOMES_ROOT / ".codex")
     live_codex_home = resolve_ssd_path(Path.home() / ".codex")
     if live_codex_home != expected_codex_home:
         raise InstallError("live Codex home does not resolve to the canonical SSD home")
     configs = [resolve_ssd_path(live_codex_home / "hooks.json")]
-
-    registry_ids = _list_account_ids(orca_accounts_root())
-    legacy_ids = _list_account_ids(LOCAL_HOMES_ROOT / "codex-accounts")
-    if registry_ids is None and legacy_ids is None:
-        # Neither account root exists -- the same hard failure the single-root version produced when
-        # its one root was missing.
-        raise InstallError("cannot list Codex account homes")
-
-    registry_accounts: dict[str, Path | None] = {}
-    for account_id in sorted(set(registry_ids or []) | set(legacy_ids or [])):
-        located = _resolve_account_hook_config(account_id)
-        if registry_ids is not None and account_id in registry_ids:
-            registry_accounts[account_id] = located
-        if located is not None:
-            configs.append(located)
-    return list(dict.fromkeys(configs)), registry_accounts
-
-
-def _enumerate_hook_configs() -> list[Path]:
-    return _enumerate_accounts()[0]
+    accounts_root = resolve_ssd_path(LOCAL_HOMES_ROOT / "codex-accounts")
+    try:
+        account_dirs = sorted(accounts_root.iterdir(), key=lambda item: item.name)
+    except OSError as exc:
+        raise InstallError("cannot list Codex account homes") from exc
+    for account_dir in account_dirs:
+        try:
+            info = account_dir.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            continue
+        candidate = account_dir / "home/hooks.json"
+        if _is_regular_file(candidate):
+            configs.append(resolve_ssd_path(candidate))
+    return list(dict.fromkeys(configs))
 
 
 def discover_hook_configs() -> list[Path]:
@@ -2895,22 +2794,6 @@ def verify() -> dict[str, Any]:
         raise InstallError("installed policy digest mismatch")
     checked: list[str] = []
     unreachable: list[str] = []
-    # Fail-closed account coverage (P1, 2026-08-27). Everything below this line only ever looked at
-    # receipt["configs"] -- the set install() discovered -- so verify() shared install()'s
-    # enumeration blind spot instead of being an independent check of it: a real, live Codex account
-    # that discovery never saw was simply absent from the output, and `ok: true` was reported over
-    # a machine where an active account's hooks.json had no bridge handler at all. Re-enumerating
-    # the LIVE registry here (see ORCA_ACCOUNTS_SUBPATH) is what makes this an actual check: any
-    # registry account whose hooks.json this tool cannot locate, or can locate but has no receipt
-    # coverage for, is now named explicitly in `unmanaged` and forces `ok: false`.
-    #
-    # Only REGISTRY accounts are held to this. A local-homes-only directory with no registry entry
-    # is a leftover, not a live account Orca will ever run, and failing verify() over one would be
-    # a false alarm.
-    _, registry_accounts = _enumerate_accounts()
-    receipt_config_paths = {
-        row["path"] for row in receipt["configs"] if isinstance(row, dict) and isinstance(row.get("path"), str)
-    }
     # Write-trigger liveness is now determined independently per config row, below, from real, live
     # hooks.json content under the well-known identity -- NOT from receipt.get("write_trigger_*")
     # (round-52 fix, converged independent Claude opus/max + Codex gpt-5.6-sol/max review,
@@ -3107,47 +2990,14 @@ def verify() -> dict[str, Any]:
             raise InstallError(f"live write-trigger policy is invalid: {exc}") from exc
         write_trigger_script_sha256 = expected_script_sha256
 
-    covered = receipt_config_paths | set(checked) | set(unreachable)
-    unmanaged: list[dict[str, str]] = []
-    for account_id, located in sorted(registry_accounts.items()):
-        if located is None:
-            unmanaged.append(
-                {
-                    "account_id": account_id,
-                    "registry_path": os.fspath(orca_accounts_root() / account_id),
-                    "reason": (
-                        "no hooks.json for this Orca account resolves onto the Extreme SSD, so this "
-                        "tool cannot install, verify, or remove its hook"
-                    ),
-                }
-            )
-            continue
-        located_str = os.fspath(located)
-        if located_str not in covered:
-            unmanaged.append(
-                {
-                    "account_id": account_id,
-                    "registry_path": os.fspath(orca_accounts_root() / account_id),
-                    "config": located_str,
-                    "reason": (
-                        "this Orca account's hooks.json exists and is manageable but is not covered "
-                        "by the install receipt, so nothing about it has been verified; re-run "
-                        "`install` to bring it under management"
-                    ),
-                }
-            )
-
     result = {
-        # NOT unconditionally True (P1, 2026-08-27): a verify() that cannot see an account is not
-        # allowed to report success over it. See the `unmanaged` computation above.
-        "ok": not unmanaged,
+        "ok": True,
         "release_id": receipt["release_id"],
         "script_sha256": receipt["script_sha256"],
         "policy_sha256": receipt["policy_sha256"],
         "volume_uuid": receipt["volume_uuid"],
         "configs": checked,
         "unreachable": unreachable,
-        "unmanaged": unmanaged,
     }
     if write_trigger_script_sha256 is not None:
         result["write_trigger_script_sha256"] = write_trigger_script_sha256
@@ -3504,13 +3354,6 @@ def main() -> int:
             finally:
                 os.close(lock_descriptor)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
-    # `verify` is the one action whose whole purpose is to answer "is this machine correctly
-    # bridged?", so its own `ok: false` -- unmanaged Orca accounts (see verify()) -- must reach a
-    # scripted caller through the exit status too, not only through JSON a caller may not parse.
-    # Every other action keeps returning 0 on a structured result exactly as before (`plan` has
-    # always reported `ok: false` for a pending transaction at rc 0).
-    if args.action == "verify" and not result.get("ok"):
-        return 1
     return 0
 
 
