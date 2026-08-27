@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.local.ego-taskspace-reaper</string>
+
+	<!-- Closes Ego task spaces that an agent registered and never finished.
+
+	     BOTH paths below MUST resolve to internal storage. This job was silently
+	     dead for ~14.8 days (2026-08-13 .. 2026-08-28) because ProgramArguments
+	     pointed at /usr/bin/python3 (an Apple stub that re-execs Xcode.app's
+	     python3, a platform binary) running
+	     ~/.agents/skills/ego-orca-profile/scripts/ego_profile_router.py, and
+	     ~/.agents is a symlink onto /Volumes/Extreme SSD. macOS TCC denies a
+	     launchd job "Files on Removable Volumes", so the interpreter could not
+	     even open the script: 21,380 x "[Errno 1] Operation not permitted",
+	     LastExitStatus 2, every 60s.
+
+	     Two independent guards now apply:
+	       1. __SCRIPT__ is a copy on internal disk, installed by install.sh.
+	          Measured under launchd: even /bin/cat is denied on /Volumes, but
+	          both interpreters read an internal path fine.
+	       2. __PYTHON__ prefers Homebrew's python3, which is not an Apple
+	          platform binary and is not subject to that denial.
+
+	     Run install.sh in doctor mode to check for exactly this regression,
+	     including drift between this copy and the source on the SSD.
+
+	     (XML comments cannot contain a double hyphen, so flag names are spelled
+	     out in prose above. plutil -lint tolerates it; expat does not.) -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>__PYTHON__</string>
+		<string>__SCRIPT__</string>
+		<string>reap</string>
+		<string>--quiet</string>
+	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>EGO_ORCA_TASK_IDLE_SECONDS</key>
+		<string>600</string>
+	</dict>
+
+	<key>StartInterval</key>
+	<integer>60</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Umask</key>
+	<integer>63</integer>
+
+	<key>StandardOutPath</key>
+	<string>__STATE_DIR__/launchd.stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>__STATE_DIR__/launchd.stderr.log</string>
+</dict>
+</plist>

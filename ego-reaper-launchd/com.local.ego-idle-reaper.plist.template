@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.local.ego-idle-reaper</string>
+
+	<!-- 用户要求：Ego 使用完后连续 10 分钟无任务即回收后台宿主。
+	     多回合任务开头 `touch ~/.local/state/ego-idle-reaper.hold` 即可占住。
+
+	     Same removable-volume failure as com.local.ego-taskspace-reaper: this job
+	     invoked ~/claudecode/本机/tools/ego_idle_reaper.py, and ~/claudecode is a
+	     symlink onto /Volumes/Extreme SSD, so the launchd-spawned interpreter was
+	     denied by TCC before it could open the file (LastExitStatus 2, 3.8MB of
+	     "[Errno 1] Operation not permitted"). __SCRIPT__ is now an internal-disk
+	     copy installed by install.sh, run by a non-platform-binary interpreter.
+	     See the sibling template for the full write-up. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>__PYTHON__</string>
+		<string>__SCRIPT__</string>
+	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>EGO_REAPER_IDLE_LIMIT</key>
+		<string>600</string>
+	</dict>
+
+	<!-- 每 60 秒查一次；脚本自己累计「连续空闲」到 IDLE_LIMIT 秒才动手
+	     当前由 EnvironmentVariables 覆盖为 600 秒；修改模板后重跑 install.sh。 -->
+	<key>StartInterval</key>
+	<integer>60</integer>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>ProcessType</key>
+	<string>Background</string>
+
+	<key>LowPriorityIO</key>
+	<true/>
+
+	<key>StandardOutPath</key>
+	<string>__STATE_DIR__/ego-idle-reaper.stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>__STATE_DIR__/ego-idle-reaper.stderr.log</string>
+</dict>
+</plist>
