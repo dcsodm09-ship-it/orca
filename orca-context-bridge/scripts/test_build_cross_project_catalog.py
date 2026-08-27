@@ -2943,5 +2943,177 @@ class AcquireLockUncreatableConsistencyTests(unittest.TestCase):
         self.assertFalse(lock_path.exists())
 
 
+
+# ---------------------------------------------------------------------------
+# assign_project_ids: a repo root sharing its derived project_id with its own
+# agent worktrees is NOT an ambiguity; two unrelated projects colliding is.
+#
+# Field shapes below are copied from the real fleet catalog
+# (/Volumes/Extreme SSD/Orca/manifests/cross-project-catalog/catalog.json):
+# the parent repo row carries repo_ids=["<uuid>"] and is_main_worktree=True,
+# while every agent worktree row carries repo_ids=[] -- its only link back to
+# the parent is the "<uuid>::<abs path>" prefix in worktree_ids.
+# ---------------------------------------------------------------------------
+
+
+def _target(
+    real_path: str,
+    *,
+    repo_ids: "tuple[str, ...]" = (),
+    worktree_ids: "tuple[str, ...]" = (),
+    is_main_worktree: bool = False,
+) -> dict:
+    return {
+        "real_path": real_path,
+        "path": real_path,
+        "aliases": [],
+        "orca_kinds": {"repo"} if repo_ids else {"worktree"},
+        "repo_ids": set(repo_ids),
+        "worktree_ids": set(worktree_ids),
+        "branch": None,
+        "is_main_worktree": is_main_worktree,
+        "is_archived": False,
+        "workspace_status": None,
+    }
+
+
+def _repo_root(real_path: str, uuid: str) -> dict:
+    return _target(
+        real_path,
+        repo_ids=(uuid,),
+        worktree_ids=(f"{uuid}::{real_path}",),
+        is_main_worktree=True,
+    )
+
+
+def _agent_worktree(real_path: str, uuid: str) -> dict:
+    return _target(real_path, worktree_ids=(f"{uuid}::{real_path}",))
+
+
+UUID_A = "5aa2f9a4-a150-4211-9fcf-0dabce61ab85"
+UUID_B = "61f0a1df-c558-4512-834f-1284c4c45a3d"
+
+
+class SelfContainedWorktreeProjectIdTests(unittest.TestCase):
+    def test_repo_root_plus_its_own_agent_worktrees_is_not_ambiguous(self) -> None:
+        """The 7-row real-fleet regression: hgcloud/rn邮箱 shaped input."""
+        root = "/fleet/projects/hgcloud"
+        targets = [
+            _repo_root(root, UUID_A),
+            _agent_worktree(f"{root}/.claude/worktrees/agent-a1ff6c73a9c2072", UUID_A),
+            _agent_worktree(f"{root}/.claude/worktrees/agent-a8d4fafa60451d3", UUID_A),
+        ]
+        collisions, ambiguous_ids, worktree_groups = bcpc.assign_project_ids(targets)
+
+        self.assertEqual([t["project_id"] for t in targets], ["hgcloud"] * 3)
+        self.assertEqual([t["project_id_source"] for t in targets], ["derived"] * 3)
+        for target in targets:
+            self.assertFalse(
+                target["project_id_ambiguous"],
+                f"{target['real_path']} must not be flagged ambiguous",
+            )
+        self.assertEqual(collisions, [])
+        self.assertEqual(ambiguous_ids, set())
+        self.assertEqual(
+            worktree_groups,
+            [
+                {
+                    "project_id": "hgcloud",
+                    "root_real_path": root,
+                    "worktree_real_paths": [
+                        f"{root}/.claude/worktrees/agent-a1ff6c73a9c2072",
+                        f"{root}/.claude/worktrees/agent-a8d4fafa60451d3",
+                    ],
+                    "repo_ids": [UUID_A],
+                }
+            ],
+        )
+
+    def test_two_unrelated_projects_on_one_derived_id_are_still_ambiguous(self) -> None:
+        """Same derived id ("shared"), two different repos, neither nested."""
+        targets = [
+            _repo_root("/fleet/projects/shared", UUID_A),
+            _repo_root("/other/projects/shared", UUID_B),
+        ]
+        collisions, ambiguous_ids, worktree_groups = bcpc.assign_project_ids(targets)
+
+        self.assertTrue(all(t["project_id_ambiguous"] for t in targets))
+        self.assertEqual(ambiguous_ids, {"shared"})
+        self.assertEqual(worktree_groups, [])
+        self.assertEqual(len(collisions), 1)
+        self.assertEqual(collisions[0]["project_id"], "shared")
+        self.assertEqual(
+            sorted(collisions[0]["real_paths"]),
+            ["/fleet/projects/shared", "/other/projects/shared"],
+        )
+
+    def test_a_nested_but_UNRELATED_repo_is_still_ambiguous(self) -> None:
+        """Path containment alone must not buy the carve-out: a worktree of
+        a DIFFERENT repo checked out inside this project's tree derives the
+        same id but shares no Orca repo id, so it stays flagged."""
+        root = "/fleet/projects/hgcloud"
+        targets = [
+            _repo_root(root, UUID_A),
+            _agent_worktree(f"{root}/vendor/other", UUID_B),
+        ]
+        collisions, ambiguous_ids, worktree_groups = bcpc.assign_project_ids(targets)
+
+        self.assertTrue(all(t["project_id_ambiguous"] for t in targets))
+        self.assertEqual(ambiguous_ids, {"hgcloud"})
+        self.assertEqual(worktree_groups, [])
+        self.assertEqual(len(collisions), 1)
+
+    def test_sibling_worktrees_with_no_root_member_stay_ambiguous(self) -> None:
+        """No member is the repo's own root, so there is nothing to fold
+        onto -- refuse to guess which sibling wins."""
+        targets = [
+            _agent_worktree("/fleet/projects/hgcloud/a", UUID_A),
+            _agent_worktree("/fleet/projects/hgcloud/b", UUID_A),
+        ]
+        collisions, ambiguous_ids, worktree_groups = bcpc.assign_project_ids(targets)
+
+        self.assertTrue(all(t["project_id_ambiguous"] for t in targets))
+        self.assertEqual(ambiguous_ids, {"hgcloud"})
+        self.assertEqual(worktree_groups, [])
+        self.assertEqual(len(collisions), 1)
+
+    def test_worktree_id_without_the_uuid_separator_falls_back_to_flagging(self) -> None:
+        """A future Orca worktree-id format must degrade to today's
+        over-flagging, never to a silent wrong merge."""
+        root = "/fleet/projects/hgcloud"
+        child = f"{root}/.claude/worktrees/agent-x"
+        targets = [
+            _repo_root(root, UUID_A),
+            _target(child, worktree_ids=(child,)),
+        ]
+        collisions, ambiguous_ids, worktree_groups = bcpc.assign_project_ids(targets)
+
+        self.assertTrue(all(t["project_id_ambiguous"] for t in targets))
+        self.assertEqual(ambiguous_ids, {"hgcloud"})
+        self.assertEqual(worktree_groups, [])
+        self.assertEqual(len(collisions), 1)
+
+    def test_prefix_sibling_directory_is_not_treated_as_nested(self) -> None:
+        """/a/bc must never count as living under /a/b (separator boundary)."""
+        self.assertTrue(bcpc._is_strictly_within("/a/b/c", "/a/b"))
+        self.assertTrue(bcpc._is_strictly_within("/a/b/c", "/a/b/"))
+        self.assertFalse(bcpc._is_strictly_within("/a/bc", "/a/b"))
+        self.assertFalse(bcpc._is_strictly_within("/a/b", "/a/b"))
+
+    def test_a_single_member_project_is_never_a_group_or_a_collision(self) -> None:
+        targets = [_repo_root("/fleet/projects/solo", UUID_A)]
+        collisions, ambiguous_ids, worktree_groups = bcpc.assign_project_ids(targets)
+        self.assertFalse(targets[0]["project_id_ambiguous"])
+        self.assertEqual((collisions, ambiguous_ids, worktree_groups), ([], set(), []))
+
+    def test_docstring_no_longer_claims_collisions_are_fallback_only(self) -> None:
+        """The claim it used to make ("only possible via the fallback tier;
+        0 collisions among 134 derived ids") was false against the live
+        fleet and enforced by nothing. Pin that it stays gone."""
+        doc = " ".join((bcpc.assign_project_ids.__doc__ or "").split())
+        self.assertNotIn("only possible via the fallback tier", doc)
+        self.assertIn("NOT only reachable through the fallback tier", doc)
+
+
 if __name__ == "__main__":
     unittest.main()

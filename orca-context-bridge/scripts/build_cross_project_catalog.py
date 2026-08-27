@@ -929,14 +929,109 @@ def build_scan_targets(repos: list[Any], worktrees: list[Any]) -> tuple[list[dic
     return targets, malformed_rows, len(literal_paths)
 
 
-def assign_project_ids(targets: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], set[str]]:
+# Orca's `worktree list --json` gives every worktree an id of the shape
+# "<repo-uuid>::<absolute path>". The segment before the FIRST "::" is the
+# id of the repo that worktree belongs to, and it is the only field that
+# actually links an agent worktree row back to its parent repo row --
+# `repo_ids` is populated on the repo's own root row ONLY (empty [] on all
+# 155 worktree rows of today's fleet), so a self-contained-worktree test
+# keyed off repo_ids alone would match nothing. Both fields are read here
+# because the root row legitimately carries either or both.
+_WORKTREE_ID_REPO_SEPARATOR = "::"
+
+
+def _orca_repo_ids(target: dict[str, Any]) -> set[str]:
+    """Every Orca repo id this target is known to belong to, from both the
+    repo rows it came from and the "<repo-uuid>::<path>" worktree ids. A
+    worktree id that does not carry the separator (a future Orca id format)
+    contributes nothing rather than being guessed at -- an empty set makes
+    the caller fall back to flagging the collision, which is the safe
+    direction."""
+    ids = set(target["repo_ids"])
+    for worktree_id in target["worktree_ids"]:
+        prefix, separator, _rest = worktree_id.partition(_WORKTREE_ID_REPO_SEPARATOR)
+        if separator and prefix:
+            ids.add(prefix)
+    return ids
+
+
+def _is_strictly_within(child: str, parent: str) -> bool:
+    """True when `child` is a proper descendant path of `parent`. Compares
+    on a separator boundary so /a/bc is never treated as living under /a/b.
+    Both arguments are already os.path.realpath() output."""
+    return child != parent and child.startswith(parent.rstrip("/") + "/")
+
+
+def _self_contained_worktree_group(members: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Recognise the one project_id collision shape that is not a collision
+    at all: a repo root plus that SAME repo's own agent worktrees, which
+    live at <root>/.claude/worktrees/agent-* and therefore derive the
+    root's project_id (derive_expected_project_id takes the single segment
+    after "projects", so every depth below the root folds onto it).
+
+    Returns the group description when every one of these holds, else None
+    -- an unrecognised shape is always reported as a genuine collision, so
+    a new Orca layout degrades to today's over-flagging rather than to a
+    silent wrong merge:
+
+      * exactly one member looks like the repo's own root (it is the main
+        worktree, or it came from a `repo list` row);
+      * every other member is a proper descendant of that root's path and
+        is NOT itself a main worktree (two main worktrees claiming one id
+        is a real ambiguity);
+      * all members share at least one Orca repo id, which is what makes
+        this the same repo rather than an unrelated checkout that happens
+        to sit inside another project's tree.
+    """
+    roots = [m for m in members if m["is_main_worktree"] or m["repo_ids"]]
+    if len(roots) != 1:
+        return None
+    root = roots[0]
+    others = [m for m in members if m is not root]
+    if not others:
+        return None
+    shared = _orca_repo_ids(root)
+    if not shared:
+        return None
+    for member in others:
+        if member["is_main_worktree"]:
+            return None
+        if not _is_strictly_within(member["real_path"], root["real_path"]):
+            return None
+        shared &= _orca_repo_ids(member)
+        if not shared:
+            return None
+    return {
+        "root_real_path": root["real_path"],
+        "worktree_real_paths": [m["real_path"] for m in others],
+        "repo_ids": sorted(shared),
+    }
+
+
+def assign_project_ids(
+    targets: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], set[str], list[dict[str, Any]]]:
     """real_path is always the row key and dedup identity. project_id is
     always non-null (never the key) via a fallback-basename tier -- a null
     join key would make ~2 of 7 real content-bearing projects unaddressable
-    by M5/M6. Ambiguous project_ids (only possible via the fallback tier;
-    0 collisions among 134 derived ids today) are flagged on every member
-    and excluded from capability_ref_index rather than silently
-    last-write-wins joined."""
+    by M5/M6.
+
+    A project_id claimed by more than one real_path is ambiguous, flagged on
+    every member and excluded from capability_ref_index rather than silently
+    last-write-wins joined -- with one carve-out. Collisions are NOT only
+    reachable through the fallback tier: on today's fleet (142 derived ids,
+    16 fallback) all 7 colliding rows are derived, and every one of them is
+    a repo root plus that repo's own agent worktrees under
+    <root>/.claude/worktrees/. Those are one project, not several, so
+    _self_contained_worktree_group() carves them out: they keep
+    project_id_ambiguous=False and are reported separately as
+    project_id_worktree_groups. Flagging them poisoned every SessionStart
+    freshness reminder for the whole project (catalog_session_hint's
+    _index_project_paths treats the flag as "no tier may answer"), silently
+    and for 7 of 158 rows. Genuine collisions between unrelated projects
+    are still flagged; see the docstring there for the exact shape test.
+
+    Returns (collisions, ambiguous_ids, worktree_groups)."""
     groups: dict[str, list[dict[str, Any]]] = {}
     for target in targets:
         derived = derive_expected_project_id(Path(target["real_path"]))
@@ -951,10 +1046,14 @@ def assign_project_ids(targets: list[dict[str, Any]]) -> tuple[list[dict[str, An
         groups.setdefault(target["project_id"], []).append(target)
 
     collisions: list[dict[str, Any]] = []
+    worktree_groups: list[dict[str, Any]] = []
     for pid, members in groups.items():
-        ambiguous = len(members) > 1
+        group = _self_contained_worktree_group(members) if len(members) > 1 else None
+        ambiguous = len(members) > 1 and group is None
         for member in members:
             member["project_id_ambiguous"] = ambiguous
+        if group is not None:
+            worktree_groups.append({"project_id": pid, **group})
         if ambiguous:
             collisions.append(
                 {
@@ -964,7 +1063,7 @@ def assign_project_ids(targets: list[dict[str, Any]]) -> tuple[list[dict[str, An
                 }
             )
     ambiguous_ids = {c["project_id"] for c in collisions}
-    return collisions, ambiguous_ids
+    return collisions, ambiguous_ids, worktree_groups
 
 
 # ---------------------------------------------------------------------------
@@ -1129,7 +1228,7 @@ def assemble_catalog(
     literal_path_count: int,
     generator_sha256: str,
 ) -> dict[str, Any]:
-    collisions, ambiguous_ids = assign_project_ids(targets)
+    collisions, ambiguous_ids, worktree_groups = assign_project_ids(targets)
 
     project_rows: list[dict[str, Any]] = []
     all_caps: list[dict[str, Any]] = []
@@ -1690,6 +1789,12 @@ def assemble_catalog(
             1 for cap in all_caps if not cap["project_id_addressable"]
         ),
         "project_id_fallback_count": fallback_count,
+        # Collisions between unrelated projects (flagged, ref_keys excluded)
+        # vs. a repo root sharing its id with its own agent worktrees
+        # (carved out, NOT flagged). Kept as two counts so a real ambiguity
+        # appearing can never be mistaken for one more worktree group.
+        "project_id_collisions": len(collisions),
+        "project_id_worktree_groups": len(worktree_groups),
         "degraded_sources": len(degraded),
     }
 
@@ -1730,6 +1835,7 @@ def assemble_catalog(
         "self_references": self_references,
         "unresolved_wiki_links": unresolved_wiki_links,
         "project_id_collisions": collisions,
+        "project_id_worktree_groups": worktree_groups,
         "degraded": degraded,
     }
     return catalog
