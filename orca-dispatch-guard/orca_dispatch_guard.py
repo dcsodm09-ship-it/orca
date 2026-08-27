@@ -182,6 +182,18 @@ WAIT_CHECK_CHUNK_MS = 30_000
 # multi-minute wait budget.
 WAIT_JOURNAL_LOCK_TIMEOUT_SECONDS = 30.0
 
+# Bound on `orchestration task-list --json`, used only by the best-effort
+# original-spec-text lookup (_fetch_task_spec_text). That call runs while the
+# caller's TerminalLock is still held, so an unbounded hang here would block
+# recovery for every other terminal, not just this one -- exactly the class
+# of stuck-CLI problem this whole tool exists to route around. Matches
+# WAIT_JOURNAL_LOCK_TIMEOUT_SECONDS: this is a plain JSON list call with no
+# `--wait`/`--timeout-ms` of its own, so it should return almost immediately
+# under normal conditions; 30s is generous slack, not an expected duration.
+# A timeout here is caught by _fetch_task_spec_text's existing
+# SubprocessError handling and degrades to the bare-task-id harvest prompt.
+TASK_LIST_TIMEOUT_SECONDS = 30.0
+
 # Exit codes -- documented explicitly so a caller can tell these apart.
 EXIT_OK = 0
 EXIT_FAILURE = 1  # genuine failure passthrough (same code worker-start itself
@@ -729,7 +741,7 @@ def _task_list(*, run_id: str | None) -> subprocess.CompletedProcess:
     args = ["orchestration", "task-list", "--json"]
     if run_id:
         args += ["--run", run_id]
-    return _run_orca(args)
+    return _run_orca(args, timeout=TASK_LIST_TIMEOUT_SECONDS)
 
 
 def _terminal_wait_tui_idle(terminal: str, *, timeout_ms: int) -> subprocess.CompletedProcess:

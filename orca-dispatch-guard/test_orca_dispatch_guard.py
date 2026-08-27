@@ -132,11 +132,11 @@ class OrcaCallRouter:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.calls: list[list[str]] = []
-        self.handlers: dict[str, list[subprocess.CompletedProcess]] = {}
+        self.handlers: dict[str, list[subprocess.CompletedProcess | BaseException]] = {}
         self.active = 0
         self.max_active = 0
 
-    def queue(self, key: str, *results: subprocess.CompletedProcess) -> None:
+    def queue(self, key: str, *results: subprocess.CompletedProcess | BaseException) -> None:
         self.handlers.setdefault(key, []).extend(results)
 
     def __call__(self, args: list[str], **_kwargs) -> subprocess.CompletedProcess:
@@ -157,6 +157,12 @@ class OrcaCallRouter:
         time.sleep(0.01)
         with self._lock:
             self.active -= 1
+        # A queued exception (e.g. subprocess.TimeoutExpired) simulates the
+        # real `subprocess.run(..., timeout=...)` behavior of raising rather
+        # than returning, so tests can simulate a hung CLI call without an
+        # actual hang.
+        if isinstance(result, BaseException):
+            raise result
         return result
 
 
@@ -978,6 +984,46 @@ class RecoveryFlowTests(DispatchGuardTestCase):
         code, _out, _err = self.run_cli(["start", "--task", "orig-t", "--terminal", "term-absent"])
         self.assertEqual(code, dg.EXIT_OK)
         self.assertNotIn("Original task spec text", self._harvest_spec_submitted())
+
+    def test_recovery_still_proceeds_when_the_spec_lookup_hangs(self) -> None:
+        # P2 fix: `task-list` is a best-effort read (see
+        # `_fetch_task_spec_text`) that runs while the caller's TerminalLock
+        # is still held, so an unbounded hang there would block recovery for
+        # every other terminal, not just this one -- the exact class of
+        # stuck-CLI problem this whole tool exists to route around. A real
+        # hang is simulated by having the CLI call raise
+        # `subprocess.TimeoutExpired`, which is what the real
+        # `subprocess.run(..., timeout=...)` does when TASK_LIST_TIMEOUT_SECONDS
+        # elapses; the recovery flow must still complete instead of
+        # propagating the exception or hanging.
+        self.router.queue("worker-start", cp([], 1, stdout=_stalled_worker_start_body("orig-d-hang")))
+        self.router.queue(
+            "task-list", subprocess.TimeoutExpired(cmd=["orca", "orchestration", "task-list", "--json"], timeout=dg.TASK_LIST_TIMEOUT_SECONDS)
+        )
+        self.router.queue("terminal-wait", cp([], 0, stdout=ok_envelope({})))
+        self.router.queue("terminal-read", cp([], 0, stdout="tail"))
+        self.router.queue("task-create", cp([], 0, stdout=ok_envelope({"task": {"id": "harvest-t-h"}})))
+        self.router.queue("worker-start-retry", cp([], 0, stdout=ok_envelope({"dispatchId": "remount-d-h"})))
+
+        code, out, _err = self.run_cli(["start", "--task", "orig-t", "--terminal", "term-hang"])
+        self.assertEqual(code, dg.EXIT_OK)
+        self.assertIn("remount-d-h", out)
+
+        submitted = self._harvest_spec_submitted()
+        self.assertIn("Original task id", submitted)
+        self.assertNotIn("Original task spec text", submitted, "a timed-out lookup must degrade to the bare-id prompt")
+
+    def test_fetch_task_spec_text_returns_none_on_timeout(self) -> None:
+        # Narrower unit-level companion to the end-to-end test above: exercises
+        # `_fetch_task_spec_text` directly, confirming the timeout is caught
+        # by its existing `except (OSError, subprocess.SubprocessError)`
+        # handling (TimeoutExpired is a SubprocessError subclass) with no
+        # other call involved.
+        self.router.queue(
+            "task-list", subprocess.TimeoutExpired(cmd=["orca", "orchestration", "task-list", "--json"], timeout=dg.TASK_LIST_TIMEOUT_SECONDS)
+        )
+        result = dg._fetch_task_spec_text(task_id="orig-t", run_id=None)
+        self.assertIsNone(result)
 
 
 # ---------------------------------------------------------------------------

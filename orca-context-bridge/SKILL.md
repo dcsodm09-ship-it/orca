@@ -1214,12 +1214,13 @@ performs that re-sign itself. Every `draft`/`amend`/`approve` call holds the sam
 lock, closing a real lost-update race a review caught between concurrent
 `approve` calls landing on the same target.
 
-**Status: candidate deployed and tested** (against disposable fake projects only — nothing here has ever
-touched a real project's real files). `draft-from-discovery-hit` is now implemented (commit ed84194de8,
-"Gate C: wire discovery-to-staging queue") as the automated bridge from Gate C (discovery triage) to Gate B
-(promotion). It is wired into `catalog_session_hint.py` and used by the discovery pipeline's automated
-promotion path. However, the discovery pipeline itself (M8-1 and M8-2 tools) is still not registered in any
-SessionStart path and has not been run against any real project's directory in production use.
+**Status: command implemented, not yet automatically invoked** (commit ed84194de8, "Gate C: wire discovery-to-staging queue").
+`promote_capability.py draft-from-discovery-hit` is fully implemented and can be called manually to read a triaged discovery hit
+and draft it as a promotion candidate through the normal validation/dedup/approval path. However, nothing automatically invokes
+this command yet: templates for a nightly scan (`gate-c-nightly-scan.sh`, `com.orca.gate-c-nightly-scan.plist`) exist under
+`ops/` as staging-only examples, but are not installed, not registered in `catalog_session_hint.py`, and not wired into any
+SessionStart path. The discovery pipeline itself (M8-1 and M8-2 tools) is also still not registered in any SessionStart path
+and has not been run against any real project's directory in production use.
 
 ### Discovering and evidencing cross-project candidates (M8 Gate C — deferred, real-data numbers not encouraging)
 
@@ -1270,10 +1271,11 @@ python3 <skill-dir>/scripts/review_capability_candidates.py mark --hit-id <id> \
 A discovery hit is a strictly lower-stakes concept than a promotion
 candidate: marking one `triaged_for_promotion` is bookkeeping in
 `discovery-hits.json`, not a step that reaches any project's `wiki/`.
-Turning a hit into an actual `promote_capability.py` candidate is now automated:
-`promote_capability.py draft-from-discovery-hit` (commit ed84194de8) reads
-a triaged hit and drafts it through the same validation/dedup/approval path
-as a hand-authored candidate, with automatic non-human source tagging.
+The command to turn a hit into an actual `promote_capability.py` candidate now exists:
+`promote_capability.py draft-from-discovery-hit` (commit ed84194de8) reads a triaged hit
+and drafts it through the same validation/dedup/approval path as a hand-authored candidate,
+with automatic non-human source tagging. However, nothing automatically invokes this
+command yet; it must be called manually or through a user-installed scheduled scan.
 
 **Not yet true, and not a formality**: neither pair is registered in
 `catalog_session_hint.py` or any SessionStart path, and neither has been
