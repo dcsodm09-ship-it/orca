@@ -102,14 +102,21 @@ PROTECTED_SHA256 = {
 # (matched by "catalog_session_hint.py" + "--no-compat-spawn" both appearing
 # in its command string) is present, unique, and byte-for-byte the entry
 # pinned below. So this is scoped to a hash of just that one hook-entry
-# object (its command/timeout/statusMessage/type, canonical-JSON-encoded),
-# not the surrounding file. See _extract_session_hint_hook_entry() and
+# object (its command/timeout/statusMessage/type, canonical-JSON-encoded)
+# *plus* the "matcher" field of the hooks.SessionStart group it lives
+# inside -- not the surrounding file, and not the rest of that group. The
+# matcher has to be in scope too: it decides which SessionStart events
+# actually fire the hook (e.g. "startup|resume|clear|compact|fork"), so
+# rewriting it to something that never matches silently disables the hook
+# forever without touching the hook entry's own command/timeout/etc, which
+# would otherwise sail through this check undetected. See
+# _extract_session_hint_hook_scope() and
 # test_the_four_protected_files_are_unchanged() /
 # test_settings_json_session_hint_hook_entry_is_pinned() below for how this
 # is computed and checked.
 SETTINGS_JSON_PATH = "/Users/www1adwawd/.claude/settings.json"
 PROTECTED_SESSION_HINT_HOOK_SHA256 = (
-    "b74b3238f19e36c238b2053a1dd1882080b9724f15e59c9f11320286d37614b8"
+    "af417b4f4448e4404c3f5004b718f66cce1f95e9df34201799043cc56279c620"
 )
 
 
@@ -118,11 +125,12 @@ def _canonical_hook_entry_json(entry: dict) -> str:
     return json.dumps(entry, sort_keys=True, ensure_ascii=True)
 
 
-def _extract_session_hint_hook_entry(settings_path: str) -> dict:
+def _extract_session_hint_hook_scope(settings_path: str) -> dict:
     """Find the one hooks.SessionStart entry that invokes
     catalog_session_hint.py with --no-compat-spawn inside settings.json,
-    and return that single hook-entry dict (not the whole file, not the
-    whole matcher group it lives in).
+    and return {"matcher": <the containing group's matcher>, "hook_entry":
+    <that single hook-entry dict>} -- not the whole file, and not the rest
+    of the matcher group beyond its "matcher" field.
 
     Raises AssertionError if the file is missing that section, or if the
     entry isn't present exactly once -- an ambiguous match would make the
@@ -135,7 +143,7 @@ def _extract_session_hint_hook_entry(settings_path: str) -> dict:
         for hook_entry in group.get("hooks", []):
             command = hook_entry.get("command", "")
             if "catalog_session_hint.py" in command and "--no-compat-spawn" in command:
-                matches.append(hook_entry)
+                matches.append({"matcher": group.get("matcher"), "hook_entry": hook_entry})
     if len(matches) != 1:
         raise AssertionError(
             "expected exactly one hooks.SessionStart entry invoking "
@@ -2532,56 +2540,113 @@ class IndependenceTests(unittest.TestCase):
         # see test_settings_json_session_hint_hook_entry_is_pinned.
 
     def test_settings_json_session_hint_hook_entry_is_pinned(self) -> None:
-        """Boundary #1 for settings.json, scoped: only the hooks.SessionStart
-        entry that invokes catalog_session_hint.py --no-compat-spawn must be
-        byte-for-byte pinned, not the whole shared config file (see the
-        comment above PROTECTED_SESSION_HINT_HOOK_SHA256 for why)."""
+        """Boundary #1 for settings.json, scoped: the hooks.SessionStart
+        entry that invokes catalog_session_hint.py --no-compat-spawn, plus
+        the "matcher" field of the group it lives in, must be byte-for-byte
+        pinned together -- not the whole shared config file, and not just
+        the hook entry alone (see the comment above
+        PROTECTED_SESSION_HINT_HOOK_SHA256 for why the matcher has to be in
+        scope too)."""
         if not Path(SETTINGS_JSON_PATH).is_file():
             self.skipTest(f"{SETTINGS_JSON_PATH} not present on this host")
-        entry = _extract_session_hint_hook_entry(SETTINGS_JSON_PATH)
+        scope = _extract_session_hint_hook_scope(SETTINGS_JSON_PATH)
         digest = hashlib.sha256(
-            _canonical_hook_entry_json(entry).encode("utf-8")
+            _canonical_hook_entry_json(scope).encode("utf-8")
         ).hexdigest()
         self.assertEqual(
             digest,
             PROTECTED_SESSION_HINT_HOOK_SHA256,
             "PROTECTED SETTINGS.JSON HOOK ENTRY MODIFIED: "
-            "hooks.SessionStart catalog_session_hint.py --no-compat-spawn entry",
+            "hooks.SessionStart catalog_session_hint.py --no-compat-spawn entry "
+            "or its group's matcher",
         )
 
-    def test_settings_json_hook_entry_tamper_is_detected(self) -> None:
-        """Negative control: mutating ONLY the pinned hook entry's command
-        string must flip the scoped check to failing."""
-        if not Path(SETTINGS_JSON_PATH).is_file():
-            self.skipTest(f"{SETTINGS_JSON_PATH} not present on this host")
+    def _tamper_settings_json(self, mutate_group) -> str:
+        """Write a copy of the real settings.json to a temp path with
+        `mutate_group(group_dict) -> group_dict` applied to the
+        hooks.SessionStart group that contains the pinned hook entry, and
+        return the temp path. Shared by the two tamper negative controls
+        below."""
         real = json.loads(Path(SETTINGS_JSON_PATH).read_text(encoding="utf-8"))
-        entry = _extract_session_hint_hook_entry(SETTINGS_JSON_PATH)
+        scope = _extract_session_hint_hook_scope(SETTINGS_JSON_PATH)
+        target_entry = scope["hook_entry"]
         tampered = dict(real)
         tampered_session_start = []
         for group in tampered["hooks"]["SessionStart"]:
             new_group = dict(group)
-            new_hooks = []
-            for hook_entry in group.get("hooks", []):
-                if hook_entry is entry or hook_entry == entry:
-                    hook_entry = dict(hook_entry)
-                    hook_entry["command"] = hook_entry["command"] + " --tampered"
-                new_hooks.append(hook_entry)
-            new_group["hooks"] = new_hooks
+            if any(
+                hook_entry is target_entry or hook_entry == target_entry
+                for hook_entry in group.get("hooks", [])
+            ):
+                new_group = mutate_group(new_group)
             tampered_session_start.append(new_group)
         tampered["hooks"] = dict(tampered["hooks"])
         tampered["hooks"]["SessionStart"] = tampered_session_start
 
         tampered_path = self.tmp / "settings.json"
         tampered_path.write_text(json.dumps(tampered), encoding="utf-8")
+        return str(tampered_path)
 
-        tampered_entry = _extract_session_hint_hook_entry(str(tampered_path))
+    def test_settings_json_hook_entry_tamper_is_detected(self) -> None:
+        """Negative control: mutating ONLY the pinned hook entry's command
+        string (matcher untouched) must flip the scoped check to failing."""
+        if not Path(SETTINGS_JSON_PATH).is_file():
+            self.skipTest(f"{SETTINGS_JSON_PATH} not present on this host")
+
+        def mutate(group: dict) -> dict:
+            new_hooks = []
+            for hook_entry in group.get("hooks", []):
+                command = hook_entry.get("command", "")
+                if "catalog_session_hint.py" in command and "--no-compat-spawn" in command:
+                    hook_entry = dict(hook_entry)
+                    hook_entry["command"] = hook_entry["command"] + " --tampered"
+                new_hooks.append(hook_entry)
+            group["hooks"] = new_hooks
+            return group
+
+        tampered_path = self._tamper_settings_json(mutate)
+        tampered_scope = _extract_session_hint_hook_scope(tampered_path)
         digest = hashlib.sha256(
-            _canonical_hook_entry_json(tampered_entry).encode("utf-8")
+            _canonical_hook_entry_json(tampered_scope).encode("utf-8")
         ).hexdigest()
         self.assertNotEqual(
             digest,
             PROTECTED_SESSION_HINT_HOOK_SHA256,
             "tampering the pinned hook entry's command should change its hash",
+        )
+
+    def test_settings_json_matcher_tamper_is_detected(self) -> None:
+        """Regression for the P2 this commit fixes: mutating ONLY the
+        containing group's "matcher" field -- e.g. to a value that never
+        matches any real SessionStart event, silently disabling the hook
+        from ever firing -- must ALSO flip the scoped check to failing,
+        even though the hook entry's own command/timeout/etc are
+        untouched."""
+        if not Path(SETTINGS_JSON_PATH).is_file():
+            self.skipTest(f"{SETTINGS_JSON_PATH} not present on this host")
+
+        def mutate(group: dict) -> dict:
+            group["matcher"] = "this-value-never-matches-any-session-start-event"
+            return group
+
+        tampered_path = self._tamper_settings_json(mutate)
+        tampered_scope = _extract_session_hint_hook_scope(tampered_path)
+        # The hook entry itself is provably untouched by this mutation...
+        self.assertEqual(
+            tampered_scope["hook_entry"],
+            _extract_session_hint_hook_scope(SETTINGS_JSON_PATH)["hook_entry"],
+        )
+        # ...yet the scoped hash must still change, because it now covers
+        # the matcher too.
+        digest = hashlib.sha256(
+            _canonical_hook_entry_json(tampered_scope).encode("utf-8")
+        ).hexdigest()
+        self.assertNotEqual(
+            digest,
+            PROTECTED_SESSION_HINT_HOOK_SHA256,
+            "tampering only the containing group's matcher (leaving the hook "
+            "entry's command untouched) should still change the scoped hash "
+            "-- a matcher that never matches silently disables the hook",
         )
 
     def test_settings_json_unrelated_hook_addition_does_not_trip_the_check(self) -> None:
@@ -2609,9 +2674,9 @@ class IndependenceTests(unittest.TestCase):
         mutated_path = self.tmp / "settings.json"
         mutated_path.write_text(json.dumps(mutated), encoding="utf-8")
 
-        entry = _extract_session_hint_hook_entry(str(mutated_path))
+        scope = _extract_session_hint_hook_scope(str(mutated_path))
         digest = hashlib.sha256(
-            _canonical_hook_entry_json(entry).encode("utf-8")
+            _canonical_hook_entry_json(scope).encode("utf-8")
         ).hexdigest()
         self.assertEqual(
             digest,
