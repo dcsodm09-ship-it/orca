@@ -970,12 +970,27 @@ _PEM_RE = re.compile(
 # hunting for it -- O(n) wasted work per start position, and the lookbehind admits O(n) start
 # positions, so `redact()` went quadratic. Measured on this file before the bound, against
 # `"a-" * n`: 4,000 chars 0.03s, 32,000 chars 1.93s (x3.8 per doubling). Bounded, the same input is
-# 0.005s and scales linearly. The bounds are deliberately far above anything real: 31 characters of
-# scheme tail (the longest IANA-registered scheme is well under half that) and 255 characters for
-# each userinfo half. A URL past those bounds is no longer redacted -- accepted, because the
-# alternative is a pattern that blows the hook's own 5s budget on ~11,000 characters of input.
+# 0.005s and scales linearly.
+#
+# Bound widening (2026-08-28, round 2): the first cut of this bound used 31 scheme-tail characters
+# and 255 per userinfo half, and both were too tight -- they cut real credentials in half instead of
+# only rejecting adversarial input. `redact("https://u:" + "%41" * 86 + "@example.com")` has a
+# 258-character percent-encoded password, so at 255 the match stopped short of the `@`; the pattern
+# failed, `_EMAIL_RE` then matched the tail on its own, and ~65 literal `%41` groups of the password
+# survived in plaintext next to a `[REDACTED_EMAIL]` tag. A scheme tail of 31 (32 characters of
+# scheme in total) is likewise under the real ceiling: `microsoft.windows.camera.multipicker` is a
+# registered IANA scheme at 36 characters, so `<that>://user:pass@host` stopped being redacted too.
+#
+# The bounds below are chosen from measurement, not intuition. What fixes the ReDoS is that the
+# quantifier is *finite* -- a finite bound caps backtracking per start position at a constant, so
+# total cost stays O(len x bound) instead of O(len^2) -- and the size of the constant barely
+# registers here, because on the adversarial `"a-" * n` input the cost is dominated by the
+# scheme-tail retry ladder and the userinfo halves are never even reached. Measured through full
+# `redact()` on 32,000 adversarial characters: (31, 255) 0.037s, (63, 4096) 0.040s -- inside noise.
+# So the halves are set to 4,096 (a fully percent-encoded 1,365-byte password, or an embedded JWT)
+# and the scheme tail to 63, both far past anything real, for no measurable cost.
 _URL_USERINFO_RE = re.compile(
-    r"(?i)(?<!(?-i:[A-Za-z0-9_]))([a-z][a-z0-9+.-]{0,31}://)[^\s/@:]{1,255}:[^\s/@]{1,255}@"
+    r"(?i)(?<!(?-i:[A-Za-z0-9_]))([a-z][a-z0-9+.-]{0,63}://)[^\s/@:]{1,4096}:[^\s/@]{1,4096}@"
 )
 # `_BEARER_RE`'s CJK-adjacency fix above (`(?<![A-Za-z0-9_])` in place of `\b`) has its own,
 # narrower bug: this pattern also carries `(?i)`, and IGNORECASE applies to *every* character
@@ -1148,18 +1163,45 @@ _REDACTED_PLACEHOLDER_PATTERN = r"\[REDACTED[A-Z_]*\]"
 # positions. This was the dominant term in the measured ReDoS: against `"a-" * n` this pattern alone
 # took 0.29s at 4,000 chars and 32.1s at 32,000 chars (x6.9 per doubling) -- on its own past the
 # hook's 5s budget at roughly 11,000 characters, and `redact()` is called on untruncated block text
-# (see `split_blocks`), so that input size is reachable. With both repeats bounded to 8 segments the
-# same input takes 0.02s and scales linearly (x2.0 per doubling, verified to 256,000 chars). Any
-# finite bound restores linearity and cost grows linearly with the bound; 8 is the tightest value
-# that still covers every realistic identifier shape. Known, accepted narrowing: a label with more
-# than 8 `[_-]`-separated *suffix* segments (e.g. `key_a_b_c_d_e_f_g_h_i: <value>`) no longer
-# matches at all. A label with more than 8 *prefix* segments still matches, just starting later in
-# the run, so its value is still redacted.
+# (see `split_blocks`), so that input size is reachable. With both repeats bounded the same input
+# takes 0.02s and scales linearly (x2.0 per doubling, verified to 256,000 chars). Any finite bound
+# restores linearity, which is the whole ReDoS fix; the bound's *size* only sets the constant.
+#
+# Bound widening (2026-08-28, round 2): the first cut set both repeats to 8 and wrote off the
+# resulting narrowing as accepted. It is not acceptable -- it leaks. `redact("api_key" + "_svc" * 9
+# + ": secret-value-123")` has 9 suffix segments, so the whole pattern failed to match and
+# `secret-value-123` was emitted in plaintext. The two repeats are NOT symmetric, and that is what
+# decides the two bounds:
+#
+#   * Overflowing the SUFFIX bound is a plaintext leak. The keyword has already matched, so there
+#     is no later start position that can rescue the match -- it simply fails and the value is
+#     emitted verbatim. Verified across 9/12/40/200 suffix segments: value lost every time.
+#   * Overflowing the PREFIX bound loses nothing. Every prefix segment ends in `[_-]`, so the
+#     lookbehind admits a start position at every segment boundary; the match just begins further
+#     along the run. The skipped text is label, not value, and `keyword_run` is echoed back verbatim
+#     into the replacement (see `_redact_assignment`), so `redact()`'s output is byte-identical.
+#     Verified at 9/12/40/200 prefix segments: value covered every time.
+#
+# Cost is roughly the product of the two bounds -- the engine backtracks the whole (prefix_count,
+# suffix_count) grid before giving up -- so raising the prefix bound would buy no leak coverage at
+# double the price. Measured through full `redact()` on 32,000 chars of `"key_" * n`, the worst
+# shape found (it makes the keyword alternation succeed at every offset, so the full grid is
+# explored; ordinary `"a-"`/`"a_"` runs are ~50x cheaper):
+#
+#     (prefix, suffix)    worst shape @ 32,000 chars    adversarial chars to burn the 5s budget
+#     (8, 8)   [old]              0.282s                              ~567,000
+#     (8, 32)                     1.024s                              ~156,000
+#     (8, 64)  [chosen]           2.112s                               ~75,000
+#     (16, 64)                    3.716s                               ~43,000
+#
+# So: suffix 64 (7x the 9-segment case that leaked, and past any label a human would write), prefix
+# left at 8 because widening it is provably pure cost. Scaling stays linear in input length at these
+# bounds -- x2.1 per doubling, measured to 32,000 chars -- which is the property that matters.
 _ASSIGNMENT_RE = re.compile(
     r"(?i)(?<!(?-i:[A-Za-z0-9]))"
     r"(?P<keyword_run>(?:[A-Za-z][A-Za-z0-9]*[_-]){0,8}"
     r"(?:password|passwd|pwd|secret|token|signature|key|api[_-]?key|private[_-]?key|[A-Za-z0-9]+[_-]key)"
-    r"(?:[_-][A-Za-z0-9]+){0,8})"
+    r"(?:[_-][A-Za-z0-9]+){0,64})"
     r'(?P<preq>"?)'
     r"(?P<sep>\s*[:：=＝]\s*)"
     r'(?P<preval>"?)'

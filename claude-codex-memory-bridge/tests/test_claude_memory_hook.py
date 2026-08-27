@@ -2193,11 +2193,15 @@ class RedactQuantifierBoundTests(unittest.TestCase):
         )
 
     def test_url_userinfo_quantifiers_are_bounded(self) -> None:
+        # Widened 2026-08-28 round 2 (31 -> 63, 255 -> 4096): the first values cut real
+        # credentials in half. Still explicitly bounded -- that is what fixes the ReDoS.
         pattern = hook._URL_USERINFO_RE.pattern
-        self.assertIn("[a-z0-9+.-]{0,31}", pattern)
-        self.assertIn(r"[^\s/@:]{1,255}", pattern)
-        self.assertIn(r"[^\s/@]{1,255}", pattern)
+        self.assertIn("[a-z0-9+.-]{0,63}", pattern)
+        self.assertIn(r"[^\s/@:]{1,4096}", pattern)
+        self.assertIn(r"[^\s/@]{1,4096}", pattern)
         self.assertNotIn("[a-z0-9+.-]*", pattern)
+        self.assertNotIn(r"[^\s/@:]+", pattern)
+        self.assertNotIn(r"[^\s/@]+", pattern)
 
     def test_email_quantifiers_are_bounded(self) -> None:
         pattern = hook._EMAIL_RE.pattern
@@ -2208,9 +2212,13 @@ class RedactQuantifierBoundTests(unittest.TestCase):
         self.assertNotIn("[A-Z0-9._%+-]+", pattern)
 
     def test_assignment_keyword_run_segments_are_bounded(self) -> None:
+        # Asymmetric on purpose (see `_ASSIGNMENT_RE`'s comment). Overflowing the SUFFIX bound
+        # loses the value entirely, so it was widened 8 -> 64 in round 2; overflowing the PREFIX
+        # bound only moves the match's start, so 8 stays. Cost is ~the product of the two, so
+        # widening the prefix would buy no leak coverage at double the adversarial price.
         pattern = hook._ASSIGNMENT_RE.pattern
         self.assertIn("(?:[A-Za-z][A-Za-z0-9]*[_-]){0,8}", pattern)
-        self.assertIn("(?:[_-][A-Za-z0-9]+){0,8}", pattern)
+        self.assertIn("(?:[_-][A-Za-z0-9]+){0,64}", pattern)
         self.assertNotIn("(?:[A-Za-z][A-Za-z0-9]*[_-])*", pattern)
         self.assertNotIn("(?:[_-][A-Za-z0-9]+)*", pattern)
 
@@ -2250,13 +2258,18 @@ class RedactQuantifierBoundTests(unittest.TestCase):
         cases = {
             "url": "https://user:pass@example.com/path",
             "url_compound_scheme": "git+ssh://user:tok@github.com/o/r",
-            "url_scheme_tail_at_bound": "a" * 31 + "://u:p@h",
+            "url_scheme_tail_at_bound": "a" * 63 + "://u:p@h",
+            # 36 characters, and a real IANA-registered scheme -- it did not fit the old 31.
+            "url_longest_real_iana_scheme": (
+                "microsoft.windows.camera.multipicker://user:pass@example.com"
+            ),
+            "url_userinfo_at_bound": "https://" + "u" * 4096 + ":" + "p" * 4096 + "@example.com",
             "email": "contact alice@example.com now",
             "email_local_part_at_rfc_limit": "x" * 64 + "@example.com",
             "email_long_domain": "u@" + "d" * 60 + "." + "e" * 60 + ".com",
             "email_tld_at_iana_limit": "u@example." + "t" * 24,
             "assignment": "password: hunter2secret",
-            "assignment_suffix_at_bound": "key" + "_zz" * 8 + ": value123",
+            "assignment_suffix_at_bound": "key" + "_zz" * 64 + ": value123",
             "assignment_prefix_at_bound": "_".join(["aa"] * 8) + "_key: value123",
             # Past the prefix bound the run simply matches starting further along, so the value is
             # still redacted -- only the leading label text falls outside the match.
@@ -2269,17 +2282,130 @@ class RedactQuantifierBoundTests(unittest.TestCase):
                 self.assertIn("[REDACTED", redacted)
 
     def test_known_accepted_narrowing_is_limited_to_absurd_suffix_runs(self) -> None:
-        # Documented, accepted cost of the `{0,8}` suffix bound: a secret label carrying more than
-        # eight '[_-]'-separated *suffix* segments no longer matches at all. Nothing shaped like a
-        # real identifier reaches that, and the alternative is a pattern that stalls the hook past
-        # its own 5s budget on ~11,000 characters. This pin exists so the boundary is a decision
-        # someone made rather than a surprise: eight segments must keep working.
-        at_bound = "key" + "_zz" * 8 + ": value123"
+        # The `{0,64}` suffix bound still narrows *somewhere* -- any finite bound does. The pin is
+        # on where: 64 '[_-]'-separated suffix segments is a 250+ character label made of nothing
+        # but qualifiers after the keyword, roughly 7x the longest the review's repro used and far
+        # past anything a human writes. The first cut of this bound was 8, which a plainly
+        # realistic label reached; see RedactRegexBoundWideningTests for that regression.
+        at_bound = "key" + "_zz" * 64 + ": value123"
         self.assertIn("[REDACTED", hook.redact(at_bound))
         # And the ordinary shapes this pattern actually exists for are unaffected.
         for text in ("api_key: abc123", "db_password = s3cr3t", "AWS_SECRET_ACCESS_KEY=wJalrXU"):
             with self.subTest(text=text):
                 self.assertIn("[REDACTED", hook.redact(text))
+
+
+class RedactRegexBoundWideningTests(unittest.TestCase):
+    """Round-2 regression pins for fc39b99705's bounds, which were tight enough to leak.
+
+    fc39b99705 bounded three ReDoS-prone quantifiers, which was the right fix, but picked values
+    that cut real secrets instead of only rejecting adversarial input. An independent final review
+    found two reproducers; both are pinned verbatim below against the output the *parent* of
+    fc39b99705 produced, so the fix cannot silently regress in either direction -- the bounds must
+    stay finite (ReDoS) and stay generous (leaks).
+    """
+
+    # Verbatim from the review, with the parent-of-fc39b99705 output each one must reproduce.
+    USERINFO_REPRO = "https://u:" + "%41" * 86 + "@example.com"
+    USERINFO_EXPECTED = "https://[REDACTED]@example.com"
+    LABEL_REPRO = "api_key" + "_svc" * 9 + ": secret-value-123"
+    LABEL_EXPECTED = "api_key_svc_svc_svc_svc_svc_svc_svc_svc_svc: [REDACTED]"
+
+    def test_percent_encoded_userinfo_password_fully_redacts(self) -> None:
+        # 86 '%41' groups = a 258-character password. Against the old {1,255} the match stopped 3
+        # characters short of the '@', the whole pattern failed, `_EMAIL_RE` then matched the tail
+        # on its own, and ~65 '%41' groups of the password survived in plaintext beside a
+        # [REDACTED_EMAIL] tag. Nothing of the password may appear in the output.
+        redacted = hook.redact(self.USERINFO_REPRO)
+        self.assertEqual(redacted, self.USERINFO_EXPECTED)
+        self.assertNotIn("%41", redacted)
+
+    def test_nine_segment_label_fully_redacts(self) -> None:
+        # Nine '[_-]'-separated suffix segments. Against the old {0,8} the label stopped being
+        # recognised as a label at all and the value leaked whole -- not truncated, not tagged.
+        redacted = hook.redact(self.LABEL_REPRO)
+        self.assertEqual(redacted, self.LABEL_EXPECTED)
+        self.assertNotIn("secret-value-123", redacted)
+
+    def test_userinfo_passwords_redact_across_realistic_lengths(self) -> None:
+        # A swept range rather than the one repro length, so a future bound that merely clears
+        # 258 characters does not pass. 1,365 '%41' groups = 4,095 characters, the widest the
+        # {1,4096} bound admits.
+        for groups in (1, 20, 85, 86, 87, 100, 200, 500, 1_000, 1_365):
+            with self.subTest(groups=groups):
+                text = "https://u:" + "%41" * groups + "@example.com"
+                self.assertEqual(hook.redact(text), self.USERINFO_EXPECTED)
+
+    def test_long_labels_redact_across_realistic_segment_counts(self) -> None:
+        # Same idea for the suffix bound: every count from just-over-the-old-bound up to the new
+        # one must still redact the value.
+        for segments in (8, 9, 10, 16, 32, 48, 63, 64):
+            with self.subTest(segments=segments):
+                text = "api_key" + "_svc" * segments + ": secret-value-123"
+                redacted = hook.redact(text)
+                self.assertNotIn("secret-value-123", redacted)
+                self.assertIn("[REDACTED]", redacted)
+
+    def test_prefix_overflow_never_loses_the_value(self) -> None:
+        # Why the prefix bound stays at 8 while the suffix went to 64: every prefix segment ends
+        # in '[_-]', so the lookbehind admits a start position at every segment boundary and an
+        # over-long run just makes the match start further along. The skipped text is label, and
+        # `keyword_run` is echoed back verbatim, so the output is unchanged. Cost is ~the product
+        # of the two bounds, so widening the prefix would cost as much as the suffix did and buy
+        # no leak coverage at all.
+        for segments in (8, 9, 12, 40, 200):
+            with self.subTest(segments=segments):
+                text = "_".join(["aa"] * segments) + "_key: secret-value-123"
+                redacted = hook.redact(text)
+                self.assertNotIn("secret-value-123", redacted)
+                self.assertIn("[REDACTED]", redacted)
+
+    def test_longest_registered_iana_scheme_still_redacts(self) -> None:
+        # 'microsoft.windows.camera.multipicker' is 36 characters, so it did not fit the old
+        # 32-character scheme ceiling ([a-z] + {0,31}) and its credentials stopped being redacted.
+        text = "microsoft.windows.camera.multipicker://user:pass@example.com"
+        self.assertEqual(hook.redact(text), "microsoft.windows.camera.multipicker://[REDACTED]@example.com")
+
+    def test_widened_bounds_still_scale_linearly_on_the_worst_shape(self) -> None:
+        # The bound's *size* only sets the constant; what fixes the ReDoS is that it is finite.
+        # This is the worst shape found for `_ASSIGNMENT_RE` -- a run of 'key_' makes the keyword
+        # alternation succeed at every offset, so the engine explores the whole
+        # (prefix_count, suffix_count) grid before failing, unlike the cheap 'a-'/'a_' runs the
+        # other tests in this file use. Unbounded (parent of fc39b99705) this same shape measured
+        # 9.2s at 2,000 chars and 71.6s at 4,000 -- super-quadratic. Bounded at 8/64 it is 0.5s at
+        # 8,000 chars and 2.5s at 32,000: 4x the input for ~4x the time, and ~300x faster than
+        # unbounded at 4,000 chars.
+        small, large = "key_" * 2_000, "key_" * 8_000  # 8,000 and 32,000 chars
+        t0 = time.perf_counter()
+        hook.redact(small)
+        small_elapsed = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        hook.redact(large)
+        large_elapsed = time.perf_counter() - t0
+        # 4x the input must not cost ~16x the time. 10x absorbs noise on a loaded machine while
+        # still failing loudly on a return to quadratic behaviour.
+        self.assertLess(
+            large_elapsed,
+            max(small_elapsed * 10, 0.05),
+            f"worst-shape scaling regressed: {small_elapsed:.4f}s -> {large_elapsed:.4f}s",
+        )
+        # Absolute ceiling: the hook's budget in hooks.json is 5 seconds, and this is 32,000
+        # characters of purpose-built input. Catches a bound widened far enough to matter.
+        self.assertLess(
+            large_elapsed,
+            5.0,
+            f"worst-shape absolute cost too high at the widened bound: {large_elapsed:.4f}s",
+        )
+
+    def test_widened_userinfo_bound_does_not_slow_the_pipeline(self) -> None:
+        # The userinfo halves went 255 -> 4096, a 16x wider bound, and it costs nothing measurable:
+        # on this input the cost is dominated by the scheme-tail retry ladder and the halves are
+        # never reached at all. This is the timing check named in the review, at the new bound.
+        text = "a-" * 16_000  # 32,000 chars
+        t0 = time.perf_counter()
+        hook.redact(text)
+        elapsed = time.perf_counter() - t0
+        self.assertLess(elapsed, 1.0, f'redact("a-" * 16000) took {elapsed:.4f}s')
 
 
 if __name__ == "__main__":
