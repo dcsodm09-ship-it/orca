@@ -79,7 +79,13 @@ class FakeOrca:
             handle = args[args.index("--terminal") + 1]
             if not self.close_ok:
                 return {"ok": False, "error": {"code": "close_failed"}}
-            self.terminals.pop(handle, None)
+            victim = self.terminals.pop(handle, None)
+            if "--tab" in args and victim and victim.get("tabId"):
+                # --tab really does take the whole tab down, neighbours included.
+                for other in [
+                    h for h, t in self.terminals.items() if t.get("tabId") == victim["tabId"]
+                ]:
+                    self.terminals.pop(other, None)
             return {"ok": True, "result": {"closed": True}}
         raise AssertionError(f"unexpected orca call: {args}")
 
@@ -388,6 +394,42 @@ def main() -> None:
         check("shared tab closes pane-only", "--tab" in mod.close_args_for("term_shared", "tab-shared"), False)
         check("unknown tab is treated as shared", mod.tab_is_shared("term_x", None), True)
         check("unknown tab closes pane-only", "--tab" in mod.close_args_for("term_x", None), False)
+
+        # An UNREADABLE `terminal list` is not the answer "no sibling in this
+        # tab".  Every one of these shapes used to come back as an empty list,
+        # which reads as a confirmed solo tab and authorises `--tab` -- one
+        # transient CLI hiccup away from closing an innocent neighbour.
+        def unreadable_list(reply):
+            def call(args, timeout=None):
+                if tuple(args[:2]) == ("terminal", "list"):
+                    return reply()
+                return solo(args, timeout)
+            return call
+
+        def boom():
+            raise mod.DispatchError("orca terminal list timed out")
+
+        list_faults = (
+            # timeout / non-JSON / unrunnable CLI: run_orca raises
+            ("raising", unreadable_list(boom)),
+            # a well-formed refusal, which never raised in the first place
+            ("error envelope", unreadable_list(lambda: {"ok": False, "error": {"code": "orca_unavailable"}})),
+            # the known `orca --json` truncation shape: parseable, array missing
+            ("truncated payload", unreadable_list(lambda: {"ok": True, "result": {}})),
+        )
+        for label, faulty in list_faults:
+            mod.run_orca = faulty
+            try:
+                mod.terminal_list()
+                failures.append(f"terminal_list: expected {label} to propagate, got a list")
+            except mod.DispatchError:
+                pass
+            check(f"unreadable list ({label}) counts as shared", mod.tab_is_shared("term_solo", "tab-solo"), True)
+            check(
+                f"unreadable list ({label}) closes pane-only",
+                "--tab" in mod.close_args_for("term_solo", "tab-solo"),
+                False,
+            )
         mod.run_orca = fake
 
         # ------------------------------------------------------------------ close
@@ -602,6 +644,34 @@ def main() -> None:
         )
         mod.terminal_show = original_terminal_show
 
+        # The whole reason the tab check exists, end to end through the armed
+        # reaper: a registered dispatch that Orca placed as a split pane beside
+        # an UNREGISTERED session, reaped at the exact moment `terminal list`
+        # is unavailable.  The reap may proceed, but only pane-only -- the
+        # neighbour is not ours and must still be there afterwards.
+        reap_fake.terminals["term_leak"] = leak
+        reap_fake.terminals["term_bystander"] = {
+            "handle": "term_bystander", "ptyId": "pb", "incarnationId": "ib",
+            "tabId": "tl", "leafId": "lb", "title": "somebody else's session",
+            "lastOutputAt": 1,
+        }
+        mod.private_json_write(mod.REGISTRY_PATH, reap_registry)
+
+        def list_down(args, timeout=None):
+            if tuple(args[:2]) == ("terminal", "list"):
+                raise mod.DispatchError("orca terminal list timed out")
+            return reap_fake(args, timeout)
+
+        mod.run_orca = list_down
+        blind = mod.command_reap(FakeArgs(dry_run=False, idle_seconds=None, quiet=False))
+        check("reap still handles the leak when the tab check is blind", [r["action"] for r in blind["results"]], ["closed"])
+        last_close = [c for c in reap_fake.calls if tuple(c[:2]) == ("terminal", "close")][-1]
+        check("blind tab check never asks for --tab", "--tab" in last_close, False)
+        check("blind tab check spared the unregistered neighbour", "term_bystander" in reap_fake.terminals, True)
+        check("blind tab check still closed our own pane", "term_leak" in reap_fake.terminals, False)
+        mod.run_orca = reap_fake
+        reap_fake.terminals.pop("term_bystander", None)
+
         # ----------------------------------------------- stale-handle cross-check
         cross = FakeOrca(terminals=[])
         cross.terminals["term_ghost"] = {"handle": "term_ghost"}
@@ -619,6 +689,17 @@ def main() -> None:
         state, live = mod.terminal_show("term_really_gone")
         check("genuinely absent handle stays stale", state, "stale")
         check("genuinely absent handle has no record", live, None)
+
+        # The cross-check is corroboration, not a gate: when the list is also
+        # unreadable the stale answer stands rather than raising, and "stale"
+        # only ever drops a registry entry -- it closes nothing.
+        def both_down(args, timeout=None):
+            if tuple(args[:2]) == ("terminal", "list"):
+                raise mod.DispatchError("orca terminal list timed out")
+            return show_lies(args, timeout)
+
+        mod.run_orca = both_down
+        check("unreadable cross-check leaves the stale verdict", mod.terminal_show("term_ghost"), ("stale", None))
 
         mod.run_orca = original_run_orca
 

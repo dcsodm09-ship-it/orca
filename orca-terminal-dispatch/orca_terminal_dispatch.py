@@ -287,20 +287,37 @@ def terminal_show(handle: str) -> tuple[str, dict | None]:
         if isinstance(terminal, dict):
             return "found", terminal
         return "stale", None
-    for listed in terminal_list():
+    try:
+        listed_terminals = terminal_list()
+    except DispatchError:
+        # The cross-check is corroboration only.  When it cannot be run, the
+        # stale answer stands -- which drops a registry entry and closes
+        # nothing, so an unanswerable list still resolves non-destructively.
+        listed_terminals = []
+    for listed in listed_terminals:
         if listed.get("handle") == handle:
             return "stale-but-listed", listed
     return "stale", None
 
 
 def terminal_list() -> list:
-    try:
-        envelope = run_orca(["terminal", "list", "--json"])
-    except DispatchError:
-        return []
+    """Every live terminal Orca reports, or DispatchError when it will not say.
+
+    The failure is deliberately not swallowed here.  An empty list has to mean
+    "Orca positively answered: there is nothing else out there", and a timeout,
+    a truncated payload or an `ok: false` envelope turned into `[]` reads as
+    exactly that confirmation -- which is how `tab_is_shared` would clear a
+    whole-tab close on a tab it never actually managed to inspect.  Each caller
+    decides what "unknown" means for it; both resolve it away from closing.
+    """
+    envelope = run_orca(["terminal", "list", "--json"])
+    if not envelope.get("ok"):
+        raise DispatchError(f"orca terminal list failed: {envelope_error_code(envelope)}")
     result = envelope.get("result")
     terminals = result.get("terminals") if isinstance(result, dict) else None
-    return [t for t in terminals if isinstance(t, dict)] if isinstance(terminals, list) else []
+    if not isinstance(terminals, list):
+        raise DispatchError("orca terminal list returned no terminal array")
+    return [t for t in terminals if isinstance(t, dict)]
 
 
 def tab_is_shared(handle: str, tab_id: str | None) -> bool:
@@ -310,10 +327,22 @@ def tab_is_shared(handle: str, tab_id: str | None) -> bool:
     tab, but if Orca ever placed one as a split pane beside somebody else's
     session, closing the tab would take that session down too.  When the tab is
     not provably ours alone the close degrades to pane-only.
+
+    "Not provably ours alone" includes not being able to ask.  A missing tabId
+    already resolves that way, and a `terminal list` that timed out or answered
+    with an error is the same kind of ambiguity: it is the absence of an answer,
+    never the answer "no sibling".  Treating that silence as a confirmed solo
+    tab is what would let one transient CLI hiccup close somebody else's
+    session, so an unreadable list degrades the close to pane-only too.
     """
     if not tab_id:
         return True
-    for listed in terminal_list():
+    try:
+        listed_terminals = terminal_list()
+    except DispatchError as exc:
+        log_event(f"tab check for {handle} failed ({exc}); closing pane-only, not the tab")
+        return True
+    for listed in listed_terminals:
         if listed.get("handle") != handle and listed.get("tabId") == tab_id:
             return True
     return False
