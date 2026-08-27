@@ -27,20 +27,32 @@ panel's own explicit "out of scope" list), not an oversight: no background
 daemon, no worker-side `orca` PATH shim, no coverage for human-UI dispatches
 are built here.
 
-DETECTION -- TEXT-SUBSTRING ONLY, NOT FIELD-PATH BASED
+DETECTION -- TEXT-SUBSTRING, BUT NEVER OVER CALLER-ECHOED FIELDS
 ------------------------------------------------------------------
 We have no captured ground-truth JSON from a real occurrence of this bug on
 this machine's current Orca version. Rather than guess at an exact field
 path (which could easily be wrong and silently fail to detect the very bug
-this tool exists to catch), detection searches the raw combined stdout+stderr
-text for the literal substrings `"agent_prompt_stalled"` (the false-positive
-stall signature) and `"dispatch_capability_invalid"` / `"capability is
-revoked"` (the downstream capability-revocation symptom). `stage`/
-`failedStage` ARE named in the real `orca` CLI's own `--help` text, so when
-present in a parsed JSON body they are captured and surfaced as diagnostics
-(see `extract_stage_diagnostics()`) -- but detection itself never requires
-them to hold any particular value, since that value has not been confirmed
-against a real occurrence.
+this tool exists to catch), detection searches the stdout/stderr text for the
+literal substrings `"agent_prompt_stalled"` (the false-positive stall
+signature) and `"dispatch_capability_invalid"` / `"capability is revoked"`
+(the downstream capability-revocation symptom). `stage`/`failedStage` ARE
+named in the real `orca` CLI's own `--help` text, so when present in a parsed
+JSON body they are captured and surfaced as diagnostics (see
+`extract_stage_diagnostics()`) -- but detection itself never requires them to
+hold any particular value, since that value has not been confirmed against a
+real occurrence.
+
+Structure IS used for one thing: deciding what NOT to search. When a stream
+parses as JSON, every caller-supplied echoed-text field in it (`spec`,
+`taskSpec`, `title`, `objective`, ... -- see `_ECHOED_CALLER_TEXT_FIELDS`) is
+stripped before the substring search runs. Dispatch specs written in this
+project routinely quote these very phrases (a task whose whole job is
+"investigate the agent_prompt_stalled false positive"), so a worker-start
+failing for an unrelated reason, with an error body echoing the submitted
+spec, used to be misclassified as the stall -- and `_do_start()` would then
+"recover" it into a real duplicate task + dispatch. See
+`is_stalled_false_positive()` for why the reverse (gating on `failedStage`'s
+VALUE) is deliberately not done.
 
 Similarly, this module has no confirmed field name for "the dispatch id"
 inside `worker-start`'s own JSON response for the SPECIFIC agent_prompt_stalled
@@ -189,13 +201,122 @@ EXIT_GAVE_UP = 4  # remount_count already at MAX_REMOUNT_COUNT: refused to
 # ---------------------------------------------------------------------------
 
 
+STALL_SIGNATURES = ("agent_prompt_stalled",)
+CAPABILITY_REVOKED_SIGNATURES = ("dispatch_capability_invalid", "capability is revoked")
+
+# Field names whose values are CALLER-SUPPLIED text that the `orca` CLI
+# echoes back verbatim in its own JSON bodies -- a task's spec, its title,
+# a run objective. Names are matched normalized (lowercased, "_"/"-"
+# stripped), so `taskSpec`, `task_spec` and `TASK-SPEC` all match one entry.
+#
+# Detection must never search these: dispatch specs written by this very
+# project routinely quote the literal strings below (e.g. a task whose whole
+# job is "investigate the agent_prompt_stalled false positive"), so a
+# worker-start that fails for a COMPLETELY unrelated reason -- with an error
+# body that happens to echo the submitted spec back -- would otherwise be
+# misread as the false-positive stall this module exists to detect, and
+# `_do_start()` would "recover" it by creating a task and dispatching for
+# real. That is a duplicate real dispatch caused purely by a caller's own
+# choice of words, which is why this exclusion matters more here than in the
+# read-side matching helpers.
+#
+# Deliberately conservative membership: only fields confirmed to carry
+# caller-authored text in the real task shape (`orchestration task-list
+# --json` -> `result.tasks[]` has `spec`, `task_title`, `display_name`) plus
+# their obvious spelling variants. CLI-authored fields (`code`, `message`,
+# `reason`, `stage`, `failedStage`, ...) are all still searched.
+_ECHOED_CALLER_TEXT_FIELDS = frozenset(
+    {
+        "spec",
+        "taskspec",
+        "specification",
+        "prompt",
+        "prompttext",
+        "preamble",
+        "instruction",
+        "instructions",
+        "title",
+        "tasktitle",
+        "displayname",
+        "objective",
+    }
+)
+
+
+def _normalize_field_name(name: str) -> str:
+    return name.replace("_", "").replace("-", "").lower()
+
+
+def _strip_echoed_caller_text(value: Any) -> Any:
+    """Recursively drop every `_ECHOED_CALLER_TEXT_FIELDS` key from a parsed
+    JSON value. String values that are themselves JSON-encoded objects/arrays
+    are decoded, stripped and re-encoded -- the `payload` field of a real
+    message arrives in exactly that shape (see
+    `_extract_dispatch_id_from_worker_done`), so a spec echoed one level
+    deeper inside it must be excluded too."""
+    if isinstance(value, dict):
+        return {
+            key: _strip_echoed_caller_text(item)
+            for key, item in value.items()
+            if not (isinstance(key, str) and _normalize_field_name(key) in _ECHOED_CALLER_TEXT_FIELDS)
+        }
+    if isinstance(value, list):
+        return [_strip_echoed_caller_text(item) for item in value]
+    if isinstance(value, str):
+        nested = _parse_json_value_loose(value)
+        if isinstance(nested, (dict, list)):
+            return json.dumps(_strip_echoed_caller_text(nested), ensure_ascii=False)
+    return value
+
+
+def _cli_authored_text(raw: str | None) -> str:
+    """`raw` reduced to the parts the CLI itself authored: when `raw` parses
+    as a JSON object/array, its caller-echoed text fields are stripped and it
+    is re-serialized; otherwise `raw` is returned unchanged.
+
+    KNOWN RESIDUAL LIMITATION: a non-JSON stderr line that interpolates a
+    caller's spec into free text ("failed to start task with spec: ...")
+    offers no structure to strip, so it is still searched whole. That is
+    narrower than the previous behaviour (which searched caller text even
+    when it WAS cleanly separated into its own JSON field) but not zero."""
+    if not raw:
+        return ""
+    parsed = _parse_json_value_loose(raw)
+    if not isinstance(parsed, (dict, list)):
+        return raw
+    return json.dumps(_strip_echoed_caller_text(parsed), ensure_ascii=False)
+
+
+def _signature_present(raw_stdout: str | None, raw_stderr: str | None, signatures: tuple[str, ...]) -> bool:
+    """True iff any signature appears in the CLI-authored part of either
+    stream. Each stream is examined separately (rather than concatenated as
+    before) because each is independently either a JSON body to strip or
+    free text -- no signature spans the boundary between them."""
+    for raw in (raw_stdout, raw_stderr):
+        text = _cli_authored_text(raw)
+        if any(signature in text for signature in signatures):
+            return True
+    return False
+
+
 def is_stalled_false_positive(raw_stdout: str, raw_stderr: str, exit_code: int) -> bool:
-    """True iff the combined stdout+stderr text contains the literal
-    substring "agent_prompt_stalled". This is the ONLY signal available at
-    submission time per the design -- we deliberately do NOT require
-    `failedStage` to equal any particular string, since its exact value has
-    not been confirmed against a real occurrence of this bug on this
-    machine.
+    """True iff the CLI-authored part of stdout/stderr contains the literal
+    substring "agent_prompt_stalled" -- i.e. the same substring search as
+    before, but with caller-echoed text fields (`spec`/`taskSpec`/`title`/
+    ..., see `_ECHOED_CALLER_TEXT_FIELDS`) excluded from what is searched, so
+    a task whose OWN description merely mentions the phrase can no longer
+    trigger a recovery (and therefore a duplicate real dispatch).
+
+    We deliberately still do NOT require `stage`/`failedStage` to EQUAL any
+    particular string. Those fields are captured for diagnostics
+    (`extract_stage_diagnostics()`), but using their value as the gate --
+    "stalled iff failedStage == 'agent_prompt_stalled'" -- would be a guess:
+    no ground-truth body from a real occurrence of this bug has been captured
+    on this machine, and a real occurrence reporting the signature in
+    `message` while `failedStage` says something coarser (e.g. "settle")
+    would then go undetected. Missing the bug is the worse failure of the
+    two, so structure is used to decide WHERE to search, never to veto a
+    signature the CLI did emit.
 
     `exit_code` gates the match to a non-zero exit: a successful
     `worker-start` (exit 0) reporting this substring somewhere in its own
@@ -210,17 +331,19 @@ def is_stalled_false_positive(raw_stdout: str, raw_stderr: str, exit_code: int) 
     """
     if exit_code == 0:
         return False
-    combined = (raw_stdout or "") + (raw_stderr or "")
-    return "agent_prompt_stalled" in combined
+    return _signature_present(raw_stdout, raw_stderr, STALL_SIGNATURES)
 
 
 def is_capability_revoked_failure(raw_stdout: str, raw_stderr: str) -> bool:
-    """True iff the combined text contains the literal substring
-    "dispatch_capability_invalid" or "capability is revoked" -- the
+    """True iff the CLI-authored part of stdout/stderr contains the literal
+    substring "dispatch_capability_invalid" or "capability is revoked" -- the
     downstream symptom of a worker's real, eventual `worker_done` being
-    rejected because this exact race already burned its capability token."""
-    combined = (raw_stdout or "") + (raw_stderr or "")
-    return "dispatch_capability_invalid" in combined or "capability is revoked" in combined
+    rejected because this exact race already burned its capability token.
+
+    Same caller-echo exclusion as `is_stalled_false_positive()` above, for
+    the same reason: a message that merely quotes a spec naming these
+    phrases is not itself a revocation."""
+    return _signature_present(raw_stdout, raw_stderr, CAPABILITY_REVOKED_SIGNATURES)
 
 
 def _is_wrapped_envelope(parsed: dict[str, Any]) -> bool:
@@ -368,13 +491,21 @@ def extract_delivery_id(parsed: dict[str, Any] | None) -> str | None:
     return None
 
 
-def _parse_json_loose(text: str | None) -> dict[str, Any] | None:
+def _parse_json_value_loose(text: str | None) -> Any:
+    """Parse `text` as JSON, returning None instead of raising on anything
+    that is not valid JSON. Unlike `_parse_json_loose()` below, ANY JSON
+    value is returned (a list, a bare string, a number), not just an object
+    -- the caller decides what shapes it accepts."""
     if not text:
         return None
     try:
-        obj = json.loads(text)
+        return json.loads(text)
     except (json.JSONDecodeError, TypeError, ValueError):
         return None
+
+
+def _parse_json_loose(text: str | None) -> dict[str, Any] | None:
+    obj = _parse_json_value_loose(text)
     return obj if isinstance(obj, dict) else None
 
 
@@ -890,7 +1021,9 @@ def _find_capability_revoked_hit(parsed: dict[str, Any] | None, watched_ids: set
 
     The signature itself (`is_capability_revoked_failure`) is still a text
     search -- there is no confirmed field name for "this message reports a
-    revoked capability" to key off instead. But WHICH dispatch id it names is
+    revoked capability" to key off instead -- though it no longer searches
+    caller-echoed text fields, so a message merely quoting a spec that names
+    the phrase is not a hit. But WHICH dispatch id it names is
     resolved via the same structured-field extraction as the worker_done
     sibling below (`_extract_dispatch_id_from_worker_done`), not a substring
     scan of the serialized message: this symptom is documented as the

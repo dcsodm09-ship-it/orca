@@ -228,6 +228,99 @@ class DetectionFunctionTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Detection must never match on CALLER-ECHOED text. Regression tests for the
+# confirmed P2: dispatch specs in this project routinely quote these exact
+# phrases (this very audit's tasks did), so an unrelated failure whose error
+# body echoes the submitted spec back used to be misread as the stall/
+# revocation signature -- which for `is_stalled_false_positive()` triggers a
+# real recovery (new task + worker-start), i.e. a duplicate real dispatch.
+# ---------------------------------------------------------------------------
+
+
+class DetectionCallerEchoTests(unittest.TestCase):
+    def test_stalled_false_positive_ignores_task_spec_echo_when_failed_stage_differs(self) -> None:
+        # The exact confirmed repro: an unrelated failure (`terminal_busy`),
+        # with a structured failedStage that is something else entirely, whose
+        # body merely echoes back a task spec that NAMES the phrase.
+        body = json.dumps(
+            {
+                "id": "rpc-tracking-id",
+                "ok": False,
+                "error": {
+                    "code": "terminal_busy",
+                    "failedStage": "submit",
+                    "message": "terminal is busy",
+                    "taskSpec": "Investigate the agent_prompt_stalled false positive and report",
+                },
+                "_meta": {"runtimeId": "rt-1"},
+            }
+        )
+        self.assertFalse(
+            dg.is_stalled_false_positive(body, "", 1),
+            "a caller's own spec text naming the phrase must never trigger recovery",
+        )
+
+    def test_capability_revoked_ignores_spec_echo_when_failed_stage_differs(self) -> None:
+        body = json.dumps(
+            {
+                "ok": False,
+                "error": {
+                    "code": "some_unrelated_problem",
+                    "failedStage": "submit",
+                    "spec": "docs mention dispatch_capability_invalid",
+                },
+            }
+        )
+        self.assertFalse(dg.is_capability_revoked_failure(body, ""))
+
+    def test_echoed_field_variants_and_nested_json_encoded_payload_are_all_excluded(self) -> None:
+        # Name normalization (camelCase / snake_case / SCREAMING) and the
+        # JSON-encoded-string `payload` shape a real message uses.
+        for field in ("spec", "taskSpec", "task_spec", "TASK-SPEC", "prompt", "task_title", "displayName", "objective"):
+            with self.subTest(field=field):
+                body = json.dumps({"ok": False, "error": {"code": "boom", field: "about agent_prompt_stalled"}})
+                self.assertFalse(dg.is_stalled_false_positive(body, "", 1))
+        nested = json.dumps(
+            {"ok": False, "error": {"code": "boom", "payload": json.dumps({"spec": "about agent_prompt_stalled"})}}
+        )
+        self.assertFalse(dg.is_stalled_false_positive(nested, "", 1))
+
+    def test_cli_authored_fields_alongside_an_echoed_spec_still_detect(self) -> None:
+        # The exclusion must not blind detection: the same body that echoes a
+        # spec ALSO carries the signature in a CLI-authored field, so this is
+        # a genuine occurrence and must still be caught.
+        body = json.dumps(
+            {
+                "ok": False,
+                "error": {
+                    "code": "agent_prompt_stalled",
+                    "message": "agent_prompt_stalled: worker prompt did not settle",
+                    "taskSpec": "some unrelated task text",
+                },
+            }
+        )
+        self.assertTrue(dg.is_stalled_false_positive(body, "", 1))
+
+    def test_non_json_free_text_is_still_searched_whole(self) -> None:
+        # Documented residual limitation: free text offers no structure to
+        # strip, so it is searched as-is (unchanged from before this fix).
+        self.assertTrue(dg.is_stalled_false_positive("", "worker-start failed: agent_prompt_stalled", 1))
+
+    def test_capability_revoked_hit_ignores_a_message_whose_spec_merely_quotes_the_phrase(self) -> None:
+        # End-to-end through the read-side helper: a real worker_done for a
+        # watched id whose echoed spec names the phrase is NOT a revocation.
+        message = {
+            "id": "msg-echo",
+            "type": "worker_done",
+            "payload": json.dumps(
+                {"dispatchId": "d-echo", "spec": "fix the dispatch_capability_invalid handling"}
+            ),
+        }
+        parsed = json.loads(ok_envelope({"messages": [message]}))
+        self.assertIsNone(dg._find_capability_revoked_hit(parsed, {"d-echo"}))
+
+
+# ---------------------------------------------------------------------------
 # Extraction against the REAL nested envelope shape -- this is the class of
 # bug the previous round shipped: every helper below reads keys off the bare
 # top level while every real `orca ... --json` response wraps its payload
