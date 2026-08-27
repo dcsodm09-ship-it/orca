@@ -2144,5 +2144,143 @@ class DiskVolumeUuidPerCallerTimeoutTests(unittest.TestCase):
         self.assertIn("detail", context)
 
 
+class RedactQuantifierBoundTests(unittest.TestCase):
+    """ReDoS regression pins for the three quantifier bounds added 2026-08-28.
+
+    Each pattern below previously carried an unbounded quantifier over a character class that
+    excludes the literal the quantifier must eventually reach ('://', '@', '.'). On input that
+    never reaches that literal the engine ate the whole run and then gave it back one character
+    at a time, at O(n) starting offsets -- quadratic. Measured against `"a-" * n` on the pre-fix
+    definitions of these same patterns:
+
+        pattern             8,000 chars   32,000 chars   growth per doubling
+        _ASSIGNMENT_RE          1.18s        32.10s           x6.9
+        _EMAIL_RE               0.12s         2.16s           x4.3
+        _URL_USERINFO_RE        0.14s         1.93s           x3.8
+
+    `redact()` runs on *untruncated* block text (see `split_blocks`, which deliberately redacts
+    before slicing to 4,000 chars so a long PEM body is not cut in half), and the hook's budget in
+    hooks.json is 5 seconds -- so `_ASSIGNMENT_RE` alone blew that budget on roughly 11,000
+    characters of ordinary dash-separated prose.
+    """
+
+    # 4x apart, so a quadratic regression shows up as ~16x and cannot hide inside timing noise.
+    ADVERSARIAL_SMALL = "a-" * 4_000  # 8,000 chars
+    ADVERSARIAL_LARGE = "a-" * 16_000  # 32,000 chars
+
+    @staticmethod
+    def _timed(call, text: str) -> float:
+        start = time.perf_counter()
+        call(text)
+        return time.perf_counter() - start
+
+    def _assert_near_linear(self, call, name: str, *, ceiling: float = 1.0) -> None:
+        small = self._timed(call, self.ADVERSARIAL_SMALL)
+        large = self._timed(call, self.ADVERSARIAL_LARGE)
+        # The ratio is the real property: 4x the input must not cost ~16x the time. The 10x
+        # allowance (rather than 4x) absorbs scheduling noise on a loaded machine while still
+        # failing loudly on a genuine quadratic regression. The absolute ceiling catches a
+        # regression that keeps a flat ratio while being slow in absolute terms.
+        self.assertLess(
+            large,
+            max(small * 10, 0.05),
+            f"{name} scaled worse than near-linearly: {small:.4f}s -> {large:.4f}s",
+        )
+        self.assertLess(
+            large,
+            ceiling,
+            f"{name} stalled on 32,000 chars of adversarial input: {large:.4f}s",
+        )
+
+    def test_url_userinfo_quantifiers_are_bounded(self) -> None:
+        pattern = hook._URL_USERINFO_RE.pattern
+        self.assertIn("[a-z0-9+.-]{0,31}", pattern)
+        self.assertIn(r"[^\s/@:]{1,255}", pattern)
+        self.assertIn(r"[^\s/@]{1,255}", pattern)
+        self.assertNotIn("[a-z0-9+.-]*", pattern)
+
+    def test_email_quantifiers_are_bounded(self) -> None:
+        pattern = hook._EMAIL_RE.pattern
+        # RFC 5321: local part <= 64 octets, domain <= 253. Longest IANA root TLD is 24 chars.
+        self.assertIn("[A-Z0-9._%+-]{1,64}", pattern)
+        self.assertIn("[A-Z0-9.-]{1,253}", pattern)
+        self.assertIn("[A-Z]{2,24}", pattern)
+        self.assertNotIn("[A-Z0-9._%+-]+", pattern)
+
+    def test_assignment_keyword_run_segments_are_bounded(self) -> None:
+        pattern = hook._ASSIGNMENT_RE.pattern
+        self.assertIn("(?:[A-Za-z][A-Za-z0-9]*[_-]){0,8}", pattern)
+        self.assertIn("(?:[_-][A-Za-z0-9]+){0,8}", pattern)
+        self.assertNotIn("(?:[A-Za-z][A-Za-z0-9]*[_-])*", pattern)
+        self.assertNotIn("(?:[_-][A-Za-z0-9]+)*", pattern)
+
+    def test_url_userinfo_pattern_scales_near_linearly(self) -> None:
+        self._assert_near_linear(
+            lambda text: hook._URL_USERINFO_RE.sub("X", text), "_URL_USERINFO_RE"
+        )
+
+    def test_email_pattern_scales_near_linearly(self) -> None:
+        self._assert_near_linear(lambda text: hook._EMAIL_RE.sub("X", text), "_EMAIL_RE")
+
+    def test_assignment_pattern_scales_near_linearly(self) -> None:
+        self._assert_near_linear(
+            lambda text: hook._ASSIGNMENT_RE.sub("X", text), "_ASSIGNMENT_RE"
+        )
+
+    def test_assignment_pattern_scales_near_linearly_on_underscore_runs(self) -> None:
+        # `_ASSIGNMENT_RE`'s keyword-run segments accept '_' as well as '-', and an underscore run
+        # was measurably the worse of the two before the bound (3.70s at 8,000 chars vs 1.18s for
+        # the dash run), so it gets its own pin rather than riding on the shared dash fixture.
+        small, large = "a_" * 4_000, "a_" * 16_000
+        small_elapsed = self._timed(lambda t: hook._ASSIGNMENT_RE.sub("X", t), small)
+        large_elapsed = self._timed(lambda t: hook._ASSIGNMENT_RE.sub("X", t), large)
+        self.assertLess(large_elapsed, max(small_elapsed * 10, 0.05))
+        self.assertLess(large_elapsed, 1.0)
+
+    def test_full_redact_pipeline_scales_near_linearly_on_adversarial_dash_heavy_input(
+        self,
+    ) -> None:
+        # The whole pipeline, not one pattern in isolation -- this is what `split_blocks()` calls
+        # on untruncated block text. Pre-fix, `redact("a-" * 8000)` measured 2.52s here.
+        self._assert_near_linear(hook.redact, "redact()", ceiling=2.0)
+
+    def test_bounds_do_not_narrow_redaction_of_realistic_values(self) -> None:
+        # Every bound sits far above what a real URL/address/identifier uses, so nothing that was
+        # redacted before the bound stops being redacted now. Each case is a full-pipeline check.
+        cases = {
+            "url": "https://user:pass@example.com/path",
+            "url_compound_scheme": "git+ssh://user:tok@github.com/o/r",
+            "url_scheme_tail_at_bound": "a" * 31 + "://u:p@h",
+            "email": "contact alice@example.com now",
+            "email_local_part_at_rfc_limit": "x" * 64 + "@example.com",
+            "email_long_domain": "u@" + "d" * 60 + "." + "e" * 60 + ".com",
+            "email_tld_at_iana_limit": "u@example." + "t" * 24,
+            "assignment": "password: hunter2secret",
+            "assignment_suffix_at_bound": "key" + "_zz" * 8 + ": value123",
+            "assignment_prefix_at_bound": "_".join(["aa"] * 8) + "_key: value123",
+            # Past the prefix bound the run simply matches starting further along, so the value is
+            # still redacted -- only the leading label text falls outside the match.
+            "assignment_prefix_past_bound": "_".join(["aa"] * 12) + "_key: value123",
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                redacted = hook.redact(text)
+                self.assertNotEqual(redacted, text, f"{name} stopped being redacted")
+                self.assertIn("[REDACTED", redacted)
+
+    def test_known_accepted_narrowing_is_limited_to_absurd_suffix_runs(self) -> None:
+        # Documented, accepted cost of the `{0,8}` suffix bound: a secret label carrying more than
+        # eight '[_-]'-separated *suffix* segments no longer matches at all. Nothing shaped like a
+        # real identifier reaches that, and the alternative is a pattern that stalls the hook past
+        # its own 5s budget on ~11,000 characters. This pin exists so the boundary is a decision
+        # someone made rather than a surprise: eight segments must keep working.
+        at_bound = "key" + "_zz" * 8 + ": value123"
+        self.assertIn("[REDACTED", hook.redact(at_bound))
+        # And the ordinary shapes this pattern actually exists for are unaffected.
+        for text in ("api_key: abc123", "db_password = s3cr3t", "AWS_SECRET_ACCESS_KEY=wJalrXU"):
+            with self.subTest(text=text):
+                self.assertIn("[REDACTED", hook.redact(text))
+
+
 if __name__ == "__main__":
     unittest.main()

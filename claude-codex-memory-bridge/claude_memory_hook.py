@@ -962,7 +962,21 @@ _PEM_RE = re.compile(
 # observable through `redact()` today. Fixed with the same `(?<!(?-i:[A-Za-z0-9_]))` idiom as
 # `_BEARER_RE` anyway, for consistency: the "accidentally immune" property is a coincidence of this
 # pattern's shape, not something a future edit to it (or a copy of it) can rely on.
-_URL_USERINFO_RE = re.compile(r"(?i)(?<!(?-i:[A-Za-z0-9_]))([a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@")
+#
+# ReDoS bound (2026-08-28): all three quantifiers here were previously unbounded (`*`, `+`, `+`)
+# over character classes that exclude the literal each one must eventually reach (`://`, `:`, `@`).
+# On a long run of scheme-tail- or userinfo-shaped characters that never reaches that literal, each
+# quantifier greedily eats the whole remaining run and then gives one character back at a time
+# hunting for it -- O(n) wasted work per start position, and the lookbehind admits O(n) start
+# positions, so `redact()` went quadratic. Measured on this file before the bound, against
+# `"a-" * n`: 4,000 chars 0.03s, 32,000 chars 1.93s (x3.8 per doubling). Bounded, the same input is
+# 0.005s and scales linearly. The bounds are deliberately far above anything real: 31 characters of
+# scheme tail (the longest IANA-registered scheme is well under half that) and 255 characters for
+# each userinfo half. A URL past those bounds is no longer redacted -- accepted, because the
+# alternative is a pattern that blows the hook's own 5s budget on ~11,000 characters of input.
+_URL_USERINFO_RE = re.compile(
+    r"(?i)(?<!(?-i:[A-Za-z0-9_]))([a-z][a-z0-9+.-]{0,31}://)[^\s/@:]{1,255}:[^\s/@]{1,255}@"
+)
 # `_BEARER_RE`'s CJK-adjacency fix above (`(?<![A-Za-z0-9_])` in place of `\b`) has its own,
 # narrower bug: this pattern also carries `(?i)`, and IGNORECASE applies to *every* character
 # class in the compiled pattern, including the lookbehind's -- not just the literal "Bearer" text
@@ -1126,11 +1140,26 @@ _REDACTED_PLACEHOLDER_PATTERN = r"\[REDACTED[A-Z_]*\]"
 # real bracket-bearing secret can never grow an extra `[[REDACTED]]` wrapper. ','/';'/'"'/'&' stay
 # excluded -- those four are the ones the P2 comment above actually depends on (JSON/array
 # delimiters and the query-string '&key=value' boundary), and are unaffected by this change.
+#
+# ReDoS bound (2026-08-28): `keyword_run`'s two segment repeats were `*` (unbounded). Both repeat a
+# group that itself contains an unbounded quantifier over an overlapping class, so a run of
+# `<alnum><sep>` pairs that never reaches a keyword literal can be partitioned into segments an
+# exponential-in-shape number of ways, and the engine tries them at every one of O(n) start
+# positions. This was the dominant term in the measured ReDoS: against `"a-" * n` this pattern alone
+# took 0.29s at 4,000 chars and 32.1s at 32,000 chars (x6.9 per doubling) -- on its own past the
+# hook's 5s budget at roughly 11,000 characters, and `redact()` is called on untruncated block text
+# (see `split_blocks`), so that input size is reachable. With both repeats bounded to 8 segments the
+# same input takes 0.02s and scales linearly (x2.0 per doubling, verified to 256,000 chars). Any
+# finite bound restores linearity and cost grows linearly with the bound; 8 is the tightest value
+# that still covers every realistic identifier shape. Known, accepted narrowing: a label with more
+# than 8 `[_-]`-separated *suffix* segments (e.g. `key_a_b_c_d_e_f_g_h_i: <value>`) no longer
+# matches at all. A label with more than 8 *prefix* segments still matches, just starting later in
+# the run, so its value is still redacted.
 _ASSIGNMENT_RE = re.compile(
     r"(?i)(?<!(?-i:[A-Za-z0-9]))"
-    r"(?P<keyword_run>(?:[A-Za-z][A-Za-z0-9]*[_-])*"
+    r"(?P<keyword_run>(?:[A-Za-z][A-Za-z0-9]*[_-]){0,8}"
     r"(?:password|passwd|pwd|secret|token|signature|key|api[_-]?key|private[_-]?key|[A-Za-z0-9]+[_-]key)"
-    r"(?:[_-][A-Za-z0-9]+)*)"
+    r"(?:[_-][A-Za-z0-9]+){0,8})"
     r'(?P<preq>"?)'
     r"(?P<sep>\s*[:：=＝]\s*)"
     r'(?P<preval>"?)'
@@ -1908,8 +1937,17 @@ _MAC_ADDRESS_RE = re.compile(
 # *every* possible match boundary fails and the whole address leaks unredacted. Fixed with the same
 # `(?<!(?-i:[A-Za-z0-9_]))`/`(?!(?-i:[A-Za-z0-9_]))` idiom as `_BEARER_RE`, moving `IGNORECASE` to an
 # inline `(?i)` so it can be locally negated at the two boundary points.
+#
+# ReDoS bound (2026-08-28): the local-part `+`, the domain `+` and the TLD `{2,}` were all
+# unbounded, and the first two must reach a literal (`@`, `.`) their own class excludes -- the same
+# greedy-eat-then-give-back-one-character-at-a-time shape as `_URL_USERINFO_RE` above, at O(n) start
+# positions. Measured before the bound against `"a-" * n`: 0.03s at 4,000 chars, 2.16s at 32,000
+# chars (x4.3 per doubling); bounded, 0.009s and linear. Every bound here is the real protocol
+# limit, so no deliverable address is lost: RFC 5321 caps the local part at 64 octets and the domain
+# at 253, and the longest TLD in the IANA root is 24 characters.
 _EMAIL_RE = re.compile(
-    r"(?i)(?<!(?-i:[A-Za-z0-9_]))[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?!(?-i:[A-Za-z0-9_]))"
+    r"(?i)(?<!(?-i:[A-Za-z0-9_]))[A-Z0-9._%+-]{1,64}@[A-Z0-9.-]{1,253}\.[A-Z]{2,24}"
+    r"(?!(?-i:[A-Za-z0-9_]))"
 )
 _LONG_BLOB_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9+/=_-]{48,}(?![A-Za-z0-9])")
 _HOME_RE = re.compile(r"/Users/[^/\s]+")
