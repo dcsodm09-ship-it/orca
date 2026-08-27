@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.local.orca-terminal-dispatch-reaper</string>
+
+	<!-- Backstop for CLAUDE.md rule 1: closes terminals that `orca-terminal-dispatch
+	     create` registered and nobody ever closed. It can only ever touch handles
+	     present in its own 0600 registry, and re-verifies handle+ptyId+
+	     incarnationId+tabId+leafId plus the per-dispatch title marker before
+	     closing anything. Unregistered interactive sessions are invisible to it.
+
+	     Both paths below MUST resolve to internal storage. The Ego reaper this
+	     mirrors was silently dead for ~2 weeks because its script lived under
+	     ~/.agents, which resolves onto /Volumes/Extreme SSD, and macOS TCC denies
+	     a launchd job "Files on Removable Volumes" (Errno 1, Operation not
+	     permitted, 21,380 times). `orca-terminal-dispatch doctor` checks for
+	     exactly that regression. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>__PYTHON__</string>
+		<string>__SCRIPT__</string>
+		<string>reap</string>
+		<string>--quiet</string>
+__EXTRA_ARGS__	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>ORCA_TERMINAL_DISPATCH_IDLE_SECONDS</key>
+		<string>600</string>
+	</dict>
+
+	<key>StartInterval</key>
+	<integer>60</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Umask</key>
+	<integer>63</integer>
+
+	<key>StandardOutPath</key>
+	<string>__STATE_DIR__/launchd.stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>__STATE_DIR__/launchd.stderr.log</string>
+</dict>
+</plist>
