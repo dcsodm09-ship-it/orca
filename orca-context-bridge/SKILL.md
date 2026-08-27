@@ -1000,11 +1000,10 @@ the catalog itself (unknown `schema_version`, entries that were not JSON
 objects, a `verified_at` ahead of this clock). `--quiet` suppresses all
 output for callers that only want the exit code.
 
-The script is read-only in the strongest sense available: it has no output
-file, no cache, no lockfile, and no write path at all — one file opened for
-reading, results printed to stdout. There is no write guard because there is
-nothing to guard. Its test suite pins that with an OS-level read-only tree
-that comes back byte-identical and an interceptor that fails if any file
+The script is read-only: it has no output file, no cache, no lockfile — one file opened for
+reading, results printed to stdout. There is no persistent write guard because the script itself does not write;
+the hook path, however, does have a write path (see below under `catalog_session_hint.py`). Its test suite pins query-only behavior
+with an OS-level read-only tree that comes back byte-identical and an interceptor that fails if any file
 descriptor is ever requested with a write flag.
 
 Two limits worth knowing before you trust a `1`:
@@ -1021,7 +1020,7 @@ Two limits worth knowing before you trust a `1`:
 
 `query_catalog.py` only helps an agent that remembers the catalog exists.
 `catalog_session_hint.py` is the SessionStart hook that does the
-remembering: it prints at most two lines into a new session's context and
+remembering: it prints at most three lines into a new session's context and
 then gets out of the way.
 
 ```bash
@@ -1129,8 +1128,10 @@ Properties that make it safe to put on every session start:
   100ms while an 8-second rebuild was still running in the background.
   `stdout=DEVNULL` is what makes that true — an inherited stdout pipe would
   keep the harness blocked for the child's entire lifetime.
-- **Read-only, with no write path at all.** One file opened for reading, one
-  `lstat` for the rebuild debounce, and nothing else.
+- **Mostly read-only, with a limited write path for compatibility checks.** One file opened for reading, one
+  `lstat` for the rebuild debounce; when Gate D is authorized and active, `claim_compat_trigger_slot()` creates
+  zero-byte marker files under `manifests/compat-check-triggers/` to debounce compatibility check spawning
+  (though this write path is currently gated by `--no-compat-spawn` in the live settings).
 - **Injection-hardened at the one interpolation boundary.** `global_id`s come
   from other projects' hand-maintained files, so control characters, U+2028/9
   and bidi overrides are flattened to spaces before rendering, and line 2
@@ -1213,14 +1214,12 @@ performs that re-sign itself. Every `draft`/`amend`/`approve` call holds the sam
 lock, closing a real lost-update race a review caught between concurrent
 `approve` calls landing on the same target.
 
-**Not yet true**: this is deployed to `~/.agents/skills/orca-context-bridge/scripts/`
-and tested (against disposable fake projects only — nothing here has ever
-touched a real project's real files) but still not registered in
-`catalog_session_hint.py` or any SessionStart path, not wired to any
-automation, and not the target of any discovery pipeline yet (`draft
---from-discovery-hit` is intentionally unimplemented). Actually using it
-against a real project, and any future automation that would call it
-without a human in the loop, are separate, unauthorized steps.
+**Status: candidate deployed and tested** (against disposable fake projects only — nothing here has ever
+touched a real project's real files). `draft-from-discovery-hit` is now implemented (commit ed84194de8,
+"Gate C: wire discovery-to-staging queue") as the automated bridge from Gate C (discovery triage) to Gate B
+(promotion). It is wired into `catalog_session_hint.py` and used by the discovery pipeline's automated
+promotion path. However, the discovery pipeline itself (M8-1 and M8-2 tools) is still not registered in any
+SessionStart path and has not been run against any real project's directory in production use.
 
 ### Discovering and evidencing cross-project candidates (M8 Gate C — deferred, real-data numbers not encouraging)
 
@@ -1271,9 +1270,10 @@ python3 <skill-dir>/scripts/review_capability_candidates.py mark --hit-id <id> \
 A discovery hit is a strictly lower-stakes concept than a promotion
 candidate: marking one `triaged_for_promotion` is bookkeeping in
 `discovery-hits.json`, not a step that reaches any project's `wiki/`.
-Turning a hit into an actual `promote_capability.py` candidate is a manual,
-human transcription step in v1 — `draft --from-discovery-hit` is
-intentionally unimplemented.
+Turning a hit into an actual `promote_capability.py` candidate is now automated:
+`promote_capability.py draft-from-discovery-hit` (commit ed84194de8) reads
+a triaged hit and drafts it through the same validation/dedup/approval path
+as a hand-authored candidate, with automatic non-human source tagging.
 
 **Not yet true, and not a formality**: neither pair is registered in
 `catalog_session_hint.py` or any SessionStart path, and neither has been

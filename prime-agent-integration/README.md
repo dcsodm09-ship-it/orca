@@ -11,9 +11,9 @@ lifecycle replay) was most recently gathered against installed Orca 1.4.184.
 That version number is not itself a live gate: `verify_orca_support()` never
 compares an Orca version string, it checks the actual support-file markers
 and hashes under `/Applications/Orca.app` at install/verify time, so it stays
-correct as Orca is updated. The missing local prerequisite is a trustworthy
-`prime-agent` command. This directory supplies that prerequisite, but the
-real user install has not been run.
+correct as Orca is updated. The local `prime-agent` command prerequisite has
+been installed: `~/.local/bin/prime-agent` is a symlink to the v0.7.2 release
+(installed 2026-08-22 after dual-review approval).
 
 ## Pinned upstream evidence
 
