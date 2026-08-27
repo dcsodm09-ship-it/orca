@@ -475,32 +475,53 @@ def _list_account_ids(root: Path) -> list[str] | None:
     return ids
 
 
-def _resolve_account_hook_config(account_id: str) -> Path | None:
+def _hook_config_under(root: Path, account_id: str) -> Path | None:
+    # One account root's `<root>/<id>/home/hooks.json`, resolved, or None if this tool cannot manage
+    # it. Goes through resolve_ssd_path(), so an account whose home is a REAL directory outside the
+    # Extreme SSD (Orca's current provisioning shape) resolves to None -- this tool's entire write
+    # path requires SSD residency, so "not on the SSD" genuinely means "not manageable", and the
+    # honest report for it is `unmanaged`, not silent omission.
+    candidate = root / account_id / "home/hooks.json"
+    try:
+        resolved = resolve_ssd_path(candidate)
+    except InstallError:
+        return None
+    try:
+        if _is_regular_file(resolved):
+            return resolved
+    except InstallError:
+        return None
+    return None
+
+
+def _resolve_account_hook_config(account_id: str, *, in_live_registry: bool) -> Path | None:
     # Locate one account's manageable hooks.json, or None if this tool cannot manage it at all.
     #
-    # The registry entry is tried first (`<registry>/<id>/home/hooks.json` -- which, for the
-    # accounts whose `home` is a symlink into local-homes, resolves onto the SSD exactly like the
-    # legacy path did), then the legacy local-homes location as a supplementary/compat fallback for
-    # an account that exists there but no longer has, or never had, a registry entry.
+    # `in_live_registry` is NOT a convenience flag -- it is the whole correctness boundary (P1,
+    # independent review, 2026-08-28). This function used to try the registry path and then the
+    # legacy `local-homes/codex-accounts` path UNCONDITIONALLY, which meant that an account really
+    # present in the live registry, but whose real home is an off-SSD directory this tool may not
+    # touch, was silently "resolved" to whatever same-id directory the legacy SSD snapshot happened
+    # to contain. Those two directories are unrelated; sharing a name makes neither a copy of nor a
+    # stand-in for the other. The snapshot then received the bridge handler, the receipt covered it,
+    # and verify() -- seeing the account covered -- reported ok: true while the account Orca
+    # actually runs still had no redaction hook at all. That is the very P1 this whole registry
+    # rework exists to fix (see ORCA_ACCOUNTS_SUBPATH), reproduced through a second code path.
     #
-    # Both go through resolve_ssd_path(), so an account whose home is a REAL directory outside the
-    # Extreme SSD (Orca's current provisioning shape) resolves to None here -- this tool's entire
-    # write path requires SSD residency, so "not on the SSD" genuinely means "not manageable", and
-    # the honest report for it is `unmanaged`, not silent omission.
-    for candidate in (
-        orca_accounts_root() / account_id / "home/hooks.json",
-        LOCAL_HOMES_ROOT / "codex-accounts" / account_id / "home/hooks.json",
-    ):
-        try:
-            resolved = resolve_ssd_path(candidate)
-        except InstallError:
-            continue
-        try:
-            if _is_regular_file(resolved):
-                return resolved
-        except InstallError:
-            continue
-    return None
+    # So: once an id is confirmed present in the live registry, ONLY that account's own registry
+    # home may satisfy it. `<registry>/<id>/home/hooks.json` still resolves onto the SSD for the
+    # accounts whose `home` is a symlink into local-homes -- the common case -- and for every other
+    # shape the answer is None, i.e. `unmanaged`, i.e. verify() fails closed.
+    #
+    # The legacy location survives only in its documented, originally intended scope: an id ABSENT
+    # from the live registry (including a machine with no registry at all, where `registry_ids is
+    # None` makes every id absent). Such an id is not a live account being shadowed, it is a
+    # leftover home this tool has always been able to manage, and dropping it would break older
+    # layouts for no safety gain.
+    located = _hook_config_under(orca_accounts_root(), account_id)
+    if located is not None or in_live_registry:
+        return located
+    return _hook_config_under(LOCAL_HOMES_ROOT / "codex-accounts", account_id)
 
 
 def _enumerate_accounts() -> tuple[list[Path], dict[str, Path | None]]:
@@ -532,13 +553,28 @@ def _enumerate_accounts() -> tuple[list[Path], dict[str, Path | None]]:
         # its one root was missing.
         raise InstallError("cannot list Codex account homes")
 
+    registry_id_set = set(registry_ids or [])
+    legacy_id_set = set(legacy_ids or [])
     registry_accounts: dict[str, Path | None] = {}
-    for account_id in sorted(set(registry_ids or []) | set(legacy_ids or [])):
-        located = _resolve_account_hook_config(account_id)
-        if registry_ids is not None and account_id in registry_ids:
+    for account_id in sorted(registry_id_set | legacy_id_set):
+        in_live_registry = account_id in registry_id_set
+        located = _resolve_account_hook_config(account_id, in_live_registry=in_live_registry)
+        if in_live_registry:
             registry_accounts[account_id] = located
         if located is not None:
             configs.append(located)
+        elif in_live_registry and account_id in legacy_id_set:
+            # The live account is unmanageable AND a same-id legacy snapshot exists -- the shadowing
+            # case _resolve_account_hook_config() now refuses to conflate. The snapshot must never
+            # count as this account's configuration (registry_accounts keeps the None above, so
+            # verify() still reports it unmanaged), but the snapshot file itself may hold a handler
+            # some earlier install wrote into it, so it stays in the managed-config list and
+            # install/uninstall keep being able to reach and clean it. Coverage and reachability are
+            # two different questions; only the first one was ever allowed to be answered by an id
+            # match.
+            legacy = _hook_config_under(LOCAL_HOMES_ROOT / "codex-accounts", account_id)
+            if legacy is not None:
+                configs.append(legacy)
     return list(dict.fromkeys(configs)), registry_accounts
 
 
@@ -3116,8 +3152,10 @@ def verify() -> dict[str, Any]:
                     "account_id": account_id,
                     "registry_path": os.fspath(orca_accounts_root() / account_id),
                     "reason": (
-                        "no hooks.json for this Orca account resolves onto the Extreme SSD, so this "
-                        "tool cannot install, verify, or remove its hook"
+                        "this Orca account's OWN home/hooks.json does not resolve onto the Extreme "
+                        "SSD, so this tool cannot install, verify, or remove its hook; a same-id "
+                        "directory under local-homes/codex-accounts, if one exists, is an unrelated "
+                        "legacy snapshot and is not a substitute for it"
                     ),
                 }
             )

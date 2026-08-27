@@ -4555,6 +4555,100 @@ class RealOrcaAccountRegistryEnumerationTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["unmanaged"], [])
 
+    def _add_shadowed_offssd_registry_account(self, account_id: str) -> tuple[Path, Path]:
+        # The exact shape of the P1 found by independent review on 2026-08-28: the SAME account id
+        # exists BOTH in the live Orca registry -- with a real, off-SSD home this tool may not touch
+        # -- AND in the SSD's legacy `local-homes/codex-accounts` snapshot. The two are unrelated
+        # directories that merely share a name; nothing makes the snapshot a copy of, or a stand-in
+        # for, the live account's configuration.
+        live_home = self.registry / account_id / "home"
+        live_home.mkdir(parents=True)
+        live_config = live_home / "hooks.json"
+        self._write(live_config, self._base_hooks_json())
+
+        legacy_home = self.local_homes / "codex-accounts" / account_id / "home"
+        legacy_home.mkdir(parents=True)
+        legacy_config = legacy_home / "hooks.json"
+        self._write(legacy_config, self._base_hooks_json())
+
+        self.assertFalse(
+            live_home.is_symlink(),
+            "fixture precondition: the live account's home must be a real off-SSD directory",
+        )
+        return live_config, legacy_config
+
+    def _mentions_bridge(self, config: Path) -> bool:
+        return installer.BRIDGE_ID in config.read_text()
+
+    def test_live_registry_account_is_never_satisfied_by_a_same_id_legacy_snapshot(self) -> None:
+        # Regression for the P1 of 2026-08-28. `_resolve_account_hook_config()` tried the registry
+        # path and then the legacy `local-homes/codex-accounts` path UNCONDITIONALLY, so an account
+        # that really is in the live registry but whose real home lives off the SSD was silently
+        # "resolved" to whatever same-id directory the legacy snapshot happened to contain. That
+        # snapshot then got the bridge handler, the receipt covered it, verify() found the account
+        # covered and reported ok: true -- while the account Orca actually runs still had no
+        # redaction hook. That is the ORIGINAL P1 (verify green over an unprotected live account)
+        # reproduced through a second code path, so it must fail closed exactly the same way.
+        live_config, legacy_config = self._add_shadowed_offssd_registry_account("acct-shadowed")
+
+        # Resolution itself: a live-registry id must resolve to the live account's own hooks.json or
+        # to nothing at all. It must never resolve to the same-id legacy snapshot.
+        _, registry_accounts = installer._enumerate_accounts()
+        self.assertIn("acct-shadowed", registry_accounts)
+        self.assertIsNone(
+            registry_accounts["acct-shadowed"],
+            "a live registry account whose own home is unreachable must resolve to None, "
+            "never to a same-id legacy snapshot",
+        )
+
+        installer.install()
+        result = installer.verify()
+
+        # Before the fix: ok=True, unmanaged=[].
+        self.assertFalse(result["ok"])
+        self.assertEqual([entry["account_id"] for entry in result["unmanaged"]], ["acct-shadowed"])
+        self.assertEqual(
+            result["unmanaged"][0]["registry_path"],
+            os.fspath(self.registry / "acct-shadowed"),
+        )
+        self.assertIn("Extreme SSD", result["unmanaged"][0]["reason"])
+        # And the report must not name the legacy snapshot as this account's config -- that claim is
+        # precisely the falsehood being fixed.
+        self.assertNotIn("config", result["unmanaged"][0])
+
+        # The ground truth the whole fix exists to protect: the account Orca actually runs has no
+        # bridge handler, so verify() must not be green -- whatever the legacy snapshot contains.
+        self.assertFalse(self._mentions_bridge(live_config))
+        self.assertTrue(legacy_config.exists())
+
+        # The accounts this tool genuinely can manage are still managed and still reported.
+        self.assertEqual(
+            sorted(result["configs"]),
+            sorted(os.fspath(p) for p in (self.main_config, self.symlinked_config, legacy_config)),
+        )
+
+    def test_legacy_only_account_still_resolves_through_the_local_homes_tree(self) -> None:
+        # The complement, pinning the narrowed fallback's remaining scope: an id ABSENT from the
+        # live registry is not a live account being shadowed, it is a leftover this tool has always
+        # been able to manage, and the local-homes fallback must keep resolving it. Without this the
+        # fix above could be "achieved" by deleting the fallback outright.
+        legacy_home = self.local_homes / "codex-accounts/acct-legacy-only/home"
+        legacy_home.mkdir(parents=True)
+        legacy_config = legacy_home / "hooks.json"
+        self._write(legacy_config, self._base_hooks_json())
+        self.assertFalse((self.registry / "acct-legacy-only").exists())
+
+        configs, registry_accounts = installer._enumerate_accounts()
+        self.assertIn(legacy_config, configs)
+        # Not a registry account, so it is not held to registry coverage and raises no finding.
+        self.assertNotIn("acct-legacy-only", registry_accounts)
+
+        installer.install()
+        result = installer.verify()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["unmanaged"], [])
+        self.assertTrue(self._mentions_bridge(legacy_config))
+
 
 if __name__ == "__main__":
     unittest.main()
