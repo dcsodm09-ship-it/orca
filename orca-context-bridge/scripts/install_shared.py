@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 
@@ -28,10 +29,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-delete",
         action="store_true",
         help=(
-            "Permit --update to remove files that exist in the deployed "
-            "destination but not in this repo's source tree. Without this "
-            "flag, --update refuses and lists such files instead of "
-            "silently deleting them."
+            "Permit --update to destroy deployed content: files that exist in "
+            "the deployed destination but not in this repo's source tree, and "
+            "paths whose node type differs between the two trees (a deployed "
+            "file that is a directory in source, a deployed symlink replaced "
+            "by a real file, ...). Without this flag, --update refuses and "
+            "lists them instead of silently destroying them."
         ),
     )
     parser.add_argument("--shared-root", type=Path, default=Path.home() / ".agents" / "skills")
@@ -49,24 +52,118 @@ def existing_points_to(path: Path, destination: Path) -> bool:
         return False
 
 
-def files_only_in_destination(destination: Path, incoming: Path) -> list[str]:
-    """Relative paths that exist under ``destination`` but not under ``incoming``.
+def node_kind(path: Path) -> str:
+    """The kind of filesystem node at ``path`` itself, never its symlink target.
+
+    ``os.lstat`` is deliberate: ``Path.exists``/``Path.is_dir``/``Path.is_file``
+    all follow symlinks, so they cannot tell a deployed symlink apart from the
+    plain file or directory it happens to point at, and they answer "yes, that
+    path exists" for a file and a directory alike. Both blind spots let a
+    destructive replace slip past the guard below.
+
+    Returns one of ``file``, ``directory``, ``symlink``, ``other`` (fifo,
+    socket, device, ...), or ``absent`` (nothing there, or unreadable).
+    """
+    try:
+        info = os.lstat(path)
+    except (OSError, ValueError):
+        return "absent"
+    if stat.S_ISLNK(info.st_mode):
+        return "symlink"
+    if stat.S_ISDIR(info.st_mode):
+        return "directory"
+    if stat.S_ISREG(info.st_mode):
+        return "file"
+    return "other"
+
+
+def destination_changes(destination: Path, incoming: Path) -> list[dict[str, str]]:
+    """Everything under ``destination`` the replace would destroy, not overwrite.
 
     ``incoming`` is expected to be the fully-populated replacement tree (the
     temporary copy of ``source``, after the same ignore patterns used for the
     real copy have been applied) so the comparison reflects exactly what the
     destructive rename is about to remove.
+
+    A path counts as destroyed when the node *type* at that path differs
+    between the two trees, which covers both the plain case (absent from the
+    incoming tree entirely) and the type-change cases (a live file whose path
+    is a directory in the incoming tree, a live directory that becomes a file,
+    a live symlink replaced by a real file or directory). Type changes matter
+    because the deployed content disappears just as completely as an outright
+    deletion does, while ``exists()`` reports "present on both sides" and lets
+    the update through. Matching types are left alone: replacing a file with a
+    file, or a symlink with a symlink, is the ordinary overwrite that
+    ``--update`` exists to perform.
+
+    Each entry is ``{"path", "reason", "deployed", "source"}`` where ``reason``
+    is ``missing_from_source`` or ``type_change``.
     """
-    missing: list[str] = []
-    if not destination.exists():
-        return missing
-    for path in destination.rglob("*"):
-        if path.is_dir():
+    changes: list[dict[str, str]] = []
+    destination_kind = node_kind(destination)
+    if destination_kind == "absent":
+        return changes
+    incoming_kind = node_kind(incoming)
+    if destination_kind != incoming_kind:
+        # The deployed root itself is not what the incoming root is — most
+        # plausibly a symlinked installation about to become a real directory.
+        return [{
+            "path": ".",
+            "reason": "missing_from_source" if incoming_kind == "absent" else "type_change",
+            "deployed": destination_kind,
+            "source": incoming_kind,
+        }]
+    if destination_kind != "directory":
+        return changes
+    _collect_changes(destination, incoming, None, changes)
+    return sorted(changes, key=lambda change: change["path"])
+
+
+def _collect_changes(
+    destination: Path,
+    incoming: Path,
+    relative: Path | None,
+    changes: list[dict[str, str]],
+) -> None:
+    current = destination if relative is None else destination / relative
+    try:
+        names = sorted(entry.name for entry in current.iterdir())
+    except OSError:
+        return
+    for name in names:
+        child = Path(name) if relative is None else relative / name
+        deployed_kind = node_kind(current / name)
+        source_kind = node_kind(incoming / child)
+        if deployed_kind != source_kind:
+            changes.append({
+                "path": str(child),
+                "reason": "missing_from_source" if source_kind == "absent" else "type_change",
+                "deployed": deployed_kind,
+                "source": source_kind,
+            })
+            # The whole subtree goes with it; reporting the root is enough.
             continue
-        relative = path.relative_to(destination)
-        if not (incoming / relative).exists():
-            missing.append(str(relative))
-    return sorted(missing)
+        if deployed_kind == "directory":
+            _collect_changes(destination, incoming, child, changes)
+
+
+def files_only_in_destination(destination: Path, incoming: Path) -> list[str]:
+    """Relative paths of everything :func:`destination_changes` would destroy."""
+    return [change["path"] for change in destination_changes(destination, incoming)]
+
+
+def describe_changes(changes: list[dict[str, str]]) -> list[str]:
+    """One human-readable line per change, so the refusal says what kind it is."""
+    lines = []
+    for change in changes:
+        if change["reason"] == "missing_from_source":
+            lines.append(f"{change['path']}: deployed {change['deployed']} is absent from source")
+        else:
+            lines.append(
+                f"{change['path']}: deployed {change['deployed']} becomes "
+                f"{change['source']} in source"
+            )
+    return lines
 
 
 def is_owned_installation(path: Path) -> bool:
@@ -124,23 +221,27 @@ def main() -> int:
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
         )
         if destination_exists:
-            orphaned = files_only_in_destination(destination, temporary)
-            if orphaned and not args.allow_delete:
+            destroyed = destination_changes(destination, temporary)
+            if destroyed and not args.allow_delete:
                 print(json.dumps({
                     "ok": False,
                     "error": "update_would_delete_files",
                     "destination": str(destination),
-                    "files": orphaned,
+                    "files": [change["path"] for change in destroyed],
+                    "changes": destroyed,
+                    "details": describe_changes(destroyed),
                     "hint": "Re-run with --allow-delete to proceed and remove these files.",
                 }, indent=2))
                 shutil.rmtree(temporary, ignore_errors=True)
                 return 3
-            if orphaned:
+            if destroyed:
                 print(json.dumps({
                     "ok": True,
                     "warning": "deleting_files_not_in_source",
                     "destination": str(destination),
-                    "files": orphaned,
+                    "files": [change["path"] for change in destroyed],
+                    "changes": destroyed,
+                    "details": describe_changes(destroyed),
                 }, indent=2))
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if destination_exists:
