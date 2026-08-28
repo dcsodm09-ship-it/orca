@@ -49,6 +49,36 @@ def _min_elapsed(fn, attempts: int = 5) -> float:
     return best
 
 
+def _min_cpu_elapsed(fn, attempts: int = 3) -> float:
+    """Best-of-`attempts` CPU timing -- `_min_elapsed` for assertions with an ABSOLUTE ceiling.
+
+    Round 5 F6 (live-verification run, 2026-08-28). Best-of-N wall clock is enough to stabilize a
+    RATIO ("4x the input must not cost 16x the time"): both readings absorb the same noise, so the
+    quotient survives it. It is not enough to stabilize an absolute ceiling, because the noise has
+    nothing to cancel against. Measured directly, by oversubscribing this machine's CPUs 2x while
+    re-running the two tests that flaked:
+
+        redact("password:" * 6400)   wall  1.99s idle -> 6.47s loaded   (the 5.0s ceiling: FAILS)
+                                     cpu   1.99s idle -> 2.70s loaded
+
+    The wall-clock inflation is this process being descheduled while other work runs -- it is not
+    redact() doing more work, which is the only thing these tests exist to detect, and no ceiling
+    that still fails on a real quadratic regression can survive a 3.3x machine-load multiplier. CPU
+    time excludes exactly that noise (1.36x residual here, from cache/memory-bandwidth contention)
+    and includes every cycle a backtracking regex would actually burn, so the assertion keeps its
+    sensitivity instead of buying reliability by being loosened.
+
+    Wall clock stays right for the many tests here that assert only a ratio; this is for the two that
+    also assert "and not more than N seconds", where wall clock measures the machine, not the code.
+    """
+    best = float("inf")
+    for _ in range(attempts):
+        started = time.process_time()
+        fn()
+        best = min(best, time.process_time() - started)
+    return best
+
+
 class HookFixture:
     def __init__(self, cwd: str = DEFAULT_CWD) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -6088,8 +6118,13 @@ class ArchitecturalRewriteRound5Tests(unittest.TestCase):
 
     def test_p1_repeated_password_label_no_real_terminator_scales_near_linearly(self) -> None:
         # The finding's second concrete repro shape: `'password:' * n` with no real terminator.
+        #
+        # CPU-timed, not wall-timed (round 5 F6 -- see `_min_cpu_elapsed`). This is the slowest
+        # shape in this file at rest (~2.0s for the large input), which left the 5.0s ceiling below
+        # only 2.5x of headroom -- less than the 3.3x wall-clock inflation a 2x-oversubscribed
+        # machine actually produces here, measured. The bounds are unchanged; only the clock is.
         def timed(text: str) -> float:
-            return _min_elapsed(lambda: hook.redact(text), attempts=3)
+            return _min_cpu_elapsed(lambda: hook.redact(text), attempts=3)
 
         small = "password:" * 1600  # ~14.4KB
         large = "password:" * 6400  # 4x input, ~57.6KB
@@ -6786,17 +6821,19 @@ class ArchitecturalRewriteRound13FixTests(unittest.TestCase):
         # of non-pipe filler after "is " with no closing pipe ever reached, forcing the bounded
         # `{1,63}` residual to repeatedly fail and backtrack at every starting offset the outer
         # `finditer()` scan considers.
+        # Round 5 F6 (live-verification run, 2026-08-28): this was the last timing assertion in this
+        # file still taking a SINGLE `time.perf_counter()` reading per input, and its ratio bound was
+        # the tightest here -- the true CPU ratio for this shape is ~5.6x against a 10x ceiling, so a
+        # single unlucky reading on `large` (or a lucky one on `small`, which only tightens the
+        # bound) flipped it. Best-of-3 CPU timing plus a 12x ceiling restores real headroom while
+        # staying well under the ~16x a genuine quadratic regression produces at 4x the input.
         small = "密码 is " + ("Wm " * 4_000)
         large = "密码 is " + ("Wm " * 16_000)  # 4x the character count of `small`
-        t0 = time.perf_counter()
-        hook.redact(small)
-        small_elapsed = time.perf_counter() - t0
-        t1 = time.perf_counter()
-        hook.redact(large)
-        large_elapsed = time.perf_counter() - t1
+        small_elapsed = _min_cpu_elapsed(lambda: hook.redact(small), attempts=3)
+        large_elapsed = _min_cpu_elapsed(lambda: hook.redact(large), attempts=3)
         self.assertLess(
             large_elapsed,
-            max(small_elapsed * 10, 0.05),
+            max(small_elapsed * 12, 0.05),
             f"redact() scaled worse than near-linearly: {small_elapsed:.4f}s -> {large_elapsed:.4f}s",
         )
         self.assertLess(large_elapsed, 2.0, "redact() must not stall on adversarial input")

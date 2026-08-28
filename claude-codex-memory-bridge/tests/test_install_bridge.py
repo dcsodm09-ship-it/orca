@@ -1355,6 +1355,73 @@ class InstallEndToEndTests(unittest.TestCase):
             sorted(os.fspath(p) for p in (self.main_config, self.account_config)),
         )
 
+    def test_verify_names_a_deleted_live_codex_config_instead_of_aborting_opaquely(self) -> None:
+        # Round 5, live-verification finding F1 (2026-08-28). `~/.codex/hooks.json` deleted is the
+        # 2026-08-21 incident verbatim, and it was the ONE config shape round 4's whole reporting
+        # contract could not describe: _enumerate_accounts() resolved this path at must_exist=True as
+        # its first statement, so verify() raised before computing anything and main() printed a bare
+        # {"ok": false, "error": "path unavailable: ..."} -- no broken, no drift, no hook_functional,
+        # no summary, no per-config detail. Indistinguishable, to a reader, from the SSD being
+        # unplugged, which is exactly the "the signal carried no information so it stopped being
+        # read" failure the round-4 rewrite exists to end.
+        installer.install()
+        self.main_config.unlink()
+
+        result = installer.verify()  # must not raise
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["hook_functional"], result)
+        self.assertNotIn("error", result)
+        broken = [record for record in result["broken"] if record["config"] == os.fspath(self.main_config)]
+        self.assertEqual(len(broken), 1, result["broken"])
+        self.assertEqual(broken[0]["problems"][0]["kind"], "config_missing")
+        self.assertIn("2026-08-21", broken[0]["problems"][0]["detail"])
+        self.assertIn("NOT being redacted", result["summary"])
+        # And it must NOT be filed under the bucket documented as "not a failure".
+        self.assertNotIn(os.fspath(self.main_config), result["unreachable"])
+
+    def test_verify_still_reports_every_other_config_when_the_live_codex_config_is_gone(self) -> None:
+        # The other half of F1: breaking config[0] must not cost the reader the state of config[1]
+        # and config[2]. Round 4 already fixed abort-on-first-drift for reachable configs; this pins
+        # the same guarantee for the one config whose absence used to abort the call itself.
+        second_account = self.local_homes / "codex-accounts/acct-two/home/hooks.json"
+        second_account.parent.mkdir(parents=True)
+        self._write(second_account, self._base_hooks_json())
+        installer.install()
+        self.main_config.unlink()
+
+        result = installer.verify()
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            sorted(result["configs"]),
+            sorted(os.fspath(p) for p in (self.account_config, second_account)),
+        )
+        self.assertEqual([record["config"] for record in result["broken"]], [os.fspath(self.main_config)])
+
+    def test_verify_drift_detail_stops_claiming_the_hook_is_unaffected_when_it_is_broken(self) -> None:
+        # Round 5, live-verification finding F4 (2026-08-28). A foreign writer that edits this config
+        # AND drops our handler in the same edit produced a drift record whose structured
+        # `hook_functional` field correctly read false while its human-readable `detail` still ended
+        # "the redaction hook itself is unaffected (see hook_functional)" -- the half a person
+        # actually reads, asserting the opposite of the `broken` entry two keys away.
+        installer.install()
+        payload = json.loads(self.main_config.read_bytes())
+        payload["hooks"]["UserPromptSubmit"] = [
+            handler for handler in payload["hooks"]["UserPromptSubmit"] if not installer.owned_handler(handler)
+        ]
+        payload["hooks"]["UserPromptSubmit"].append({"hooks": [{"type": "command", "command": "/bin/echo hi"}]})
+        self.main_config.chmod(0o600)
+        self.main_config.write_bytes((json.dumps(payload, sort_keys=True, indent=2) + "\n").encode())
+        self.main_config.chmod(0o600)
+
+        result = installer.verify()
+        self.assertFalse(result["hook_functional"])
+        drift = [record for record in result["drift"] if record["config"] == os.fspath(self.main_config)]
+        self.assertEqual(len(drift), 1, result["drift"])
+        self.assertEqual(drift[0]["classification"], "foreign_change")
+        self.assertFalse(drift[0]["hook_functional"])
+        self.assertNotIn("is unaffected", drift[0]["detail"])
+        self.assertIn("broken", drift[0]["detail"])
+
     # ------------------------------------------------------------------------------ doctor
     def test_doctor_is_healthy_after_a_plain_install(self) -> None:
         installer.install()
@@ -1429,6 +1496,50 @@ class InstallEndToEndTests(unittest.TestCase):
         result = installer.doctor()
         self.assertFalse(result["ok"])
         self.assertIn("script_digest_mismatch", {finding["kind"] for finding in result["findings"]})
+
+    def test_doctor_reports_one_finding_for_the_one_shared_tampered_script(self) -> None:
+        # Round 5, live-verification finding F3 (2026-08-28). `expected_script` is a single
+        # release-directory path that EVERY managed account's handler points at, so checking it
+        # inside the per-config loop emitted one byte-identical finding per healthy config -- four on
+        # the real machine, for one tampered file -- each targeting the script rather than any
+        # account. Three configs here, so the pre-fix count (3) and the fixed count (1) cannot be
+        # confused with each other or with the number of configs.
+        second_account = self.local_homes / "codex-accounts/acct-two/home/hooks.json"
+        second_account.parent.mkdir(parents=True)
+        self._write(second_account, self._base_hooks_json())
+        receipt = installer.install()
+        self.assertEqual(len(receipt["configs"]), 3)
+        installed_script = Path(receipt["release_dir"]) / "claude_memory_hook.py"
+        installed_script.chmod(0o600)
+        installed_script.write_bytes(b"# tampered\n")
+        installed_script.chmod(0o600)
+
+        result = installer.doctor()
+        self.assertFalse(result["ok"])
+        tampered = [f for f in result["findings"] if f["kind"] == "script_digest_mismatch"]
+        self.assertEqual(len(tampered), 1, result["findings"])
+        self.assertEqual(tampered[0]["target"], os.fspath(installed_script))
+        # The finding still says WHICH configs are affected -- the per-config information the loop
+        # used to convey by repetition is now carried inside the single finding.
+        for config in (self.main_config, self.account_config, second_account):
+            self.assertIn(os.fspath(config), tampered[0]["detail"])
+
+    def test_doctor_does_not_blame_the_registry_when_the_live_codex_config_is_deleted(self) -> None:
+        # Same root cause as F1, seen from doctor(): _enumerate_accounts() used to raise on this
+        # exact shape, and doctor()'s except clause turned that into a `registry_unreadable` finding
+        # pointing at the Orca account registry -- a real finding about an unrelated, healthy
+        # subsystem, sitting next to the true one and reported with equal weight.
+        installer.install()
+        self.main_config.unlink()
+        result = installer.doctor()
+        self.assertFalse(result["ok"])
+        kinds = [finding["kind"] for finding in result["findings"]]
+        self.assertEqual(kinds.count("config_missing"), 1, result["findings"])
+        self.assertNotIn("registry_unreadable", kinds, result["findings"])
+        self.assertEqual(
+            next(f for f in result["findings"] if f["kind"] == "config_missing")["target"],
+            os.fspath(self.main_config),
+        )
 
     def test_doctor_flags_the_launchd_tcc_hazard_only_for_an_apple_platform_interpreter(self) -> None:
         # The Ego reaper on this machine was silently dead for ~2 weeks because of this, and every
@@ -1689,6 +1800,12 @@ class InstallEndToEndTests(unittest.TestCase):
         # unreachable and still checks the surviving accounts.
         verify_result = installer.verify()
         self.assertTrue(verify_result["ok"])
+        # Round 5 (F1/F2) added a "this path is still LIVE" distinction so a deleted config can be
+        # called broken instead of tolerated. This account is genuinely retired -- absent from the
+        # live registry -- so it must stay on the tolerated side of that line, or the fix turns every
+        # deleted account into a permanent red light.
+        self.assertTrue(verify_result["hook_functional"])
+        self.assertEqual(verify_result["broken"], [])
         self.assertIn(os.fspath(self.account_config), verify_result["unreachable"])
         self.assertIn(os.fspath(self.main_config), verify_result["configs"])
         self.assertIn(os.fspath(second_account), verify_result["configs"])
@@ -4741,6 +4858,92 @@ class RealOrcaAccountRegistryEnumerationTests(unittest.TestCase):
         self.assertTrue(healed["ok"])
         self.assertEqual(healed["unmanaged"], [])
         self.assertEqual(len(healed["configs"]), 3)
+
+    def test_verify_is_broken_not_merely_unmanaged_when_a_live_accounts_config_is_deleted(self) -> None:
+        # Round 5, live-verification finding F2 (2026-08-28). Deleting a LIVE registry account's
+        # hooks.json used to reclassify it out of "managed" twice over -- `unreachable` (its receipt
+        # row's path is gone) and `unmanaged` (_hook_config_under() requires the file to exist, so it
+        # answers None) -- and both of those buckets leave `hook_functional` reading TRUE. `ok` did
+        # go false via `unmanaged`, but the field the code's own comment calls "the answer to the
+        # only question that mattered during the incident", and which README tells callers they can
+        # act on without interpreting anything else, said the redaction hook was fine while a live
+        # account had no hooks.json at all.
+        #
+        # The `unmanaged` reason line was wrong about it too: it reads "does not resolve onto the
+        # Extreme SSD", which is the genuinely-undeterminable off-SSD case. This account's config
+        # resolves perfectly well; there is simply no file there, which is not an ambiguity but a
+        # proof.
+        installer.install()
+        self.assertTrue(installer.verify()["ok"])
+        self.symlinked_config.unlink()
+
+        result = installer.verify()
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["hook_functional"], result)
+        broken = [record for record in result["broken"] if record["config"] == os.fspath(self.symlinked_config)]
+        self.assertEqual(len(broken), 1, result["broken"])
+        self.assertEqual(broken[0]["problems"][0]["kind"], "config_missing")
+        self.assertIn("acct-symlinked", broken[0]["problems"][0]["detail"])
+        self.assertIn("NOT being redacted", result["summary"])
+        # Reported once, under the name that is true of it -- not also as an unmanaged account with
+        # an off-SSD explanation that does not apply.
+        self.assertEqual(result["unmanaged"], [], result["unmanaged"])
+        self.assertNotIn(os.fspath(self.symlinked_config), result["unreachable"])
+
+    def test_verify_is_broken_for_a_live_account_with_no_receipt_row_and_no_config(self) -> None:
+        # The same finding arriving without a receipt row to hang it on: an account added to the live
+        # registry after the last install, whose hooks.json is also absent. Nothing receipt-driven
+        # can see this one at all, so it is what proves the check is an independent enumeration
+        # rather than a re-read of what install() already knew.
+        installer.install()
+        (self.local_homes / "codex-accounts/acct-late/home").mkdir(parents=True)
+        (self.registry / "acct-late").mkdir()
+        (self.registry / "acct-late/home").symlink_to(self.local_homes / "codex-accounts/acct-late/home")
+        expected = self.local_homes / "codex-accounts/acct-late/home/hooks.json"
+        self.assertFalse(expected.exists(), "fixture precondition: this account has no hooks.json")
+
+        result = installer.verify()
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["hook_functional"], result)
+        self.assertEqual([record["config"] for record in result["broken"]], [os.fspath(expected)])
+        self.assertEqual(result["broken"][0]["problems"][0]["kind"], "config_missing")
+
+    def test_verify_does_not_abort_when_one_live_accounts_path_is_merely_indeterminate(self) -> None:
+        # The way F1's own fix could re-introduce F1. The new "is this live path absent?" sweep calls
+        # _path_is_absent(), which fails closed by RAISING on anything that is not ENOENT -- correct
+        # where the caller is about to write to that path, and catastrophic here, where one account
+        # whose directory merely lost +x would abort the whole call and hide every other account's
+        # state. "Cannot determine" is not "absent" and is not a reason to stop reporting.
+        installer.install()
+        blocked_home = self.local_homes / "codex-accounts/acct-blocked/home"
+        blocked_home.mkdir(parents=True)
+        (self.registry / "acct-blocked").mkdir()
+        (self.registry / "acct-blocked/home").symlink_to(blocked_home)
+        blocked_home.chmod(0o000)
+        self.addCleanup(blocked_home.chmod, 0o700)
+
+        result = installer.verify()  # must not raise
+        self.assertFalse(result["ok"])
+        # Undeterminable, so not claimed as broken -- reported as the account we could not check.
+        self.assertEqual(result["broken"], [], result["broken"])
+        self.assertIn("acct-blocked", [entry["account_id"] for entry in result["unmanaged"]])
+        # ...and the healthy accounts are still reported rather than lost to an abort.
+        self.assertIn(os.fspath(self.main_config), result["configs"])
+        self.assertIn(os.fspath(self.symlinked_config), result["configs"])
+
+    def test_verify_keeps_reporting_an_offssd_account_as_unmanaged_not_broken(self) -> None:
+        # The boundary F2's fix must not cross. An account whose home is a real off-SSD directory is
+        # UNDETERMINABLE from here -- this machine has one, and its hook really is installed, by
+        # hand. Calling it broken would be a false alarm asserting the opposite of the truth; it
+        # stays `unmanaged`, and `hook_functional` stays true because nothing was proven bad.
+        installer.install()
+        self._add_offssd_registry_account("acct-offssd")
+
+        result = installer.verify()
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["hook_functional"], result)
+        self.assertEqual(result["broken"], [])
+        self.assertEqual([entry["account_id"] for entry in result["unmanaged"]], ["acct-offssd"])
 
     def test_verify_cli_action_exits_nonzero_when_an_account_is_unmanaged(self) -> None:
         installer.install()

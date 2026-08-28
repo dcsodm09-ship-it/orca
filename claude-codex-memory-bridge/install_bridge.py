@@ -524,6 +524,58 @@ def _resolve_account_hook_config(account_id: str, *, in_live_registry: bool) -> 
     return _hook_config_under(LOCAL_HOMES_ROOT / "codex-accounts", account_id)
 
 
+def _live_codex_hook_config() -> Path:
+    # The main Codex home's hooks.json -- `~/.codex/hooks.json` -- resolved WITHOUT requiring it to
+    # exist (round 5, live-verification finding F1, 2026-08-28).
+    #
+    # This one path is not like the account configs below it. It is live BY CONSTRUCTION: the two
+    # resolve_ssd_path() calls here prove `~/.codex` really is the canonical SSD Codex home, so
+    # whatever this returns is the file the machine's own default Codex profile reads. There is no
+    # "maybe this account was retired" reading of it available, and its absence is not an ambiguity
+    # to tolerate -- it is precisely the 2026-08-21 incident (a Codex app upgrade deleted this exact
+    # file and the machine ran an unredacted hook for about a week).
+    #
+    # Splitting it out of _enumerate_accounts() is what lets every caller say so. Previously the
+    # enumeration opened with `resolve_ssd_path(live_codex_home / "hooks.json")` at the default
+    # must_exist=True, so this file being missing raised InstallError from the FIRST statement
+    # verify() runs -- and verify()'s whole round-4 output contract (broken / drift / unreachable /
+    # hook_functional / summary / per-config detail) collapsed to a bare
+    # `{"ok": false, "error": "path unavailable: ..."}` with none of it. That is the same opaque,
+    # non-actionable abort round 4 exists to eliminate, reproduced through the one config it matters
+    # most for. The resolution work is identical; only `must_exist` changes, so callers that DO need
+    # the file to exist (install()/plan(), via discover_hook_configs()) still fail closed on it --
+    # one statement later, in validate_owned_file(), with a message that names the real problem
+    # ("cannot read <path>") rather than a resolution failure.
+    expected_codex_home = resolve_ssd_path(LOCAL_HOMES_ROOT / ".codex")
+    live_codex_home = resolve_ssd_path(Path.home() / ".codex")
+    if live_codex_home != expected_codex_home:
+        raise InstallError("live Codex home does not resolve to the canonical SSD home")
+    return resolve_ssd_path(live_codex_home / "hooks.json", must_exist=False)
+
+
+def _registry_account_expected_config(account_id: str) -> Path | None:
+    # Where a LIVE registry account's hooks.json would be, whether or not it currently exists.
+    #
+    # _hook_config_under() answers a different question -- "can this tool manage this account's
+    # config right now?" -- and returns None for two states that are not remotely equivalent
+    # (round 5, live-verification finding F2, 2026-08-28):
+    #   * the account's home is a real directory off the SSD. This tool cannot see inside it, so
+    #     whether a redaction hook runs there is genuinely UNDETERMINABLE from here. `unmanaged` is
+    #     the honest report.
+    #   * the account's home resolves onto the SSD and its hooks.json simply is not there. That is
+    #     not undeterminable at all: there is no hooks.json, so there is no hook, so this live
+    #     account's prompts are NOT being redacted. Reporting it as merely `unmanaged` -- with a
+    #     reason line that says "does not resolve onto the Extreme SSD", which is not even true of
+    #     it -- left `hook_functional` reading true over an account we can prove is unprotected.
+    # Resolving with must_exist=False is what separates the two: a path comes back for the second
+    # shape (and _path_is_absent() then confirms the file is gone), None only for the first.
+    candidate = orca_accounts_root() / account_id / "home/hooks.json"
+    try:
+        return resolve_ssd_path(candidate, must_exist=False)
+    except InstallError:
+        return None
+
+
 def _enumerate_accounts() -> tuple[list[Path], dict[str, Path | None]]:
     # The raw enumeration discover_hook_configs() is built on, split out so
     # a caller that only wants to know "what managed-shaped configs
@@ -540,11 +592,10 @@ def _enumerate_accounts() -> tuple[list[Path], dict[str, Path | None]]:
     #   [1] the live Orca registry's accounts mapped to the config located for each, with None for
     #       any registry account no manageable hooks.json could be found for. Empty dict when this
     #       machine has no registry at all -- the enumeration then behaves exactly as it always did.
-    expected_codex_home = resolve_ssd_path(LOCAL_HOMES_ROOT / ".codex")
-    live_codex_home = resolve_ssd_path(Path.home() / ".codex")
-    if live_codex_home != expected_codex_home:
-        raise InstallError("live Codex home does not resolve to the canonical SSD home")
-    configs = [resolve_ssd_path(live_codex_home / "hooks.json")]
+    # Always present in this list, existing or not (see _live_codex_hook_config()): a caller that
+    # needs it to exist enforces that itself, and the two callers that must NOT be aborted by its
+    # absence -- verify() and doctor() -- get to report it as the finding it actually is.
+    configs = [_live_codex_hook_config()]
 
     registry_ids = _list_account_ids(orca_accounts_root())
     legacy_ids = _list_account_ids(LOCAL_HOMES_ROOT / "codex-accounts")
@@ -2962,6 +3013,10 @@ _HOOK_HEALTH_DUPLICATE = "hook_duplicated"
 _HOOK_HEALTH_MISPOINTED = "hook_points_elsewhere"
 _HOOK_HEALTH_TAMPERED = "script_digest_mismatch"
 _HOOK_HEALTH_UNPARSEABLE = "config_unparseable"
+# The file itself is gone. doctor() has always reported this (under this exact string); verify()
+# gained it in round 5 for the configs it can prove are still live -- named here once so the two
+# cannot drift apart in what they call the same state.
+_HOOK_HEALTH_CONFIG_MISSING = "config_missing"
 
 
 def _live_handler_arguments(command: str) -> dict[str, str]:
@@ -3057,8 +3112,21 @@ def _config_hook_health(
     return {"hook_present": True, "problems": problems, "payload": payload, "command": command}
 
 
-def _classify_config_drift(raw: bytes, row: dict[str, Any], payload: Any) -> dict[str, Any] | None:
-    """None when the bytes still match the receipt; otherwise a classified drift record."""
+def _classify_config_drift(
+    raw: bytes, row: dict[str, Any], payload: Any, *, hook_functional: bool
+) -> dict[str, Any] | None:
+    """None when the bytes still match the receipt; otherwise a classified drift record.
+
+    `hook_functional` is THIS config's own semantic verdict (i.e. `not health["problems"]`), and it
+    is a parameter rather than something the caller staples on afterwards because the detail strings
+    below are read by humans and two of them used to end in an unconditional reassurance -- "the
+    redaction hook itself is unaffected (see hook_functional)" and "Cosmetic." -- that this function
+    had no way to know was true (round 5, live-verification finding F4, 2026-08-28). Byte drift and
+    a broken hook are independent: a foreign writer that rewrites this file is perfectly capable of
+    dropping our handler in the same edit, and the record then said the hook was unaffected while
+    `broken` said the opposite two keys away. The structured `hook_functional` field on the record
+    was always correct; only the prose lied, which is the half a human actually reads.
+    """
     if sha256_bytes(raw) == row.get("after_sha256"):
         return None
     classification = "unclassified"
@@ -3077,12 +3145,21 @@ def _classify_config_drift(raw: bytes, row: dict[str, Any], payload: Any) -> dic
                     detail = (
                         "byte-for-byte different but semantically identical to what install() "
                         "wrote: another writer reformatted this file. Cosmetic."
+                        if hook_functional
+                        else "byte-for-byte different but semantically identical to what install() "
+                        "wrote: another writer reformatted this file. The reformat itself is "
+                        "cosmetic, but the redaction hook is NOT correctly wired on this config -- "
+                        "see its entry in `broken`, which is the finding that matters here."
                     )
                 else:
                     classification = "foreign_change"
                     detail = (
                         "another tool changed this config's own content; the redaction hook itself "
                         "is unaffected (see hook_functional)"
+                        if hook_functional
+                        else "another tool changed this config's own content, AND the redaction "
+                        "hook is not correctly wired on this config -- see its entry in `broken`. "
+                        "Do not read this record as reassurance that the hook survived the edit."
                     )
         except InstallError:
             pass
@@ -3121,6 +3198,26 @@ def verify() -> dict[str, Any]:
     # is a leftover, not a live account Orca will ever run, and failing verify() over one would be
     # a false alarm.
     _, registry_accounts = _enumerate_accounts()
+    # Round 5 (live-verification findings F1 and F2, 2026-08-28). Both come from one missing notion:
+    # verify() could not tell which of the paths it handles are still LIVE.
+    #
+    # `unreachable` -- "the path in this receipt row is gone, skip it and report it, do not fail" --
+    # is correct and load-bearing for a RETIRED account (R3-P1-A; two tests pin it). It is exactly
+    # wrong for a config that still exists as a live target and merely lost its file, which is the
+    # 2026-08-21 incident verbatim. Without the distinction the incident's own shape landed in the
+    # tolerated bucket: `ok: true`, `hook_functional: true`, `broken: []`, the deleted config
+    # mentioned only in a list documented as "not a failure".
+    #
+    # `live_targets` is the distinction, built from the two sources that can answer "is this path
+    # live right now?" independently of any receipt: the canonical Codex home (live by construction
+    # -- see _live_codex_hook_config()) and the LIVE Orca account registry.
+    live_targets: dict[str, str] = {os.fspath(_live_codex_hook_config()): "the live Codex home (~/.codex)"}
+    for account_id in sorted(registry_accounts):
+        expected = _registry_account_expected_config(account_id)
+        if expected is not None:
+            live_targets.setdefault(os.fspath(expected), f"the live Orca account {account_id}")
+    # path -> which live target it is; filled in below and turned into `broken` entries afterwards.
+    missing_live: dict[str, str] = {}
     receipt_config_paths = {
         row["path"] for row in receipt["configs"] if isinstance(row, dict) and isinstance(row.get("path"), str)
     }
@@ -3161,7 +3258,13 @@ def verify() -> dict[str, Any]:
         # R4-P1-A and gets the same errno-discriminating fix.
         path = resolve_ssd_path(Path(row["path"]), must_exist=False)
         if _path_is_absent(path):
-            unreachable.append(os.fspath(path))
+            # Round 5: absent is still tolerated for a retired account, and is now a `broken` finding
+            # for a path `live_targets` proves is live (see its comment above).
+            live_reason = live_targets.get(os.fspath(path))
+            if live_reason is None:
+                unreachable.append(os.fspath(path))
+            else:
+                missing_live[os.fspath(path)] = live_reason
             continue
         raw = validate_owned_file(path, private=True)
         # Round-4 (see the block comment above `_config_hook_health`): SEMANTIC first, bytes second,
@@ -3174,14 +3277,15 @@ def verify() -> dict[str, Any]:
             expected_script_sha256=receipt["script_sha256"],
             expected_policy_sha256=receipt["policy_sha256"],
         )
+        config_hook_functional = not health["problems"]
         if health["problems"]:
             broken.append({"config": os.fspath(path), "problems": health["problems"]})
-        drift_record = _classify_config_drift(raw, row, health["payload"])
+        drift_record = _classify_config_drift(raw, row, health["payload"], hook_functional=config_hook_functional)
         if drift_record is not None:
             drift.append(
                 {
                     "config": os.fspath(path),
-                    "hook_functional": not health["problems"],
+                    "hook_functional": config_hook_functional,
                     **drift_record,
                 }
             )
@@ -3335,10 +3439,58 @@ def verify() -> dict[str, Any]:
             raise InstallError(f"live write-trigger policy is invalid: {exc}") from exc
         write_trigger_script_sha256 = expected_script_sha256
 
+    # Round 5: a live target with no receipt row at all reaches the loop above never having been
+    # looked at, so sweep whatever `live_targets` still holds. This is the same finding arriving by
+    # a different door -- a live account this tool never installed into, whose hooks.json is also
+    # absent, is no more redacted than one whose receipt row went stale -- and it is what makes the
+    # check independent of the receipt rather than a re-read of it.
+    for live_path, live_reason in live_targets.items():
+        if live_path in missing_live or live_path in checked or live_path in unreachable:
+            continue
+        try:
+            absent = _path_is_absent(Path(live_path))
+        except InstallError:
+            # _path_is_absent() fails closed by raising on anything that is not ENOENT (EACCES from a
+            # parent directory that lost +x, EIO from this external SSD), which is right where it is
+            # called on a path this function is about to act on -- and wrong here, where it would
+            # make one indeterminate account abort the entire call and hide every other account's
+            # state. That is the exact failure mode F1 is about, and re-introducing it through the
+            # fix for it would be its own bug. "Cannot determine" is not "absent": leave this account
+            # to the `unmanaged` reporting below, which still forces `ok: false` over it.
+            continue
+        if absent:
+            missing_live[live_path] = live_reason
+    for live_path in sorted(missing_live):
+        broken.append(
+            {
+                "config": live_path,
+                "problems": [
+                    {
+                        "kind": _HOOK_HEALTH_CONFIG_MISSING,
+                        "detail": (
+                            f"hooks.json does not exist, and this path is {missing_live[live_path]} "
+                            "-- a config that is live right now, so NOTHING is redacting its "
+                            "prompts. This is the exact state a Codex app upgrade left this machine "
+                            "in on 2026-08-21. Re-run `install`."
+                        ),
+                    }
+                ],
+            }
+        )
+
     covered = receipt_config_paths | set(checked) | set(unreachable)
     unmanaged: list[dict[str, str]] = []
     for account_id, located in sorted(registry_accounts.items()):
         if located is None:
+            expected = _registry_account_expected_config(account_id)
+            if expected is not None and os.fspath(expected) in missing_live:
+                # Round 5: already reported in `broken`, and reported there far better. This branch's
+                # reason line below says the account's config "does not resolve onto the Extreme
+                # SSD", which is the undeterminable case -- for a deleted hooks.json it is simply
+                # untrue (it resolves fine; there is just no file), and it downgrades a proven "this
+                # live account is unprotected" into "we could not look". Emitting both would also
+                # double-report one account under two different names for two different reasons.
+                continue
             unmanaged.append(
                 {
                     "account_id": account_id,
@@ -3379,6 +3531,22 @@ def verify() -> dict[str, Any]:
     # `test_install_carries_forward_a_temporarily_undiscovered_config_without_losing_baseline`).
     # An account that no longer exists submits no prompts; the check that catches a LIVE account
     # going unprotected is the registry enumeration below, which reports it as `unmanaged`.
+    #
+    # Round 5 (F2) states the scope this field has, because "a caller can act on it without parsing
+    # anything else" is only honest if the boundary is written down. `hook_functional` is
+    # THREE-valued information squeezed into a bool, and the squeeze is deliberately one-directional:
+    #   false -- proven bad. Some config that is live right now has no correctly-wired hook. Round 4
+    #           covered "the file is there and the entry is wrong"; round 5 added "the file itself is
+    #           gone", via `missing_live` above, which is the state the 2026-08-21 incident actually
+    #           produced and which previously read `true` here.
+    #   true  -- proven good FOR EVERY CONFIG THIS TOOL COULD INSPECT. It is not a claim about
+    #           accounts it cannot reach at all: an Orca account whose home is a real off-SSD
+    #           directory (this machine has one) is undeterminable from here, not healthy, and it is
+    #           reported in `unmanaged` instead. `ok` is the field that folds both in
+    #           (`hook_functional and not unmanaged`), which is why `ok` and not this field is what a
+    #           scripted caller should gate on. A caller reading `hook_functional` alone must read
+    #           `unmanaged` alongside it -- there is nothing else it needs, and this is the one thing
+    #           it does need.
     hook_functional = not broken
     cosmetic = [record for record in drift if record["hook_functional"]]
     if broken:
@@ -3457,6 +3625,9 @@ def verify() -> dict[str, Any]:
 def doctor() -> dict[str, Any]:
     findings: list[dict[str, str]] = []
     checked: list[str] = []
+    # Every config found to be running the release's own script, collected so the one shared script
+    # file behind all of them is checked once instead of once per config (see F3, below).
+    configs_running_the_release: list[str] = []
 
     def finding(kind: str, target: str, detail: str) -> None:
         findings.append({"kind": kind, "target": target, "detail": detail})
@@ -3492,6 +3663,19 @@ def doctor() -> dict[str, Any]:
     # `_enumerate_accounts()` rather than `discover_hook_configs()` on purpose: the latter enforces
     # an "at least 2 configs" policy that belongs to INSTALLING, and a health check must keep
     # working when only one config is left -- the same reasoning uninstall()'s safety scan uses.
+    #
+    # The live Codex home's hooks.json is added as a target FIRST and unconditionally (round 5,
+    # 2026-08-28), before and independently of that enumeration. It is the file the 2026-08-21
+    # incident deleted, and the states where _enumerate_accounts() still raises outright -- no
+    # account roots on this machine at all, an unlistable registry -- are exactly the states where
+    # it would otherwise be checked only if a receipt happened to survive and name it.
+    try:
+        live_codex_config = os.fspath(_live_codex_hook_config())
+    except InstallError as exc:
+        finding("codex_home_unreachable", os.fspath(Path.home() / ".codex"), str(exc))
+    else:
+        if live_codex_config not in targets:
+            targets.append(live_codex_config)
     try:
         discovered, registry_accounts = _enumerate_accounts()
     except InstallError as exc:
@@ -3523,7 +3707,7 @@ def doctor() -> dict[str, Any]:
             # THE incident. A Codex app upgrade deleted ~/.codex/hooks.json on 2026-08-21 and the
             # machine ran an unredacted hook for about a week.
             finding(
-                "config_missing",
+                _HOOK_HEALTH_CONFIG_MISSING,
                 target,
                 "hooks.json does not exist. If this account is live, NOTHING is redacting its "
                 "prompts -- this is the exact state a Codex app upgrade left this machine in on "
@@ -3562,18 +3746,29 @@ def doctor() -> dict[str, Any]:
         for problem in health["problems"]:
             finding(problem["kind"], target, problem["detail"])
         if health["hook_present"] and not health["problems"]:
-            # The handler self-declares the script it runs; confirm that file is really there and
-            # really is the release, rather than trusting the command line's own assertion about it.
-            try:
-                script_raw = validate_owned_file(resolve_ssd_path(Path(expected_script)), private=True)
-            except InstallError as exc:
-                finding("script_unreadable", expected_script, str(exc))
-                continue
+            # The handler self-declares the script it runs; that file is confirmed to be really
+            # there and really the release AFTER this loop, once, rather than here, per config
+            # (round 5, live-verification finding F3, 2026-08-28). `expected_script` is a single
+            # release-directory path that every managed account's handler points at, so doing it
+            # inside the loop emitted one byte-identical finding per healthy config -- four of them
+            # on the real machine, for one tampered file -- each targeting the script rather than any
+            # account, which reads as four separate problems and points at the wrong subject.
+            configs_running_the_release.append(target)
+
+    if receipt is not None and expected_script is not None and configs_running_the_release:
+        try:
+            script_raw = validate_owned_file(resolve_ssd_path(Path(expected_script)), private=True)
+        except InstallError as exc:
+            finding("script_unreadable", expected_script, str(exc))
+        else:
             if sha256_bytes(script_raw) != receipt["script_sha256"]:
                 finding(
                     _HOOK_HEALTH_TAMPERED,
                     expected_script,
-                    "the script this account's hook runs does not hash to the installed release",
+                    "the script does not hash to the installed release, and "
+                    + str(len(configs_running_the_release))
+                    + " config(s) run it: "
+                    + ", ".join(configs_running_the_release),
                 )
 
     # Self-check for the way a periodic runner of THIS command would die silently. The hazard is

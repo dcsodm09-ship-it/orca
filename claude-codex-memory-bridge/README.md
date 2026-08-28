@@ -154,16 +154,33 @@ separate `drift` list, and each one is classified:
 |---|---|---|
 | `reserialized` | same JSON, different formatting; another writer rewrote the file | no |
 | `foreign_change` | another tool changed its own handlers; ours is untouched | no |
-| *(a `broken` entry)* | our handler is missing, duplicated, or points elsewhere | **yes** |
+| *(a `broken` entry)* | our handler is missing, duplicated, points elsewhere, or its whole `hooks.json` is gone while the account is still live | **yes** |
+
+Since round 5, a missing `hooks.json` is one of those `broken` entries
+(`config_missing`) whenever the config is still **live** — the canonical
+`~/.codex` home, or an account present in the Orca registry. A missing
+`hooks.json` for a *retired* account stays in `unreachable`, which is not a
+failure: an account that no longer exists submits no prompts. Before round 5 the
+live case landed in the tolerated bucket too, or (for `~/.codex` itself) aborted
+the whole call with a bare `{"ok": false, "error": "path unavailable: ..."}`.
 
 `hook_functional` and a plain-English `summary` are top-level, so a caller does
-not have to interpret anything to learn whether prompts are being redacted.
+not have to interpret anything to learn whether prompts are being redacted. Its
+scope is exact and worth knowing: **`false` means proven bad** — some live config
+has no correctly-wired hook. **`true` means proven good for every config this
+tool could inspect**, which is not the same as "every account on this machine":
+an Orca account whose home is a real off-SSD directory cannot be inspected from
+here at all, and is reported in `unmanaged` instead. `ok` is
+`hook_functional and not unmanaged`, so `ok` — not `hook_functional` alone — is
+what a scripted caller should gate on.
 
 `doctor` asks **"is the redaction hook running right now?"** It never raises —
 a missing receipt is a *finding*, not an exception — and it enumerates configs
 live rather than from the receipt, so it still answers on a machine whose
 receipt is gone. It exists for one failure class: `hooks.json` disappearing, or
-losing its redaction entry. Both exit non-zero on failure.
+losing its redaction entry. Both exit non-zero on failure. One release's script
+is shared by every managed account, so a tampered script is reported **once**,
+naming the configs that run it, rather than once per config.
 
 Why the byte comparison had to go: on 2026-08-21 a Codex app upgrade deleted
 `~/.codex/hooks.json`, and this machine ran the original, unbounded,
