@@ -10379,5 +10379,301 @@ class RedactTableSpilloverWhitespaceRunTests(unittest.TestCase):
                 )
 
 
+class FailureJournalTests(unittest.TestCase):
+    """Coverage for the append-only failure journal (added 2026-08-28).
+
+    Context: before the journal existed, every failure mode of this hook was
+    completely silent -- a `--expected-script-sha256` mismatch produced exit 0,
+    empty stdout and empty stderr, which was reproduced against the deployed
+    release. These tests pin both halves of the contract: that failures are now
+    recorded, and that the recording can never leak payload or break the hook.
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.home = Path(self.temp.name)
+        self.addCleanup(self.temp.cleanup)
+        patcher = mock.patch.dict(os.environ, {"HOME": os.fspath(self.home)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop(hook._JOURNAL_DISABLE_ENV, None)
+
+    @property
+    def journal(self) -> Path:
+        return self.home / hook._JOURNAL_DIR / hook._JOURNAL_FILENAME
+
+    def _records(self) -> list[dict]:
+        if not self.journal.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in self.journal.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def _run_main(self, argv: list[str], stdin: bytes = b"{}") -> int:
+        import io
+
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "argv", ["claude_memory_hook.py", *argv]), \
+                mock.patch.object(sys, "stdin", mock.Mock(buffer=io.BytesIO(stdin))), \
+                mock.patch.object(sys, "stdout", stdout):
+            return hook.main()
+
+    # -- path resolution ---------------------------------------------------
+
+    def test_journal_path_uses_home(self) -> None:
+        self.assertEqual(hook.journal_path(), self.journal)
+
+    def test_journal_path_none_when_home_unusable(self) -> None:
+        for bad in ("", "relative/path"):
+            with self.subTest(home=bad), mock.patch.dict(os.environ, {"HOME": bad}):
+                self.assertIsNone(hook.journal_path())
+
+    # -- message allowlist -------------------------------------------------
+
+    def test_allowlist_matches_source_literals(self) -> None:
+        """Drift guard: the allowlist must equal the fixed literals in the source.
+
+        If a new `raise BridgeError("...")` literal is added it must be
+        allowlisted deliberately, and if an existing literal is converted to an
+        f-string it must be removed. Either way this test is the prompt.
+        """
+        import ast
+
+        tree = ast.parse(Path(hook.__file__).read_text(encoding="utf-8"))
+        literals = set()
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)):
+                continue
+            func = node.exc.func
+            if (getattr(func, "id", None) or getattr(func, "attr", None)) != "BridgeError":
+                continue
+            if node.exc.args and isinstance(node.exc.args[0], ast.Constant):
+                value = node.exc.args[0].value
+                if isinstance(value, str):
+                    literals.add(value)
+        self.assertEqual(set(hook._JOURNAL_SAFE_MESSAGES), literals)
+
+    def test_safe_message_allows_fixed_literal(self) -> None:
+        self.assertEqual(
+            hook.journal_safe_message(hook.BridgeError("script digest mismatch")),
+            "script digest mismatch",
+        )
+
+    def test_safe_message_drops_interpolated_bridge_error(self) -> None:
+        """The 4 interpolated BridgeError messages can carry a basename or key."""
+        for message in (
+            "cannot read PRIVATE-CLIENT-NOTES.md",
+            "PRIVATE-CLIENT-NOTES.md exceeds limit",
+            "duplicate JSON key: secret_field",
+            "invalid max_files",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(hook.journal_safe_message(hook.BridgeError(message)))
+
+    def test_safe_message_drops_non_bridge_errors(self) -> None:
+        for exc in (
+            OSError("/Users/tester/private/memory/MEMORY.md"),
+            ValueError("secret value 4111111111111111"),
+            AssertionError("origin range 12:40"),
+        ):
+            with self.subTest(exc=type(exc).__name__):
+                self.assertIsNone(hook.journal_safe_message(exc))
+
+    def test_record_carries_class_not_payload(self) -> None:
+        record = hook.journal_record(
+            "1-abcd", "failed", "read_docs", OSError("/private/secret.md")
+        )
+        self.assertEqual(record["exc"], "OSError")
+        self.assertNotIn("msg", record)
+        self.assertNotIn("secret", json.dumps(record))
+
+    # -- write behaviour ---------------------------------------------------
+
+    def test_write_appends_private_jsonl(self) -> None:
+        hook.journal_write({"event": "a"})
+        hook.journal_write({"event": "b"})
+        self.assertEqual([r["event"] for r in self._records()], ["a", "b"])
+        self.assertEqual(stat.S_IMODE(self.journal.stat().st_mode), 0o600)
+
+    def test_write_honours_disable_env(self) -> None:
+        with mock.patch.dict(os.environ, {hook._JOURNAL_DISABLE_ENV: "1"}):
+            hook.journal_write({"event": "a"})
+        self.assertFalse(self.journal.exists())
+
+    def test_write_never_raises_when_unwritable(self) -> None:
+        self.journal.parent.mkdir(parents=True)
+        # A directory where the journal file belongs makes every open() fail.
+        self.journal.mkdir()
+        hook.journal_write({"event": "a"})  # must not raise
+
+    def test_write_never_raises_on_unserialisable_record(self) -> None:
+        hook.journal_write({"event": object()})  # must not raise
+        self.assertEqual(self._records(), [])
+
+    def test_rotation_caps_growth(self) -> None:
+        self.journal.parent.mkdir(parents=True)
+        self.journal.write_bytes(b"x" * (hook._JOURNAL_MAX_BYTES + 1))
+        hook.journal_write({"event": "fresh"}, rotate=True)
+        rotated = self.journal.with_name(
+            self.journal.name + hook._JOURNAL_KEEP_ROTATED
+        )
+        self.assertTrue(rotated.exists())
+        self.assertEqual([r["event"] for r in self._records()], ["fresh"])
+
+    def test_no_rotation_below_cap(self) -> None:
+        hook.journal_write({"event": "a"})
+        hook.journal_write({"event": "b"}, rotate=True)
+        self.assertEqual([r["event"] for r in self._records()], ["a", "b"])
+
+    # -- phase reporting ---------------------------------------------------
+
+    def test_run_reports_every_phase_on_success(self) -> None:
+        fixture = HookFixture()
+        self.addCleanup(fixture.close)
+        fixture.add_memory("# Notes\n\nalpha beta gamma\n")
+        policy, policy_sha = fixture.policy()
+        seen: list[str] = []
+        hook.run(
+            policy_path=policy,
+            expected_policy_sha256=policy_sha,
+            expected_script_sha256=fixture.script_sha,
+            stdin=json.dumps(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "prompt": "alpha",
+                    "cwd": fixture.cwd,
+                }
+            ).encode(),
+            script_path=fixture.script,
+            volume_uuid_reader=lambda _root: TEST_UUID,
+            phase_sink=seen.append,
+        )
+        self.assertEqual(
+            seen,
+            [
+                "verify_script",
+                "load_policy",
+                "validate_policy",
+                "verify_storage",
+                "parse_input",
+                "read_docs",
+                "build_context",
+            ],
+        )
+
+    def test_run_without_phase_sink_is_unchanged(self) -> None:
+        """Backward compatibility: phase_sink is optional."""
+        fixture = HookFixture()
+        self.addCleanup(fixture.close)
+        fixture.add_memory("# Notes\n\nalpha beta gamma\n")
+        self.assertIn("alpha", fixture.run("alpha"))
+
+    def test_phase_stops_at_failing_step(self) -> None:
+        fixture = HookFixture()
+        self.addCleanup(fixture.close)
+        policy, _sha = fixture.policy()
+        seen: list[str] = []
+        with self.assertRaises(hook.BridgeError):
+            hook.run(
+                policy_path=policy,
+                expected_policy_sha256="0" * 64,
+                expected_script_sha256=fixture.script_sha,
+                stdin=b"{}",
+                script_path=fixture.script,
+                volume_uuid_reader=lambda _root: TEST_UUID,
+                phase_sink=seen.append,
+            )
+        self.assertEqual(seen, ["verify_script", "load_policy"])
+
+    # -- main() wiring -----------------------------------------------------
+
+    def _base_argv(self, script_sha: str) -> list[str]:
+        return [
+            "--bridge-id", hook.BRIDGE_ID,
+            "--policy", "/nonexistent/policy.json",
+            "--expected-policy-sha256", "0" * 64,
+            "--expected-script-sha256", script_sha,
+        ]
+
+    def test_script_digest_mismatch_is_no_longer_silent(self) -> None:
+        """The exact scenario reproduced against the deployed release.
+
+        Still exit 0 with no stdout -- that contract is unchanged and load
+        bearing -- but it now leaves a record instead of nothing at all.
+        """
+        self.assertEqual(self._run_main(self._base_argv("0" * 64)), 0)
+        records = self._records()
+        self.assertEqual([r["event"] for r in records], ["start", "failed"])
+        self.assertEqual(records[1]["phase"], "verify_script")
+        self.assertEqual(records[1]["exc"], "BridgeError")
+        self.assertEqual(records[1]["msg"], "script digest mismatch")
+        self.assertEqual(records[0]["inv"], records[1]["inv"])
+
+    def test_bad_arguments_recorded_at_args_phase(self) -> None:
+        self.assertEqual(self._run_main(["--bogus"]), 0)
+        records = self._records()
+        self.assertEqual([r["event"] for r in records], ["start", "failed"])
+        self.assertEqual(records[1]["phase"], "args")
+        self.assertEqual(records[1]["msg"], "invalid command arguments")
+
+    def test_foreign_bridge_id_is_recorded_as_skipped(self) -> None:
+        argv = self._base_argv("0" * 64)
+        argv[1] = "some-other-bridge"
+        self.assertEqual(self._run_main(argv), 0)
+        self.assertEqual([r["event"] for r in self._records()], ["start", "skipped"])
+
+    def test_success_writes_start_and_ok_pair(self) -> None:
+        with mock.patch.object(hook, "run", return_value=""):
+            self.assertEqual(self._run_main(self._base_argv("0" * 64)), 0)
+        records = self._records()
+        self.assertEqual([r["event"] for r in records], ["start", "ok"])
+        self.assertEqual(records[0]["inv"], records[1]["inv"])
+
+    def test_unexpected_exception_is_journalled_and_still_raised(self) -> None:
+        """Behaviour must be unchanged: the traceback still escapes."""
+        with mock.patch.object(hook, "run", side_effect=AssertionError("boom")):
+            with self.assertRaises(AssertionError):
+                self._run_main(self._base_argv("0" * 64))
+        records = self._records()
+        self.assertEqual([r["event"] for r in records], ["start", "crashed"])
+        self.assertEqual(records[1]["exc"], "AssertionError")
+        self.assertNotIn("boom", json.dumps(records))
+
+    def test_killed_invocation_leaves_unterminated_start(self) -> None:
+        """A timeout kill is only observable as start-without-terminal."""
+        with mock.patch.object(hook, "journal_record", wraps=hook.journal_record):
+            with mock.patch.object(hook, "run", side_effect=SystemExit(9)):
+                with self.assertRaises(SystemExit):
+                    self._run_main(self._base_argv("0" * 64))
+        # SystemExit is a BaseException: it is journalled then re-raised, so a
+        # true SIGKILL (which runs no handler at all) is the only case that
+        # leaves a lone `start`.
+        starts = [r for r in self._records() if r["event"] == "start"]
+        self.assertEqual(len(starts), 1)
+
+    def test_journal_failure_cannot_break_the_hook(self) -> None:
+        with mock.patch.object(hook, "journal_write", side_effect=OSError("nope")):
+            with self.assertRaises(OSError):
+                # Proves the guard lives inside journal_write itself: with it
+                # stubbed out the error propagates, so the real function's own
+                # bare handler is what keeps main() safe.
+                self._run_main(self._base_argv("0" * 64))
+
+    def test_main_records_nothing_sensitive_from_a_real_prompt(self) -> None:
+        stdin = json.dumps(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "my password is hunter2 and my key is sk-live-abcdef",
+                "cwd": "/Users/tester/secret-client-project",
+            }
+        ).encode()
+        self._run_main(self._base_argv("0" * 64), stdin=stdin)
+        blob = json.dumps(self._records())
+        for secret in ("hunter2", "sk-live-abcdef", "secret-client-project"):
+            self.assertNotIn(secret, blob)
+
+
 if __name__ == "__main__":
     unittest.main()

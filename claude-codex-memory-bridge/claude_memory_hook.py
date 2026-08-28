@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
 """Expose relevant Claude native memory to Codex as untrusted hook context.
 
-The hook is intentionally read-only.  It only scans the fixed Claude native
-memory layout selected by a private, hash-pinned policy and emits bounded,
-redacted context for a Codex UserPromptSubmit event.
+The hook is read-only with respect to everything it reads.  It only scans the
+fixed Claude native memory layout selected by a private, hash-pinned policy and
+emits bounded, redacted context for a Codex UserPromptSubmit event.  Nothing
+under the policy's `ssd_root` -- the policy, this script, or any memory
+document -- is ever written.
+
+The one exception, added 2026-08-28, is an append-only failure journal at
+`~/.local/state/claude-codex-memory-bridge/hook-journal.log` on internal
+storage.  Every failure mode of this hook was previously completely silent,
+including a `--expected-script-sha256` mismatch.  The journal records failure
+*class* only (phase, exception type, and an allowlisted fixed message) and
+never any payload, prompt, path, or memory content.  Set
+`ORCA_MEMORY_BRIDGE_NO_JOURNAL=1` to disable it.  See the "Failure journal"
+section further down for the full rationale.
 """
 
 from __future__ import annotations
@@ -17,6 +28,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 import unicodedata
 import bisect
 from dataclasses import dataclass
@@ -9697,6 +9709,189 @@ def hook_output(context: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Failure journal
+#
+# Why this exists: before this, every failure mode of this hook was completely
+# silent. `main()` catches BridgeError/OSError/ValueError and returns 0 with no
+# output, Codex persists nothing about hook exit status or stderr, and a
+# `--expected-script-sha256` mismatch -- a tampered or drifted script, the most
+# security-relevant failure of all -- produced exit 0, empty stdout, empty
+# stderr. Verified by reproduction against the deployed release, 2026-08-28.
+#
+# Scope of the invariant change: the module docstring used to say "The hook is
+# intentionally read-only." That is now stated more precisely -- read-only with
+# respect to everything it *reads* (the SSD-resident policy, script and memory
+# documents are still never written), plus exactly one append-only journal on
+# internal storage. Nothing under `ssd_root` is written, so `verify_storage`'s
+# residency guarantee is untouched.
+#
+# Why internal storage and not the SSD: the same reason this project's doctor
+# plist already documents for its own logs -- a journal on /Volumes/Extreme SSD
+# is unwritable under a launchd session (macOS TCC denies removable-volume
+# access) and, more importantly, is unavailable in precisely the failure this
+# most needs to record: the SSD being unmounted.
+#
+# Timeout coverage: `hooks.json` sets `"timeout": 5` and the harness *kills*
+# the process, so no in-process `except` can ever observe a timeout. That is
+# why this is a start-marker design: a `start` record with no matching terminal
+# record for the same invocation id means the process was killed (timeout, OOM,
+# SIGKILL) rather than having failed cleanly. This is the only structure that
+# can observe the 5s kill.
+#
+# Cost: measured hot path is 0.42-0.47s against the 5s ceiling; two O_APPEND
+# writes of ~150 bytes each are sub-millisecond and, being well under PIPE_BUF,
+# do not interleave across concurrent Codex sessions.
+_JOURNAL_DISABLE_ENV = "ORCA_MEMORY_BRIDGE_NO_JOURNAL"
+_JOURNAL_DIR = ".local/state/claude-codex-memory-bridge"
+_JOURNAL_FILENAME = "hook-journal.log"
+_JOURNAL_MAX_BYTES = 1_048_576
+_JOURNAL_KEEP_ROTATED = ".1"
+
+# Only these exact BridgeError messages may be written to the journal.
+#
+# This allowlist is deliberately an allowlist and not "log str(exc) for
+# BridgeError". An audit of every `raise BridgeError(...)` site (AST walk,
+# 2026-08-28) found 39 sites, of which 4 build their message by interpolation:
+#
+#     line 109: f'duplicate JSON key: {key}'      (contained: strict_json_loads
+#                                                  rewrites it to 'invalid JSON')
+#     line 130: f'cannot read {path.name}'        (escapes, carries a basename)
+#     line 132: f'{path.name} exceeds limit'      (escapes, carries a basename)
+#     line 208: f'invalid {key}'                  (escapes, policy key name)
+#
+# A basename can be memory-document-derived, so it is content, not a fixed
+# label. Any message not listed here is dropped and the record carries only the
+# exception type and phase. A newly added interpolated message therefore fails
+# safe (omitted) rather than fails open (logged).
+_JOURNAL_SAFE_MESSAGES = frozenset(
+    {
+        "SSD UUID mismatch",
+        "SSD volume has no UUID",
+        "bridge id mismatch",
+        "bridge not authorized",
+        "cannot stat SSD path",
+        "cannot verify SSD volume",
+        "hook input exceeds limit",
+        "hook input must be an object",
+        "invalid JSON",
+        "invalid command arguments",
+        "invalid cwd",
+        "invalid expected policy digest",
+        "invalid expected script digest",
+        "invalid limits",
+        "invalid prompt",
+        "invalid volume UUID",
+        "max_blocks out of range",
+        "max_file_bytes out of range",
+        "max_files out of range",
+        "max_output_bytes out of range",
+        "max_total_bytes out of range",
+        "missing limits",
+        "path escaped SSD root",
+        "path is not on expected SSD device",
+        "policy digest mismatch",
+        "policy must be an object",
+        "required path is unavailable",
+        "runtime file is not private",
+        "runtime file ownership mismatch",
+        "runtime root is not private",
+        "script digest mismatch",
+        "unexpected policy keys",
+        "unsafe Claude projects root",
+        "unsupported policy schema",
+        "wrong hook event",
+    }
+)
+
+
+def journal_path() -> Path | None:
+    """Absolute path of the failure journal, or None if HOME is unusable."""
+    home = os.environ.get("HOME")
+    if not home or not os.path.isabs(home):
+        return None
+    return Path(home) / _JOURNAL_DIR / _JOURNAL_FILENAME
+
+
+def journal_safe_message(exc: BaseException | None) -> str | None:
+    """The exception's message, only when it is a known fixed literal."""
+    if not isinstance(exc, BridgeError):
+        return None
+    message = str(exc)
+    return message if message in _JOURNAL_SAFE_MESSAGES else None
+
+
+def _journal_rotate(path: Path) -> None:
+    try:
+        if path.stat().st_size < _JOURNAL_MAX_BYTES:
+            return
+    except OSError:
+        return
+    # os.replace is atomic. Two racing invocations can both rotate; the loser
+    # simply overwrites an already-rotated file, which costs at most one
+    # generation of history and never corrupts the live journal.
+    os.replace(path, path.with_name(path.name + _JOURNAL_KEEP_ROTATED))
+
+
+def journal_write(record: dict[str, Any], *, rotate: bool = False) -> None:
+    """Append one bounded JSON line to the failure journal.
+
+    This must never raise and never change what the hook returns to Codex:
+    an unwritable journal is a diagnostic loss, not a hook failure. It is
+    deliberately guarded by its own bare handler so that it can never widen
+    `main()`'s `except (BridgeError, OSError, ValueError)`.
+    """
+    try:
+        if os.environ.get(_JOURNAL_DISABLE_ENV):
+            return
+        path = journal_path()
+        if path is None:
+            return
+        # 0700 on the leaf directory, 0600 on the file below: the journal
+        # names failure classes on a multi-account machine, so it stays
+        # owner-only in the same spirit as the runtime root check.
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if rotate:
+            _journal_rotate(path)
+        line = json.dumps(
+            record, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        )
+        payload = (line + "\n").encode("utf-8", "replace")
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600
+        )
+        try:
+            os.write(descriptor, payload)
+        finally:
+            os.close(descriptor)
+    except Exception:  # noqa: BLE001 - a journal failure must stay invisible
+        return
+
+
+def journal_record(
+    invocation: str, event: str, phase: str, exc: BaseException | None = None
+) -> dict[str, Any]:
+    """Build one journal record. Carries failure *class*, never payload."""
+    record: dict[str, Any] = {
+        "ts": time.time(),
+        "bridge": BRIDGE_ID,
+        "inv": invocation,
+        "event": event,
+        "phase": phase,
+    }
+    if exc is not None:
+        record["exc"] = type(exc).__name__
+        message = journal_safe_message(exc)
+        if message is not None:
+            record["msg"] = message
+    return record
+
+
+def new_invocation_id() -> str:
+    """Unique enough to pair a start record with its terminal record."""
+    return f"{os.getpid():d}-{os.urandom(4).hex()}"
+
+
 def run(
     *,
     policy_path: Path,
@@ -9705,24 +9900,47 @@ def run(
     stdin: bytes,
     script_path: Path | None = None,
     volume_uuid_reader: Callable[[Path], str] = _disk_volume_uuid_user_prompt_submit,
+    phase_sink: Callable[[str], None] | None = None,
 ) -> str:
+    def phase(name: str) -> None:
+        if phase_sink is not None:
+            phase_sink(name)
+
     script_path = script_path or Path(__file__)
+    phase("verify_script")
     verify_script(script_path, expected_script_sha256)
+    phase("load_policy")
     policy, _raw = load_policy(policy_path, expected_policy_sha256)
+    phase("validate_policy")
     limits = validate_policy(policy)
+    phase("verify_storage")
     source_root, _runtime_root = verify_storage(
         policy,
         policy_path,
         script_path,
         volume_uuid_reader=volume_uuid_reader,
     )
+    phase("parse_input")
     prompt, cwd = parse_hook_input(stdin)
+    phase("read_docs")
     documents = read_memory_documents(source_root, cwd, limits)
+    phase("build_context")
     context = build_context(documents, prompt, limits)
     return hook_output(context) if context else ""
 
 
 def main() -> int:
+    invocation = new_invocation_id()
+    phase = "args"
+
+    def record_phase(name: str) -> None:
+        nonlocal phase
+        phase = name
+
+    # Write-before-work: this start record is what makes a harness kill
+    # (the 5s hooks.json timeout) observable at all. A start with no matching
+    # terminal record for the same `inv` was killed, not cleanly failed.
+    journal_write(journal_record(invocation, "start", phase), rotate=True)
     try:
         argv = sys.argv[1:]
         expected_names = {
@@ -9740,6 +9958,7 @@ def main() -> int:
                 raise BridgeError("invalid command arguments")
             values[name] = value
         if set(values) != expected_names or values["--bridge-id"] != BRIDGE_ID:
+            journal_write(journal_record(invocation, "skipped", phase))
             return 0
         stdin = sys.stdin.buffer.read(INPUT_LIMIT_BYTES + 1)
         output = run(
@@ -9747,9 +9966,19 @@ def main() -> int:
             expected_policy_sha256=values["--expected-policy-sha256"],
             expected_script_sha256=values["--expected-script-sha256"],
             stdin=stdin,
+            phase_sink=record_phase,
         )
-    except (BridgeError, OSError, ValueError):
+    except (BridgeError, OSError, ValueError) as exc:
+        journal_write(journal_record(invocation, "failed", phase, exc))
         return 0
+    except BaseException as exc:  # noqa: BLE001 - journal, then re-raise
+        # Deliberately does NOT widen the handler above: this re-raises, so an
+        # AssertionError/TypeError still escapes with its traceback and a
+        # nonzero exit exactly as before. It only adds a journal record on the
+        # way out.
+        journal_write(journal_record(invocation, "crashed", phase, exc))
+        raise
+    journal_write(journal_record(invocation, "ok", phase))
     if output:
         sys.stdout.write(output)
     return 0

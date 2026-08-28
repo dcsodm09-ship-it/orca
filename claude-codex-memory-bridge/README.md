@@ -124,6 +124,61 @@ untrusted historical reference, and emits at most 7,000 UTF-8 bytes.
 - No network request, subprocess supplied by memory text, database access, or
   write to Claude memory is permitted. The sole subprocess is fixed
   `/usr/sbin/diskutil info -plist` for the volume UUID gate.
+- The hook writes nothing under `ssd_root`. Its one write is the failure
+  journal below, on internal storage.
+
+## Failure journal
+
+Added 2026-08-28. Until then the hook was **completely silent on every failure
+path**: `main()` caught `BridgeError`/`OSError`/`ValueError` and returned 0 with
+no output, and Codex persists no hook exit status or stderr anywhere. That was
+measured, not assumed — invoking the deployed release with a deliberately wrong
+`--expected-script-sha256` (a tampered or drifted script, the most
+security-relevant failure of all) produced **exit 0, empty stdout, empty
+stderr**. There was no way to notice.
+
+    ~/.local/state/claude-codex-memory-bridge/hook-journal.log
+
+One JSON object per line, `0600` inside a `0700` directory, rotated to
+`hook-journal.log.1` past 1 MiB:
+
+    {"bridge":"orca-claude-native-memory-v1","event":"start","inv":"17674-92f56b7b","phase":"args","ts":1787899338.03}
+    {"bridge":"orca-claude-native-memory-v1","event":"failed","exc":"BridgeError","inv":"17674-92f56b7b","msg":"script digest mismatch","phase":"verify_script","ts":1787899338.04}
+
+`event` is one of `start`, `ok`, `failed`, `skipped` (foreign `--bridge-id`), or
+`crashed` (an exception outside the caught tuple — still re-raised, so the
+traceback and nonzero exit are unchanged). `phase` is the last step reached:
+`args`, `verify_script`, `load_policy`, `validate_policy`, `verify_storage`,
+`parse_input`, `read_docs`, `build_context`.
+
+Four properties are deliberate:
+
+- **Internal storage, not the SSD.** Same reason the doctor plist puts its logs
+  there: a journal on `/Volumes/Extreme SSD` is unwritable under a launchd
+  session and unavailable in exactly the failure it most needs to record — the
+  SSD being unmounted.
+- **A `start` record written before any work.** `hooks.json` sets
+  `"timeout": 5` and the harness *kills* the process, so no in-process `except`
+  can ever observe a timeout. **A `start` with no matching terminal record for
+  the same `inv` was killed** (timeout, OOM, SIGKILL), not cleanly failed. This
+  is the only structure that can see the 5s kill.
+- **Failure class only, never payload.** A record carries the phase, the
+  exception type, and a message *only* when that message is on an explicit
+  allowlist of the 35 fixed literals in the source. Four `BridgeError` messages
+  are built by interpolation and can carry a memory-document basename or a JSON
+  key; those are dropped. A newly added interpolated message therefore fails
+  safe. `tests/test_claude_memory_hook.py::FailureJournalTests` re-derives the
+  allowlist from the source by AST walk and fails if the two drift apart.
+- **It can never fail the hook.** `journal_write` is wrapped in its own bare
+  handler and does not widen `main()`'s catch. An unwritable journal is a
+  diagnostic loss, not a hook failure.
+
+Measured cost is ~22 ms against the 5 s budget (hot path is 0.42–0.47 s).
+Set `ORCA_MEMORY_BRIDGE_NO_JOURNAL=1` to disable.
+
+This is the one place the hook is not literally read-only. It is read-only with
+respect to everything it *reads* — nothing under `ssd_root` is written — and
+`verify_storage`'s residency guarantee is untouched.
 
 ## Commands
 
