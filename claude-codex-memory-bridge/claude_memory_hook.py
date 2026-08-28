@@ -7531,13 +7531,240 @@ def _redact_atomic_labeled_spans(text: str, *, record: "list[tuple[int, int, str
 _TABLE_CONNECTOR_STRICT_WORD_ASCII_LABEL = (
     _ATOMIC_ASCII_LABEL_BASE + _LABEL_QUALIFIER_SUFFIX
 )
-_TABLE_CONNECTOR_STRICT_WORD_SPILLOVER_RE = re.compile(
+# Round-7 (this round) LIVE ReDoS, disclosed by round 6's own fix agent as explicitly out of that
+# round's scope and pre-existing: not a round-6 regression, present identically in round 3 and every
+# release since, including the one deployed on all four accounts right now.
+#
+# `residual`'s own class is `[^|\n]`, which CONTAINS horizontal whitespace -- and it sits directly
+# between two OTHER unbounded horizontal-whitespace quantifiers, `connector`'s trailing `[^\S\n]+`
+# and `gap`'s `[^\S\n]*`. All three can consume the same characters, so a horizontal-whitespace RUN
+# between the connector word and a closing pipe that never arrives is re-parsed
+# O(run) x 63 x O(run) ways before the match is finally abandoned: `connector` gives the run back
+# one character at a time, at each of those positions the lazy `{1,63}?` grows through 63 lengths,
+# and at each of THOSE `gap` swallows the rest of the run and hands it back one character at a time
+# hunting for a `\|`. Measured on `redact("pin is " + " " * n)` (/usr/bin/python3 3.9.6):
+# 1.98s / 7.96s / 32.06s at n = 2,000 / 4,000 / 8,000 -- past this hook's own 5-second `timeout`
+# at roughly 3KB of trailing whitespace, which is well inside what a pasted terminal transcript or
+# a trailing-padded table row routinely carries.
+#
+# Fixed with the SAME technique round 6 proved out for `_CJK_VALUE_GUARD_SCAN_WS_BRIDGE` (see that
+# constant and `_cjk_value_guard_scan_ws_exclusion_is_lossless` above): take horizontal whitespace
+# out of the ambiguous repeated class, keep every input shape that genuinely needed it reachable
+# through ONE extra alternative narrow enough to fail in O(1), and VERIFY the substitution against
+# the real patterns instead of asserting it -- falling back to the slow-but-correct form if the
+# verification ever disagrees, because a performance regression is recoverable and a silently
+# narrowed secret-detection gate is not.
+#
+# The structure here is NOT the one round 6 fixed, so the whitespace-crossing question is a
+# different one and is answered separately. Round 6's ambiguity was a flat value class versus a
+# lookBEHIND-vouched body bridge; this one is three ADJACENT quantifiers sharing one repertoire,
+# where the run between the connector word and the pipe is `w r g` with `w` in `[^\S\n]+`, `r` in
+# `[^|\n]{1,63}` and `g` in `[^\S\n]*`. Because `g` can only ever be whitespace, `r` is forced to
+# cover every non-whitespace character before the pipe, so that decomposition exists at all exactly
+# when the run begins with whitespace AND either (a) it holds a non-whitespace character and the
+# span from its first to its last non-whitespace character is at most 63 long, or (b) it is
+# whitespace-only and at least two characters (one for `w`, one for `r`). Case (a) is spelled below
+# as a residual pinned to non-whitespace at BOTH ends -- which also happens to be the exact split
+# the old pattern's own greedy-`w`-then-lazy-`r` search order already settled on, so no group's
+# captured TEXT moves either, and `_looks_like_secret_code(residual)` in the callback below keeps
+# seeing byte-identical input. Case (b) is the extra alternative: a single whitespace character
+# pinned by lookahead directly against the pipe, which is what makes it O(1) to reject at every
+# position inside a whitespace run instead of O(63 x run).
+#
+# Both halves are DERIVED from the real classes rather than re-typed -- the cell class below, this
+# file's one horizontal-whitespace class (`_CJK_VALUE_HORIZONTAL_WS_RE`, so NBSP and the Unicode
+# spaces round 4 lost are covered here too), and one shared length bound the reference and fast
+# forms are both built from, so the two can never drift apart the way round 4's hand-copied
+# whitespace repertoire did.
+_TABLE_CONNECTOR_SPILLOVER_CELL = r"[^|\n]"
+_TABLE_CONNECTOR_SPILLOVER_HWS = _CJK_VALUE_HORIZONTAL_WS_RE.pattern
+# "a cell character that is not horizontal whitespace", composed from the two classes above rather
+# than hand-written as a third literal that could drift from either.
+_TABLE_CONNECTOR_SPILLOVER_CELL_NONWS = (
+    r"(?!" + _TABLE_CONNECTOR_SPILLOVER_HWS + r")" + _TABLE_CONNECTOR_SPILLOVER_CELL
+)
+_TABLE_CONNECTOR_SPILLOVER_RESIDUAL_MAX = 63
+_TABLE_CONNECTOR_SPILLOVER_RESIDUAL_REFERENCE = (
+    r"(?P<residual>" + _TABLE_CONNECTOR_SPILLOVER_CELL
+    + r"{1," + str(_TABLE_CONNECTOR_SPILLOVER_RESIDUAL_MAX) + r"}?)"
+)
+_TABLE_CONNECTOR_SPILLOVER_RESIDUAL_FAST = (
+    r"(?P<residual>"
+    # (a) the ordinary cell: first and last character non-whitespace, same 63-character ceiling.
+    + _TABLE_CONNECTOR_SPILLOVER_CELL_NONWS
+    + r"(?:" + _TABLE_CONNECTOR_SPILLOVER_CELL
+    + r"{0," + str(_TABLE_CONNECTOR_SPILLOVER_RESIDUAL_MAX - 2) + r"}"
+    + _TABLE_CONNECTOR_SPILLOVER_CELL_NONWS + r")?"
+    # (b) the whitespace-only cell ("| 密码 is  | XKQR-ZMPT |", two spaces and nothing else): the
+    # lookahead is what keeps this O(1) to reject -- inside a whitespace run the next character is
+    # another space, never the pipe, so the scan gives up immediately instead of re-deriving the
+    # whole tail. `gap` is necessarily empty here, which is one of the splits the old pattern
+    # already chose for this shape.
+    + r"|" + _TABLE_CONNECTOR_SPILLOVER_HWS + r"(?=\|)"
+    + r")"
+)
+_TABLE_CONNECTOR_SPILLOVER_PREFIX = (
     r"(?<![A-Za-z0-9_])(?P<keyword>(?:" + _ATOMIC_CJK_LABEL + r")|(?i:" + _TABLE_CONNECTOR_STRICT_WORD_ASCII_LABEL + r"))"
     r"(?![A-Za-z0-9_])"
     r"(?P<connector>[^\S\n]+(?i:is|equals)(?![A-Za-z0-9])[^\S\n]+)"
-    r"(?P<residual>[^|\n]{1,63}?)"
+)
+_TABLE_CONNECTOR_SPILLOVER_SUFFIX = (
     r"(?P<gap>[^\S\n]*)(?P<pipe>\|)(?P<post_gap>[^\S\n]*)"
     r"(?P<value>" + _CJK_SECRET_VALUE_PERMISSIVE_TABLE + r")"
+)
+# Probe vocabularies for the equivalence check below. Every entry is FILTERED through the real
+# sub-pattern it is meant to exercise, so an entry for a keyword or connector word some future
+# vocabulary no longer carries simply contributes nothing (round 6's `_CJK_VALUE_GUARD_SCAN_PROBES`
+# discipline: a probe the real pattern declines is harmless, a hand-copied repertoire is not).
+_TABLE_CONNECTOR_SPILLOVER_KEYWORD_PROBES = (
+    "密码", "密码2", "密钥", "备份码", "验证码", "pin", "password", "password-prod", "token",
+    "signature", "api_key", "pwd", "secret",
+)
+_TABLE_CONNECTOR_SPILLOVER_CONNECTOR_PROBES = (
+    " is ", "  is  ", " IS ", " Is ", " equals ", " EQUALS ", "\tis\t", " is\t", "\tis ", " is   ",
+)
+
+
+def _table_connector_spillover_residual_is_lossless(reference: str, fast: str) -> bool:
+    """Does the fast residual form parse EXACTLY like the reference one, on every probe?
+
+    Compared over full matches of the real assembled pattern, not the residual fragment alone:
+    identical match spans AND identical text for all seven named groups, since
+    `_redact_table_connector_strict_word_spillover` below echoes six of them back verbatim and
+    routes `residual` through `_looks_like_secret_code`/`_REDACTED_PLACEHOLDER_RE`. A split that
+    merely moved whitespace between `connector`, `residual` and `gap` would leave the output text
+    alone but could still flip that decline check, so the check here is on the split too, not only
+    on the span.
+
+    The corpus is BUILT from the pattern's own pieces -- the keyword and connector probes filtered
+    through the real sub-patterns, the whitespace repertoire taken from
+    `_CJK_VALUE_GUARD_SCAN_HORIZONTAL_WS` plus the non-ASCII spaces `[^\\S\\n]` also matches, and
+    the cell fillers pinned to `_TABLE_CONNECTOR_SPILLOVER_RESIDUAL_MAX` rather than to a literal
+    63 -- so widening any of them widens this check with them.
+
+    Layered rather than one full cartesian product, because this runs at import time inside a hook
+    with a 5-second budget: the residual SHAPE is swept exhaustively against one keyword/connector
+    pair (that is where the substitution actually lives), the whitespace REPERTOIRE gets its own
+    narrower sweep, and the keyword/connector VOCABULARY a third. No axis is left unexercised; the
+    full product of all four at once is ~577,000 probes and tens of seconds of import time, these
+    three layers are ~5,000 and a few tens of milliseconds.
+    """
+    reference_re = re.compile(_TABLE_CONNECTOR_SPILLOVER_PREFIX + reference + _TABLE_CONNECTOR_SPILLOVER_SUFFIX)
+    fast_re = re.compile(_TABLE_CONNECTOR_SPILLOVER_PREFIX + fast + _TABLE_CONNECTOR_SPILLOVER_SUFFIX)
+    if reference_re.groupindex != fast_re.groupindex:
+        return False
+    group_names = sorted(reference_re.groupindex)
+    keyword_re = re.compile(
+        r"(?:" + _ATOMIC_CJK_LABEL + r")|(?i:" + _TABLE_CONNECTOR_STRICT_WORD_ASCII_LABEL + r")"
+    )
+    keywords = [kw for kw in _TABLE_CONNECTOR_SPILLOVER_KEYWORD_PROBES if keyword_re.fullmatch(kw)]
+    connector_re = re.compile(r"[^\S\n]+(?i:is|equals)(?![A-Za-z0-9])[^\S\n]+")
+    connectors = [c for c in _TABLE_CONNECTOR_SPILLOVER_CONNECTOR_PROBES if connector_re.fullmatch(c)]
+    if not keywords or not connectors:
+        return False
+    whitespace = sorted(_CJK_VALUE_GUARD_SCAN_HORIZONTAL_WS) + [
+        char for char in "\xa0      　"
+        if _CJK_VALUE_HORIZONTAL_WS_RE.fullmatch(char)
+    ]
+    limit = _TABLE_CONNECTOR_SPILLOVER_RESIDUAL_MAX
+
+    def agrees(text: str) -> bool:
+        expected = [
+            (m.span(), tuple(m.group(name) for name in group_names))
+            for m in reference_re.finditer(text)
+        ]
+        actual = [
+            (m.span(), tuple(m.group(name) for name in group_names))
+            for m in fast_re.finditer(text)
+        ]
+        return expected == actual
+
+    def shapes(space: str) -> "tuple[str, ...]":
+        """Short residual shapes that can distinguish the two forms, given one space character."""
+        return (
+            "", space, space * 2, space * 3, "a", "Wm", "a b", "-", "A-B", "7", "x7",
+            "XKQR-ZMPT", "[REDACTED]", "$USER_HOME", "密", "@", "|", "||",
+            space + "a", "a" + space, space + "a" + space, "a" + space + "b",
+            space + "[REDACTED]", "[REDACTED]" + space, space + "[REDACTED]" + space,
+            space + "$USER_HOME" + space, space + "A-B" + space, space + "7" + space,
+            "a" + space * 3 + "b",
+        )
+
+    def boundary_shapes(space: str) -> "tuple[str, ...]":
+        """Residual shapes straddling the length ceiling, given one space character.
+
+        Kept separate from `shapes` only because they are the expensive probes (a ~65-character
+        filler costs roughly 20x a 2-character one at import time) and they exercise exactly one
+        question, so they need fewer tails to answer it. That question is the one place the two
+        forms could differ without differing anywhere else: the reference bounds the WHOLE residual
+        at `limit`, the fast form bounds the span from its first to its last non-whitespace
+        character, so they are only equivalent if the surrounding whitespace was never inside the
+        reference's residual to begin with -- which is what these straddle on both sides.
+        """
+        return (
+            "z" * (limit - 1), "z" * limit, "z" * (limit + 1),
+            space + "z" * (limit - 2), "z" * (limit - 2) + space, space + "z" * (limit - 2) + space,
+            space + "z" * (limit - 1), "z" * (limit - 1) + space, space + "z" * (limit - 1) + space,
+            space + "z" * limit, "z" * limit + space, space + "z" * (limit + 1),
+            "a" + space * (limit + 4) + "b", space * (limit + 4),
+        )
+
+    tails = ("", "|", " |", "XKQR-ZMPT |", " XKQR-ZMPT |", "|Ax7Wm |", " more |", " 1234 |",
+             "[REDACTED] |", " | Zx8Qm2 |", "  ")
+    narrow_tails = ("", " |", " XKQR-ZMPT |", "|Ax7Wm |")
+    # Layer 1 -- the residual shape itself, exhaustively, on the plain-ASCII-space case.
+    for filler in shapes(" "):
+        for tail in tails:
+            for lead in ("", "| "):
+                if not agrees(lead + keywords[0] + connectors[0] + filler + tail):
+                    return False
+    for filler in boundary_shapes(" "):
+        for tail in narrow_tails:
+            if not agrees(keywords[0] + connectors[0] + filler + tail):
+                return False
+    # Layer 2 -- the same shapes for every OTHER horizontal-whitespace character the class admits,
+    # including the non-ASCII spaces that `[^\S\n]` matches but the flat ASCII repertoire misses.
+    for space in whitespace:
+        if space == " ":
+            continue
+        for filler in shapes(space):
+            for tail in ("", " |", "|Ax7Wm |"):
+                if not agrees(keywords[0] + connectors[0] + filler + tail):
+                    return False
+        for filler in boundary_shapes(space):
+            for tail in ("", " |"):
+                if not agrees(keywords[0] + connectors[0] + filler + tail):
+                    return False
+    # Layer 3 -- the keyword and connector vocabularies, against the shapes that most depend on the
+    # prefix's own whitespace handling (`connector` ends in `[^\S\n]+`, so a residual that starts
+    # with -- or is entirely -- whitespace is where a differently-spelled connector could diverge).
+    # Swept as a STAR rather than a cross (every keyword against one connector, every connector
+    # against one keyword): keyword spelling and connector spelling are independent alternations in
+    # the prefix with no interaction between them, and the full cross costs 5x this for no axis
+    # this does not already reach. `RedactTableSpilloverWhitespaceRunTests` in `tests/` runs the
+    # full cross (~164,000 probes), where import time is not the constraint; round 7's own
+    # out-of-tree sweep ran 453,976 span-and-split probes plus a 612,682-input `redact()`/
+    # `redact_v2()` differential against round-6 HEAD, all agreeing.
+    star = [(keyword, connectors[0]) for keyword in keywords]
+    star += [(keywords[0], connector) for connector in connectors[1:]]
+    for keyword, connector in star:
+        for filler in ("", " ", "  ", "   ", " a", "a ", " [REDACTED] "):
+            for tail in ("", " |", "|Ax7Wm |"):
+                if not agrees("| " + keyword + connector + filler + tail):
+                    return False
+    return True
+
+
+_TABLE_CONNECTOR_STRICT_WORD_SPILLOVER_RE = re.compile(
+    _TABLE_CONNECTOR_SPILLOVER_PREFIX
+    + (
+        _TABLE_CONNECTOR_SPILLOVER_RESIDUAL_FAST
+        if _table_connector_spillover_residual_is_lossless(
+            _TABLE_CONNECTOR_SPILLOVER_RESIDUAL_REFERENCE, _TABLE_CONNECTOR_SPILLOVER_RESIDUAL_FAST
+        )
+        else _TABLE_CONNECTOR_SPILLOVER_RESIDUAL_REFERENCE
+    )
+    + _TABLE_CONNECTOR_SPILLOVER_SUFFIX
 )
 
 

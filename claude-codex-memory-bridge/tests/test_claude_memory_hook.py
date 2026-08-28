@@ -10131,5 +10131,253 @@ class RedactStrictGuardWhitespaceBridgeTests(unittest.TestCase):
                     self.assertEqual(hook.redact(out), out)
 
 
+class RedactTableSpilloverWhitespaceRunTests(unittest.TestCase):
+    """Round-7: `_TABLE_CONNECTOR_STRICT_WORD_SPILLOVER_RE` was quadratic on a whitespace run.
+
+    Disclosed by round 6's own fix agent as explicitly out of that round's scope and PRE-EXISTING
+    (round 3 and every release since, including the one that was deployed on all four accounts when
+    this round started). `residual`'s class is `[^|\\n]`, which contains horizontal whitespace, and
+    it sits between `connector`'s trailing `[^\\S\\n]+` and `gap`'s `[^\\S\\n]*`. All three consume
+    the same characters, so a whitespace run leading to a pipe that never arrives was reparsed
+    O(run) x 63 x O(run) ways. Measured on round-6 HEAD (08adb40f43, /usr/bin/python3 3.9.6):
+
+        redact("pin is " + " " * n)      1.98s / 7.96s / 32.06s   at n = 2,000 / 4,000 / 8,000
+        redact("密码 is " + " "*n + "|" + " "*n)   23.15s at n = 2,000
+
+    -- past this hook's own 5-second `timeout` at roughly 3KB of trailing whitespace.
+
+    Fixed with round 6's own technique (see `RedactStrictGuardWhitespaceBridgeTests` above): take
+    whitespace out of the ambiguous repeated positions, keep the one input shape that genuinely
+    needed it (a whitespace-only cell) reachable through a single narrow alternative that fails in
+    O(1), and VERIFY the substitution against the real patterns rather than asserting it, falling
+    back to the slow-but-correct reference form on any disagreement.
+    """
+
+    # `[^\S\n]`'s own ASCII repertoire plus the non-ASCII spaces it also matches -- the same list
+    # `RedactStrictGuardWhitespaceBridgeTests` uses, for the same reason (round 4's hand-written
+    # exclusion list missed `\x1c`-`\x1f` and every non-ASCII space).
+    HORIZONTAL_WS = (" ", "\t", "\x0b", "\x0c", "\r", "\x1c", "\x1d", "\x1e", "\x1f", "\xa0", "　")
+
+    @staticmethod
+    def _splits(pattern: "re.Pattern[str]", text: str) -> list:
+        names = sorted(pattern.groupindex)
+        return [(m.span(), tuple(m.group(name) for name in names)) for m in pattern.finditer(text)]
+
+    @classmethod
+    def _assemble(cls, residual: str) -> "re.Pattern[str]":
+        return re.compile(
+            hook._TABLE_CONNECTOR_SPILLOVER_PREFIX + residual
+            + hook._TABLE_CONNECTOR_SPILLOVER_SUFFIX
+        )
+
+    # ------------------------------------------------------------------- 1. the ReDoS itself
+    def test_the_whitespace_run_redos_round_7_closed_stays_closed(self) -> None:
+        # Ratio, not just an absolute ceiling: 4x the input must not cost anything like 16x the
+        # time. CPU timing (see `_min_cpu_elapsed`) so a loaded machine cannot flip it.
+        small = "pin is " + " " * 4_000
+        large = "pin is " + " " * 16_000
+        small_elapsed = _min_cpu_elapsed(lambda: hook.redact(small), attempts=3)
+        large_elapsed = _min_cpu_elapsed(lambda: hook.redact(large), attempts=3)
+        self.assertLess(
+            large_elapsed,
+            max(small_elapsed * 12, 0.05),
+            f"redact() scaled worse than near-linearly: {small_elapsed:.4f}s -> {large_elapsed:.4f}s",
+        )
+        # At round-6 HEAD this input took ~32s at 8,000 characters alone.
+        self.assertLess(large_elapsed, 2.0, "redact() must not stall on a trailing whitespace run")
+
+    def test_every_whitespace_flavour_and_both_connector_words_stay_linear(self) -> None:
+        # The quadratic was never specific to the space character or to "is": `[^\S\n]` is one
+        # class, and both connector words route through the same three quantifiers.
+        for space in self.HORIZONTAL_WS:
+            for keyword, connector in (("pin", " is "), ("密码", " is "), ("password", " equals ")):
+                with self.subTest(space=repr(space), keyword=keyword, connector=connector):
+                    text = keyword + connector + space * 8_000
+                    self.assertLess(
+                        _min_cpu_elapsed(lambda: hook.redact(text), attempts=2), 2.0,
+                        f"redact() stalled on {keyword!r} + {connector!r} + {space!r} * 8000",
+                    )
+
+    def test_the_whitespace_run_that_does_reach_a_pipe_is_linear_too(self) -> None:
+        # The worst measured shape at round-6 HEAD -- 23.1s at only n=2,000 -- because `post_gap`
+        # then re-walks a second run for a value that is not there.
+        text = "密码 is " + " " * 8_000 + "|" + " " * 8_000
+        self.assertLess(_min_cpu_elapsed(lambda: hook.redact(text), attempts=2), 2.0)
+
+    def test_redact_v2_shares_the_fix(self) -> None:
+        # `collect_findings_v2` drives the SAME compiled pattern, so it inherits the same defect
+        # and the same fix -- asserted, not assumed, because it is a separate call site.
+        text = "pin is " + " " * 16_000
+        self.assertLess(_min_cpu_elapsed(lambda: hook.redact_v2(text), attempts=2), 2.0)
+
+    # ------------------------------------------------- 2. the substitution is the verified one
+    def test_the_fast_residual_form_is_the_one_actually_compiled(self) -> None:
+        # A silent fallback to the reference form would leave the ReDoS live while every behaviour
+        # test still passed, so the shipped pattern is checked directly.
+        shipped = hook._TABLE_CONNECTOR_STRICT_WORD_SPILLOVER_RE.pattern
+        self.assertIn(hook._TABLE_CONNECTOR_SPILLOVER_RESIDUAL_FAST, shipped)
+        self.assertNotIn(hook._TABLE_CONNECTOR_SPILLOVER_RESIDUAL_REFERENCE, shipped)
+        # ... and that it is assembled from the same two halves the predicate verifies against.
+        self.assertTrue(shipped.startswith(hook._TABLE_CONNECTOR_SPILLOVER_PREFIX))
+        self.assertTrue(shipped.endswith(hook._TABLE_CONNECTOR_SPILLOVER_SUFFIX))
+
+    def test_the_residual_classes_are_derived_not_retyped(self) -> None:
+        # The non-whitespace cell class is COMPOSED from the two real classes. Round 4's regression
+        # came from a hand-copied whitespace repertoire drifting from the class it stood for.
+        self.assertEqual(hook._TABLE_CONNECTOR_SPILLOVER_HWS, hook._CJK_VALUE_HORIZONTAL_WS_RE.pattern)
+        self.assertIn(hook._TABLE_CONNECTOR_SPILLOVER_HWS, hook._TABLE_CONNECTOR_SPILLOVER_CELL_NONWS)
+        self.assertIn(hook._TABLE_CONNECTOR_SPILLOVER_CELL, hook._TABLE_CONNECTOR_SPILLOVER_CELL_NONWS)
+        nonws = re.compile(hook._TABLE_CONNECTOR_SPILLOVER_CELL_NONWS)
+        cell = re.compile(hook._TABLE_CONNECTOR_SPILLOVER_CELL)
+        for space in self.HORIZONTAL_WS:
+            with self.subTest(space=repr(space)):
+                self.assertIsNotNone(cell.match(space), "the cell class must still admit whitespace")
+                self.assertIsNone(nonws.match(space), "the non-ws class must reject every space")
+        for char in "aZ7-@[]$|\n密":
+            expected = char not in "|\n"
+            self.assertIs(bool(cell.match(char)), expected, char)
+
+    def test_the_length_ceiling_is_shared_by_both_forms(self) -> None:
+        limit = hook._TABLE_CONNECTOR_SPILLOVER_RESIDUAL_MAX
+        self.assertIn("{1,%d}" % limit, hook._TABLE_CONNECTOR_SPILLOVER_RESIDUAL_REFERENCE)
+        self.assertIn("{0,%d}" % (limit - 2), hook._TABLE_CONNECTOR_SPILLOVER_RESIDUAL_FAST)
+
+    # ------------------------------------------------------- 3. the predicate actually decides
+    def test_the_predicate_accepts_the_reference_form_against_itself(self) -> None:
+        reference = hook._TABLE_CONNECTOR_SPILLOVER_RESIDUAL_REFERENCE
+        self.assertTrue(hook._table_connector_spillover_residual_is_lossless(reference, reference))
+        self.assertTrue(
+            hook._table_connector_spillover_residual_is_lossless(
+                reference, hook._TABLE_CONNECTOR_SPILLOVER_RESIDUAL_FAST
+            )
+        )
+
+    def test_the_predicate_rejects_every_non_equivalent_residual_form(self) -> None:
+        # Mutation test. A predicate that cannot say no is not a check, and this one is the only
+        # thing standing between a future edit of the residual and a silently narrowed gate. Each
+        # mutant below was separately confirmed to differ from the reference on a real input
+        # (that input is named in the subTest), so accepting any of them would be a real blind spot.
+        hws = hook._TABLE_CONNECTOR_SPILLOVER_HWS
+        cell = hook._TABLE_CONNECTOR_SPILLOVER_CELL
+        nonws = hook._TABLE_CONNECTOR_SPILLOVER_CELL_NONWS
+        limit = hook._TABLE_CONNECTOR_SPILLOVER_RESIDUAL_MAX
+        reference = hook._TABLE_CONNECTOR_SPILLOVER_RESIDUAL_REFERENCE
+        head = r"(?P<residual>" + nonws + r"(?:" + cell + r"{0," + str(limit - 2) + r"}"
+        mutants = {
+            # A NARROWING: the whitespace-only cell "| 密码 is  | XKQR-ZMPT |" stops matching.
+            "drops the whitespace-only alternative": head + nonws + r")?)",
+            # Ceiling off by one in each direction.
+            "ceiling one too high":
+                r"(?P<residual>" + nonws + r"(?:" + cell + r"{0," + str(limit - 1) + r"}"
+                + nonws + r")?|" + hws + r"(?=\|))",
+            "ceiling one too low":
+                r"(?P<residual>" + nonws + r"(?:" + cell + r"{0," + str(limit - 3) + r"}"
+                + nonws + r")?|" + hws + r"(?=\|))",
+            # Trailing whitespace allowed back inside the residual: same language, different split,
+            # and the split is what `_looks_like_secret_code(residual)` sees.
+            "trailing edge not pinned": head + cell + r")?|" + hws + r"(?=\|))",
+            # Round 4's actual mistake, transplanted here: an ASCII-only whitespace repertoire.
+            "ascii-only whitespace repertoire":
+                r"(?P<residual>(?![ \t\x0b\x0c\r])" + cell + r"(?:" + cell
+                + r"{0," + str(limit - 2) + r"}(?![ \t\x0b\x0c\r])" + cell + r")?"
+                r"|[ \t\x0b\x0c\r](?=\|))",
+            # A one-character residual becomes unreachable.
+            "optional tail made mandatory": head + nonws + r")|" + hws + r"(?=\|))",
+        }
+        for name, mutant in mutants.items():
+            with self.subTest(mutant=name):
+                self.assertFalse(
+                    hook._table_connector_spillover_residual_is_lossless(reference, mutant),
+                    f"the losslessness predicate accepted a non-equivalent residual: {name}",
+                )
+                # ... and it really is non-equivalent, so this is not a vacuous rejection. The
+                # probes are generated rather than listed so a changed ceiling moves them with it.
+                reference_re = self._assemble(reference)
+                mutant_re = self._assemble(mutant)
+                probes = [
+                    "| 密码 is " + lead + core + trail + pipe_gap + "| XKQR-ZMPT |"
+                    for space in (" ", "\xa0")
+                    for core in ("", "a", "z" * (limit - 1), "z" * limit, "z" * (limit + 1))
+                    for lead in ("", space)
+                    for trail in ("", space)
+                    for pipe_gap in ("", " ")
+                ]
+                self.assertTrue(
+                    any(self._splits(reference_re, p) != self._splits(mutant_re, p) for p in probes),
+                    f"{name} was rejected but no probe distinguishes it -- vacuous rejection",
+                )
+
+    # ------------------------------------------------------------------ 4. behaviour is unchanged
+    def test_reference_and_fast_forms_agree_on_the_full_vocabulary_cross(self) -> None:
+        # The import-time predicate sweeps keyword x connector as a STAR to keep import cheap; the
+        # full CROSS runs here, where it costs nothing that matters.
+        reference_re = self._assemble(hook._TABLE_CONNECTOR_SPILLOVER_RESIDUAL_REFERENCE)
+        fast_re = self._assemble(hook._TABLE_CONNECTOR_SPILLOVER_RESIDUAL_FAST)
+        limit = hook._TABLE_CONNECTOR_SPILLOVER_RESIDUAL_MAX
+        keywords = ("密码", "密码2", "密钥", "备份码", "pin", "pin码", "password", "password-prod",
+                    "token", "signature", "api_key", "pwd", "secret")
+        connectors = (" is ", "  is  ", "   is   ", " IS ", " Is ", " equals ", " EQUALS ",
+                      "\tis\t", " is\t", "\tis ")
+        fillers = ["", "a", "Wm", "a b", "-", "A-B", "7", "[REDACTED]", "$USER_HOME", "密", "@",
+                   "|", "z" * (limit - 1), "z" * limit, "z" * (limit + 1)]
+        for space in self.HORIZONTAL_WS:
+            fillers += [space, space * 2, space * 3, space + "a", "a" + space,
+                        space + "a" + space, "a" + space + "b", space + "[REDACTED]" + space,
+                        space + "z" * (limit - 1), "z" * (limit - 1) + space,
+                        space + "z" * limit, "z" * limit + space, space * (limit + 4)]
+        tails = ("", "|", " |", " XKQR-ZMPT |", "|Ax7Wm |", " more |", " 1234 |", "[REDACTED] |")
+        for keyword in keywords:
+            for connector in connectors:
+                for filler in fillers:
+                    for tail in tails:
+                        text = "| " + keyword + connector + filler + tail
+                        if self._splits(reference_re, text) != self._splits(fast_re, text):
+                            self.fail(f"residual forms disagree on {text!r}")
+
+    def test_the_table_shapes_this_fallback_exists_for_still_redact(self) -> None:
+        # The four shapes named in `_TABLE_CONNECTOR_STRICT_WORD_SPILLOVER_RE`'s own comment, plus
+        # the whitespace-only and multi-space label cells the new alternative exists to keep.
+        for text, leaked in (
+            ("| 项 | 密码 is Wm|XKQR-ZMPT |", "XKQR-ZMPT"),
+            ("| 密码 is Wm | XKQR-ZMPT |", "XKQR-ZMPT"),
+            ("| 密码 is  | XKQR-ZMPT |", "XKQR-ZMPT"),
+            ("| 密码 is   | XKQR-ZMPT |", "XKQR-ZMPT"),
+            ("| 密码 is \t | XKQR-ZMPT |", "XKQR-ZMPT"),
+            ("| 密码 is Wm\xa0| XKQR-ZMPT |", "XKQR-ZMPT"),
+            ("| password equals Wm | XKQR-ZMPT |", "XKQR-ZMPT"),
+        ):
+            with self.subTest(text=text):
+                out = hook.redact(text)
+                self.assertNotIn(leaked, out, out)
+                self.assertIn("[REDACTED", out, out)
+
+    def test_the_round_17_unrelated_cell_guard_still_holds(self) -> None:
+        # The decline check reads `residual`, so a substitution that moved whitespace between
+        # `connector`, `residual` and `gap` could flip it without changing any span. Pinned here.
+        self.assertEqual(
+            hook.redact("| 密码 is 186 7723 4491 5508 | more |"),
+            "| 密码 is [REDACTED] | more |",
+        )
+        self.assertEqual(
+            hook.redact("| 密码 is Ax7Wm|XKQR-ZMPT |"),
+            "| 密码 is [REDACTED] |",
+        )
+
+    def test_the_residual_group_text_is_byte_identical_to_the_reference_form(self) -> None:
+        # Not just "the same span": `_redact_table_connector_strict_word_spillover` echoes six
+        # groups back verbatim and decides on the seventh, so every group's TEXT is pinned.
+        reference_re = self._assemble(hook._TABLE_CONNECTOR_SPILLOVER_RESIDUAL_REFERENCE)
+        for text in (
+            "| 密码 is Wm | XKQR-ZMPT |", "| 密码 is  | XKQR-ZMPT |",
+            "| 密码 is    Wm    | XKQR-ZMPT |", "| 密码 is Wm|XKQR-ZMPT |",
+            "| 密码 is [REDACTED] | XKQR-ZMPT |", "| 密码 is 186 7723 4491 5508 | more |",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    self._splits(reference_re, text),
+                    self._splits(hook._TABLE_CONNECTOR_STRICT_WORD_SPILLOVER_RE, text),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
