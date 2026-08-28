@@ -9730,8 +9730,12 @@ class RedactSiblingFlatQuantifierTests(unittest.TestCase):
         # multi-character tokens to their constituent characters made horizontal whitespace
         # crossable from every position of a long run, and `test_inline_cjk_secret_connector_is_not
         # _cubic` went from passing to a multi-second failure (whole-suite wall time 77s -> 159s).
-        # `_CJK_VALUE_GUARD_SCAN_NEVER_CROSSABLE` is what keeps it closed; this asserts the property
-        # directly against the guard scan rather than only through that older test's own pattern.
+        # Round 6 re-measured it directly: 6.07s here, from `_CJK_CONNECTOR_WS_TRAILING`'s unbounded
+        # `[^\S\n]*` retrying the value scan at every position inside the run. Keeping whitespace out
+        # of the flat class -- and reachable only through `_CJK_VALUE_GUARD_SCAN_WS_BRIDGE`, which
+        # preserves the body's own `(?<=[A-Za-z0-9])` precondition -- is what keeps it closed; this
+        # asserts the property directly against the guard scan rather than only through that older
+        # test's own pattern.
         for name, pattern in (
             ("_CJK_SECRET_VALUE_PERMISSIVE_TABLE_RE", hook._CJK_SECRET_VALUE_PERMISSIVE_TABLE_RE),
             ("_INLINE_CJK_SECRET_RE", hook._INLINE_CJK_SECRET_RE),
@@ -9860,6 +9864,271 @@ class RedactSiblingFlatQuantifierTests(unittest.TestCase):
                         # the one most sensitive to a gate that changed which candidates it admits.
                         once = hook.redact(text)
                         self.assertEqual(hook.redact(once), once)
+
+
+class RedactStrictGuardWhitespaceBridgeTests(unittest.TestCase):
+    """Round-6 P1-1: the STRICT guard has to cross whitespace; the PERMISSIVE guard must not.
+
+    Round 4 replaced `_cjk_value_pattern`'s three-branch `(?:body){0,256}` guard scan with one flat
+    character class derived from `body`, and -- correctly, for a PERMISSIVE `[A-Za-z0-9]` guard --
+    dropped horizontal whitespace from it. It then applied that exclusion to the STRICT `[0-9-]`
+    guard too, where it is NOT redundant: the character vouching for a body-level whitespace bridge
+    is often a plain LETTER, which satisfies the PERMISSIVE guard but not the STRICT one, so the
+    scan genuinely has to cross the space to reach the value's first digit. Every space-grouped
+    STRICT value silently stopped being redacted. The four repros below are the Codex `sol`/`xhigh`
+    final review's own (2026-08-28); its 59,480-input differential sweep counted 737 such
+    regressions, all previously redacted, all leaking in the clear afterwards.
+
+    The fix is NOT a revert. Round 3's shape is genuinely worse in two independent ways, both
+    measured here rather than argued:
+      * its unbounded/deep multi-branch scan is the 250us-per-character constant round 4 removed;
+      * `(?:...|Bearer[^\\S\\n]+|charclass)` is AMBIGUOUS -- "BEARER " is crossable both as one
+        bearer token and as letters-then-space -- so every group is a backtracking diamond and the
+        scan is EXPONENTIAL. Measured on round 3, `redact("token is " + "BEARER " * k + "x")`:
+        1.1ms / 33ms / 1053ms / >20s at k=10/15/20/25. Restoring any Bearer-shaped alternative
+        reopens exactly that, which is why the bridge below is a single whitespace-only branch,
+        disjoint from the flat class.
+    """
+
+    # Every ASCII horizontal-whitespace character `[^\S\n]` matches, plus two non-ASCII ones the
+    # body's bridges can also cross but `_CJK_VALUE_EXCLUDED_UNICODE_RANGES` keeps out of the flat
+    # class. Round 4's hand-written exclusion list missed `\x1c`-`\x1f` entirely.
+    HORIZONTAL_WS = (" ", "\t", "\x0b", "\x0c", "\r", "\x1c", "\x1d", "\x1e", "\x1f", "\xa0", "　")
+
+    @staticmethod
+    def _timed(call, text: str) -> float:
+        start = time.perf_counter()
+        call(text)
+        return time.perf_counter() - start
+
+    # ------------------------------------------------------------------ 1. the review's own repros
+    def test_the_four_review_repros_are_redacted_again(self) -> None:
+        for text, leaked in (
+            ("token is Bearer Zx8Qm2", "Bearer Zx8Qm2"),
+            ("backup code is ABCD 1234", "ABCD 1234"),
+            ("recovery code is XKCD 7742 QRST 6015", "XKCD 7742 QRST 6015"),
+            ("passphrase is alpha 7xyzQWERTY", "alpha 7xyzQWERTY"),
+        ):
+            with self.subTest(text=text):
+                out = hook.redact(text)
+                self.assertNotIn(leaked, out)
+                self.assertIn("[REDACTED", out)
+                # Not merely "something was replaced": the grouped value has to go as ONE span, so
+                # no fragment of it survives next to a placeholder that makes the line look handled.
+                for group in leaked.split():
+                    self.assertNotIn(group, out)
+
+    def test_a_multi_space_bearer_run_is_still_reachable(self) -> None:
+        # `_CJK_VALUE_BEARER_BRIDGE`'s `[^\S\n]+` crosses a whitespace RUN, so the character before
+        # the second space is another space and no single-character bridge can reach past it. This
+        # is why `_CJK_VALUE_GUARD_SCAN_WS_BRIDGE` ends in `+` rather than matching one character.
+        for gap in ("  ", "   ", " \t ", "\t\t"):
+            with self.subTest(gap=repr(gap)):
+                out = hook.redact("token is Bearer" + gap + "Zx8Qm2")
+                self.assertNotIn("Zx8Qm2", out)
+
+    def test_a_lowercase_bearer_token_ending_in_a_digit_is_still_reachable(self) -> None:
+        # The narrower "reuse `_SECRET_VALUE_CODE_TOKEN_LOOKAHEAD` in the bridge" variant was tried
+        # and rejected on exactly this: that lookahead declines a lowercase run ending in a digit,
+        # which `_CJK_VALUE_BEARER_BRIDGE` itself does not, so it leaked here while round 3 did not.
+        for text in ("token is Bearer xoxb1", "令牌 Bearer xoxb1", "secret is v2.Bearer xoxb1"):
+            with self.subTest(text=text):
+                self.assertNotIn("xoxb1", hook.redact(text))
+
+    # ---------------------------------------------------- 2. the strict-vs-permissive distinction
+    def test_the_ws_exclusion_predicate_splits_strict_from_permissive(self) -> None:
+        # The decision is derived from `body`/`guard`, never from `guard == "[0-9-]"`. Asserted on
+        # the real bodies so a future guard vocabulary cannot silently pick the wrong branch.
+        for body_name, guard, expected in (
+            ("_CJK_VALUE_BODY_INLINE_PERMISSIVE", "[A-Za-z0-9]", True),
+            ("_CJK_VALUE_BODY_INLINE_WORDLIST", "[A-Za-z0-9]", True),
+            ("_CJK_VALUE_BODY_TABLE_PERMISSIVE", "[A-Za-z0-9]", True),
+            ("_CJK_VALUE_BODY_INLINE_PERMISSIVE", "[0-9-]", False),
+            ("_CJK_VALUE_BODY_INLINE_STRICT_SPACED", "[0-9-]", False),
+        ):
+            with self.subTest(body=body_name, guard=guard):
+                self.assertIs(
+                    hook._cjk_value_guard_scan_ws_exclusion_is_lossless(
+                        re.compile(getattr(hook, body_name)), re.compile(guard)
+                    ),
+                    expected,
+                )
+
+    def test_permissive_patterns_keep_the_bare_flat_scan_class(self) -> None:
+        # The performance property round 4 bought. The two patterns run UNANCHORED via `.sub()` at
+        # every position of a table cell are both PERMISSIVE, and they must keep compiling to the
+        # engine's tight repeat-one-character-set loop -- i.e. the scan atom stays a single negated
+        # class with no alternation bolted on.
+        for name in (
+            "_CJK_SECRET_VALUE_PERMISSIVE_INLINE",
+            "_CJK_SECRET_VALUE_PERMISSIVE_INLINE_WORDLIST",
+            "_CJK_SECRET_VALUE_PERMISSIVE_TABLE",
+        ):
+            with self.subTest(pattern=name):
+                atom = self._scan_atom(getattr(hook, name))
+                self.assertTrue(atom.startswith("[^"), f"{name} scan atom is not a bare class")
+                self.assertNotIn("\\S", atom, f"{name} scan atom gained a whitespace branch")
+
+    def test_strict_patterns_carry_the_lookbehind_preserving_bridge(self) -> None:
+        for name in ("_CJK_SECRET_VALUE_STRICT_INLINE", "_CJK_SECRET_VALUE_STRICT_INLINE_SPACED"):
+            with self.subTest(pattern=name):
+                atom = self._scan_atom(getattr(hook, name))
+                self.assertIn(hook._CJK_VALUE_GUARD_SCAN_WS_BRIDGE, atom)
+                # The precondition is the whole point: without it a long whitespace run becomes
+                # crossable from every position inside itself, which is the round-6 six seconds.
+                self.assertIn("(?<=[A-Za-z0-9])", atom)
+
+    @staticmethod
+    def _scan_atom(pattern: str) -> str:
+        start = pattern.index("(?=") + 3
+        end = pattern.index("{0,%d}" % hook._CJK_VALUE_GUARD_SCAN_MAX, start)
+        return pattern[start:end]
+
+    # -------------------------------------------------------- 3. vocabulary x whitespace coverage
+    # Values whose groups all END on a digit or an uppercase letter, so they satisfy the NARROWEST
+    # bridge lookbehind any STRICT body carries (`_CJK_VALUE_SPACE_DIGIT_TO_DIGIT_CONTINUATION`'s
+    # `(?<=[0-9A-Z])`) and are therefore expected to redact through EVERY vocabulary below.
+    CODE_GROUP_VALUES = (
+        ("ABCD{w}1234", "1234"),
+        ("XKCD{w}7742{w}QRST{w}6015", "6015"),
+        ("A1B2{w}C3D4{w}E5F6", "E5F6"),
+        ("186{w}7723{w}4491{w}5508", "5508"),
+    )
+
+    def test_grouped_codes_redact_across_every_horizontal_whitespace_form(self) -> None:
+        # Four guard vocabularies reaching a STRICT class by four different routes: the ASCII
+        # "is" connector (`_INLINE_ASCII_SECRET_RE`), a CJK bare mention and a CJK explicit
+        # separator (`_INLINE_CJK_SECRET_RE`'s two branches), and a CJK keyword with a suffix.
+        for template in (
+            "backup code is {v}",
+            "recovery code is {v}",
+            "otp is {v}",
+            "passphrase is {v}",
+            "恢复码 {v}",
+            "验证码 {v}",
+            "密码：{v}",
+            "备份码 {v}",
+        ):
+            for value, secret in self.CODE_GROUP_VALUES:
+                for whitespace in self.HORIZONTAL_WS:
+                    text = template.format(v=value.format(w=whitespace))
+                    with self.subTest(text=repr(text)):
+                        self.assertNotIn(secret, hook.redact(text))
+
+    def test_a_word_ending_group_redacts_on_the_vouched_connectors_only(self) -> None:
+        # "alpha 7xyzQWERTY" ends its first group on a LOWERCASE letter, so it only bridges where
+        # the body's lookbehind is `(?<=[A-Za-z0-9])`. That is every explicit-connector STRICT path
+        # (`_CJK_SECRET_VALUE_STRICT_INLINE_SPACED`, body `_CJK_VALUE_BODY_INLINE_PERMISSIVE`) --
+        # the review's fourth repro -- and NOT the CJK bare-mention path, whose dedicated
+        # `(?<=[0-9A-Z])` continuation exists precisely so "密码 used 2 factor auth codes" cannot
+        # bridge word-to-digit (round-11 P1). Both halves are asserted, and both match round 3
+        # exactly; the fix restores reachability, it does not widen the bare-mention signal.
+        for template in ("passphrase is {v}", "backup code is {v}", "密码：{v}", "令牌 是 {v}"):
+            for whitespace in self.HORIZONTAL_WS:
+                text = template.format(v="alpha" + whitespace + "7xyzQWERTY")
+                with self.subTest(bridged=repr(text)):
+                    self.assertNotIn("7xyzQWERTY", hook.redact(text))
+        for template in ("恢复码 {v}", "验证码 {v}", "备份码 {v}", "密码 {v}", "令牌 {v}"):
+            text = template.format(v="alpha 7xyzQWERTY")
+            with self.subTest(not_bridged=text):
+                self.assertEqual(hook.redact(text), text)
+
+    def test_a_digit_reachable_only_across_several_groups_is_still_reachable(self) -> None:
+        # A grouped backup code whose first digit is several groups in. One whitespace crossing is
+        # not enough here, which is why the bridge is an alternative INSIDE the scan's repetition
+        # rather than a single optional segment bolted onto a one-shot flat scan.
+        for text, secret in (
+            ("backup code is ABCD EFGH 1234", "1234"),
+            ("backup code is ABCD EFGH IJKL 5678", "5678"),
+            ("recovery code is QRST UVWX YZAB CDEF 9012", "9012"),
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn(secret, hook.redact(text))
+
+    def test_the_permissive_path_is_byte_identical_to_round_4_on_spaced_values(self) -> None:
+        # The PERMISSIVE guard succeeds on the first alphanumeric character it meets, so it never
+        # needed to reach a space at all. Pinned as OUTPUT so "provably redundant" stays a fact
+        # about rendered text rather than a claim about the class.
+        for text, secret in (
+            ("密码：Ab7xK9m", "Ab7xK9m"),
+            ("助记词：apple banana cherry dolphin elephant", "elephant"),
+            ("| 密钥 | v2.Bearer xoxbslackbotusertoken |", "xoxbslackbotusertoken"),
+            ("密钥：Bearer aB3xK9mQ2vR8pLz7WcN4", "aB3xK9mQ2vR8pLz7WcN4"),
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn(secret, hook.redact(text))
+
+    def test_the_false_positive_guards_the_strict_class_exists_for_still_hold(self) -> None:
+        # Widening the GATE must not widen the CAPTURE. These are the pinned over-redaction guards
+        # from rounds 9-11; every one of them reaches a STRICT class whose scan now crosses spaces.
+        for text in (
+            "密码 used 2 factor auth codes for login",
+            "backup token is essential",
+            "the recovery code is well documented",
+            "passphrase is fundamental to REST design",
+        ):
+            with self.subTest(text=text):
+                out = hook.redact(text)
+                self.assertEqual(out, text, f"over-redacted: {out!r}")
+
+    def test_trailing_prose_after_a_labeled_value_is_not_swallowed(self) -> None:
+        # The round-11 content-destruction regression: a wide space bridge must not consume the rest
+        # of the sentence. The gate crossing a space is not the same as the capture crossing it.
+        out = hook.redact("密码：Ab7xK9m and the port is 8080 for staging")
+        self.assertIn("and the port is", out)
+        self.assertNotIn("Ab7xK9m", out)
+
+    # ------------------------------------------------------------------------ 4. ReDoS regressions
+    def test_the_bearer_group_ambiguity_stays_flat(self) -> None:
+        # "BEARER " is crossable BOTH as one Bearer token and as flat-class letters plus a bridged
+        # space, so any design carrying a Bearer-shaped scan alternative turns every group into a
+        # backtracking diamond. Round 3 does exactly that and needs >20s at k=25; the shipped bridge
+        # is whitespace-only and disjoint from the flat class, so there is no second path at all.
+        for k in (10, 20, 30, 60):
+            with self.subTest(groups=k):
+                elapsed = self._timed(hook.redact, "token is " + "BEARER " * k + "x")
+                self.assertLess(elapsed, 0.5, f"{k} BEARER groups took {elapsed:.3f}s")
+
+    def test_the_strict_whitespace_bridge_stays_linear(self) -> None:
+        # Worst measured shape for the bridge: maximum keyword density crossed with a maximally
+        # crossable, digit-free run, so the scan runs to its full `_CJK_VALUE_GUARD_SCAN_MAX` window
+        # and then fails at every keyword position. Linear, `/usr/bin/python3` 3.9.6:
+        # 101 / 207 / 425 / 887 / 1871 / 4150 ms at 8k / 16k / 32k / 64k / 128k / 256k.
+        small = self._timed(hook.redact, "otp is " * (8_000 // 7))
+        large = self._timed(hook.redact, "otp is " * (256_000 // 7))
+        self.assertLess(
+            large,
+            max(small * 150, 0.05),
+            f"strict whitespace bridge scaled worse than linearly: {small:.4f}s -> {large:.4f}s",
+        )
+
+    def test_realistic_sizes_of_the_bridge_worst_shape_stay_inside_the_hook_budget(self) -> None:
+        # The budget that actually matters, at the sizes round 4's own live incident was measured
+        # at (36-56KB). ~0.43s and ~0.81s here against a 5-second hook timeout.
+        for size in (36_000, 56_000):
+            with self.subTest(size=size):
+                elapsed = self._timed(hook.redact, "otp is " * (size // 7))
+                self.assertLess(elapsed, 2.0, f"{size} chars took {elapsed:.3f}s")
+
+    # --------------------------------------------------------------- 5. differential against round 3
+    def test_no_shape_round_3_redacted_leaks_now(self) -> None:
+        # A standing slice of the round-6 differential sweep: round 3 is the correctness baseline for
+        # what SHOULD be redacted, so any input it redacted and this module does not is a leak.
+        # The full sweep (59,480 inputs, both directions, in this round's report) found zero; this
+        # keeps the STRICT-path corner of it in the suite.
+        labels = ["backup code is", "recovery code is", "otp is", "passphrase is", "token is",
+                  "恢复码", "验证码", "备份码", "密码", "令牌"]
+        values = ["ABCD 1234", "XKCD 7742 QRST 6015", "A1B2 C3D4 E5F6",
+                  "Bearer Zx8Qm2", "Bearer  Zx8Qm2", "186 7723 4491 5508", "ABCD\t1234",
+                  "ABCD EFGH 1234"]
+        for label in labels:
+            for value in values:
+                text = f"{label} {value}"
+                with self.subTest(text=text):
+                    out = hook.redact(text)
+                    self.assertIn("[REDACTED", out, f"nothing redacted in {text!r}")
+                    self.assertNotIn(value.split()[-1], out, f"tail of the value leaked: {out!r}")
+                    self.assertEqual(hook.redact(out), out)
 
 
 if __name__ == "__main__":

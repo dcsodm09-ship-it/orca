@@ -3018,6 +3018,164 @@ _HOOK_HEALTH_UNPARSEABLE = "config_unparseable"
 # cannot drift apart in what they call the same state.
 _HOOK_HEALTH_CONFIG_MISSING = "config_missing"
 
+# Round-6 P1-2 (Codex sol/xhigh final review, 2026-08-28). Rounds 4-5 taught verify()/doctor() to
+# report an off-SSD Orca account as `unmanaged`/`account_unmanageable` instead of omitting it -- a
+# real improvement over silence, but the resulting signal still carries NO information about the
+# thing that actually matters. "This tool cannot manage that account" is identical text whether the
+# account is running the current release or a year-old vulnerable script, so an operator reading it
+# learns nothing and does nothing. That is precisely the detection-failure mechanism the 2026-08-21
+# incident ran on for a week: a real problem present, a check running, and its output unable to
+# distinguish healthy from broken.
+#
+# The WRITE boundary is unchanged and stays unchanged -- resolve_ssd_path() still refuses to install
+# into, rewrite, or remove anything off the SSD, and nothing below writes. This is a READ: the same
+# `_read_for_detection()` this file already uses to inspect hooks.json files it does not own, over
+# the account's real registry path, answering one question -- which script hash does the handler
+# living there pin itself to, and is that this release's? Read-only inspection of a file whose
+# contents already determine what runs on every prompt is strictly less privileged than the write
+# path this boundary exists to constrain.
+#
+# Five outcomes, deliberately distinct, because each one implies a different action:
+_UNMANAGED_SCRIPT_CURRENT = "unmanaged_script_current"      # hand-updated and current: no action
+_UNMANAGED_SCRIPT_STALE = "unmanaged_script_stale"          # running an OLD script: hand-update it
+_UNMANAGED_HOOK_MISSING = "unmanaged_hook_missing"          # no handler at all: NOT redacted
+_UNMANAGED_CONFIG_UNINSPECTABLE = "unmanaged_config_uninspectable"  # genuinely cannot look
+_UNMANAGED_HOOK_UNPINNED = "unmanaged_hook_unpinned"        # handler present, no --expected-script-sha256
+# ... and the sixth, for the OTHER shape verify() already reported as `unmanaged`: an account whose
+# config IS on the SSD and manageable but which no receipt row covers. Named alongside the five so
+# every record in verify()'s `unmanaged` list carries a `finding` and a caller can switch on it.
+_UNMANAGED_NOT_IN_RECEIPT = "unmanaged_not_in_receipt"
+
+# The findings that mean "this account is demonstrably not getting this release's redaction", as
+# opposed to "current" or "could not determine". Kept as one set so verify()'s summary, doctor()'s
+# findings and any future caller agree on which half of the split is the actionable one.
+_UNMANAGED_ACTIONABLE = frozenset(
+    {_UNMANAGED_SCRIPT_STALE, _UNMANAGED_HOOK_MISSING, _UNMANAGED_HOOK_UNPINNED}
+)
+
+
+def _inspect_unmanaged_account_config(
+    account_id: str, expected_script_sha256: str | None
+) -> dict[str, str]:
+    """Read an off-SSD account's own hooks.json and say which script its handler pins.
+
+    Returns a `{"finding": ..., "detail": ...}` record, plus `config` and `pinned_script_sha256`
+    when they could be determined. NEVER raises and never writes: every failure mode collapses to
+    `_UNMANAGED_CONFIG_UNINSPECTABLE`, because one unreadable account must not abort a call whose
+    whole job is reporting on the others (the same fail-soft rule round 5 applied to
+    `_path_is_absent()` inside verify()'s live sweep).
+
+    Deliberately NOT `validate_owned_file()`: its uid / not-group-writable / private-mode checks are
+    the right questions for "may I rewrite this?" and the wrong ones here -- every one of them
+    answers "no handler" for a file that is merely loosely permissioned, which does not stop the
+    handler inside it from running on every prompt. `_read_for_detection()` exists for exactly this
+    distinction; see its own comment (round 9, R9-P1-B).
+    """
+    config = orca_accounts_root() / account_id / "home/hooks.json"
+    record: dict[str, str] = {"config": os.fspath(config)}
+    # Absence is checked BEFORE the read, and only ENOENT counts as it. `_read_for_detection()`
+    # funnels every OSError -- including FileNotFoundError -- into one InstallError, which is right
+    # for its own caller and wrong here: "there is no hooks.json" is a proven "nothing is redacting
+    # this account", not an "I could not look". The two must not collapse into one finding, since
+    # that collapse is the whole defect this round is closing.
+    try:
+        config.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        record["finding"] = _UNMANAGED_HOOK_MISSING
+        record["detail"] = (
+            f"this account has no hooks.json at {config}, so NOTHING is redacting its prompts. Its "
+            "home is off the SSD, so this tool cannot install it: write the handler by hand, or "
+            "move the account home onto the SSD and re-run `install`."
+        )
+        return record
+    except OSError:
+        record["finding"] = _UNMANAGED_CONFIG_UNINSPECTABLE
+        record["detail"] = (
+            f"this account's own hooks.json at {config} could not be stat'ed, so whether it runs a "
+            "current, stale, or absent redaction hook is unknown. Inspect it by hand."
+        )
+        return record
+    try:
+        raw = _read_for_detection(config)
+    except (_CandidateTooLargeForDetection, InstallError, OSError):
+        raw = None
+    if raw is None:
+        # Not a regular file, a symlink (`_read_for_detection()` refuses to follow one), too large,
+        # or unreadable. A handler inside any of those still runs, so this is "cannot look", never
+        # "no hook".
+        record["finding"] = _UNMANAGED_CONFIG_UNINSPECTABLE
+        record["detail"] = (
+            f"this account's own hooks.json at {config} exists but could not be inspected (not a "
+            "regular file, a symlink, oversized, or unreadable), so which script its redaction hook "
+            "runs is unknown. Inspect it by hand."
+        )
+        return record
+    payload = _safe_parse_strict_utf8(raw)
+    if payload is _NOT_PARSED or not isinstance(payload, dict):
+        record["finding"] = _UNMANAGED_CONFIG_UNINSPECTABLE
+        record["detail"] = (
+            f"this account's own hooks.json at {config} is not parseable as the canonical JSON this "
+            "tool writes, so which script its redaction hook runs is unknown. Inspect it by hand."
+        )
+        return record
+    handlers = payload.get("hooks", {}).get(DEFAULT_HOOK_EVENT, []) if isinstance(payload.get("hooks"), dict) else []
+    commands = [
+        command
+        for handler in (handlers if isinstance(handlers, list) else [])
+        for command in [_owned_handler_command(handler)]
+        if command is not None
+    ]
+    if not commands:
+        record["finding"] = _UNMANAGED_HOOK_MISSING
+        record["detail"] = (
+            f"this account's own hooks.json at {config} carries no {DEFAULT_HOOK_EVENT} handler "
+            f"owned by {BRIDGE_ID}, so its prompts are NOT being redacted. Its home is off the SSD, "
+            "so this tool cannot install it: write the handler by hand, or move the account home "
+            "onto the SSD and re-run `install`."
+        )
+        return record
+    try:
+        pinned = {_live_handler_arguments(command).get("expected_script_sha256") for command in commands}
+    except InstallError:
+        pinned = {None}
+    pinned.discard(None)
+    if not pinned:
+        record["finding"] = _UNMANAGED_HOOK_UNPINNED
+        record["detail"] = (
+            f"this account's redaction handler at {config} does not pin an "
+            "--expected-script-sha256, so the script it runs is unverified and could be any "
+            "version. Rewrite it with the current release's full command line."
+        )
+        return record
+    record["pinned_script_sha256"] = ", ".join(sorted(pinned))
+    if expected_script_sha256 is None:
+        record["finding"] = _UNMANAGED_CONFIG_UNINSPECTABLE
+        record["detail"] = (
+            f"this account's redaction handler at {config} pins script sha256 "
+            f"{record['pinned_script_sha256']}, but there is no installed release on this machine "
+            "to compare it against, so whether it is current is unknown."
+        )
+        return record
+    if pinned == {expected_script_sha256}:
+        record["finding"] = _UNMANAGED_SCRIPT_CURRENT
+        record["detail"] = (
+            f"this account is outside this tool's write path, but its own hooks.json at {config} "
+            f"pins the CURRENT release's script sha256 ({expected_script_sha256}), so it is running "
+            "the same redaction script as the managed accounts. No action needed."
+        )
+        return record
+    record["finding"] = _UNMANAGED_SCRIPT_STALE
+    record["detail"] = (
+        f"this account's redaction handler at {config} pins script sha256"
+        f" {record['pinned_script_sha256']}, but the installed release is {expected_script_sha256}. "
+        "It is running an OUT-OF-DATE redaction script, so every fix made since that version -- "
+        "including any leak this release closed -- is NOT in effect for this account's prompts. "
+        "This tool cannot rewrite it (its home is off the SSD): update the command line by hand to "
+        "the one the managed accounts carry, or move the account home onto the SSD and re-run "
+        "`install`."
+    )
+    return record
+
 
 def _live_handler_arguments(command: str) -> dict[str, str]:
     """Pull the self-declared `--policy`/`--expected-*-sha256` pairs (and argv[1]) out of a command.
@@ -3491,18 +3649,23 @@ def verify() -> dict[str, Any]:
                 # live account is unprotected" into "we could not look". Emitting both would also
                 # double-report one account under two different names for two different reasons.
                 continue
-            unmanaged.append(
-                {
-                    "account_id": account_id,
-                    "registry_path": os.fspath(orca_accounts_root() / account_id),
-                    "reason": (
-                        "this Orca account's OWN home/hooks.json does not resolve onto the Extreme "
-                        "SSD, so this tool cannot install, verify, or remove its hook; a same-id "
-                        "directory under local-homes/codex-accounts, if one exists, is an unrelated "
-                        "legacy snapshot and is not a substitute for it"
-                    ),
-                }
-            )
+            # Round-6 P1-2: "cannot manage" is not "cannot look". The write path still refuses
+            # this account (that boundary is unchanged), but its own hooks.json is readable from
+            # here, and which script hash its handler pins is the one fact that turns this entry
+            # from a shrug into an instruction. See `_inspect_unmanaged_account_config()`.
+            inspection = _inspect_unmanaged_account_config(account_id, receipt["script_sha256"])
+            record = {
+                "account_id": account_id,
+                "registry_path": os.fspath(orca_accounts_root() / account_id),
+                "reason": (
+                    "this Orca account's OWN home/hooks.json does not resolve onto the Extreme "
+                    "SSD, so this tool cannot install, verify, or remove its hook; a same-id "
+                    "directory under local-homes/codex-accounts, if one exists, is an unrelated "
+                    "legacy snapshot and is not a substitute for it"
+                ),
+            }
+            record.update(inspection)
+            unmanaged.append(record)
             continue
         located_str = os.fspath(located)
         if located_str not in covered:
@@ -3511,6 +3674,9 @@ def verify() -> dict[str, Any]:
                     "account_id": account_id,
                     "registry_path": os.fspath(orca_accounts_root() / account_id),
                     "config": located_str,
+                    # Every entry in this list now carries a `finding`, so a scripted caller can
+                    # switch on one field instead of pattern-matching prose (round-6 P1-2).
+                    "finding": _UNMANAGED_NOT_IN_RECEIPT,
                     "reason": (
                         "this Orca account's hooks.json exists and is manageable but is not covered "
                         "by the install receipt, so nothing about it has been verified; re-run "
@@ -3556,11 +3722,31 @@ def verify() -> dict[str, Any]:
             + ". Prompts submitted from these accounts are NOT being redacted. Re-run `install`."
         )
     elif unmanaged:
+        # Round-6 P1-2: an unmanaged account that is PROVABLY behind must not read the same as one
+        # that was inspected and found current. Both still force `ok: false` (this tool still cannot
+        # manage either), but only one of them needs a human to go and do something, and the summary
+        # is the line an operator actually reads.
+        actionable = [
+            record for record in unmanaged if record.get("finding") in _UNMANAGED_ACTIONABLE
+        ]
         summary = (
             "INCOMPLETE: the redaction hook is correctly wired on every config this tool manages, "
-            "but " + str(len(unmanaged)) + " live Orca account(s) are outside its management and "
-            "were not verified."
+            "but " + str(len(unmanaged)) + " live Orca account(s) are outside its management."
         )
+        if actionable:
+            summary += (
+                " " + str(len(actionable)) + " of them "
+                + ("is" if len(actionable) == 1 else "are")
+                + " NOT running this release's redaction script ("
+                + ", ".join(
+                    sorted({str(record.get("finding")) for record in actionable})
+                )
+                + "): "
+                + ", ".join(record["account_id"] for record in actionable)
+                + ". This tool cannot fix them from here; see each entry's `detail`."
+            )
+        else:
+            summary += " Each was inspected read-only; see each entry's `finding`."
     elif cosmetic:
         summary = (
             "HEALTHY: the redaction hook is correctly wired and functional on every managed config. "
@@ -3624,6 +3810,18 @@ def verify() -> dict[str, Any]:
 # that is a change to the user's own machine configuration and is theirs to make.
 def doctor() -> dict[str, Any]:
     findings: list[dict[str, str]] = []
+    # Round-6 P1-2. States this check INSPECTED and found healthy, but which are still worth naming
+    # in the output. They are deliberately NOT `findings`, because `findings` drives `ok` and `ok`
+    # drives this command's exit status, and this command is meant to run unattended.
+    #
+    # This file's own history is the argument. The 2026-08-21 incident lasted a week because a real
+    # failure and a harmless Orca reserialization produced the same word, the same exit code and the
+    # same abort -- "the signal carried no information", as verify()'s own comment puts it. An
+    # off-SSD account is a PERMANENT feature of this machine's provisioning, so reporting it as a
+    # problem means `doctor` exits 1 forever, and a health check that always fails teaches its reader
+    # to ignore it. Now that the account's own hooks.json can actually be read, the honest split is:
+    # proven current -> a note; stale, missing, unpinned or uninspectable -> a finding that fails.
+    notes: list[dict[str, str]] = []
     checked: list[str] = []
     # Every config found to be running the release's own script, collected so the one shared script
     # file behind all of them is checked once instead of once per config (see F3, below).
@@ -3686,12 +3884,22 @@ def doctor() -> dict[str, Any]:
             targets.append(os.fspath(config))
     for account_id, located in sorted(registry_accounts.items()):
         if located is None:
-            finding(
-                "account_unmanageable",
-                account_id,
-                "this live Orca account's hooks.json does not resolve onto the Extreme SSD, so its "
-                "redaction hook cannot be checked from here",
-            )
+            # Round-6 P1-2. The old `account_unmanageable` finding said only that this tool's WRITE
+            # path cannot reach the account -- true, unchanged, and useless on its own: it read
+            # identically whether the account was hand-updated to the current release or still
+            # running a vulnerable one. doctor() exists to be the check that produces an actionable
+            # signal when something is genuinely wrong, so it now reads the account's own hooks.json
+            # (read-only; nothing here writes) and reports which of the five states it is in.
+            inspection = _inspect_unmanaged_account_config(account_id, receipt["script_sha256"] if receipt else None)
+            record = {
+                "kind": inspection["finding"],
+                "target": account_id,
+                "detail": (
+                    "this live Orca account's home is off the Extreme SSD, so this tool cannot "
+                    "install or repair its hook. " + inspection["detail"]
+                ),
+            }
+            (notes if inspection["finding"] == _UNMANAGED_SCRIPT_CURRENT else findings).append(record)
             continue
         if os.fspath(located) not in targets:
             targets.append(os.fspath(located))
@@ -3813,6 +4021,7 @@ def doctor() -> dict[str, Any]:
         "ok": not findings,
         "checked": checked,
         "findings": findings,
+        "notes": notes,
         "runtime_base": os.fspath(RUNTIME_BASE),
         "interpreter": sys.executable,
         "launchd_tcc_risk": runtime_external and apple_platform_interpreter,
@@ -3836,6 +4045,12 @@ def doctor() -> dict[str, Any]:
         result["summary"] = (
             "HEALTHY: a redaction handler owned by this bridge is present, correctly pointed and "
             "backed by the expected script on all " + str(len(checked)) + " config(s) checked."
+        )
+    if notes:
+        result["summary"] += (
+            " Also inspected read-only, no action needed: "
+            + "; ".join(f"[{item['kind']}] {item['target']}" for item in notes)
+            + "."
         )
     return result
 

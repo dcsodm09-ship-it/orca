@@ -3046,24 +3046,119 @@ _CJK_VALUE_GUARD_SCAN_PROBES: tuple[tuple[str, int], ...] = (
     ("Bearer  x", 0),  # `_CJK_VALUE_BEARER_BRIDGE` plus its trailing whitespace run
 )
 
-# Horizontal whitespace is then subtracted back out of whatever those probes discovered. It is the
-# one character class where flattening a token to its characters is NOT one-way safe, because it is
-# the only body token whose own precondition depends on what precedes it, and dropping that
-# precondition is what makes a long whitespace run crossable from every position in it.
+# The horizontal-whitespace repertoire, DERIVED from the same `[^\S\n]` class every body-level
+# whitespace bridge in this file is written with, rather than re-typed as a literal. Round 4 hand-
+# listed it as `" \t\x0b\x0c\r"` and missed `\x1c`-`\x1f`, which Python's `\s` (and therefore
+# `[^\S\n]`) does match -- harmless while whitespace was excluded unconditionally, but a silent
+# narrowing the moment it is not (see `_cjk_value_guard_scan_ws_exclusion_is_lossless` below).
+_CJK_VALUE_HORIZONTAL_WS_RE = re.compile(r"[^\S\n]")
+_CJK_VALUE_GUARD_SCAN_HORIZONTAL_WS = frozenset(
+    chr(code) for code in range(0x80) if _CJK_VALUE_HORIZONTAL_WS_RE.fullmatch(chr(code))
+)
+
+# Whether horizontal whitespace may be subtracted back out of whatever the probes discovered.
 #
-# Caught by this repo's own `test_inline_cjk_secret_connector_is_not_cubic`, which pins exactly this
-# shape ("密码" + 12,000 spaces + "x") because round 6 already had a ReDoS here: with whitespace left
-# in the scan class that test went from passing to a multi-second failure, and the whole suite's
-# wall time doubled (77s -> 159s). Keeping it out costs nothing real:
-#   * `_CJK_VALUE_SPACE_DIGIT_CONTINUATION` only crosses a space that is IMMEDIATELY PRECEDED by
-#     `[A-Za-z0-9]`. Whenever `guard` is the PERMISSIVE `[A-Za-z0-9]` -- which is both of the table
-#     patterns this round is fixing -- that preceding character IS a guard character, so the scan
-#     had already succeeded on it and never needed to reach the space at all. Provably redundant,
-#     not a judgement call.
-#   * For the STRICT `[0-9-]` guard the preceding character may be a letter, so a value whose first
-#     digit sits behind a space ("密码：abc 7xyz") is the one shape that could narrow. Verified by
-#     differential sweep against the pre-fix module rather than assumed -- see the round-4 report.
-_CJK_VALUE_GUARD_SCAN_NEVER_CROSSABLE = " \t\x0b\x0c\r"
+# Round-4 excluded it UNCONDITIONALLY, and that is the one part of the flat-scan rewrite that was
+# not one-way safe. Excluding it is only LOSSLESS when the guard has already been satisfied by the
+# time the scan reaches the whitespace, and that depends on `guard`:
+#   * PERMISSIVE (`[A-Za-z0-9]`): every body-level whitespace bridge is vouched for by an
+#     alphanumeric character the scan must already have passed -- `_CJK_VALUE_SPACE_*_CONTINUATION`
+#     by their `(?<=[A-Za-z0-9])`/`(?<=[0-9A-Z])` lookbehind, `_CJK_VALUE_BEARER_BRIDGE` by the
+#     literal letters of "Bearer" it consumes before its own `[^\S\n]+`. That character IS a guard
+#     character, so the scan succeeded on it and never needed to reach the whitespace at all.
+#     Provably redundant, not a judgement call.
+#   * STRICT (`[0-9-]`): the vouching character may be a plain LETTER, which is not a guard
+#     character, so the scan genuinely has to cross the whitespace to reach the value's first digit.
+#     Round 4 excluded it here too and turned redaction OFF for every grouped-code value --
+#     `redact('token is Bearer Zx8Qm2')`, `redact('backup code is ABCD 1234')`,
+#     `redact('recovery code is XKCD 7742 QRST 6015')`, `redact('passphrase is alpha 7xyzQWERTY')`
+#     all round-3-redacted, all round-4 plaintext (round-6 P1-1, Codex sol/xhigh final review,
+#     2026-08-28; its own 59,480-input differential sweep counted 737 such regressions). Round 4's
+#     comment claimed this shape had been "verified by differential sweep" -- the sweep it ran had
+#     no space-grouped STRICT value in its corpus at all, which is why the claim survived.
+#
+# The predicate below decides which case applies by asking `body` and `guard` themselves rather than
+# by testing `guard == "[0-9-]"`, so a future guard vocabulary cannot silently pick the wrong branch.
+def _cjk_value_guard_scan_ws_exclusion_is_lossless(
+    body_re: "re.Pattern[str]", guard_re: "re.Pattern[str]"
+) -> bool:
+    """Can horizontal whitespace be dropped from the scan class without narrowing the gate?
+
+    Two independent conditions, both probed against the real `body`/`guard` rather than asserted:
+
+    1. No NON-guard character may be able to stand immediately before a whitespace this `body` can
+       bridge. This is the lookbehind-vouched family (`_CJK_VALUE_SPACE_*_CONTINUATION`): if some
+       character the guard does not accept can legally precede a bridged space, then a value whose
+       first guard character sits behind that space becomes unreachable once whitespace is dropped.
+    2. Every multi-character probe token that CONSUMES whitespace must consume, or be preceded by, a
+       guard character before its first whitespace character. This is the self-vouching family
+       (`_CJK_VALUE_BEARER_BRIDGE`, whose `[^\\S\\n]+` can cross a whitespace RUN, so the character
+       immediately before the second space is another space and condition 1 cannot see it).
+    """
+    for code in range(0x80):
+        lead = chr(code)
+        if guard_re.fullmatch(lead):
+            continue
+        for whitespace in _CJK_VALUE_GUARD_SCAN_HORIZONTAL_WS:
+            # "9" trails the whitespace because every bridge in this file also carries a forward
+            # "is the upcoming token a plausible code group" lookahead; a bare digit satisfies all
+            # of them, so a body that declines this probe genuinely cannot bridge from `lead`.
+            match = body_re.match(lead + whitespace + "9", 1)
+            if match is not None and match.end() > 1:
+                return False
+    for probe, offset in _CJK_VALUE_GUARD_SCAN_PROBES:
+        match = body_re.match(probe, offset)
+        if match is None or match.end() <= offset:
+            continue
+        consumed = probe[offset:match.end()]
+        first_ws = next(
+            (i for i, char in enumerate(consumed) if char in _CJK_VALUE_GUARD_SCAN_HORIZONTAL_WS),
+            None,
+        )
+        if first_ws is None:
+            continue
+        vouching = (probe[offset - 1] if offset else "") + consumed[:first_ws]
+        if not any(guard_re.fullmatch(char) for char in vouching):
+            return False
+    return True
+
+
+# When the predicate above says NO, whitespace has to stay reachable -- but NOT as a member of the
+# flat class. That was this round's first attempt and it reopened the exact ReDoS round 4 fixed:
+# measured 6.07s on `_INLINE_CJK_SECRET_RE.search("密码" + " " * 12_000 + "x")`, caught by this
+# repo's own `test_inline_cjk_secret_connector_is_not_cubic` and
+# `test_the_whitespace_redos_round_6_closed_stays_closed`. The amplifier is
+# `_CJK_CONNECTOR_WS_TRAILING`'s unbounded `[^\S\n]*`: it swallows the whole run, the value fails,
+# and it then gives back one character at a time, so the value scan is retried at EVERY position
+# inside the run. A flat class containing whitespace costs the full `_CJK_VALUE_GUARD_SCAN_MAX`
+# window at each of those positions; 12,000 x 512 is the six seconds.
+#
+# The property that made round 3 cheap on exactly this input is the bridge's own LOOKBEHIND: a
+# whitespace character is only crossable when an alphanumeric sits immediately before it, which is
+# false at every position inside a whitespace run (the predecessor is another space) and false at
+# the run's own leading edge here (the predecessor is "码"). So the scan fails in O(1) per position
+# rather than O(window). Round 4 flattened that precondition away along with everything else; this
+# keeps it, as ONE extra alternative beside the flat class instead of restoring round 3's
+# three-branch, inner-quantifier-carrying `(?:body){0,256}` -- the flat class still absorbs every
+# ordinary value character, which is where round 4's ~7x constant-factor win actually came from.
+#
+# `(?<=[A-Za-z0-9])[^\S\n]+` is a deliberate SUPERSET of all four bridge tokens this file defines:
+#   * `_CJK_VALUE_SPACE_DIGIT_CONTINUATION` and `_CJK_VALUE_SPACE_ALNUM_CONTINUATION` -- same
+#     lookbehind, minus their forward "is the upcoming token a plausible code group" lookahead.
+#   * `_CJK_VALUE_SPACE_DIGIT_TO_DIGIT_CONTINUATION` -- its `(?<=[0-9A-Z])` is narrower still.
+#   * `_CJK_VALUE_BEARER_BRIDGE` -- its literal "Bearer" is consumed by the flat class (letters are
+#     not STRICT guard characters), leaving `[^\S\n]+` preceded by "r". The `+` is what covers the
+#     whitespace RUN that bridge allows, so `"token is Bearer   Zx8Qm2"` stays reachable; with a
+#     single `[^\S\n]` it would not be, and that is a leak round 3 did not have.
+# Being a superset only ever widens the GATE, never the capture (`body{4,max_len}` is untouched), so
+# the direction is the safe one -- and `_cjk_value_guard_scan_class` VERIFIES the containment
+# against the real `body` rather than trusting this list, falling back to the slower
+# whitespace-in-the-flat-class form if a future bridge ever escapes it.
+#
+# `[^\S\n]` rather than the ASCII repertoire above: the body's own bridges are written with exactly
+# this class, so they can also cross NBSP and the Unicode spaces that
+# `_CJK_VALUE_EXCLUDED_UNICODE_RANGES` keeps out of the flat class. Round 4 lost those too.
+_CJK_VALUE_GUARD_SCAN_WS_BRIDGE = r"(?<=[A-Za-z0-9])[^\S\n]+"
 
 _CJK_VALUE_GUARD_SCAN_CACHE: dict[tuple[str, str], str] = {}
 
@@ -3138,13 +3233,18 @@ def _subtract_codepoints(
 
 
 def _cjk_value_guard_scan_class(body: str, guard: str) -> str:
-    """The flat, guard-disjoint scan class for `body` (see `_CJK_VALUE_GUARD_SCAN_MAX` above).
+    """The flat, guard-disjoint scan atom for `body` (see `_CJK_VALUE_GUARD_SCAN_MAX` above).
 
     Returns a NEGATED class listing what the scan may NOT cross: every ASCII character `body`
     cannot consume, plus every character `guard` can (so the two are disjoint and the scan is
     deterministic), plus `_CJK_VALUE_EXCLUDED_UNICODE_RANGES` (the non-ASCII ranges
     `_CJK_VALUE_NON_ASCII_TOKEN` itself excludes). Everything else -- all remaining non-ASCII --
     stays crossable, matching that token exactly.
+
+    Horizontal whitespace is never a member of that class. For a guard that does not subsume
+    `[A-Za-z0-9]` the return value is that class OR-ed with one extra alternative that keeps the
+    body's own lookbehind precondition -- see `_CJK_VALUE_GUARD_SCAN_WS_BRIDGE` and
+    `_cjk_value_guard_scan_with_ws_bridge` for why whitespace cannot simply join the class.
 
     ... with one carve-out, because `_CJK_VALUE_CHARS_COMMON` and `_CJK_VALUE_NON_ASCII_TOKEN`
     OVERLAP: `_CJK_VALUE_FULLWIDTH_SEP_CHARS` ("：＝") and `_CJK_CONNECTOR_FULLWIDTH_PUNCT_CHARS`
@@ -3168,7 +3268,15 @@ def _cjk_value_guard_scan_class(body: str, guard: str) -> str:
         match = body_re.match(probe, offset)
         if match is not None and match.end() > offset:
             crossable.update(probe[offset:match.end()])
-    crossable.difference_update(_CJK_VALUE_GUARD_SCAN_NEVER_CROSSABLE)
+    # Whitespace never belongs in the flat class -- see `_CJK_VALUE_GUARD_SCAN_WS_BRIDGE` for the
+    # measured six seconds that costs. Only the characters whitespace bridging contributed are
+    # removed, never one the body can already consume unconditionally at a run's leading edge (none
+    # of this file's bodies can, but subtracting wholesale would silently narrow one that could).
+    ws_exclusion_is_lossless = _cjk_value_guard_scan_ws_exclusion_is_lossless(body_re, guard_re)
+    crossable.difference_update(
+        _CJK_VALUE_GUARD_SCAN_HORIZONTAL_WS
+        - {char for char in _CJK_VALUE_GUARD_SCAN_HORIZONTAL_WS if body_re.match(char)}
+    )
     # Disjointness with `guard` is what removes the backtracking; it is enforced here rather than
     # assumed, so a future `guard` that stops being a subset of the body repertoire cannot silently
     # reintroduce an ambiguous scan.
@@ -3209,8 +3317,43 @@ def _cjk_value_guard_scan_class(body: str, guard: str) -> str:
             if 0 <= code <= 0x10FFFF
         )
         rendered = candidate if agrees else reference.pattern
+    if not ws_exclusion_is_lossless:
+        rendered = _cjk_value_guard_scan_with_ws_bridge(rendered, body_re)
     _CJK_VALUE_GUARD_SCAN_CACHE[key] = rendered
     return rendered
+
+
+def _cjk_value_guard_scan_with_ws_bridge(flat: str, body_re: "re.Pattern[str]") -> str:
+    """Add the lookbehind-preserving whitespace alternative to a flat scan class, and verify it.
+
+    Verification, not trust: every (predecessor, whitespace) pair `body` can actually bridge must
+    also be crossable by the returned atom. If any escapes -- a future bridge token with a different
+    lookbehind, say -- fall back to putting whitespace straight into the flat class, which is
+    correct for every such pair by construction and merely slow (the round-6 six seconds), because a
+    performance regression is recoverable and a silently narrowed secret-detection gate is not.
+    This mirrors the identical "keep the slower form on disagreement" discipline the carve-out above
+    already uses.
+    """
+    atom = "(?:" + flat + "|" + _CJK_VALUE_GUARD_SCAN_WS_BRIDGE + ")"
+    atom_re = re.compile(atom)
+    # Non-ASCII whitespace is probed too: `[^\S\n]` matches it, so the body's own bridges cross it,
+    # but `_CJK_VALUE_EXCLUDED_UNICODE_RANGES` keeps it out of the flat class.
+    whitespace_repertoire = sorted(_CJK_VALUE_GUARD_SCAN_HORIZONTAL_WS) + [
+        char
+        for char in "\xa0\u1680\u2000\u2007\u200a\u202f\u205f\u3000"
+        if _CJK_VALUE_HORIZONTAL_WS_RE.fullmatch(char)
+    ]
+    for code in range(0x80):
+        lead = chr(code)
+        for whitespace in whitespace_repertoire:
+            probe = lead + whitespace + "9"
+            body_match = body_re.match(probe, 1)
+            if body_match is None or body_match.end() <= 1:
+                continue
+            atom_match = atom_re.match(probe, 1)
+            if atom_match is None or atom_match.end() <= 1:
+                return "(?:" + flat + "|[^\\S\\n])"
+    return atom
 
 
 def _cjk_value_pattern(body: str, *, guard: str, max_len: int = _CJK_VALUE_MAX_LEN) -> str:
@@ -3236,7 +3379,9 @@ def _cjk_value_pattern(body: str, *, guard: str, max_len: int = _CJK_VALUE_MAX_L
         rf"(?![{re.escape(_CJK_VALUE_FULLWIDTH_SEP_CHARS)}])"
         # One flat class, one quantifier, disjoint from `guard` -- see `_CJK_VALUE_GUARD_SCAN_MAX`
         # and `_cjk_value_guard_scan_class()` above for the measurement, the soundness argument and
-        # why the window's unit changed from body tokens to characters.
+        # why the window's unit changed from body tokens to characters. A STRICT guard adds exactly
+        # one further alternative for the whitespace bridge (round-6 P1-1); the flat class still
+        # absorbs every ordinary value character, which is where the constant-factor win lives.
         rf"(?={_cjk_value_guard_scan_class(body, guard)}{{0,{_CJK_VALUE_GUARD_SCAN_MAX}}}{guard})"
         rf"{body}{{4,{max_len}}}{_CJK_VALUE_WRAP}?"
     )

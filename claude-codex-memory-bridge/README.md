@@ -169,10 +169,36 @@ not have to interpret anything to learn whether prompts are being redacted. Its
 scope is exact and worth knowing: **`false` means proven bad** — some live config
 has no correctly-wired hook. **`true` means proven good for every config this
 tool could inspect**, which is not the same as "every account on this machine":
-an Orca account whose home is a real off-SSD directory cannot be inspected from
-here at all, and is reported in `unmanaged` instead. `ok` is
+an Orca account whose home is a real off-SSD directory is outside this tool's
+write path and is reported in `unmanaged` instead. `ok` is
 `hook_functional and not unmanaged`, so `ok` — not `hook_functional` alone — is
 what a scripted caller should gate on.
+
+### Unmanaged accounts are inspected, not shrugged at
+
+"Outside the write path" is not the same as "invisible". Since round 6 every
+entry in `unmanaged` carries a machine-readable `finding`, and for an off-SSD
+account that finding comes from actually **reading** that account's own
+`hooks.json` and comparing the `--expected-script-sha256` its handler pins
+against the installed release:
+
+| `finding` | meaning | needs action |
+|---|---|---|
+| `unmanaged_script_current` | pinned hash == the installed release; hand-updated and up to date | no |
+| `unmanaged_script_stale` | pinned hash is an **older** release; every fix since then is not in effect there | **yes** |
+| `unmanaged_hook_missing` | no `hooks.json`, or no handler owned by this bridge; prompts are not redacted | **yes** |
+| `unmanaged_hook_unpinned` | handler present but pins no script hash, so what it runs is unverified | **yes** |
+| `unmanaged_config_uninspectable` | unreadable, unparseable, or behind a symlink — genuinely cannot tell | **yes** |
+| `unmanaged_not_in_receipt` | on-SSD and manageable, but no receipt row covers it | **yes** |
+
+The write boundary did not move: `resolve_ssd_path()` still refuses to install
+into, rewrite, or remove anything off the SSD. This is a read-only inspection of
+a file whose contents already decide what runs on every prompt.
+
+Before round 6 all of those states produced the *same* output — "this tool
+cannot manage that account" — which is the same defect as the byte-comparison
+`drift` below: a check that runs, finds a real problem, and emits a signal that
+cannot distinguish it from a healthy one.
 
 `doctor` asks **"is the redaction hook running right now?"** It never raises —
 a missing receipt is a *finding*, not an exception — and it enumerates configs
@@ -181,6 +207,14 @@ receipt is gone. It exists for one failure class: `hooks.json` disappearing, or
 losing its redaction entry. Both exit non-zero on failure. One release's script
 is shared by every managed account, so a tampered script is reported **once**,
 naming the configs that run it, rather than once per config.
+
+`doctor` splits its output in two: `findings` drives `ok` and the exit status,
+while `notes` holds states it inspected and found healthy. An off-SSD account is
+a permanent feature of this machine's provisioning, so reporting a
+*proven-current* one as a problem would make `doctor` exit non-zero forever —
+and a health check that always fails is a health check nobody reads, which is
+precisely how the 2026-08-21 incident stayed invisible. `unmanaged_script_stale`
+and every other actionable finding still fail it.
 
 Why the byte comparison had to go: on 2026-08-21 a Codex app upgrade deleted
 `~/.codex/hooks.json`, and this machine ran the original, unbounded,

@@ -5028,8 +5028,14 @@ class RealOrcaAccountRegistryEnumerationTests(unittest.TestCase):
         )
         self.assertIn("Extreme SSD", result["unmanaged"][0]["reason"])
         # And the report must not name the legacy snapshot as this account's config -- that claim is
-        # precisely the falsehood being fixed.
-        self.assertNotIn("config", result["unmanaged"][0])
+        # precisely the falsehood being fixed. Asserted directly rather than through the absence of
+        # the key: round 6 added a read-only inspection of the account's OWN off-SSD hooks.json, so
+        # `config` is present again -- pointing at the live account's real path, which is the
+        # opposite of the falsehood. The invariant that matters is WHICH path it names.
+        self.assertEqual(result["unmanaged"][0]["config"], os.fspath(live_config))
+        self.assertNotEqual(result["unmanaged"][0]["config"], os.fspath(legacy_config))
+        # ...and, from that inspection, the actionable half: the live account really has no handler.
+        self.assertEqual(result["unmanaged"][0]["finding"], installer._UNMANAGED_HOOK_MISSING)
 
         # The ground truth the whole fix exists to protect: the account Orca actually runs has no
         # bridge handler, so verify() must not be green -- whatever the legacy snapshot contains.
@@ -5063,6 +5069,219 @@ class RealOrcaAccountRegistryEnumerationTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["unmanaged"], [])
         self.assertTrue(self._mentions_bridge(legacy_config))
+
+    # ---------------------------------------------------------------------- round-6 P1-2 coverage
+    # Rounds 4-5 taught verify()/doctor() to NAME an off-SSD account instead of omitting it. That
+    # was still not a usable signal: "this tool cannot manage that account" reads identically
+    # whether the account was hand-updated to the current release or is still running the
+    # vulnerable script the whole saga is about, so an operator learns nothing and does nothing.
+    # That is the same "a real problem produces no actionable output" mechanism that let the
+    # 2026-08-21 incident run for a week. The write boundary is unchanged -- resolve_ssd_path()
+    # still refuses this account -- but the READ now happens and the outcomes are distinct.
+
+    def _handler_command(self, script_sha256: str, *, pin: bool = True) -> str:
+        pinned = f" --expected-script-sha256 {script_sha256}" if pin else ""
+        return (
+            f"/usr/bin/python3 /somewhere/claude_memory_hook.py --bridge-id {installer.BRIDGE_ID}"
+            f" --policy /somewhere/policy.json --expected-policy-sha256 {'0' * 64}{pinned}"
+        )
+
+    def _add_offssd_account_pinning(self, account_id: str, command: str) -> Path:
+        account_home = self.registry / account_id / "home"
+        account_home.mkdir(parents=True)
+        config = account_home / "hooks.json"
+        self._write(
+            config,
+            (
+                json.dumps(
+                    {"hooks": {installer.DEFAULT_HOOK_EVENT: [{"hooks": [{"type": "command", "command": command}]}]}},
+                    sort_keys=True,
+                    indent=2,
+                )
+                + "\n"
+            ).encode(),
+        )
+        return config
+
+    def test_an_offssd_account_pinned_to_the_current_release_reports_script_current(self) -> None:
+        installer.install()
+        receipt = installer.read_receipt()
+        config = self._add_offssd_account_pinning(
+            "acct-offssd-current", self._handler_command(receipt["script_sha256"])
+        )
+
+        result = installer.verify()
+        entry = result["unmanaged"][0]
+        self.assertEqual(entry["account_id"], "acct-offssd-current")
+        self.assertEqual(entry["finding"], installer._UNMANAGED_SCRIPT_CURRENT)
+        self.assertEqual(entry["config"], os.fspath(config))
+        self.assertEqual(entry["pinned_script_sha256"], receipt["script_sha256"])
+        # Still not `ok`: this tool genuinely cannot manage the account, and that boundary did not
+        # move. What changed is that the entry now says which of the two states it is in.
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["hook_functional"])
+        self.assertIn("Each was inspected read-only", result["summary"])
+
+        # doctor() is the unattended runner, so a state it INSPECTED and found healthy must not
+        # keep it exiting non-zero forever -- a check that always fails is a check nobody reads,
+        # which is the same failure this round is closing, inverted.
+        health = installer.doctor()
+        self.assertTrue(health["ok"], health["summary"])
+        self.assertEqual([note["kind"] for note in health["notes"]], [installer._UNMANAGED_SCRIPT_CURRENT])
+        self.assertEqual([note["target"] for note in health["notes"]], ["acct-offssd-current"])
+        self.assertIn("no action needed", health["summary"])
+
+    def test_an_offssd_account_pinned_to_an_old_release_reports_script_stale(self) -> None:
+        installer.install()
+        receipt = installer.read_receipt()
+        stale = "1" * 64
+        self.assertNotEqual(stale, receipt["script_sha256"])
+        config = self._add_offssd_account_pinning("acct-offssd-stale", self._handler_command(stale))
+
+        result = installer.verify()
+        entry = result["unmanaged"][0]
+        self.assertEqual(entry["finding"], installer._UNMANAGED_SCRIPT_STALE)
+        self.assertEqual(entry["pinned_script_sha256"], stale)
+        self.assertEqual(entry["config"], os.fspath(config))
+        # Actionable means it says what is wrong AND what to do, and names both hashes.
+        self.assertIn(stale, entry["detail"])
+        self.assertIn(receipt["script_sha256"], entry["detail"])
+        self.assertIn("OUT-OF-DATE", entry["detail"])
+        self.assertIn("by hand", entry["detail"])
+        self.assertFalse(result["ok"])
+        # The summary is the line a human actually reads, so the distinction has to reach it.
+        self.assertIn(installer._UNMANAGED_SCRIPT_STALE, result["summary"])
+        self.assertIn("acct-offssd-stale", result["summary"])
+        self.assertIn("NOT running this release's redaction script", result["summary"])
+
+        health = installer.doctor()
+        self.assertFalse(health["ok"])
+        self.assertIn(installer._UNMANAGED_SCRIPT_STALE, [item["kind"] for item in health["findings"]])
+        self.assertEqual(health["notes"], [])
+
+    def test_the_stale_and_current_reports_are_not_the_same_string(self) -> None:
+        # The defect in one assertion: rounds 4-5 produced byte-identical output for these two
+        # states, so no caller -- human or scripted -- could act on either.
+        installer.install()
+        receipt = installer.read_receipt()
+
+        def report(command: str) -> dict:
+            account_home = self.registry / "acct-probe" / "home"
+            if account_home.exists():
+                shutil.rmtree(self.registry / "acct-probe")
+            self._add_offssd_account_pinning("acct-probe", command)
+            entry = dict(installer.verify()["unmanaged"][0])
+            return entry
+
+        current = report(self._handler_command(receipt["script_sha256"]))
+        stale = report(self._handler_command("2" * 64))
+        self.assertNotEqual(current["finding"], stale["finding"])
+        self.assertNotEqual(current["detail"], stale["detail"])
+
+    def test_an_offssd_account_with_no_bridge_handler_reports_hook_missing(self) -> None:
+        installer.install()
+        self._add_offssd_registry_account("acct-offssd-nohook")
+        entry = installer.verify()["unmanaged"][0]
+        self.assertEqual(entry["finding"], installer._UNMANAGED_HOOK_MISSING)
+        self.assertIn("NOT being redacted", entry["detail"])
+        self.assertIn(installer._UNMANAGED_HOOK_MISSING, [item["kind"] for item in installer.doctor()["findings"]])
+
+    def test_an_offssd_account_with_no_hooks_json_at_all_reports_hook_missing(self) -> None:
+        # Absence is PROOF of no redaction, not an inability to look -- the two must not collapse
+        # into one finding, since that collapse is the defect.
+        installer.install()
+        (self.registry / "acct-offssd-empty" / "home").mkdir(parents=True)
+        entry = installer.verify()["unmanaged"][0]
+        self.assertEqual(entry["finding"], installer._UNMANAGED_HOOK_MISSING)
+        self.assertIn("no hooks.json", entry["detail"])
+
+    def test_an_offssd_handler_without_a_pinned_hash_reports_unpinned(self) -> None:
+        installer.install()
+        self._add_offssd_account_pinning(
+            "acct-offssd-unpinned", self._handler_command("unused", pin=False)
+        )
+        entry = installer.verify()["unmanaged"][0]
+        self.assertEqual(entry["finding"], installer._UNMANAGED_HOOK_UNPINNED)
+        self.assertNotIn("pinned_script_sha256", entry)
+
+    def test_an_unparseable_offssd_config_reports_uninspectable_not_healthy(self) -> None:
+        # Fails toward "I could not determine this", never toward silence or a green verdict.
+        installer.install()
+        self._add_offssd_account_pinning("acct-offssd-broken", self._handler_command("0" * 64))
+        self._write(self.registry / "acct-offssd-broken/home/hooks.json", b"{not json at all")
+        entry = installer.verify()["unmanaged"][0]
+        self.assertEqual(entry["finding"], installer._UNMANAGED_CONFIG_UNINSPECTABLE)
+        self.assertFalse(installer.verify()["ok"])
+        self.assertIn(
+            installer._UNMANAGED_CONFIG_UNINSPECTABLE,
+            [item["kind"] for item in installer.doctor()["findings"]],
+        )
+
+    def test_a_symlinked_offssd_config_reports_uninspectable_not_hook_missing(self) -> None:
+        # `_read_for_detection()` refuses to follow a symlink. A handler behind one still RUNS, so
+        # reporting "no hook" there would assert the opposite of the truth.
+        installer.install()
+        receipt = installer.read_receipt()
+        real = self.home / "elsewhere-hooks.json"
+        self._write(
+            real,
+            (
+                json.dumps(
+                    {
+                        "hooks": {
+                            installer.DEFAULT_HOOK_EVENT: [
+                                {"hooks": [{"type": "command", "command": self._handler_command(receipt["script_sha256"])}]}
+                            ]
+                        }
+                    },
+                    sort_keys=True,
+                    indent=2,
+                )
+                + "\n"
+            ).encode(),
+        )
+        account_home = self.registry / "acct-offssd-symlink" / "home"
+        account_home.mkdir(parents=True)
+        (account_home / "hooks.json").symlink_to(real)
+
+        entry = installer.verify()["unmanaged"][0]
+        self.assertEqual(entry["finding"], installer._UNMANAGED_CONFIG_UNINSPECTABLE)
+
+    def test_the_read_only_inspection_never_writes_to_the_offssd_account(self) -> None:
+        # The write boundary is the thing this round must NOT relax. Byte-for-byte, mtime and inode
+        # included, across verify() and doctor().
+        installer.install()
+        config = self._add_offssd_account_pinning("acct-offssd-ro", self._handler_command("3" * 64))
+        before_bytes = config.read_bytes()
+        before_stat = config.stat()
+        installer.verify()
+        installer.doctor()
+        self.assertEqual(config.read_bytes(), before_bytes)
+        after_stat = config.stat()
+        self.assertEqual(
+            (before_stat.st_ino, before_stat.st_size, before_stat.st_mtime_ns, before_stat.st_mode),
+            (after_stat.st_ino, after_stat.st_size, after_stat.st_mtime_ns, after_stat.st_mode),
+        )
+
+    def test_every_unmanaged_entry_carries_a_machine_readable_finding(self) -> None:
+        # The other `unmanaged` shape -- an on-SSD, manageable account no receipt row covers -- gets
+        # a `finding` too, so a scripted caller switches on one field instead of matching prose.
+        installer.install()
+        late_home = self.local_homes / "codex-accounts/acct-late/home"
+        late_home.mkdir(parents=True)
+        self._write(late_home / "hooks.json", self._base_hooks_json())
+        (self.registry / "acct-late").mkdir()
+        (self.registry / "acct-late/home").symlink_to(late_home)
+        self._add_offssd_account_pinning("acct-zz-offssd", self._handler_command("4" * 64))
+
+        entries = installer.verify()["unmanaged"]
+        self.assertEqual(
+            {entry["account_id"]: entry["finding"] for entry in entries},
+            {
+                "acct-late": installer._UNMANAGED_NOT_IN_RECEIPT,
+                "acct-zz-offssd": installer._UNMANAGED_SCRIPT_STALE,
+            },
+        )
 
 
 if __name__ == "__main__":
