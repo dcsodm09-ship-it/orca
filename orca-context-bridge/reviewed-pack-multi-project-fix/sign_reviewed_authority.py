@@ -1,12 +1,55 @@
 #!/usr/bin/env python3
 """
-Independent manifest signing tool for orca-context-bridge authority.
+Provenance-labelling tool for the orca-context-bridge authority manifest.
 
 This tool is NOT called automatically by SessionStart hooks. It must be invoked
 by a separate review/CI process to generate or update the reviewed startup pack manifest.
 
-The manifest contains cryptographic signatures (authority_signed_at, signed_by, signature_nonce)
-that allow verification hooks to distinguish between "externally signed" and "self-signed" manifests.
+WHAT THIS DOES NOT DO (corrected 2026-08-28; this docstring previously claimed
+the opposite and contradicted `SKILL.md` -> "Authority Signing and Freshness"):
+
+    The three fields this tool writes -- `authority_signed_at`, `signed_by`,
+    and `signature_nonce` -- are NOT cryptographic signatures, and they do NOT
+    let a verifier distinguish an externally signed manifest from a self-signed
+    one. Look at what is actually produced below:
+
+        authority_signed_at = datetime.now(timezone.utc).isoformat()
+        signed_by           = <the reviewer-id string the caller passed in>
+        signature_nonce     = secrets.token_hex(16)
+
+    There is no key, no HMAC, no signature value, and nothing to verify any of
+    them against. A random nonce with no key authenticates nothing: anyone able
+    to write the manifest can write these three fields too, with any values they
+    like. They are provenance *labels* -- useful for a human reading the file to
+    see who claims to have reviewed it and when -- and nothing more.
+
+    They are also, today, read by nothing. Neither the deployed verifier
+    (`scripts/build_startup_bundle.py::verify_reviewed_pack`) nor the deployed
+    SessionStart hook (`scripts/startup_context.py`) reads any of the three;
+    the only reader anywhere is `scripts/build_knowledge_graph.py`, which copies
+    `authority_signed_at` into a graph node as display metadata marked
+    `reference_only`. Re-verified by grep over the deployed tree, 2026-08-28:
+    `signed_by` 0 hits, `signature_nonce` 0 hits, `authority_signed_at` 1
+    cosmetic hit.
+
+    The consequence is a real, still-open gap and is recorded as such: the
+    manifest is the trust anchor -- it pins the pack hash, the shared-source
+    hashes and the authority git state -- but the manifest's own bytes are
+    unauthenticated. Whoever can write it can simply re-pin every hash to
+    whatever they just installed and verification still passes.
+
+    Closing that needs a real keyed MAC over the manifest's canonical JSON,
+    with the key held outside the manifest's own directory. That is a design
+    task, deliberately not attempted here. Starting to *read* these existing
+    fields would not close it and would be worse than leaving them alone,
+    because it would create the appearance of a check that still authenticates
+    nothing.
+
+Note also that this tool emits `schema_version: 3` while the deployed verifier
+is v2 and rejects it, and it has no file-write path of its own -- its only
+current use is producing values a human hand-copies into the manifest. See
+`SKILL.md` -> "Re-signing reviewed-startup-pack-manifest.json" for the
+procedure actually in use.
 """
 
 from __future__ import annotations
@@ -117,7 +160,8 @@ def sign_authority(
         # Authority git state - this is what will be verified by hooks
         "authority_git": git_state,
         
-        # Signature fields - these prove external signing
+        # Provenance labels. These prove NOTHING on their own -- unkeyed and
+        # read by no deployed verifier. See the module docstring.
         "authority_signed_at": timestamp,
         "signed_by": reviewer_id,
         "signature_nonce": nonce,
